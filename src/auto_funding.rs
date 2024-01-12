@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use core_ethereum_actions::channels::ChannelActions;
+use chain_actions::channels::ChannelActions;
 use core_types::channels::ChannelDirection::Outgoing;
 use core_types::channels::{ChannelChange, ChannelDirection, ChannelEntry, ChannelStatus};
 use log::info;
@@ -14,7 +14,7 @@ use crate::strategy::SingularStrategy;
 use crate::Strategy;
 
 #[cfg(all(feature = "prometheus", not(test)))]
-use utils_metrics::metrics::SimpleCounter;
+use metrics::metrics::SimpleCounter;
 
 #[cfg(all(feature = "prometheus", not(test)))]
 lazy_static::lazy_static! {
@@ -113,16 +113,16 @@ mod tests {
     use crate::auto_funding::{AutoFundingStrategy, AutoFundingStrategyConfig};
     use crate::strategy::SingularStrategy;
     use async_trait::async_trait;
-    use core_crypto::random::random_bytes;
-    use core_crypto::types::Hash;
-    use core_ethereum_actions::action_queue::{ActionConfirmation, PendingAction};
-    use core_ethereum_actions::channels::ChannelActions;
-    use core_ethereum_types::actions::Action;
-    use core_ethereum_types::chain_events::ChainEventType;
+    use chain_actions::action_queue::{ActionConfirmation, PendingAction};
+    use chain_actions::channels::ChannelActions;
+    use chain_types::actions::Action;
+    use chain_types::chain_events::ChainEventType;
     use core_types::channels::ChannelChange::CurrentBalance;
     use core_types::channels::ChannelDirection::Outgoing;
     use core_types::channels::{ChannelEntry, ChannelStatus};
     use futures::{future::ok, FutureExt};
+    use hopr_crypto::random::random_bytes;
+    use hopr_crypto::types::Hash;
     use mockall::mock;
     use utils_types::primitives::{Address, Balance, BalanceType};
     use utils_types::traits::BinarySerializable;
@@ -131,14 +131,14 @@ mod tests {
         ChannelAct { }
         #[async_trait]
         impl ChannelActions for ChannelAct {
-            async fn open_channel(&self, destination: Address, amount: Balance) -> core_ethereum_actions::errors::Result<PendingAction>;
-            async fn fund_channel(&self, channel_id: Hash, amount: Balance) -> core_ethereum_actions::errors::Result<PendingAction>;
+            async fn open_channel(&self, destination: Address, amount: Balance) -> chain_actions::errors::Result<PendingAction>;
+            async fn fund_channel(&self, channel_id: Hash, amount: Balance) -> chain_actions::errors::Result<PendingAction>;
             async fn close_channel(
                 &self,
                 counterparty: Address,
                 direction: core_types::channels::ChannelDirection,
                 redeem_before_close: bool,
-            ) -> core_ethereum_actions::errors::Result<PendingAction>;
+            ) -> chain_actions::errors::Result<PendingAction>;
         }
     }
 

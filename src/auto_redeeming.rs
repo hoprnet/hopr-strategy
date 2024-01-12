@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use core_ethereum_actions::redeem::TicketRedeemActions;
+use chain_actions::redeem::TicketRedeemActions;
 use core_types::acknowledgement::AcknowledgedTicket;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use crate::strategy::SingularStrategy;
 use crate::Strategy;
 
 #[cfg(all(feature = "prometheus", not(test)))]
-use utils_metrics::metrics::SimpleCounter;
+use metrics::metrics::SimpleCounter;
 
 #[cfg(all(feature = "prometheus", not(test)))]
 lazy_static::lazy_static! {
@@ -84,17 +84,17 @@ mod tests {
     use crate::auto_redeeming::{AutoRedeemingStrategy, AutoRedeemingStrategyConfig};
     use crate::strategy::SingularStrategy;
     use async_trait::async_trait;
-    use core_crypto::keypairs::{ChainKeypair, Keypair};
-    use core_crypto::random::random_bytes;
-    use core_crypto::types::{Challenge, CurvePoint, HalfKey, Hash};
-    use core_ethereum_actions::action_queue::{ActionConfirmation, PendingAction};
-    use core_ethereum_actions::redeem::TicketRedeemActions;
-    use core_ethereum_types::actions::Action;
-    use core_ethereum_types::chain_events::ChainEventType;
+    use chain_actions::action_queue::{ActionConfirmation, PendingAction};
+    use chain_actions::redeem::TicketRedeemActions;
+    use chain_types::actions::Action;
+    use chain_types::chain_events::ChainEventType;
     use core_types::acknowledgement::{AcknowledgedTicket, UnacknowledgedTicket};
     use core_types::channels::{ChannelEntry, ChannelStatus, Ticket};
     use futures::{future::ok, FutureExt};
     use hex_literal::hex;
+    use hopr_crypto::keypairs::{ChainKeypair, Keypair};
+    use hopr_crypto::random::random_bytes;
+    use hopr_crypto::types::{Challenge, CurvePoint, HalfKey, Hash};
     use mockall::mock;
     use utils_types::primitives::{Address, Balance, BalanceType, U256};
     use utils_types::traits::BinarySerializable;
@@ -136,18 +136,18 @@ mod tests {
         TicketRedeemAct { }
         #[async_trait]
         impl TicketRedeemActions for TicketRedeemAct {
-            async fn redeem_all_tickets(&self, only_aggregated: bool) -> core_ethereum_actions::errors::Result<Vec<PendingAction>>;
+            async fn redeem_all_tickets(&self, only_aggregated: bool) -> chain_actions::errors::Result<Vec<PendingAction>>;
             async fn redeem_tickets_with_counterparty(
                 &self,
                 counterparty: &Address,
                 only_aggregated: bool,
-            ) -> core_ethereum_actions::errors::Result<Vec<PendingAction >>;
+            ) -> chain_actions::errors::Result<Vec<PendingAction >>;
             async fn redeem_tickets_in_channel(
                 &self,
                 channel: &ChannelEntry,
                 only_aggregated: bool,
-            ) -> core_ethereum_actions::errors::Result<Vec<PendingAction >>;
-            async fn redeem_ticket(&self, ack: AcknowledgedTicket) -> core_ethereum_actions::errors::Result<PendingAction>;
+            ) -> chain_actions::errors::Result<Vec<PendingAction >>;
+            async fn redeem_ticket(&self, ack: AcknowledgedTicket) -> chain_actions::errors::Result<PendingAction>;
         }
     }
 

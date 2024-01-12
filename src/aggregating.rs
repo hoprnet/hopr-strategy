@@ -1,8 +1,8 @@
 use async_lock::{Mutex, RwLock};
 use async_trait::async_trait;
-use core_ethereum_actions::errors::CoreEthereumActionsError::ChannelDoesNotExist;
-use core_ethereum_actions::redeem::TicketRedeemActions;
-use core_ethereum_db::traits::HoprCoreEthereumDbActions;
+use chain_actions::errors::CoreEthereumActionsError::ChannelDoesNotExist;
+use chain_actions::redeem::TicketRedeemActions;
+use chain_db::traits::HoprCoreEthereumDbActions;
 use core_protocol::ticket_aggregation::processor::{AggregationList, TicketAggregationActions};
 use core_types::acknowledgement::{AcknowledgedTicket, AcknowledgedTicketStatus};
 use core_types::channels::ChannelDirection::Incoming;
@@ -25,7 +25,7 @@ use crate::{strategy::SingularStrategy, Strategy};
 use async_std::task::spawn;
 
 #[cfg(all(feature = "prometheus", not(test)))]
-use utils_metrics::metrics::SimpleCounter;
+use metrics::metrics::SimpleCounter;
 
 #[cfg(all(feature = "prometheus", not(test)))]
 lazy_static::lazy_static! {
@@ -327,13 +327,9 @@ mod tests {
     use crate::strategy::SingularStrategy;
     use async_lock::RwLock;
     use async_trait::async_trait;
-    use core_crypto::{
-        keypairs::{ChainKeypair, Keypair, OffchainKeypair},
-        types::{Hash, Response},
-    };
-    use core_ethereum_actions::action_queue::PendingAction;
-    use core_ethereum_actions::redeem::TicketRedeemActions;
-    use core_ethereum_db::{db::CoreEthereumDb, traits::HoprCoreEthereumDbActions};
+    use chain_actions::action_queue::PendingAction;
+    use chain_actions::redeem::TicketRedeemActions;
+    use chain_db::{db::CoreEthereumDb, traits::HoprCoreEthereumDbActions};
     use core_protocol::ticket_aggregation::processor::{
         TicketAggregationActions, TicketAggregationInteraction, TicketAggregationProcessed,
     };
@@ -346,6 +342,10 @@ mod tests {
     use futures::channel::oneshot::Receiver;
     use futures::{FutureExt, StreamExt};
     use hex_literal::hex;
+    use hopr_crypto::{
+        keypairs::{ChainKeypair, Keypair, OffchainKeypair},
+        types::{Hash, Response},
+    };
     use lazy_static::lazy_static;
     use mockall::mock;
     use std::pin::pin;
@@ -378,18 +378,18 @@ mod tests {
         TicketRedeemAct { }
         #[async_trait]
         impl TicketRedeemActions for TicketRedeemAct {
-            async fn redeem_all_tickets(&self, only_aggregated: bool) -> core_ethereum_actions::errors::Result<Vec<PendingAction >>;
+            async fn redeem_all_tickets(&self, only_aggregated: bool) -> chain_actions::errors::Result<Vec<PendingAction >>;
             async fn redeem_tickets_with_counterparty(
                 &self,
                 counterparty: &Address,
                 only_aggregated: bool,
-            ) -> core_ethereum_actions::errors::Result<Vec<PendingAction >>;
+            ) -> chain_actions::errors::Result<Vec<PendingAction >>;
             async fn redeem_tickets_in_channel(
                 &self,
                 channel: &ChannelEntry,
                 only_aggregated: bool,
-            ) -> core_ethereum_actions::errors::Result<Vec<PendingAction >>;
-            async fn redeem_ticket(&self, ack: AcknowledgedTicket) -> core_ethereum_actions::errors::Result<PendingAction>;
+            ) -> chain_actions::errors::Result<Vec<PendingAction >>;
+            async fn redeem_ticket(&self, ack: AcknowledgedTicket) -> chain_actions::errors::Result<PendingAction>;
         }
     }
 

@@ -1,5 +1,5 @@
-use core_crypto::types::OffchainPublicKey;
 use core_types::channels::{ChannelDirection, ChannelStatus};
+use hopr_crypto::types::OffchainPublicKey;
 use log::{debug, error, info, warn};
 use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
@@ -8,8 +8,8 @@ use utils_types::primitives::{Address, Balance, BalanceType};
 
 use async_lock::RwLock;
 use async_trait::async_trait;
-use core_ethereum_actions::channels::ChannelActions;
-use core_ethereum_db::traits::HoprCoreEthereumDbActions;
+use chain_actions::channels::ChannelActions;
+use chain_db::traits::HoprCoreEthereumDbActions;
 use core_network::network::{Network, NetworkExternalActions};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -27,7 +27,7 @@ use crate::strategy::SingularStrategy;
 use crate::{decision::ChannelDecision, Strategy};
 
 #[cfg(all(feature = "prometheus", not(test)))]
-use utils_metrics::metrics::SimpleCounter;
+use metrics::metrics::SimpleCounter;
 
 #[cfg(all(feature = "prometheus", not(test)))]
 lazy_static::lazy_static! {
@@ -394,19 +394,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_crypto::keypairs::{Keypair, OffchainKeypair};
-    use core_crypto::random::random_bytes;
-    use core_crypto::types::Hash;
-    use core_ethereum_actions::action_queue::{ActionConfirmation, PendingAction};
-    use core_ethereum_db::db::CoreEthereumDb;
-    use core_ethereum_types::actions::Action;
-    use core_ethereum_types::chain_events::ChainEventType;
+    use chain_actions::action_queue::{ActionConfirmation, PendingAction};
+    use chain_db::db::CoreEthereumDb;
+    use chain_types::actions::Action;
+    use chain_types::chain_events::ChainEventType;
     use core_network::{
         network::{NetworkConfig, NetworkEvent, NetworkExternalActions, PeerOrigin},
         PeerId,
     };
     use core_types::channels::{ChannelEntry, ChannelStatus};
     use futures::{future::ok, FutureExt};
+    use hopr_crypto::keypairs::{Keypair, OffchainKeypair};
+    use hopr_crypto::random::random_bytes;
+    use hopr_crypto::types::Hash;
     use lazy_static::lazy_static;
     use mockall::mock;
     use platform::time::native::current_timestamp;
@@ -425,14 +425,14 @@ mod tests {
         ChannelAct { }
         #[async_trait]
         impl ChannelActions for ChannelAct {
-            async fn open_channel(&self, destination: Address, amount: Balance) -> core_ethereum_actions::errors::Result<PendingAction>;
-            async fn fund_channel(&self, channel_id: Hash, amount: Balance) -> core_ethereum_actions::errors::Result<PendingAction>;
+            async fn open_channel(&self, destination: Address, amount: Balance) -> chain_actions::errors::Result<PendingAction>;
+            async fn fund_channel(&self, channel_id: Hash, amount: Balance) -> chain_actions::errors::Result<PendingAction>;
             async fn close_channel(
                 &self,
                 counterparty: Address,
                 direction: ChannelDirection,
                 redeem_before_close: bool,
-            ) -> core_ethereum_actions::errors::Result<PendingAction>;
+            ) -> chain_actions::errors::Result<PendingAction>;
         }
     }
 
