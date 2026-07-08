@@ -27,6 +27,7 @@ strategy-auto-funding      = []
 strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
+strategy-pix               = ["dep:redb", "dep:scrypt", "dep:chacha20poly1305"]
 
 [dependencies]
 anyhow              = { workspace = true }
@@ -52,6 +53,11 @@ moka               = { workspace = true, features = ["sync"] }
 multiaddr          = { workspace = true }
 parking_lot        = { workspace = true }
 
+# PIX (non-anonymous) strategy support — enabled via the `strategy-pix` feature.
+chacha20poly1305 = { workspace = true, optional = true }
+redb             = { workspace = true, optional = true }
+scrypt           = { workspace = true, optional = true }
+
 [dev-dependencies]
 chrono = { workspace = true, default-features = false, features = [
   "clock",
@@ -67,6 +73,7 @@ hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 insta = { workspace = true, features = ["redactions", "yaml"] }
 mockall = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
 tokio = { workspace = true, features = [
   "macros",
@@ -83,6 +90,7 @@ anyhow = "1.0.103"
 async-trait = "0.1.89"
 blokli-client = "0.30.0"
 bytesize = { version = "2.4.0", features = ["serde"] }
+chacha20poly1305 = "0.10.1"
 chrono = { version = "0.4.45", default-features = false }
 ctor = "0.2"
 dashmap = "6.2.1"
@@ -108,11 +116,14 @@ mockall = "0.15.0"
 moka = "0.12.15"
 multiaddr = "0.18.2"
 parking_lot = "0.12.5"
+redb = "4.1.0"
 rstest = "0.26.1"
+scrypt = "0.12.0"
 serde = "1.0.228"
 serde_json = "1.0.150"
 serde_with = "3.21.0"
 smart-default = "0.7.1"
+tempfile = "3.27.0"
 test-log = "0.2.21"
 thiserror = "2.0.18"
 tokio = "1.52.3"
