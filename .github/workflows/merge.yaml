@@ -1,0 +1,61 @@
+---
+name: Merge
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+concurrency:
+  group: merge-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+jobs:
+  build-library:
+    name: Library ${{ matrix.architecture }}
+    if: github.event.pull_request.merged == true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64-linux
+            runner: depot-ubuntu-24.04-4
+          - architecture: aarch64-linux
+            runner: depot-ubuntu-24.04-arm-4
+          - architecture: aarch64-darwin
+            runner: depot-macos-15
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@19d69bd81be66220932b18f1a7a655b422180b4e # build-library-v3
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      source_branch: ${{ github.event.pull_request.base.ref }}
+      version_type: pr
+      architecture: ${{ matrix.architecture }}
+      cachix_cache_name: hopr-strategy
+      build_file: Cargo.toml
+      package_name: hopr-strategy
+      runner: ${{ matrix.runner }}
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  notify:
+    name: Notify failure
+    needs:
+      - build-library
+    if: ${{ always() && github.event.pull_request.merged == true && !success() }}
+    runs-on: depot-ubuntu-24.04-2
+    steps:
+      - name: Notify failed merge pipeline
+        uses: zulip/github-actions-zulip/send-message@bd8ec52de371d139ae8313661b7d8318c19266aa # v2.0.1
+        with:
+          api-key: ${{ secrets.ZULIP_API_KEY }}
+          email: ${{ secrets.ZULIP_EMAIL }}
+          organization-url: "https://hopr.zulipchat.com"
+          type: "stream"
+          to: "hopr-strategy"
+          topic: "main"
+          content: |
+            The merge pipeline has failed for pull request [#${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
