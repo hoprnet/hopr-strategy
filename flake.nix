@@ -181,6 +181,19 @@
                 ''
               );
             };
+            # Strategy integration tests against the self-contained Blokli-Anvil
+            # image (anvil + contract deployment + bloklid in one container).
+            # Requires docker on the host. The `tests/integration` crate is a
+            # detached workspace, so it is built via its own manifest.
+            test-integration = {
+              type = "app";
+              program = toString (
+                pkgs.writeShellScript "test-integration" ''
+                  export BLOKLI_TEST_REMOTE_IMAGE="''${BLOKLI_TEST_REMOTE_IMAGE:-europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil:latest}"
+                  nix develop --command ${pkgs.just}/bin/just test-integration
+                ''
+              );
+            };
           };
 
           # Rust toolchains

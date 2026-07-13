@@ -33,3 +33,6 @@ result
 /.pre-commit-config.yaml
 
 *.log
+
+# nested test workspace build artifacts
+/tests/integration/target
