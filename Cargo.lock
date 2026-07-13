@@ -1504,9 +1504,9 @@ dependencies = [
 
 [[package]]
 name = "blokli-client"
-version = "0.29.3"
+version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d90fe4a22a8fe14ee2562fde41d3e11e5354d7555c8a7e7c3de81a83b0a9c22c"
+checksum = "4ecdfbd15f4ff885b4aaea1630d1e318f15462c85971b0bb3150b228b7792d60"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1526,9 +1526,11 @@ dependencies = [
  "parking_lot",
  "rand 0.10.2",
  "reqwest",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "smart-default",
+ "strum",
  "thiserror 2.0.18",
  "tracing",
  "url",
@@ -2238,7 +2240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.118",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3215,7 +3217,7 @@ dependencies = [
 [[package]]
 name = "hopr-chain-connector"
 version = "0.22.0"
-source = "git+https://github.com/hoprnet/hoprnet#ac365f2b82143fcf69adf043f6c0a38203e61f00"
+source = "git+https://github.com/hoprnet/hoprnet?branch=master#ac365f2b82143fcf69adf043f6c0a38203e61f00"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3382,7 +3384,7 @@ dependencies = [
 [[package]]
 name = "hopr-utils"
 version = "0.2.0"
-source = "git+https://github.com/hoprnet/hoprnet#ac365f2b82143fcf69adf043f6c0a38203e61f00"
+source = "git+https://github.com/hoprnet/hoprnet?branch=master#ac365f2b82143fcf69adf043f6c0a38203e61f00"
 dependencies = [
  "auto_impl",
  "futures",
