@@ -1,69 +1,75 @@
 [package]
-name = "hopr-strategy"
-description = "Contains implementations of different HOPR strategies"
-version = "0.19.2"
-edition = "2024"
-license = "GPL-3.0-only"
-readme = "README.md"
-keywords = ["hopr", "strategy", "channels"]
-repository = "https://github.com/hoprnet/hopr-strategy"
-homepage = "https://hoprnet.org/"
-categories = ["network-programming"]
-authors = ["HOPR Association <tech@hoprnet.org>"]
+authors      = ["HOPR Association <tech@hoprnet.org>"]
+categories   = ["network-programming"]
+description  = "Contains implementations of different HOPR strategies"
+edition      = "2024"
+homepage     = "https://hoprnet.org/"
+include      = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs"]
+keywords     = ["channels", "hopr", "strategy"]
+license      = "GPL-3.0-only"
+name         = "hopr-strategy"
+readme       = "README.md"
+repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.94"
-include = ["README.md", "src/**/*.rs", "Cargo.toml", "LICENSE"]
+version      = "0.19.2"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
-default = ["runtime-tokio"]
+default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
-telemetry = ["hopr-api/types-telemetry"]
+telemetry     = ["hopr-api/types-telemetry"]
 ## Strategy features — each enables one strategy implementation.
-strategy-auto-funding = []
-strategy-auto-redeeming = []
-strategy-closure-finalizer = []
+strategy-auto-funding      = []
+strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
+strategy-closure-finalizer = []
 
 [dependencies]
-anyhow = "1.0.103"
-async-trait = "0.1.89"
-dashmap = { version = "6.2.1", features = ["inline"] }
-futures = "0.3.32"
-futures-time = "3.1.0"
+anyhow              = "1.0.103"
+async-trait         = "0.1.89"
+dashmap             = { version = "6.2.1", features = ["inline"] }
+futures             = "0.3.32"
 futures-concurrency = "7.7.1"
-humantime-serde = "1.1.1"
-lazy_static = "1.5.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_with = "3.21.0"
-smart-default = "0.7.1"
-thiserror = "2.0.18"
-tracing = "0.1.44"
-validator = { version = "0.20.0", features = ["derive"] }
+futures-time        = "3.1.0"
+humantime-serde     = "1.1.1"
+lazy_static         = "1.5.0"
+serde               = { version = "1.0.228", features = ["derive"] }
+serde_with          = "3.21.0"
+smart-default       = "0.7.1"
+thiserror           = "2.0.18"
+tracing             = "0.1.44"
+validator           = { version = "0.20.0", features = ["derive"] }
 
-hopr-api = { version = "1.14.0", features = ["node", "serde"] }
-hopr-utils = { git = "https://github.com/hoprnet/hoprnet", default-features = false }
-moka = { version = "0.12.15", features = ["sync"] }
-multiaddr = "0.18.2"
+hopr-api    = { version = "1.15.0", features = ["node", "serde"] }
+hopr-utils  = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false }
+moka        = { version = "0.12.15", features = ["sync"] }
+multiaddr   = "0.18.2"
 parking_lot = "0.12.5"
 
 [dev-dependencies]
 chrono = { version = "0.4.45", default-features = false, features = [
-  "std",
   "clock",
+  "std",
 ] }
 hex-literal = "1.1.0"
-hopr-utils = { git = "https://github.com/hoprnet/hoprnet", features = ["runtime-tokio"] }
-hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", features = [
+hopr-api = { version = "1.15.0", features = ["types-random"] }
+hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
+  "runtime-tokio",
   "testing",
+] }
+hopr-utils = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
   "runtime-tokio",
 ] }
-hopr-api = { version = "1.14.0", features = ["types-random"] }
-insta = { version = "1.48.0", features = ["yaml", "redactions"] }
+insta = { version = "1.48.0", features = ["redactions", "yaml"] }
 mockall = "0.15.0"
 test-log = { version = "0.2.21", features = ["trace"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "tracing"] }
+tokio = { version = "1.52.3", features = [
+  "macros",
+  "rt-multi-thread",
+  "tracing",
+] }
 
 [workspace]
 
