@@ -39,7 +39,7 @@ use rstest::fixture;
 use tokio::sync::OnceCell;
 use tracing::{debug, info};
 
-use crate::{
+use crate::fixture::{
     anvil::AnvilAccount, config::TestConfig, constants::STACK_STARTUP_WAIT, docker::DockerEnvironment,
     transaction::TransactionBuilder,
 };

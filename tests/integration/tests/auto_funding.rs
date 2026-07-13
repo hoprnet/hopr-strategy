@@ -10,6 +10,10 @@
 //! Requires docker + a pullable bloklid image; driven only via
 //! `just test-integration` / the `#test-integration` nix app.
 
+#![allow(dead_code)]
+
+mod fixture;
+
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
@@ -21,12 +25,13 @@ use hopr_api::{
     },
 };
 use hopr_strategy::auto_funding::{AutoFundingStrategy, AutoFundingStrategyConfig};
-use hopr_strategy_integration_tests::{
+use rstest::rstest;
+use serial_test::serial;
+
+use crate::fixture::{
     fixtures::{IntegrationFixture, integration_fixture as fixture, poll_until},
     strategy_node::{ChainNode, connect_node, node_chain_keypair},
 };
-use rstest::rstest;
-use serial_test::serial;
 
 /// wxHOPR the node's Safe is funded with on deployment (ample for onboarding +
 /// channel stake + several funding rounds).

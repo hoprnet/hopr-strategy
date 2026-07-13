@@ -1,69 +1,39 @@
 [package]
+autolib = false
 edition = "2021"
 name    = "hopr-strategy-integration-tests"
 publish = false
-version = "0.0.0"
+version = "0.1.0"
 
-# Integration tests that exercise the strategies against a real Blokli-Anvil
-# stack (see docker-compose.yml). Kept out of the published `hopr-strategy`
-# crate and excluded from the default `cargo test` run — driven only through
-# the `test-integration` nix app / `just test-integration`.
+[dev-dependencies]
 
-# Detached from the published `hopr-strategy` crate's workspace: this test crate
-# pulls heavy git deps (hopli, hoprnet) that must never enter the library build.
-# It depends on `hopr-strategy` by path across the workspace boundary.
-[workspace]
-
-[lib]
-# The harness (docker orchestration + on-chain onboarding) lives in the lib;
-# the actual strategy tests live under `tests/`.
-path = "src/lib.rs"
-
-[dependencies]
-# ── On-chain onboarding + docker harness (mirrors blokli-client's tests) ────
-# This layer talks to Blokli/anvil purely via raw signed transactions, so it
-# uses the `hopr-types` 1.11 line pulled in by `blokli-client`/`hopli`.
-anyhow        = "1.0.103"
-blokli-client = { version = "0.29.1", features = ["serde"] }
-chrono        = "0.4.45"
-clap          = { version = "4.6.1", features = ["derive", "env", "string"] }
-futures       = "0.3.32"
-futures-time  = "3.1.0"
-hex           = "0.4.3"
-hopli         = { git = "https://github.com/hoprnet/hopli", branch = "main" }
-# Pinned exact so the sol!-generated HoprToken types line up with what `hopli`
-# (main) links against; 4.10 pulls a different alloy and splits the types.
-hopr-bindings = "=4.9.1"
-hopr-types = { version = "1.11", features = [
+anyhow = { workspace = true }
+blokli-client = { workspace = true, features = ["serde"] }
+chrono = { workspace = true, features = ["clock", "std"] }
+clap = { workspace = true, features = ["derive", "env", "string"] }
+futures = { workspace = true }
+futures-time = { workspace = true }
+hex = { workspace = true }
+hopli = { workspace = true }
+hopr-api = { workspace = true, features = ["node", "serde"] }
+hopr-bindings = { workspace = true }
+hopr-chain-connector = { workspace = true, features = ["runtime-tokio"] }
+hopr-strategy = { workspace = true, features = [
+  "runtime-tokio",
+  "strategy-auto-funding",
+] }
+hopr-types = { workspace = true, features = [
   "chain",
   "crypto",
   "internal",
   "primitive",
 ] }
-libc = "0.2.186"
-rand = "0.10.2"
-rstest = "0.26.1"
-serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
-tracing = "0.1.44"
-url = { version = "2.5.8", features = ["serde"] }
-
-# ── Strategy layer (drives strategies through the real connector) ───────────
-# Same `hopr-api` 1.15 / `hopr-types` 2.0 world as `hopr-strategy` itself.
-async-trait = "0.1.89"
-dashmap = { version = "6.2.1", features = ["inline"] }
-hopr-api = { version = "1.15.0", features = ["node", "serde"] }
-hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
-  "runtime-tokio",
-] }
-hopr-strategy = { path = "../..", features = [
-  "runtime-tokio",
-  "strategy-auto-funding",
-] }
-hopr-utils = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
-  "runtime-tokio",
-] }
-
-[dev-dependencies]
-serial_test = "3.5.0"
-test-log    = { version = "0.2.21", features = ["trace"] }
+libc = { workspace = true }
+rand = { workspace = true }
+rstest = { workspace = true }
+serde_json = { workspace = true }
+serial_test = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }
+url = { workspace = true, features = ["serde"] }

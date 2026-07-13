@@ -24,7 +24,7 @@ use hopr_chain_connector::{HoprBlockchainSafeConnector, create_trustful_hopr_blo
 pub type NodeConnector = HoprBlockchainSafeConnector<blokli_client::BlokliClient>;
 
 /// Reconstructs the strategy-side (`hopr-api` 1.15) chain keypair from raw secret
-/// bytes obtained from an [`crate::anvil::AnvilAccount`] (whose key lives in the
+/// bytes obtained from an [`crate::support::anvil::AnvilAccount`] (whose key lives in the
 /// `hopr-types` 1.11 world).
 pub fn node_chain_keypair(secret: &[u8]) -> anyhow::Result<ChainKeypair> {
     ChainKeypair::from_secret(secret).map_err(|e| anyhow::anyhow!("invalid node secret: {e}"))
