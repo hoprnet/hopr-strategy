@@ -1,8 +1,7 @@
-//! Integration test: the Auto-Funding strategy tops up an under-funded channel
-//! against a real Blokli-Anvil stack.
+//! Integration test: the Auto-Funding strategy tops up an under-funded channel against a real Blokli-Anvil stack.
 //!
 //! Flow (mirrors the issue's proposed approach):
-//! 1. Onboard a node on-chain (deploy Safe funded with wxHOPR, announce, approve).
+//! 1. Onboard two nodes on-chain (deploy Safe funded with wxHOPR, announce, approve).
 //! 2. Open an outgoing channel whose stake is below the strategy threshold.
 //! 3. Build the Auto-Funding strategy over a real connector targeting bloklid.
 //! 4. Run the strategy and assert the channel gets funded on-chain.
@@ -10,9 +9,7 @@
 //! Requires docker + a pullable bloklid image; driven only via
 //! `just test-integration` / the `#test-integration` nix app.
 
-#![allow(dead_code)]
-
-mod fixture;
+mod helpers;
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
@@ -28,13 +25,12 @@ use hopr_strategy::auto_funding::{AutoFundingStrategy, AutoFundingStrategyConfig
 use rstest::rstest;
 use serial_test::serial;
 
-use crate::fixture::{
+use crate::helpers::{
     fixtures::{IntegrationFixture, integration_fixture as fixture, poll_until},
     strategy_node::{ChainNode, connect_node, node_chain_keypair},
 };
 
-/// wxHOPR the node's Safe is funded with on deployment (ample for onboarding +
-/// channel stake + several funding rounds).
+/// wxHOPR the node's Safe is funded with on deployment (ample for onboarding + channel stake + several funding rounds).
 const SAFE_FUNDING: &str = "100 wxHOPR";
 /// Allowance granted to the Safe module towards the Channels contract.
 const SAFE_ALLOWANCE: &str = "100 wxHOPR";
@@ -43,46 +39,43 @@ const SAFE_ALLOWANCE: &str = "100 wxHOPR";
 #[test_log::test(tokio::test)]
 #[serial]
 async fn auto_funding_tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
-    // `bob` is the strategy's node; `chris` is the channel counterparty.
-    let [bob, chris] = fixture.sample_accounts::<2>();
+    let [src, dst] = fixture.sample_accounts::<2>();
 
-    // ── 1. Onboard the nodes on-chain: deploy + register Safe, announce ──────────
+    // Onboard the nodes on-chain: deploy + register Safe, announce
     let safe = fixture
-        .deploy_safe_and_announce(bob, SAFE_FUNDING.parse().context("parse SAFE_FUNDING")?)
+        .deploy_safe_and_announce(src, SAFE_FUNDING.parse().context("parse SAFE_FUNDING")?)
         .await
         .context("failed to onboard node safe")?;
 
     fixture
-        .deploy_safe_and_announce(chris, SAFE_FUNDING.parse().context("parse SAFE_FUNDING")?)
+        .deploy_safe_and_announce(dst, SAFE_FUNDING.parse().context("parse SAFE_FUNDING")?)
         .await
         .context("failed to onboard node safe")?;
 
     fixture
         .approve(
-            bob,
+            src,
             SAFE_ALLOWANCE.parse().context("parse SAFE_ALLOWANCE")?,
             &safe.module_address,
         )
         .await
         .context("failed to approve safe module allowance")?;
 
-    // ── 2. Open an under-funded outgoing channel bob -> chris ───────────────────
-    // Strategy threshold is 5 wxHOPR; open the channel at 1 wxHOPR so it is
-    // immediately eligible for top-up.
+    // Open an under-funded outgoing channel src -> dst
     let channel_stake = "1 wxHOPR".parse().context("parse channel stake")?;
     fixture
-        .open_channel(bob, chris, channel_stake, &safe.module_address, None)
+        .open_channel(src, dst, channel_stake, &safe.module_address, None)
         .await
         .context("failed to open channel")?;
 
-    // ── 3. Build the strategy over a real connector for bob ─────────────────────
+    // Build the strategy over a real connector for bob
     let module_address = Address::from_str(&safe.module_address).context("parse module address")?;
-    let connector = connect_node(fixture.client().clone(), &bob.secret_bytes(), module_address)
+    let connector = connect_node(fixture.client().clone(), &src.secret_bytes(), module_address)
         .await
         .context("failed to connect node connector")?;
 
-    let bob_addr = node_chain_keypair(&bob.secret_bytes())?.public().to_address();
-    let chris_addr = node_chain_keypair(&chris.secret_bytes())?.public().to_address();
+    let src_addr = node_chain_keypair(&src.secret_bytes())?.public().to_address();
+    let dst_addr = node_chain_keypair(&dst.secret_bytes())?.public().to_address();
 
     // Wait for the connector's channel graph to reflect the freshly-opened channel
     // (bloklid indexing + SSE sync are asynchronous).
@@ -92,7 +85,7 @@ async fn auto_funding_tops_up_underfunded_channel(#[future(awt)] fixture: Integr
         Duration::from_millis(500),
         || {
             let connector = connector.clone();
-            async move { Ok(connector.channel_by_parties(&bob_addr, &chris_addr)?) }
+            async move { Ok(connector.channel_by_parties(&src_addr, &dst_addr)?) }
         },
     )
     .await
@@ -113,7 +106,7 @@ async fn auto_funding_tops_up_underfunded_channel(#[future(awt)] fixture: Integr
     let node = Arc::new(ChainNode(connector.clone()));
     let mut strategy = AutoFundingStrategy::new(cfg, Duration::from_secs(60)).build(node);
 
-    // ── 4. Run the strategy; its startup tick scans + funds the channel ─────────
+    // Run the strategy; its startup tick scans + funds the channel
     let handle = tokio::spawn(async move {
         let _ = strategy.run().await;
     });
@@ -126,7 +119,7 @@ async fn auto_funding_tops_up_underfunded_channel(#[future(awt)] fixture: Integr
         || {
             let connector = connector.clone();
             async move {
-                let ch = connector.channel_by_parties(&bob_addr, &chris_addr)?;
+                let ch = connector.channel_by_parties(&src_addr, &dst_addr)?;
                 Ok(ch.filter(|c| c.balance > initial_balance))
             }
         },

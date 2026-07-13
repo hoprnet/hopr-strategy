@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
-use crate::fixture::{
+use crate::helpers::{
     anvil::AnvilAccount,
     config::{CONTAINER_API_PORT, TestConfig},
     util::{build_command, capture_command, run_command},
