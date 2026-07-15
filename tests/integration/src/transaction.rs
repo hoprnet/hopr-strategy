@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use anyhow::{Context, Result};
 use hopr_bindings::exports::alloy::{
     consensus::{SignableTransaction, TxEip1559},
@@ -16,22 +14,12 @@ pub const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
 
 pub struct TransactionBuilder {
     signer: PrivateKeySigner,
-    sender_address: String,
 }
 
 impl TransactionBuilder {
     pub fn new(keypair: &ChainKeypair) -> Result<Self> {
         let signer: PrivateKeySigner = hex::encode(keypair.secret().as_ref()).parse()?;
-        let address = format!("{:#x}", signer.address());
-
-        Ok(Self {
-            signer,
-            sender_address: address,
-        })
-    }
-
-    pub fn sender_address(&self) -> String {
-        self.sender_address.clone()
+        Ok(Self { signer })
     }
 
     /// Builds and signs an EIP-1559 contract-call transaction, returning the raw
@@ -67,22 +55,5 @@ impl TransactionBuilder {
         let mut encoded = Vec::new();
         signed.encode_2718(&mut encoded);
         Ok(encoded)
-    }
-
-    /// Convenience wrapper for a plain native-value transfer (used by harness self-tests).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn build_eip1559_transaction_hex(
-        &self,
-        chain_id: u64,
-        nonce: u64,
-        recipient: &str,
-        value: U256,
-        _max_fee_per_gas: u128,
-        _max_priority_fee_per_gas: u128,
-        _gas_limit: u64,
-    ) -> Result<String> {
-        let to = AlloyAddress::from_str(recipient).context("Invalid recipient address")?;
-        let bytes = self.build_call_tx(chain_id, nonce, to, value, Bytes::default()).await?;
-        Ok(format!("0x{}", hex::encode(bytes)))
     }
 }

@@ -1,10 +1,15 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use tracing::{info, warn};
+use url::Url;
 
-use crate::helpers::{
+use crate::{
     anvil::AnvilAccount,
     config::{CONTAINER_API_PORT, TestConfig},
     util::{build_command, capture_command, run_command},
@@ -18,28 +23,51 @@ use crate::helpers::{
 pub struct DockerEnvironment {
     config: Arc<TestConfig>,
     running: bool,
+    bloklid_url: Option<Url>,
 }
+
+const PROJECT_LABEL: &str = "org.hopr.integration.project=hopr-strategy";
 
 impl DockerEnvironment {
     pub fn new(config: Arc<TestConfig>) -> Self {
-        Self { config, running: false }
+        Self {
+            config,
+            running: false,
+            bloklid_url: None,
+        }
     }
 
     pub fn ensure_image_available(&self) -> Result<()> {
+        if !self.config.pull_image {
+            let inspect = build_command("docker", &["image", "inspect", &self.config.image]);
+            if run_command(inspect, "docker inspect bloklid-anvil image").is_ok() {
+                info!(image = %self.config.image, "using cached bloklid-anvil image");
+                return Ok(());
+            }
+        }
+
         info!(image = %self.config.image, "pulling bloklid-anvil image");
-        let cmd = build_command("docker", &["pull", "--platform", "linux/amd64", &self.config.image]);
-        run_command(cmd, true, "docker pull bloklid-anvil image")
+        let cmd = build_command(
+            "docker",
+            &["pull", "--platform", &self.config.platform, &self.config.image],
+        );
+        run_command(cmd, "docker pull bloklid-anvil image")
     }
 
     pub fn run(&mut self) -> Result<()> {
+        self.cleanup_stale_containers()?;
+
         // Remove any stale container from a previous aborted run.
         let _ = run_command(
             build_command("docker", &["rm", "-f", &self.config.container_name()]),
-            true,
             "docker rm stale container",
         );
 
-        let api_pub = format!("{}:{CONTAINER_API_PORT}", self.config.host_api_port());
+        let api_pub = self.config.host_api_port().map_or_else(
+            || format!("127.0.0.1::{CONTAINER_API_PORT}"),
+            |port| format!("127.0.0.1:{port}:{CONTAINER_API_PORT}"),
+        );
+        let stack_label = format!("org.hopr.integration.stack={}", self.config.stack_id);
 
         info!(
             container = %self.config.container_name(),
@@ -54,15 +82,45 @@ impl DockerEnvironment {
                 "--name",
                 &self.config.container_name(),
                 "--platform",
-                "linux/amd64",
+                &self.config.platform,
+                "--label",
+                PROJECT_LABEL,
+                "--label",
+                &stack_label,
                 "-p",
                 &api_pub,
                 &self.config.image,
             ],
         );
-        run_command(cmd, true, "docker run bloklid-anvil")?;
+        run_command(cmd, "docker run bloklid-anvil")?;
         self.running = true;
+
+        let mapping = capture_command(
+            build_command(
+                "docker",
+                &[
+                    "port",
+                    &self.config.container_name(),
+                    &format!("{CONTAINER_API_PORT}/tcp"),
+                ],
+            ),
+            "docker discover bloklid-anvil API port",
+        )?;
+        let port = mapping
+            .lines()
+            .next()
+            .and_then(|line| line.rsplit(':').next())
+            .context("Docker did not return a mapped bloklid API port")?
+            .parse::<u16>()
+            .context("Docker returned an invalid bloklid API port")?;
+        self.bloklid_url = Some(Url::parse(&format!("http://127.0.0.1:{port}"))?);
         Ok(())
+    }
+
+    pub fn bloklid_url(&self) -> Result<&Url> {
+        self.bloklid_url
+            .as_ref()
+            .context("managed Docker stack has not been started")
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -72,10 +130,35 @@ impl DockerEnvironment {
         info!(container = %self.config.container_name(), "stopping bloklid-anvil container");
         run_command(
             build_command("docker", &["rm", "-f", &self.config.container_name()]),
-            true,
             "docker rm container",
         )?;
         self.running = false;
+        self.bloklid_url = None;
+        Ok(())
+    }
+
+    fn cleanup_stale_containers(&self) -> Result<()> {
+        let filter = format!("label={PROJECT_LABEL}");
+        let containers = capture_command(
+            build_command("docker", &["ps", "-aq", "--filter", &filter]),
+            "docker list stale HOPR integration containers",
+        )?;
+
+        for container in containers.lines().filter(|line| !line.is_empty()) {
+            let created = capture_command(
+                build_command("docker", &["inspect", "--format", "{{.Created}}", container]),
+                "docker inspect integration container creation time",
+            )?;
+            let created = DateTime::parse_from_rfc3339(&created)?.with_timezone(&Utc);
+            let age = Utc::now().signed_duration_since(created).to_std().unwrap_or_default();
+            if age >= self.config.stale_container_max_age {
+                info!(container, ?age, "removing stale HOPR integration container");
+                run_command(
+                    build_command("docker", &["rm", "-f", container]),
+                    "docker remove stale HOPR integration container",
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -106,6 +189,11 @@ impl DockerEnvironment {
     }
 }
 
+pub fn load_anvil_accounts(path: &Path) -> Result<Vec<AnvilAccount>> {
+    let logs = fs::read_to_string(path)?;
+    parse_anvil_accounts(&logs)
+}
+
 impl Drop for DockerEnvironment {
     fn drop(&mut self) {
         if self.running {
@@ -134,7 +222,7 @@ fn parse_anvil_accounts(logs: &str) -> Result<Vec<AnvilAccount>> {
         .into_iter()
         .zip(keys)
         .map(|(address, private_key)| AnvilAccount::new(private_key, address))
-        .collect();
+        .collect::<Result<_>>()?;
 
     if accounts.is_empty() {
         bail!("Failed to parse Anvil private keys from logs");

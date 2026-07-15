@@ -1,10 +1,4 @@
-//! Bridge from the live Blokli connector to the node interface strategies expect.
-//!
-//! This is the `hopr-api` 1.15 side of the harness. A [`ChainNode`] newtype wraps
-//! a real `HoprBlockchainSafeConnector` (talking to the anvil-backed bloklid) and
-//! implements the minimal node traits (`HasChainApi`, `ActionableEventSource`) so a
-//! strategy can be built and run against it — exactly as the in-crate unit tests do,
-//! but pointed at a real chain instead of the in-memory simulator.
+//! Connector construction and the common chain-only node adapter.
 
 use std::sync::Arc;
 
@@ -19,23 +13,12 @@ use hopr_api::{
 };
 use hopr_chain_connector::{HoprBlockchainSafeConnector, create_trustful_hopr_blokli_connector};
 
-/// The concrete connector type used by the integration tests: a Safe-based
-/// connector over the real blokli client.
 pub type NodeConnector = HoprBlockchainSafeConnector<blokli_client::BlokliClient>;
 
-/// Reconstructs the strategy-side (`hopr-api` 1.15) chain keypair from raw secret
-/// bytes obtained from an [`crate::support::anvil::AnvilAccount`] (whose key lives in the
-/// `hopr-types` 1.11 world).
 pub fn node_chain_keypair(secret: &[u8]) -> anyhow::Result<ChainKeypair> {
-    ChainKeypair::from_secret(secret).map_err(|e| anyhow::anyhow!("invalid node secret: {e}"))
+    ChainKeypair::from_secret(secret).map_err(|error| anyhow::anyhow!("invalid node secret: {error}"))
 }
 
-/// Builds and connects a trustful Safe connector for the node identified by
-/// `secret`, routing writes through the node's Safe `module_address`.
-///
-/// `client` should be a clone of the fixture's blokli client so the connector
-/// shares the same anvil-backed bloklid endpoint. Contract addresses are read
-/// from bloklid (trustful).
 pub async fn connect_node(
     client: blokli_client::BlokliClient,
     secret: &[u8],
@@ -48,12 +31,7 @@ pub async fn connect_node(
     Ok(Arc::new(connector))
 }
 
-/// Wraps a chain API implementor as a minimal node for strategy tests.
-///
-/// The connector itself is a chain API, not a node. This newtype implements the
-/// `HasChainApi` and `ActionableEventSource` node traits so integration tests can
-/// drive strategies without a full `Hopr` node. Mirrors the wrapper used by the
-/// in-crate unit tests.
+/// Adapts a chain connector to the minimal node interface used by strategies.
 pub struct ChainNode<C>(pub C);
 
 impl<C> HasChainApi for ChainNode<C>
@@ -81,7 +59,7 @@ where
         _predicate: F,
         _context: String,
         _timeout: std::time::Duration,
-    ) -> EventWaitResult<<C as HoprChainApi>::ChainError, <C as HoprChainApi>::ChainError>
+    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
     where
         F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
     {
@@ -100,7 +78,7 @@ where
         Ok(self
             .0
             .subscribe()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .map(ActionableEvent::Chain)
             .boxed())
     }

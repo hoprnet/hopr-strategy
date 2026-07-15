@@ -1,20 +1,21 @@
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use tracing::debug;
 
-pub fn run_command(mut command: Command, silenced: bool, description: &str) -> Result<()> {
-    if silenced {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-
+pub fn run_command(mut command: Command, description: &str) -> Result<()> {
     debug!(description, "run command");
-    let status = command
-        .status()
+    let output = command
+        .output()
         .with_context(|| format!("Failed to run {description}"))?;
 
-    if !status.success() {
-        anyhow::bail!("`{description}` exited with status {status}");
+    if !output.status.success() {
+        anyhow::bail!(
+            "{description} exited with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
     Ok(())
 }

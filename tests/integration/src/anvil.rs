@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use anyhow::{Context, Result};
 use hopr_bindings::exports::alloy::primitives::Address as AlloyAddress;
 use hopr_types::{
     crypto::keypairs::{ChainKeypair, Keypair, OffchainKeypair},
@@ -14,18 +15,18 @@ pub struct AnvilAccount {
 }
 
 impl AnvilAccount {
-    pub fn new(private_key: String, address: String) -> Self {
-        let parsed_private_key =
-            hex::decode(private_key.strip_prefix("0x").unwrap_or(&private_key)).expect("Invalid private key hex");
+    pub(crate) fn new(private_key: String, address: String) -> Result<Self> {
+        let parsed_private_key = hex::decode(private_key.strip_prefix("0x").unwrap_or(&private_key))
+            .context("invalid Anvil private key hex")?;
 
-        let keypair = ChainKeypair::from_secret(&parsed_private_key).expect("Invalid private key hex");
+        let keypair = ChainKeypair::from_secret(&parsed_private_key).context("invalid Anvil private key")?;
 
-        let parsed_address = Address::from_str(&address).expect("Invalid address hex");
+        let parsed_address = Address::from_str(&address).context("invalid Anvil account address")?;
 
-        Self {
+        Ok(Self {
             keypair,
             address: parsed_address,
-        }
+        })
     }
 
     /// Raw secret bytes of the account key. Used to reconstruct the equivalent
@@ -34,15 +35,15 @@ impl AnvilAccount {
         self.keypair.secret().as_ref().to_vec()
     }
 
-    pub fn to_alloy_address(&self) -> AlloyAddress {
+    pub(crate) fn to_alloy_address(&self) -> AlloyAddress {
         AlloyAddress::from_str(&self.address.to_string()).expect("Invalid address hex")
     }
 
-    pub fn keybinding(&self) -> KeyBinding {
+    pub(crate) fn keybinding(&self) -> KeyBinding {
         KeyBinding::new(self.address, &self.offchain_keypair())
     }
 
-    pub fn offchain_keypair(&self) -> OffchainKeypair {
+    fn offchain_keypair(&self) -> OffchainKeypair {
         OffchainKeypair::from_secret(self.keypair.secret().as_ref()).expect("Invalid private key hex")
     }
 }
