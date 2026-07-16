@@ -114,7 +114,7 @@ async fn redeems_queued_ticket(#[future(awt)] fixture: IntegrationFixture) -> Re
         Duration::from_secs(3600),
     )
     .build(node);
-    let handle = StrategyTask::spawn(async move { strategy.run().await });
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     let redeemed = await_channel_where(
         &scenario.connector,
@@ -154,7 +154,7 @@ async fn redeems_all_tickets_on_channel_closure(#[future(awt)] fixture: Integrat
         Duration::from_secs(3600),
     )
     .build(node);
-    let handle = StrategyTask::spawn(async move { strategy.run().await });
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // Trigger the incoming-channel closure; the redeemer observes it as a
     // ChannelClosureInitiated event and should redeem the queued ticket.
@@ -199,7 +199,7 @@ async fn skips_ticket_below_minimum_value(#[future(awt)] fixture: IntegrationFix
         Duration::from_secs(3600),
     )
     .build(node);
-    let handle = StrategyTask::spawn(async move { strategy.run().await });
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // The sub-threshold ticket must never be redeemed: ticket index stays put.
     assert_channel_never(
@@ -240,7 +240,7 @@ async fn redeems_ticket_on_winning_event(#[future(awt)] fixture: IntegrationFixt
         Duration::from_secs(3600),
     )
     .build(node.clone());
-    let handle = StrategyTask::spawn(async move { strategy.run().await });
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // Emit the winning-ticket event for the queued ticket. The unbounded channel
     // buffers it, so it is delivered even if the strategy has not subscribed yet.

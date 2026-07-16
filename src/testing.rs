@@ -34,44 +34,54 @@ use hopr_api::{
     },
 };
 
+/// Implements the (identical across adapters) `HasChainApi` surface for a node
+/// newtype, given an expression yielding a `&C` reference to its chain field.
+macro_rules! impl_has_chain_api {
+    ($ty:ident, |$node:ident| $chain:expr) => {
+        impl<C> HasChainApi for $ty<C>
+        where
+            C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
+        {
+            type ChainApi = C;
+            type ChainError = <C as HoprChainApi>::ChainError;
+
+            fn identity(&self) -> &NodeOnchainIdentity {
+                static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
+                IDENTITY.get_or_init(NodeOnchainIdentity::default)
+            }
+
+            fn chain_api(&self) -> &C {
+                let $node = self;
+                $chain
+            }
+
+            fn status(&self) -> ComponentStatus {
+                let $node = self;
+                $chain.component_status()
+            }
+
+            fn wait_for_on_chain_event<F>(
+                &self,
+                _predicate: F,
+                _context: String,
+                _timeout: Duration,
+            ) -> EventWaitResult<Self::ChainError, Self::ChainError>
+            where
+                F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
+            {
+                unimplemented!("tests do not call wait_for_on_chain_event")
+            }
+        }
+    };
+}
+
 /// Wraps a chain API implementor as a minimal, chain-only node.
 ///
 /// Implements `HasChainApi` and `ActionableEventSource` — the surface required by
 /// the auto-funding, auto-redeeming and closure-finalizer strategies.
 pub struct ChainNode<C>(pub C);
 
-impl<C> HasChainApi for ChainNode<C>
-where
-    C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
-{
-    type ChainApi = C;
-    type ChainError = <C as HoprChainApi>::ChainError;
-
-    fn identity(&self) -> &NodeOnchainIdentity {
-        static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
-        IDENTITY.get_or_init(NodeOnchainIdentity::default)
-    }
-
-    fn chain_api(&self) -> &C {
-        &self.0
-    }
-
-    fn status(&self) -> ComponentStatus {
-        self.0.component_status()
-    }
-
-    fn wait_for_on_chain_event<F>(
-        &self,
-        _predicate: F,
-        _context: String,
-        _timeout: Duration,
-    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
-    where
-        F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
-    {
-        unimplemented!("tests do not call wait_for_on_chain_event")
-    }
-}
+impl_has_chain_api!(ChainNode, |node| &node.0);
 
 impl<C> ActionableEventSource for ChainNode<C>
 where
@@ -107,38 +117,7 @@ impl<C> LifecycleNode<C> {
     }
 }
 
-impl<C> HasChainApi for LifecycleNode<C>
-where
-    C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
-{
-    type ChainApi = C;
-    type ChainError = <C as HoprChainApi>::ChainError;
-
-    fn identity(&self) -> &NodeOnchainIdentity {
-        static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
-        IDENTITY.get_or_init(NodeOnchainIdentity::default)
-    }
-
-    fn chain_api(&self) -> &C {
-        &self.chain
-    }
-
-    fn status(&self) -> ComponentStatus {
-        self.chain.component_status()
-    }
-
-    fn wait_for_on_chain_event<F>(
-        &self,
-        _predicate: F,
-        _context: String,
-        _timeout: Duration,
-    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
-    where
-        F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
-    {
-        unimplemented!("tests do not call wait_for_on_chain_event")
-    }
-}
+impl_has_chain_api!(LifecycleNode, |node| &node.chain);
 
 impl<C> ActionableEventSource for LifecycleNode<C>
 where
@@ -517,38 +496,7 @@ impl<C> TicketNode<C> {
     }
 }
 
-impl<C> HasChainApi for TicketNode<C>
-where
-    C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
-{
-    type ChainApi = C;
-    type ChainError = <C as HoprChainApi>::ChainError;
-
-    fn identity(&self) -> &NodeOnchainIdentity {
-        static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
-        IDENTITY.get_or_init(NodeOnchainIdentity::default)
-    }
-
-    fn chain_api(&self) -> &C {
-        &self.chain
-    }
-
-    fn status(&self) -> ComponentStatus {
-        self.chain.component_status()
-    }
-
-    fn wait_for_on_chain_event<F>(
-        &self,
-        _predicate: F,
-        _context: String,
-        _timeout: Duration,
-    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
-    where
-        F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
-    {
-        unimplemented!("tests do not call wait_for_on_chain_event")
-    }
-}
+impl_has_chain_api!(TicketNode, |node| &node.chain);
 
 impl<C> HasTicketManagement for TicketNode<C>
 where

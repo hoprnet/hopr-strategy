@@ -153,18 +153,24 @@ impl DockerEnvironment {
         )?;
 
         for container in containers.lines().filter(|line| !line.is_empty()) {
-            let created = capture_command(
+            // Another integration-test process sharing PROJECT_LABEL may remove a
+            // container between the `docker ps` listing above and this inspect/rm.
+            // Tolerate that race instead of aborting the whole fixture setup.
+            let created = match capture_command(
                 build_command("docker", &["inspect", "--format", "{{.Created}}", container]),
                 "docker inspect integration container creation time",
-            )?;
+            ) {
+                Ok(value) => value,
+                Err(_) => continue, // removed concurrently
+            };
             let created = DateTime::parse_from_rfc3339(&created)?.with_timezone(&Utc);
             let age = Utc::now().signed_duration_since(created).to_std().unwrap_or_default();
             if age >= self.config.stale_container_max_age {
                 info!(container, ?age, "removing stale HOPR integration container");
-                run_command(
+                let _ = run_command(
                     build_command("docker", &["rm", "-f", container]),
                     "docker remove stale HOPR integration container",
-                )?;
+                );
             }
         }
         Ok(())

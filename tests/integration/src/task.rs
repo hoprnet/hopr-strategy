@@ -25,8 +25,32 @@ impl<T: Send + 'static> StrategyTask<T> {
     pub async fn stop(mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
-            let _ = handle.await;
+            // A cancelled task resolves to `Err(_)` with `is_cancelled()`, which we
+            // ignore; a task that *panicked* is re-raised so the original backtrace
+            // surfaces instead of being silently swallowed.
+            if let Err(error) = handle.await {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+            }
         }
+    }
+}
+
+impl StrategyTask<()> {
+    /// Spawns a strategy `run()` future, logging any error it returns. A strategy
+    /// that fails immediately is then surfaced in the test logs, rather than only
+    /// showing up later as a misleading poll timeout.
+    pub fn spawn_logged<F, E>(future: F) -> Self
+    where
+        F: Future<Output = Result<(), E>> + Send + 'static,
+        E: std::fmt::Debug,
+    {
+        Self::spawn(async move {
+            if let Err(error) = future.await {
+                tracing::error!(?error, "strategy task failed");
+            }
+        })
     }
 }
 

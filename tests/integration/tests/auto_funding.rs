@@ -40,7 +40,7 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
         Duration::from_secs(60),
     )
     .build(node);
-    let handle = StrategyTask::spawn(async move { strategy.run().await });
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     let funded = await_channel_where(
         &scenario.connector,
@@ -98,7 +98,7 @@ async fn skips_funding_when_safe_below_funding_amount(#[future(awt)] fixture: In
         Duration::from_secs(3600),
     )
     .build(node);
-    let handle = StrategyTask::spawn(async move { strategy.run().await });
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // The channel balance must never increase within the observation window.
     assert_channel_never(
