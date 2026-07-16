@@ -137,6 +137,14 @@ impl DockerEnvironment {
         Ok(())
     }
 
+    /// Force-removes this instance's container, ignoring errors.
+    pub fn force_remove(&self) {
+        let _ = run_command(
+            build_command("docker", &["rm", "-f", &self.config.container_name()]),
+            "docker rm container at exit",
+        );
+    }
+
     fn cleanup_stale_containers(&self) -> Result<()> {
         let filter = format!("label={PROJECT_LABEL}");
         let containers = capture_command(
@@ -172,8 +180,9 @@ impl DockerEnvironment {
             &format!("docker logs {container}"),
         )?;
         let timestamp = timestamp.format("%Y%m%d_%H%M%S");
-        let log_path = PathBuf::from("/tmp").join(format!("hopr-strategy-integration/{container}/{timestamp}.log"));
-        fs::create_dir_all(log_path.parent().unwrap())?;
+        let log_dir = std::env::temp_dir().join("hopr-strategy-integration").join(&container);
+        fs::create_dir_all(&log_dir)?;
+        let log_path = log_dir.join(format!("{timestamp}.log"));
         fs::write(&log_path, logs)?;
         info!(path = %log_path.display(), "saved container logs");
         Ok(log_path)

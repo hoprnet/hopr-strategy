@@ -20,6 +20,7 @@ pub struct TestTimeouts {
     pub indexing: Duration,
     pub visibility: Duration,
     pub action: Duration,
+    pub stable: Duration,
 }
 
 impl TestTimeouts {
@@ -29,6 +30,7 @@ impl TestTimeouts {
             indexing: duration_from_env("BLOKLI_TEST_INDEXING_TIMEOUT_SECS", 30)?,
             visibility: duration_from_env("BLOKLI_TEST_VISIBILITY_TIMEOUT_SECS", 60)?,
             action: duration_from_env("BLOKLI_TEST_ACTION_TIMEOUT_SECS", 90)?,
+            stable: duration_from_env("BLOKLI_TEST_STABLE_WINDOW_SECS", 5)?,
         })
     }
 }
@@ -78,7 +80,7 @@ impl TestConfig {
             external_anvil_logs,
             host_api_port,
             tx_confirmations: parse_env("BLOKLI_TEST_CONFIRMATIONS")?.unwrap_or(1),
-            funded_accounts: parse_env("BLOKLI_TEST_FUNDED_ACCOUNTS")?.unwrap_or(2),
+            funded_accounts: parse_env("BLOKLI_TEST_FUNDED_ACCOUNTS")?.unwrap_or(8),
             stack_id: env_value("BLOKLI_TEST_STACK_ID")?.unwrap_or_else(|| format!("{:x}", std::process::id())),
             stale_container_max_age: Duration::from_secs(
                 parse_env::<u64>("BLOKLI_TEST_STALE_CONTAINER_MAX_AGE_HOURS")?.unwrap_or(24) * 60 * 60,

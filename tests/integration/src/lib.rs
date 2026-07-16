@@ -8,4 +8,5 @@ pub mod task;
 mod transaction;
 mod util;
 
+pub use anvil::AnvilAccount;
 pub use config::TestTimeouts;

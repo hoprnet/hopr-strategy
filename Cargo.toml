@@ -20,6 +20,8 @@ crate-type = ["rlib"]
 default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
 telemetry     = ["hopr-api/types-telemetry"]
+## Exposes `crate::testing` node adapters to downstream test crates.
+testing       = []
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
 strategy-auto-redeeming    = []
@@ -79,6 +81,7 @@ async-trait         = "0.1.89"
 blokli-client       = "0.29.1"
 chrono              = { version = "0.4.45", default-features = false }
 clap                = "4.6.1"
+ctor                = "0.2"
 dashmap             = "6.2.1"
 futures             = "0.3.32"
 futures-concurrency = "7.7.1"

@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -21,7 +21,8 @@ use hopr_bindings::{
 };
 use hopr_types::chain::ContractAddresses;
 use rstest::fixture;
-use tracing::info;
+use tracing::{info, warn};
+use url::Url;
 
 use crate::{
     TestTimeouts,
@@ -33,19 +34,30 @@ use crate::{
 
 mod channels;
 mod onboarding;
+mod scenario;
+
+pub use scenario::{
+    ChannelParty, ChannelScenario, ScenarioOpts, assert_channel_never, await_channel, await_channel_where,
+};
 
 /// wxHOPR distributed to each test account at bootstrap (they start with native
 /// funds but no wxHOPR).
 const PER_ACCOUNT_TOKEN_AMOUNT: u128 = 1_000_000_000_000_000_000_000; // 1000 wxHOPR
 
-pub struct IntegrationFixture {
+/// Per-binary integration stack: the `bloklid-anvil` container plus the chain state derived from it.
+struct SharedStack {
     config: Arc<TestConfig>,
     accounts: Vec<AnvilAccount>,
-    client: BlokliClient,
+    bloklid_url: Url,
     chain_id: u64,
-    _docker: Option<DockerEnvironment>,
     contract_addrs: ContractAddresses,
     next_account: AtomicUsize,
+    docker: Option<DockerEnvironment>,
+}
+
+pub struct IntegrationFixture {
+    stack: &'static SharedStack,
+    client: BlokliClient,
 }
 
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -59,19 +71,19 @@ fn chain_addr(account: &AnvilAccount) -> [u8; 20] {
 // Accessor methods
 impl IntegrationFixture {
     pub(crate) fn config(&self) -> &TestConfig {
-        &self.config
+        &self.stack.config
     }
 
     /// Reserves a disjoint set of accounts for one integration scenario.
     /// Account zero is retained as the token-distribution deployer.
     pub fn claim_accounts<const N: usize>(&self) -> [&AnvilAccount; N] {
-        let start = self.next_account.fetch_add(N, Ordering::Relaxed);
+        let start = self.stack.next_account.fetch_add(N, Ordering::Relaxed);
         let end = start + N;
         assert!(
-            end <= self.config.funded_accounts + 1,
+            end <= self.stack.config.funded_accounts + 1,
             "not enough funded integration accounts; increase BLOKLI_TEST_FUNDED_ACCOUNTS"
         );
-        std::array::from_fn(|offset| &self.accounts[start + offset])
+        std::array::from_fn(|offset| &self.stack.accounts[start + offset])
     }
 
     pub fn client(&self) -> &BlokliClient {
@@ -79,15 +91,15 @@ impl IntegrationFixture {
     }
 
     pub fn timeouts(&self) -> TestTimeouts {
-        self.config.timeouts
+        self.stack.config.timeouts
     }
 
     pub(crate) fn contract_addresses(&self) -> &ContractAddresses {
-        &self.contract_addrs
+        &self.stack.contract_addrs
     }
 
     pub(crate) fn chain_id(&self) -> u64 {
-        self.chain_id
+        self.stack.chain_id
     }
 
     /// Current transaction count (nonce) for `account`, via bloklid.
@@ -166,6 +178,34 @@ where
     }
 }
 
+/// Watches `check` for the whole `window`, failing if it ever returns `Some`
+pub async fn poll_stable<F, Fut, T>(description: &str, window: Duration, interval: Duration, mut check: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    let deadline = Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+
+        match tokio::time::timeout(remaining, check()).await {
+            Err(_) => return Ok(()),
+            Ok(Err(error)) => return Err(error.context(format!("{description}: check failed"))),
+            Ok(Ok(Some(_))) => anyhow::bail!("{description}: forbidden state observed within {window:?}"),
+            Ok(Ok(None)) => {}
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+}
+
 /// Distributes wxHOPR from the deployer (anvil account 0, pre-minted 10M by the
 /// image) to every other test account, via raw ERC-20 `transfer` transactions
 /// submitted through the blokli client — no direct anvil RPC.
@@ -204,7 +244,16 @@ async fn distribute_tokens(
     Ok(())
 }
 
-async fn build_integration_fixture() -> Result<IntegrationFixture> {
+/// Builds a `BlokliClient` for `url`.
+fn make_client(url: Url) -> BlokliClient {
+    let blokli_config = BlokliClientConfig {
+        auto_compatibility_check: false,
+        ..Default::default()
+    };
+    BlokliClient::new(url, blokli_config)
+}
+
+async fn build_shared_stack() -> Result<SharedStack> {
     let config: Arc<TestConfig> = Arc::new(TestConfig::load()?);
     let mut docker = config.manages_docker().then(|| DockerEnvironment::new(config.clone()));
 
@@ -220,11 +269,7 @@ async fn build_integration_fixture() -> Result<IntegrationFixture> {
             .expect("external URL validated by TestConfig")
             .clone(),
     };
-    let blokli_config = BlokliClientConfig {
-        auto_compatibility_check: false,
-        ..Default::default()
-    };
-    let client = BlokliClient::new(bloklid_url, blokli_config);
+    let client = make_client(bloklid_url.clone());
     info!(
         seconds = config.timeouts.startup.as_secs(),
         base_url = %client.base_url(),
@@ -262,20 +307,59 @@ async fn build_integration_fixture() -> Result<IntegrationFixture> {
 
     info!("distributed wxHOPR to test accounts");
 
-    Ok(IntegrationFixture {
+    Ok(SharedStack {
         config,
         accounts,
-        client,
+        bloklid_url,
         chain_id,
-        _docker: docker,
         contract_addrs,
         next_account: AtomicUsize::new(1),
+        docker,
+    })
+}
+
+/// The per-binary integration stack, initialised on first access.
+static STACK: OnceLock<SharedStack> = OnceLock::new();
+
+/// Stops the shared container when the test binary exits. Rust never drops
+/// `static`s, so the `DockerEnvironment::drop` cleanup (which only fires on a
+/// setup-failure, when the value is still a local) does not run for the shared
+/// stack — collect its logs explicitly here before removing the container.
+#[ctor::dtor]
+fn teardown_shared_stack() {
+    if let Some(docker) = STACK.get().and_then(|stack| stack.docker.as_ref()) {
+        if let Err(error) = docker.collect_logs(chrono::Utc::now()) {
+            warn!(?error, "failed to collect container logs at teardown");
+        }
+        docker.force_remove();
+    }
+}
+
+/// Returns the shared stack, building it on first call. Setup runs on a
+/// dedicated thread with its own runtime: this fixture is awaited from inside a
+/// `#[tokio::test]` runtime, and `Runtime::block_on` panics if nested, so we
+/// cannot drive the async setup on the caller's runtime.
+fn shared_stack() -> &'static SharedStack {
+    STACK.get_or_init(|| {
+        std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build integration setup runtime");
+            runtime
+                .block_on(build_shared_stack())
+                .expect("failed to set up integration fixture")
+        })
+        .join()
+        .expect("integration setup thread panicked")
     })
 }
 
 #[fixture]
 pub async fn integration_fixture() -> IntegrationFixture {
-    build_integration_fixture()
-        .await
-        .expect("failed to set up integration fixture")
+    let stack = shared_stack();
+    IntegrationFixture {
+        stack,
+        client: make_client(stack.bloklid_url.clone()),
+    }
 }

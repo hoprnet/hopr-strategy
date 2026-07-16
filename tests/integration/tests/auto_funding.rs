@@ -1,77 +1,39 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use hopr_api::{
-    chain::ChainReadChannelOperations,
-    types::{
-        crypto::prelude::Keypair,
-        primitive::prelude::{Address, HoprBalance},
-    },
+use hopr_api::types::primitive::prelude::HoprBalance;
+use hopr_strategy::{
+    auto_funding::{AutoFundingStrategy, AutoFundingStrategyConfig},
+    testing::ChainNode,
 };
-use hopr_strategy::auto_funding::{AutoFundingStrategy, AutoFundingStrategyConfig};
-use rstest::rstest;
-
 use hopr_strategy_integration_tests::{
-    constants::{SAFE_ALLOWANCE, SAFE_FUNDING},
-    fixtures::{IntegrationFixture, integration_fixture as fixture, poll_until},
-    strategy_node::{ChainNode, connect_node, node_chain_keypair},
+    fixtures::{
+        IntegrationFixture, ScenarioOpts, assert_channel_never, await_channel_where, integration_fixture as fixture,
+    },
     task::StrategyTask,
 };
+use rstest::rstest;
+use serial_test::serial;
 
+/// Happy path: the periodic scan tops up an outgoing channel whose balance is
+/// at or below `min_stake_threshold`, when the safe can afford the funding round.
 #[rstest]
 #[test_log::test(tokio::test)]
+#[serial]
 async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [src, dst] = fixture.claim_accounts::<2>();
 
-    let safe = fixture
-        .deploy_safe_and_announce(src, SAFE_FUNDING.parse().context("parse SAFE_FUNDING")?)
-        .await
-        .context("failed to onboard node safe")?;
-    fixture
-        .deploy_safe_and_announce(dst, SAFE_FUNDING.parse().context("parse SAFE_FUNDING")?)
-        .await
-        .context("failed to onboard node safe")?;
-    fixture
-        .approve(
-            src,
-            SAFE_ALLOWANCE.parse().context("parse SAFE_ALLOWANCE")?,
-            &safe.module_address,
-        )
-        .await
-        .context("failed to approve safe module allowance")?;
-
-    let channel_stake = "1 wxHOPR".parse().context("parse channel stake")?;
-    fixture
-        .open_channel(src, dst, channel_stake, &safe.module_address, None)
-        .await
-        .context("failed to open channel")?;
-
-    let module_address = Address::from_str(&safe.module_address).context("parse module address")?;
-    let connector = connect_node(fixture.client().clone(), &src.secret_bytes(), module_address)
-        .await
-        .context("failed to connect node connector")?;
-    let src_addr = node_chain_keypair(&src.secret_bytes())?.public().to_address();
-    let dst_addr = node_chain_keypair(&dst.secret_bytes())?.public().to_address();
-
-    let initial = poll_until(
-        "channel visible to connector",
-        timeouts.visibility,
-        Duration::from_millis(500),
-        || {
-            let connector = connector.clone();
-            async move { Ok(connector.channel_by_parties(&src_addr, &dst_addr)?) }
-        },
-    )
-    .await
-    .context("channel never became visible to the connector")?;
-    let initial_balance = initial.balance;
+    let scenario = fixture
+        .open_channel_scenario(src, dst, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .await?;
+    let initial_balance = scenario.initial.balance;
 
     let min_stake_threshold = HoprBalance::new_base(5u32);
     let funding_amount = HoprBalance::new_base(5u32);
     assert!(initial_balance < min_stake_threshold);
 
-    let node = Arc::new(ChainNode(connector.clone()));
+    let node = Arc::new(ChainNode(scenario.connector.clone()));
     let mut strategy = AutoFundingStrategy::new(
         AutoFundingStrategyConfig {
             min_stake_threshold,
@@ -82,22 +44,76 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
     .build(node);
     let handle = StrategyTask::spawn(async move { strategy.run().await });
 
-    let funded = poll_until(
-        "channel funded by strategy",
+    let funded = await_channel_where(
+        &scenario.connector,
+        scenario.source_addr,
+        scenario.destination_addr,
         timeouts.action,
-        Duration::from_secs(1),
-        || {
-            let connector = connector.clone();
-            async move {
-                let channel = connector.channel_by_parties(&src_addr, &dst_addr)?;
-                Ok(channel.filter(|channel| channel.balance > initial_balance))
-            }
-        },
+        "channel funded by strategy",
+        move |channel| channel.balance > initial_balance,
     )
     .await
     .context("strategy did not fund the channel within the timeout")?;
 
     assert_eq!(funded.balance, initial_balance + funding_amount);
+    assert!(!handle.is_finished(), "auto-funding strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
+/// Affordability gate: when the safe balance is below `funding_amount`, the
+/// periodic scan must skip funding even though the channel is under threshold
+/// (see [`on_tick`](hopr_strategy::auto_funding) early-return).
+#[rstest]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn skips_funding_when_safe_below_funding_amount(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [src, dst] = fixture.claim_accounts::<2>();
+
+    // Fund each safe with barely more than the channel stake so that, once the
+    // channel is opened, the safe cannot cover even a single funding round.
+    let scenario = fixture
+        .open_channel_scenario(
+            src,
+            dst,
+            ScenarioOpts {
+                source_funding: "2 wxHOPR".parse()?,
+                destination_funding: "2 wxHOPR".parse()?,
+                ..ScenarioOpts::new("1 wxHOPR".parse()?)?
+            },
+        )
+        .await?;
+    let initial_balance = scenario.initial.balance;
+
+    // Threshold above the channel balance would normally trigger a top-up, but the
+    // remaining safe budget (< 2 wxHOPR) cannot cover the 5 wxHOPR funding amount.
+    let min_stake_threshold = HoprBalance::new_base(5u32);
+    let funding_amount = HoprBalance::new_base(5u32);
+    assert!(initial_balance < min_stake_threshold);
+
+    let node = Arc::new(ChainNode(scenario.connector.clone()));
+    let mut strategy = AutoFundingStrategy::new(
+        AutoFundingStrategyConfig {
+            min_stake_threshold,
+            funding_amount,
+        },
+        Duration::from_secs(3600),
+    )
+    .build(node);
+    let handle = StrategyTask::spawn(async move { strategy.run().await });
+
+    // The channel balance must never increase within the observation window.
+    assert_channel_never(
+        &scenario.connector,
+        scenario.source_addr,
+        scenario.destination_addr,
+        timeouts.stable,
+        "underfunded safe must not fund channel",
+        move |channel| channel.balance > initial_balance,
+    )
+    .await?;
+
     assert!(!handle.is_finished(), "auto-funding strategy exited unexpectedly");
     handle.stop().await;
     Ok(())

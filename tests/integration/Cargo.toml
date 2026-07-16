@@ -9,6 +9,7 @@ version = "0.1.0"
 anyhow = { workspace = true }
 blokli-client = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["clock", "std"] }
+ctor = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hopli = { workspace = true }
@@ -35,5 +36,7 @@ hopr-strategy = { workspace = true, features = [
   "strategy-auto-redeeming",
   "strategy-channel-lifecycle",
   "strategy-closure-finalizer",
+  "testing",
 ] }
+serial_test = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }

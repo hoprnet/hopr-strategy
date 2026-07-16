@@ -16,9 +16,8 @@ use hopr_types::{
 };
 use tracing::debug;
 
-use crate::anvil::AnvilAccount;
-
 use super::{IntegrationFixture, poll_until};
+use crate::anvil::AnvilAccount;
 
 impl IntegrationFixture {
     async fn deploy_safe(&self, owner: &AnvilAccount, amount: HoprBalance) -> Result<[u8; 32]> {

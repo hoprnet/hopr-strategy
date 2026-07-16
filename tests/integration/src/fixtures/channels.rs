@@ -9,9 +9,8 @@ use hopr_types::{
     primitive::prelude::{Address as HoprAddress, HoprBalance},
 };
 
-use crate::anvil::AnvilAccount;
-
 use super::IntegrationFixture;
+use crate::anvil::AnvilAccount;
 
 impl IntegrationFixture {
     pub async fn open_channel(
@@ -20,9 +19,8 @@ impl IntegrationFixture {
         to: &AnvilAccount,
         amount: HoprBalance,
         module: &str,
-        nonce: Option<u64>,
     ) -> Result<[u8; 32]> {
-        let nonce = self.nonce(from).await?.max(nonce.unwrap_or(0));
+        let nonce = self.nonce(from).await?;
         let generator = SafePayloadGenerator::new(
             &from.keypair,
             *self.contract_addresses(),
