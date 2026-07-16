@@ -16,13 +16,11 @@ use hopr_strategy_integration_tests::{
     task::StrategyTask,
 };
 use rstest::rstest;
-use serial_test::serial;
 
 /// Happy path: the strategy finalizes an outgoing `PendingToClose` channel once
 /// its closure deadline has elapsed and it is still within `max_closure_overdue`.
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn closes_elapsed_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
@@ -72,7 +70,6 @@ async fn closes_elapsed_channel(#[future(awt)] fixture: IntegrationFixture) -> R
 /// left untouched (external intervention assumed).
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn skips_channel_overdue_beyond_max(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
@@ -128,7 +125,6 @@ async fn skips_channel_overdue_beyond_max(#[future(awt)] fixture: IntegrationFix
 /// deadline so the test stays robust to the chain's closure notice period.
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn skips_channel_with_pending_deadline(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();

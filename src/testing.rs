@@ -378,6 +378,12 @@ impl LiveTicketManager {
             tickets: Arc::new(Mutex::new(vec![ticket])),
         }
     }
+
+    /// Returns a clone of the first queued ticket, if any. Used to synthesize a
+    /// winning-ticket event for a ticket that is already queued for redemption.
+    pub fn first_ticket(&self) -> Option<RedeemableTicket> {
+        self.tickets.lock().ok()?.first().cloned()
+    }
 }
 
 fn ticket_error<E: std::fmt::Display>(error: E) -> io::Error {
@@ -480,11 +486,34 @@ impl TicketManagement for LiveTicketManager {
 pub struct TicketNode<C> {
     chain: C,
     tickets: LiveTicketManager,
+    /// Sender for events injected via [`TicketNode::inject_winning_ticket`].
+    injected_tx: futures::channel::mpsc::UnboundedSender<ActionableEvent>,
+    /// Receiver, taken on the first `subscribe_to_actionable_events` call and
+    /// merged into the actionable-event stream.
+    injected_rx: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<ActionableEvent>>>,
 }
 
 impl<C> TicketNode<C> {
     pub fn new(chain: C, tickets: LiveTicketManager) -> Self {
-        Self { chain, tickets }
+        let (injected_tx, injected_rx) = futures::channel::mpsc::unbounded();
+        Self {
+            chain,
+            tickets,
+            injected_tx,
+            injected_rx: Mutex::new(Some(injected_rx)),
+        }
+    }
+
+    /// Emits a `WinningTicket` actionable event for the first queued ticket,
+    /// mirroring what the real node's event source produces when an acknowledged
+    /// winning ticket arrives. Drives the strategy's `redeem_on_winning` path.
+    /// No-op if the ticket queue is empty.
+    pub fn inject_winning_ticket(&self) {
+        if let Some(ticket) = self.tickets.first_ticket() {
+            let _ = self
+                .injected_tx
+                .unbounded_send(ActionableEvent::Ticket(TicketEvent::WinningTicket(Box::new(ticket))));
+        }
     }
 }
 
@@ -548,11 +577,16 @@ where
         &self,
         _filter: Option<&[ActionableEventDiscriminant]>,
     ) -> Result<BoxStream<'static, ActionableEvent>, String> {
-        Ok(self
+        let chain = self
             .chain
             .subscribe()
             .map_err(|error| error.to_string())?
-            .map(ActionableEvent::Chain)
-            .boxed())
+            .map(ActionableEvent::Chain);
+        // Merge in injected ticket events on the first subscription so the
+        // `redeem_on_winning` path can be driven from tests.
+        match self.injected_rx.lock().expect("injected event lock poisoned").take() {
+            Some(injected) => Ok(futures::stream::select(chain, injected).boxed()),
+            None => Ok(chain.boxed()),
+        }
     }
 }

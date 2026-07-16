@@ -38,5 +38,4 @@ hopr-strategy = { workspace = true, features = [
   "strategy-closure-finalizer",
   "testing",
 ] }
-serial_test = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }

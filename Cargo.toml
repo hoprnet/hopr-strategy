@@ -21,7 +21,7 @@ default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
 telemetry     = ["hopr-api/types-telemetry"]
 ## Exposes `crate::testing` node adapters to downstream test crates.
-testing       = []
+testing = []
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
 strategy-auto-redeeming    = []
@@ -110,7 +110,6 @@ rstest               = "0.26.1"
 serde                = "1.0.228"
 serde_json           = "1.0.150"
 serde_with           = "3.21.0"
-serial_test          = "3.5.0"
 smart-default        = "0.7.1"
 test-log             = "0.2.21"
 thiserror            = "2.0.18"

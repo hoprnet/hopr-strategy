@@ -221,6 +221,8 @@ async fn distribute_tokens(
     let base_nonce = client.query_transaction_count(&chain_addr(deployer)).await?;
     let amount = U256::from(PER_ACCOUNT_TOKEN_AMOUNT);
 
+    // Pre-sign one transfer per recipient with sequential nonces.
+    let mut signed_txs = Vec::with_capacity(accounts.len().saturating_sub(1));
     for (offset, recipient) in accounts.iter().enumerate().skip(1) {
         let calldata = transferCall {
             recipient: recipient.to_alloy_address(),
@@ -236,11 +238,17 @@ async fn distribute_tokens(
                 calldata.into(),
             )
             .await?;
-        client
-            .submit_and_confirm_transaction(&signed, confirmations)
-            .await
-            .context("failed to distribute wxHOPR to test account")?;
+        signed_txs.push(signed);
     }
+
+    futures::future::try_join_all(
+        signed_txs
+            .iter()
+            .map(|signed| client.submit_and_confirm_transaction(signed, confirmations)),
+    )
+    .await
+    .context("failed to distribute wxHOPR to test accounts")?;
+
     Ok(())
 }
 

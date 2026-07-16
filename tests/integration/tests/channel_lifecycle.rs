@@ -13,14 +13,12 @@ use hopr_strategy_integration_tests::{
     task::StrategyTask,
 };
 use rstest::rstest;
-use serial_test::serial;
 
 /// Happy path: the reactive fund pass tops up a channel below
 /// `funding.lower_balance_threshold` when the safe is funded (open/close passes
 /// neutralised via target == min == 1, proactive + finalizer disabled).
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
@@ -68,7 +66,6 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
 /// channel is left untouched.
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn skips_funding_when_safe_below_required(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();

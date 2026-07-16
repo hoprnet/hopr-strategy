@@ -13,13 +13,11 @@ use hopr_strategy_integration_tests::{
     task::StrategyTask,
 };
 use rstest::rstest;
-use serial_test::serial;
 
 /// Happy path: the periodic scan tops up an outgoing channel whose balance is
 /// at or below `min_stake_threshold`, when the safe can afford the funding round.
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [src, dst] = fixture.claim_accounts::<2>();
@@ -66,7 +64,6 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
 /// (see [`on_tick`](hopr_strategy::auto_funding) early-return).
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn skips_funding_when_safe_below_funding_amount(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [src, dst] = fixture.claim_accounts::<2>();

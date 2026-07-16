@@ -21,7 +21,6 @@ use hopr_strategy_integration_tests::{
     task::StrategyTask,
 };
 use rstest::rstest;
-use serial_test::serial;
 
 /// Builds a signed, redeemable `ALWAYS`-winning ticket for the `issuer -> redeemer`
 /// channel at the given index/epoch, mirroring what a node would acknowledge.
@@ -99,7 +98,6 @@ async fn ticket_scenario(
 /// incoming channel (`redeem_on_winning = false`, no value floor).
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn redeems_queued_ticket(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
@@ -139,7 +137,6 @@ async fn redeems_queued_ticket(#[future(awt)] fixture: IntegrationFixture) -> Re
 /// isolating the on-close path.
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn redeems_all_tickets_on_channel_closure(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
@@ -186,7 +183,6 @@ async fn redeems_all_tickets_on_channel_closure(#[future(awt)] fixture: Integrat
 /// and no on-chain transaction is issued, so the channel ticket index stays put.
 #[rstest]
 #[test_log::test(tokio::test)]
-#[serial]
 async fn skips_ticket_below_minimum_value(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
@@ -215,6 +211,51 @@ async fn skips_ticket_below_minimum_value(#[future(awt)] fixture: IntegrationFix
         move |channel| channel.ticket_index > initial_index,
     )
     .await?;
+    assert!(!handle.is_finished(), "auto-redeeming strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
+/// Event-driven path: with `redeem_on_winning = true` the periodic scan is
+/// disabled (and the tick is set far in the future), so redemption is triggered
+/// *only* by a winning-ticket event arriving on the node's actionable-event
+/// stream — the path a live node exercises on ticket acknowledgement.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn redeems_ticket_on_winning_event(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [issuer, redeemer] = fixture.claim_accounts::<2>();
+    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, issuer, redeemer).await?;
+    let initial_index = scenario.initial.ticket_index;
+    let initial_balance = scenario.initial.balance;
+
+    let mut strategy = AutoRedeemingStrategy::new(
+        AutoRedeemingStrategyConfig {
+            minimum_redeem_ticket_value: HoprBalance::zero(),
+            redeem_on_winning: true,
+            // On-close redemption disabled so the winning-ticket event is the only trigger.
+            redeem_all_on_close: false,
+        },
+        // Tick far in the future so the periodic scan cannot fire during the test.
+        Duration::from_secs(3600),
+    )
+    .build(node.clone());
+    let handle = StrategyTask::spawn(async move { strategy.run().await });
+
+    // Emit the winning-ticket event for the queued ticket. The unbounded channel
+    // buffers it, so it is delivered even if the strategy has not subscribed yet.
+    node.inject_winning_ticket();
+
+    let redeemed = await_channel_where(
+        &scenario.connector,
+        scenario.source_addr,
+        scenario.destination_addr,
+        timeouts.action,
+        "ticket redeemed on winning event",
+        move |channel| channel.ticket_index > initial_index,
+    )
+    .await?;
+    assert_eq!(redeemed.balance, initial_balance - ticket_amount);
     assert!(!handle.is_finished(), "auto-redeeming strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
