@@ -254,11 +254,7 @@ async fn distribute_tokens(
 
 /// Builds a `BlokliClient` for `url`.
 fn make_client(url: Url) -> BlokliClient {
-    let blokli_config = BlokliClientConfig {
-        auto_compatibility_check: false,
-        ..Default::default()
-    };
-    BlokliClient::new(url, blokli_config)
+    BlokliClient::new(url, BlokliClientConfig::default())
 }
 
 async fn build_shared_stack() -> Result<SharedStack> {

@@ -39,3 +39,6 @@ hopr-strategy = { workspace = true, features = [
   "testing",
 ] }
 test-log = { workspace = true, features = ["trace"] }
+
+[package.metadata.cargo-machete]
+ignored = ["hopli"]

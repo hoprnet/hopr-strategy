@@ -1493,7 +1493,7 @@ version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
- "generic-array 0.14.9",
+ "generic-array",
 ]
 
 [[package]]
@@ -1507,9 +1507,9 @@ dependencies = [
 
 [[package]]
 name = "blokli-client"
-version = "0.29.1"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ecdfbd15f4ff885b4aaea1630d1e318f15462c85971b0bb3150b228b7792d60"
+checksum = "24c4a03b3618185436fc74269e51c6945a55a3347eb05bde61a5fd3750d28401"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -1522,18 +1522,16 @@ dependencies = [
  "futures",
  "futures-time",
  "hex",
- "hopr-types 1.11.2",
+ "hopr-types",
  "http",
  "indexmap 2.14.0",
  "launchdarkly-sdk-transport",
  "parking_lot",
  "rand 0.10.2",
  "reqwest",
- "semver 1.0.28",
  "serde",
  "serde_json",
  "smart-default",
- "strum",
  "thiserror 2.0.18",
  "tracing",
  "url",
@@ -1710,9 +1708,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.1"
+version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
+checksum = "dd059f9da4f5c36b3787f65d38ccaab1cc315f07b01f89abc8359ee6a8205011"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -1720,9 +1718,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.0"
+version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
+checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2014,7 +2012,7 @@ version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
 dependencies = [
- "generic-array 0.14.9",
+ "generic-array",
  "rand_core 0.6.4",
  "subtle",
  "zeroize",
@@ -2042,7 +2040,7 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bfb12502f3fc46cca1bb51ac28df9d618d813cdc3d2f25b9fe775a34af26bb3"
 dependencies = [
- "generic-array 0.14.9",
+ "generic-array",
  "typenum",
 ]
 
@@ -2365,7 +2363,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3dd60d1080a57a05ab032377049e0591415d2b31afd7028356dbf3cc6dcb066"
 dependencies = [
- "generic-array 0.14.9",
+ "generic-array",
 ]
 
 [[package]]
@@ -2536,7 +2534,7 @@ dependencies = [
  "crypto-bigint 0.5.5",
  "digest 0.10.7",
  "ff 0.13.1",
- "generic-array 0.14.9",
+ "generic-array",
  "group 0.13.0",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
@@ -2998,18 +2996,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generic-array"
-version = "1.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab4e5aa225bc56696909483320f0ff9b600f1a971b52e07a17d70f3d9b43254b"
-dependencies = [
- "rustversion",
- "serde_core",
- "typenum",
- "zeroize",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3238,7 +3224,7 @@ dependencies = [
 [[package]]
 name = "hopli"
 version = "0.17.6"
-source = "git+https://github.com/hoprnet/hopli?branch=main#9c824c071307a8573fb94ff62062e923a2a7aabc"
+source = "git+https://github.com/hoprnet/hopli?branch=main#567a9577e2bc224314b536bf574a7211ff8daa92"
 dependencies = [
  "alloy-transport-http",
  "anyhow",
@@ -3246,7 +3232,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "hopr-bindings",
- "hopr-types 1.11.2",
+ "hopr-types",
  "lazy_static",
  "rpassword",
  "serde",
@@ -3271,7 +3257,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-concurrency",
- "hopr-types 2.0.0",
+ "hopr-types",
  "libp2p-identity",
  "multiaddr",
  "serde",
@@ -3282,9 +3268,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-bindings"
-version = "4.9.1"
+version = "4.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1afa8766e3b7c9ac7f770e5330bb08f91af6db385a1b388239814fc03f7c171a"
+checksum = "f2b7679591cc56238e934139e1e46f57e5df1d688e059a034fa0e38a5ce09b7c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3301,7 +3287,7 @@ dependencies = [
 [[package]]
 name = "hopr-chain-connector"
 version = "0.22.0"
-source = "git+https://github.com/hoprnet/hoprnet?branch=master#ac365f2b82143fcf69adf043f6c0a38203e61f00"
+source = "git+https://github.com/hoprnet/hoprnet?branch=master#118c4951f907bae5ca39083404f88357f2fa3722"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3376,69 +3362,13 @@ dependencies = [
  "hopr-bindings",
  "hopr-chain-connector",
  "hopr-strategy",
- "hopr-types 1.11.2",
+ "hopr-types",
  "rstest",
  "serde_json",
  "test-log",
  "tokio",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "hopr-types"
-version = "1.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffe8de530de5d86e896cc67ffa9b57496626d381112442800b18cd7b41e440c4"
-dependencies = [
- "aes",
- "anyhow",
- "aquamarine",
- "arrayvec",
- "async-trait",
- "babyjubjub-ec",
- "bigdecimal",
- "blake3",
- "chacha20",
- "chrono",
- "cipher",
- "const-hex",
- "ctr",
- "curve25519-dalek 5.0.0",
- "digest 0.11.3",
- "ed25519-dalek 3.0.0",
- "float-cmp",
- "generic-array 1.4.4",
- "hash2curve",
- "hex-literal",
- "hopr-bindings",
- "k256 0.14.0",
- "lazy_static",
- "libp2p-identity",
- "multiaddr",
- "num_enum",
- "poly1305",
- "primitive-types 0.14.0",
- "rand 0.10.2",
- "rayon",
- "regex",
- "rlp 0.6.1",
- "scrypt",
- "secp256k1 0.31.1",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "sha2 0.11.0",
- "sha3 0.12.0",
- "smart-default",
- "strum",
- "subtle",
- "thiserror 2.0.18",
- "tracing",
- "typenum",
- "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -3483,9 +3413,11 @@ dependencies = [
  "rayon",
  "regex",
  "rlp 0.6.1",
+ "scrypt",
  "secp256k1 0.31.1",
  "serde",
  "serde_bytes",
+ "serde_json",
  "serde_with",
  "sha2 0.11.0",
  "sha3 0.12.0",
@@ -3495,13 +3427,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "typenum",
+ "uuid",
  "zeroize",
 ]
 
 [[package]]
 name = "hopr-utils"
-version = "0.2.0"
-source = "git+https://github.com/hoprnet/hoprnet?branch=master#ac365f2b82143fcf69adf043f6c0a38203e61f00"
+version = "0.3.0"
+source = "git+https://github.com/hoprnet/hoprnet?branch=master#118c4951f907bae5ca39083404f88357f2fa3722"
 dependencies = [
  "auto_impl",
  "futures",
@@ -5715,7 +5648,7 @@ checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
 dependencies = [
  "base16ct 0.2.0",
  "der 0.7.10",
- "generic-array 0.14.9",
+ "generic-array",
  "pkcs8 0.10.2",
  "serdect 0.2.0",
  "subtle",
