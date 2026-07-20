@@ -20,6 +20,8 @@ crate-type = ["rlib"]
 default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
 telemetry     = ["hopr-api/types-telemetry"]
+## Exposes `crate::testing` node adapters to downstream test crates.
+testing = []
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
 strategy-auto-redeeming    = []
@@ -27,51 +29,89 @@ strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
 
 [dependencies]
-anyhow              = "1.0.103"
-async-trait         = "0.1.89"
-dashmap             = { version = "6.2.1", features = ["inline"] }
-futures             = "0.3.32"
-futures-concurrency = "7.7.1"
-futures-time        = "3.1.0"
-humantime-serde     = "1.1.1"
-lazy_static         = "1.5.0"
-serde               = { version = "1.0.228", features = ["derive"] }
-serde_with          = "3.21.0"
-smart-default       = "0.7.1"
-thiserror           = "2.0.18"
-tracing             = "0.1.44"
-validator           = { version = "0.20.0", features = ["derive"] }
+anyhow              = { workspace = true }
+async-trait         = { workspace = true }
+dashmap             = { workspace = true, features = ["inline"] }
+futures             = { workspace = true }
+futures-concurrency = { workspace = true }
+futures-time        = { workspace = true }
+humantime-serde     = { workspace = true }
+lazy_static         = { workspace = true }
+serde               = { workspace = true, features = ["derive"] }
+serde_with          = { workspace = true }
+smart-default       = { workspace = true }
+thiserror           = { workspace = true }
+tracing             = { workspace = true }
+validator           = { workspace = true, features = ["derive"] }
 
-hopr-api    = { version = "1.15.0", features = ["node", "serde"] }
-hopr-utils  = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false }
-moka        = { version = "0.12.15", features = ["sync"] }
-multiaddr   = "0.18.2"
-parking_lot = "0.12.5"
+hopr-api    = { workspace = true, features = ["node", "serde"] }
+hopr-utils  = { workspace = true, default-features = false }
+moka        = { workspace = true, features = ["sync"] }
+multiaddr   = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
-chrono = { version = "0.4.45", default-features = false, features = [
+chrono = { workspace = true, default-features = false, features = [
   "clock",
   "std",
 ] }
-hex-literal = "1.1.0"
-hopr-api = { version = "1.15.0", features = ["types-random"] }
-hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
+hex-literal = { workspace = true }
+hopr-api = { workspace = true, features = ["types-random"] }
+hopr-chain-connector = { workspace = true, features = [
   "runtime-tokio",
   "testing",
 ] }
-hopr-utils = { git = "https://github.com/hoprnet/hoprnet", branch = "master", features = [
-  "runtime-tokio",
-] }
-insta = { version = "1.48.0", features = ["redactions", "yaml"] }
-mockall = "0.15.0"
-test-log = { version = "0.2.21", features = ["trace"] }
-tokio = { version = "1.52.3", features = [
+hopr-utils = { workspace = true, features = ["runtime-tokio"] }
+insta = { workspace = true, features = ["redactions", "yaml"] }
+mockall = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
   "tracing",
 ] }
 
 [workspace]
+members  = ["tests/integration"]
+resolver = "3"
+
+[workspace.dependencies]
+anyhow               = "1.0.103"
+async-trait          = "0.1.89"
+blokli-client        = "0.30.0"
+chrono               = { version = "0.4.45", default-features = false }
+ctor                 = "0.2"
+dashmap              = "6.2.1"
+futures              = "0.3.32"
+futures-concurrency  = "7.7.1"
+futures-time         = "3.1.0"
+hex                  = "0.4.3"
+hex-literal          = "1.1.0"
+hopli                = { git = "https://github.com/hoprnet/hopli", branch = "main" }
+hopr-api             = "1.15.0"
+hopr-bindings        = "4.10.0"
+hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "master" }
+hopr-strategy        = { path = "." }
+hopr-types           = "2.0"
+hopr-utils           = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false }
+humantime-serde      = "1.1.1"
+insta                = "1.48.0"
+lazy_static          = "1.5.0"
+mockall              = "0.15.0"
+moka                 = "0.12.15"
+multiaddr            = "0.18.2"
+parking_lot          = "0.12.5"
+rstest               = "0.26.1"
+serde                = "1.0.228"
+serde_json           = "1.0.150"
+serde_with           = "3.21.0"
+smart-default        = "0.7.1"
+test-log             = "0.2.21"
+thiserror            = "2.0.18"
+tokio                = "1.52.3"
+tracing              = "0.1.44"
+url                  = "2.5.8"
+validator            = "0.20.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

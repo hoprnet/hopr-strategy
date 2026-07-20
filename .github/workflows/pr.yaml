@@ -104,7 +104,8 @@ jobs:
       unit_test_command: "nix run -L .#test"
       enable_unit_coverage: true
       unit_coverage_command: "nix run .#coverage-unit"
-      enable_integration_tests: false
+      enable_integration_tests: true
+      integration_test_command: "nix run -L .#test-integration"
       test_timeout: 30
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}

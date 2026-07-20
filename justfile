@@ -46,15 +46,20 @@ clean:
 
 # Run unit tests
 test:
-    cargo test --all-features --no-fail-fast
+    cargo test --workspace --exclude hopr-strategy-integration-tests --all-features --no-fail-fast
 
-# Run tests in single thread mode with output
+# Run unit tests in single thread mode with output (integration crate excluded).
 test-debug:
-    cargo test --all-features -- --test-threads=1 --nocapture
+    cargo test --workspace --exclude hopr-strategy-integration-tests --all-features -- --test-threads=1 --nocapture
 
-# Run all unit tests using nextest
+# Run all unit tests using nextest (integration crate excluded).
 nextest:
-    cargo nextest run --all-features
+    cargo nextest run --workspace --exclude hopr-strategy-integration-tests --all-features
+
+# Run strategy integration tests against a Blokli-Anvil docker stack.
+# Requires docker running on the host + a pullable bloklid image (set BLOKLI_TEST_REMOTE_IMAGE).
+test-integration:
+    cargo test --manifest-path tests/integration/Cargo.toml -- --nocapture
 
 # ============================================================================
 # Code Quality
