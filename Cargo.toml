@@ -56,8 +56,8 @@ chacha20poly1305 = { workspace = true, optional = true }
 
 [dev-dependencies]
 chrono = { workspace = true, default-features = false, features = [
-  "clock",
   "std",
+  "clock",
 ] }
 hex-literal = { workspace = true }
 hopr-api = { workspace = true, features = ["types-random"] }
@@ -94,7 +94,7 @@ futures-time         = "3.1.0"
 hex                  = "0.4.3"
 hex-literal          = "1.1.0"
 hopli                = { git = "https://github.com/hoprnet/hopli", branch = "main" }
-hopr-api             = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/add-pix-conversions" }
+hopr-api             = "1.15.0"
 hopr-bindings        = "4.10.0"
 hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "lukas/pix" }
 hopr-strategy        = { path = "." }
@@ -121,11 +121,6 @@ tokio                = "1.52.3"
 tracing              = "0.1.44"
 url                  = "2.5.8"
 validator            = "0.20.0"
-
-[patch.crates-io]
-# hopr-chain-connector and other transitive deps may reference crates.io hopr-api.
-# Ensure the entire dep tree uses the same git version so trait bounds match.
-hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/add-pix-conversions" }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

@@ -3294,7 +3294,8 @@ dependencies = [
 [[package]]
 name = "hopr-api"
 version = "1.15.0"
-source = "git+https://github.com/hoprnet/hopr-api?branch=lukas%2Fadd-pix-conversions#d47f4b89f60e049c4d2a8b2d939669a355374498"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c76f9c17f903a3a0487c7eb0766914baf94380cd7a9112043310e4bc4dc9547"
 dependencies = [
  "async-trait",
  "atomic_enum",
