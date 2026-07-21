@@ -1,5 +1,6 @@
 ---
-source: impls/strategy/src/non_anonymous_pix.rs
+source: src/non_anonymous_pix.rs
+assertion_line: 874
 expression: "*snapshot.refresh()"
 ---
 accounts:
@@ -147,10 +148,5 @@ chain_info:
   expected_block_time: "5"
   finality: "3"
 version: "1"
-client_compatibility:
-  api_version: "1"
-  supported_client_versions: ^0.29.1
-  features:
-    - indexes_safe_events
 health: OK
 active_txs: {}

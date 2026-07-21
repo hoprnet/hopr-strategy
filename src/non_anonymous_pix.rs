@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use futures_time::future::FutureExt as TimeExt;
 use hopr_api::{
     ChainKeypair,
