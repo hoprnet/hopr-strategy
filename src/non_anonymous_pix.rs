@@ -97,6 +97,7 @@ impl NonAnonymousPixStrategy {
             node,
             recovery_store,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         }))
     }
 }
@@ -111,6 +112,8 @@ struct NonAnonymousPixStrategyInner<N: HasChainApi> {
     recovery_store: Option<crate::pix_recovery_store::PixRecoveryStore>,
     /// Entry role only: IDs of deposit addresses already funded.
     processed_deposits: HashSet<hopr_api::node::PixAddressId>,
+    /// Entry role only: addresses with an in-flight withdrawal.
+    in_flight_addresses: HashSet<Address>,
 }
 
 impl<N> NonAnonymousPixStrategyInner<N>
@@ -125,7 +128,7 @@ where
 
     /// Handle PIX event.
     async fn on_pix_event(&mut self, event: PixEvent) -> crate::errors::Result<()> {
-        tracing::debug!(?event, "PixStrategy event");
+        tracing::debug!("PixStrategy event");
         match event {
             PixEvent::NewDepositAddress(new_deposit_address) => {
                 tracing::info!(?new_deposit_address, "new deposit address");
@@ -142,14 +145,24 @@ where
                     return Err(StrategyError::CriteriaNotSatisfied);
                 }
 
-                // TODO: do not allow parallel withdrawals to any address
-                if let Err(error) = self
+                let deposit_address: Address = new_deposit_address.address.try_into()?;
+
+                // Serialize concurrent withdrawals to the same deposit address.
+                if !self.in_flight_addresses.insert(deposit_address) {
+                    tracing::warn!(?deposit_address, "withdrawal already in-flight, skipping duplicate event");
+                    return Ok(());
+                }
+
+                let withdraw_result = self
                     .node
                     .chain_api()
-                    .withdraw(target_deposit, &new_deposit_address.address.try_into()?)
+                    .withdraw(target_deposit, &deposit_address)
                     .and_then(identity)
-                    .await
-                {
+                    .await;
+
+                self.in_flight_addresses.remove(&deposit_address);
+
+                if let Err(error) = withdraw_result {
                     tracing::error!(%error, %target_deposit, ?new_deposit_address, "withdraw failed");
                     return Err(StrategyError::other(error));
                 }
@@ -609,6 +622,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         let event = PixEvent::DepositAddressReceived(PixDepositAddressReceived {
@@ -686,6 +700,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         let bob_balance_before = strategy
@@ -768,6 +783,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::new(chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         let event = PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
@@ -839,6 +855,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         let safe_address = strategy.node.identity().safe_address;
@@ -966,6 +983,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         let bob_before = strategy.get_balance(*BOB).await?;
@@ -1097,6 +1115,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         let event_id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
@@ -1184,6 +1203,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None, // not needed for the test — we pass store directly
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         // No need to call on_tick or register a safe — balance is zero so replay
@@ -1255,6 +1275,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         strategy.replay_pending_recoveries(&store).await;
@@ -1330,6 +1351,7 @@ mod tests {
             node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store: None,
             processed_deposits: HashSet::new(),
+            in_flight_addresses: HashSet::new(),
         };
 
         strategy.replay_pending_recoveries(&store).await;
