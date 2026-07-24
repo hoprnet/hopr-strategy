@@ -27,7 +27,7 @@ jobs:
             runner: depot-ubuntu-24.04-arm-4
           - architecture: aarch64-darwin
             runner: depot-macos-15
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@19d69bd81be66220932b18f1a7a655b422180b4e # build-library-v3
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
     permissions:
       contents: read
       id-token: write
@@ -35,7 +35,6 @@ jobs:
       source_branch: ${{ github.event.pull_request.base.ref }}
       version_type: pr
       architecture: ${{ matrix.architecture }}
-      cachix_cache_name: hopr-strategy
       build_file: Cargo.toml
       package_name: hopr-strategy
       runner: ${{ matrix.runner }}
