@@ -149,7 +149,10 @@ where
 
                 // Serialize concurrent withdrawals to the same deposit address.
                 if !self.in_flight_addresses.insert(deposit_address) {
-                    tracing::warn!(?deposit_address, "withdrawal already in-flight, skipping duplicate event");
+                    tracing::warn!(
+                        ?deposit_address,
+                        "withdrawal already in-flight, skipping duplicate event"
+                    );
                     return Ok(());
                 }
 

@@ -169,6 +169,9 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 
 // ── Encryption helpers ───────────────────────────────────────────────────────
 
+// `chacha20poly1305` 0.10 re-exports `generic-array` 0.14, whose `from_slice` is
+// deprecated pending the 1.x upgrade; these calls remain correct until then.
+#[allow(deprecated)]
 fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], PixRecoveryStoreError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce_bytes = random_bytes::<NONCE_SIZE>();
@@ -183,6 +186,7 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], Pix
     Ok(out)
 }
 
+#[allow(deprecated)]
 fn decrypt(key: &[u8; 32], stored: &[u8; VALUE_SIZE]) -> Result<[u8; 32], PixRecoveryStoreError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from_slice(&stored[..NONCE_SIZE]);
@@ -295,10 +299,7 @@ impl PixRecoveryStore {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let stored: [u8; VALUE_SIZE] = match value_bytes.value().try_into() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let stored: [u8; VALUE_SIZE] = value_bytes.value();
             let plaintext = match decrypt(&self.encryption_key, &stored) {
                 Ok(p) => p,
                 Err(_) => continue,
