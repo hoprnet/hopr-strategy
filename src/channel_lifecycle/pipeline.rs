@@ -443,27 +443,22 @@ where
                 });
         }
 
-        // Fetch ticket economics once per tick.  Both values are needed for
-        // the capacity-to-wxHOPR conversion and for the proactive-funding drain
-        // estimate.  When either value is unavailable the fund and open passes
-        // are skipped; close and finalize still run.
-        let ticket_price = chain.minimum_ticket_price().await.unwrap_or_else(|e| {
-            warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, using zero");
-            HoprBalance::zero()
-        });
-        let min_ticket_price_wei = ticket_price.amount().low_u128() as f64;
-
-        let win_prob = match chain.minimum_incoming_ticket_win_prob().await {
-            Ok(wp) => Some(wp),
+        // Fetch the ticket price once per tick — the sole economic input to the
+        // capacity-to-wxHOPR conversion and to the proactive-funding drain estimate.
+        // When it is unavailable the fund and open passes are skipped; close and
+        // finalize still run.
+        let ticket_price = match chain.minimum_ticket_price().await {
+            Ok(price) => Some(price),
             Err(e) => {
-                warn!(%e, "channel-lifecycle: minimum_incoming_ticket_win_prob unavailable, skipping fund/open passes");
+                warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
                 None
             }
         };
+        let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
-        // `None` when win_prob is unavailable; fund/open passes are skipped.
-        let funding = win_prob.map(|wp| self.cfg.funding.resolve(ticket_price, wp));
+        // `None` when the ticket price is unavailable; fund/open passes are skipped.
+        let funding = ticket_price.map(|price| self.cfg.funding.resolve(price));
 
         // Share resolved economics with the event-driven funding handler so it
         // can reuse per-tick values rather than issuing fresh chain RPC calls.
@@ -1046,7 +1041,7 @@ mod tests {
         PeerId,
         chain::{
             AccountSelector, ChainEvent, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations,
-            ChainWriteAccountOperations, ChannelSelector, HoprChainApi, WinningProbability,
+            ChainWriteAccountOperations, ChannelSelector, HoprChainApi,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2122,12 +2117,11 @@ mod tests {
     /// correct wxHOPR **topup** amount via the live ticket economics fetched from
     /// the Blokli simulator, and the fund pass applies it to an underfunded channel.
     ///
-    /// The Blokli test sim defaults to `ticket_price = "1 wxHOPR"` and
-    /// `min_ticket_winning_probability = 1.0`.  With `assumed_hops = 3` and
-    /// `topup_capacity = 1 byte` (= 1 packet):
+    /// The Blokli test sim defaults to `ticket_price = "1 wxHOPR"`.  With
+    /// `assumed_hops = 3` and `topup_capacity = 1 byte` (= 1 packet):
     ///
     /// ```text
-    /// topup_balance = 1 packet × 1 wxHOPR × 3 hops / 1.0 = 3 wxHOPR
+    /// topup_balance = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR
     /// ```
     ///
     /// The channel starts with 0 balance (< resolved threshold), triggering a
@@ -2137,13 +2131,11 @@ mod tests {
     async fn pipeline_funds_underfunded_channel_with_capacity_derived_wxhopr_amount() -> anyhow::Result<()> {
         use super::super::config::capacity_to_balance;
 
-        // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0, assumed_hops = 3.
-        // capacity_to_balance(ByteSize::b(1), 1 wxHOPR, 1.0, 3) = 3 wxHOPR.
-        // capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3 hops) = 3 wxHOPR.
+        // Blokli defaults: ticket_price = "1 wxHOPR", assumed_hops = 3.
+        // capacity_to_balance(ByteSize::b(1), 1 wxHOPR, 3) = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR.
         let expected_topup = {
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
-            let wp = WinningProbability::try_from(1.0f64).expect("valid win_prob");
-            capacity_to_balance(ByteSize::b(1), price, wp, 3) // topup_capacity = ByteSize::b(1)
+            capacity_to_balance(ByteSize::b(1), price, 3) // topup_capacity = ByteSize::b(1)
         };
 
         // Channel starts at 0 balance — below any non-zero threshold.
