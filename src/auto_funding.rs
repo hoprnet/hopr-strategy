@@ -404,10 +404,6 @@ mod tests {
             AccountSelector, ChainEvent, ChainEvents, ChainReadAccountOperations, ChainWriteAccountOperations,
             HoprChainApi,
         },
-        node::{
-            ActionableEvent, ComponentStatus, ComponentStatusReporter, EventWaitResult, HasChainApi,
-            NodeOnchainIdentity,
-        },
         types::{
             crypto::{keypairs::Keypair, prelude::ChainKeypair},
             internal::prelude::{ChannelDirection, ChannelEntry, ChannelStatus},
@@ -417,6 +413,7 @@ mod tests {
     use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
 
     use super::*;
+    use crate::testing::ChainNode;
 
     lazy_static::lazy_static! {
         static ref BOB_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
@@ -428,63 +425,6 @@ mod tests {
         static ref BOB: Address = BOB_KP.public().to_address();
         static ref CHRIS: Address = hex!("b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234").into();
         static ref DAVE: Address = hex!("68499f50ff68d523385dc60686069935d17d762a").into();
-    }
-
-    /// Wraps a chain API implementor as a minimal node for strategy tests.
-    ///
-    /// The connector itself is a chain API, not a node. This newtype implements the
-    /// `HasChainApi` and `ActionableEventSource` node traits so integration tests can
-    /// drive strategies without a full `Hopr` node.
-    struct ChainNode<C>(C);
-
-    impl<C> HasChainApi for ChainNode<C>
-    where
-        C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
-    {
-        type ChainApi = C;
-        type ChainError = <C as HoprChainApi>::ChainError;
-
-        fn identity(&self) -> &NodeOnchainIdentity {
-            static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
-            IDENTITY.get_or_init(NodeOnchainIdentity::default)
-        }
-
-        fn chain_api(&self) -> &C {
-            &self.0
-        }
-
-        fn status(&self) -> ComponentStatus {
-            self.0.component_status()
-        }
-
-        fn wait_for_on_chain_event<F>(
-            &self,
-            _predicate: F,
-            _context: String,
-            _timeout: std::time::Duration,
-        ) -> EventWaitResult<<C as HoprChainApi>::ChainError, <C as HoprChainApi>::ChainError>
-        where
-            F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
-        {
-            unimplemented!("tests do not call wait_for_on_chain_event")
-        }
-    }
-
-    impl<C> ActionableEventSource for ChainNode<C>
-    where
-        C: ChainEvents + Send + Sync + 'static,
-    {
-        fn subscribe_to_actionable_events(
-            &self,
-            _filter: Option<&[ActionableEventDiscriminant]>,
-        ) -> Result<futures::stream::BoxStream<'static, ActionableEvent>, String> {
-            Ok(self
-                .0
-                .subscribe()
-                .map_err(|e| e.to_string())?
-                .map(ActionableEvent::Chain)
-                .boxed())
-        }
     }
 
     async fn register_test_safe<C>(chain_connector: &C, node_address: Address) -> anyhow::Result<()>
