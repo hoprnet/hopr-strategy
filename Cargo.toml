@@ -1,69 +1,124 @@
 [package]
-name = "hopr-strategy"
-description = "Contains implementations of different HOPR strategies"
-version = "0.20.0"
-edition.workspace = true
-license.workspace = true
-readme = "README.md"
-keywords = ["hopr", "strategy", "channels"]
-repository.workspace = true
-homepage.workspace = true
-categories = ["network-programming"]
-authors.workspace = true
-rust-version.workspace = true
-include = ["README.md", "src/**/*.rs", "Cargo.toml", "LICENSE"]
+authors      = ["HOPR Association <tech@hoprnet.org>"]
+categories   = ["network-programming"]
+description  = "Contains implementations of different HOPR strategies"
+edition      = "2024"
+homepage     = "https://hoprnet.org/"
+include      = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs"]
+keywords     = ["channels", "hopr", "strategy"]
+license      = "GPL-3.0-only"
+name         = "hopr-strategy"
+readme       = "README.md"
+repository   = "https://github.com/hoprnet/hopr-strategy"
+rust-version = "1.94"
+version      = "0.20.0"
 
 [lib]
 crate-type = ["rlib"]
 
 [features]
-default = []
+default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
-telemetry = ["hopr-api/types-telemetry"]
+telemetry     = ["hopr-api/types-telemetry"]
+## Exposes `crate::testing` node adapters to downstream test crates.
+testing = []
 ## Strategy features — each enables one strategy implementation.
-strategy-auto-funding = []
-strategy-auto-redeeming = []
-strategy-closure-finalizer = []
+strategy-auto-funding      = []
+strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
+strategy-closure-finalizer = []
 
 [dependencies]
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-dashmap = { workspace = true, features = ["inline"] }
-futures = { workspace = true }
-futures-time = { workspace = true }
+anyhow              = { workspace = true }
+async-trait         = { workspace = true }
+bytesize            = { workspace = true }
+dashmap             = { workspace = true, features = ["inline"] }
+futures             = { workspace = true }
 futures-concurrency = { workspace = true }
-humantime-serde = { workspace = true }
-lazy_static = { workspace = true }
-serde = { workspace = true }
-serde_with = { workspace = true }
-smart-default = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-validator = { workspace = true }
+futures-time        = { workspace = true }
+humantime-serde     = { workspace = true }
+lazy_static         = { workspace = true }
+serde               = { workspace = true, features = ["derive"] }
+serde_with          = { workspace = true }
+smart-default       = { workspace = true }
+thiserror           = { workspace = true }
+tracing             = { workspace = true }
+validator           = { workspace = true, features = ["derive"] }
 
-bytesize = { workspace = true }
-hopr-api = { workspace = true, features = ["node", "serde"] }
+hopr-api           = { workspace = true, features = ["node", "serde"] }
 hopr-crypto-packet = { workspace = true }
-hopr-utils = { workspace = true }
-moka = { workspace = true, features = ["sync"] }
-multiaddr = { workspace = true }
-parking_lot = { workspace = true }
+hopr-utils         = { workspace = true, default-features = false }
+moka               = { workspace = true, features = ["sync"] }
+multiaddr          = { workspace = true }
+parking_lot        = { workspace = true }
 
 [dev-dependencies]
-chrono = { workspace = true }
-hex-literal = { workspace = true }
-hopr-utils = { workspace = true, features = ["runtime-tokio"] }
-hopr-chain-connector = { workspace = true, features = [
-  "testing",
-  "runtime-tokio",
+chrono = { workspace = true, default-features = false, features = [
+  "clock",
+  "std",
 ] }
+hex-literal = { workspace = true }
 hopr-api = { workspace = true, features = ["types-random"] }
-insta = { workspace = true }
+hopr-chain-connector = { workspace = true, features = [
+  "runtime-tokio",
+  "testing",
+] }
+hopr-utils = { workspace = true, features = ["runtime-tokio"] }
+insta = { workspace = true, features = ["redactions", "yaml"] }
 mockall = { workspace = true }
 serde_json = { workspace = true }
-test-log = { workspace = true }
-tokio = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "tracing",
+] }
+
+[workspace]
+members  = ["tests/integration"]
+resolver = "3"
+
+[workspace.dependencies]
+anyhow               = "1.0.103"
+async-trait          = "0.1.89"
+blokli-client        = "0.30.0"
+bytesize             = { version = "2.4.0", features = ["serde"] }
+chrono               = { version = "0.4.45", default-features = false }
+ctor                 = "0.2"
+dashmap              = "6.2.1"
+futures              = "0.3.32"
+futures-concurrency  = "7.7.1"
+futures-time         = "3.1.0"
+hex                  = "0.4.3"
+hex-literal          = "1.1.0"
+hopli                = { git = "https://github.com/hoprnet/hopli", branch = "main" }
+hopr-api             = "1.15.0"
+hopr-bindings        = "4.10.0"
+hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "master" }
+hopr-crypto-packet   = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false, features = [
+  "ed25519",
+] }
+hopr-strategy        = { path = "." }
+hopr-types           = "2.0"
+hopr-utils           = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false }
+humantime-serde      = "1.1.1"
+insta                = "1.48.0"
+lazy_static          = "1.5.0"
+mockall              = "0.15.0"
+moka                 = "0.12.15"
+multiaddr            = "0.18.2"
+parking_lot          = "0.12.5"
+rstest               = "0.26.1"
+serde                = "1.0.228"
+serde_json           = "1.0.150"
+serde_with           = "3.21.0"
+smart-default        = "0.7.1"
+test-log             = "0.2.21"
+thiserror            = "2.0.18"
+tokio                = "1.52.3"
+tracing              = "0.1.44"
+url                  = "2.5.8"
+validator            = "0.20.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

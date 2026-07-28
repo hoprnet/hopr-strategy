@@ -1,0 +1,141 @@
+---
+################################################################################
+# Pull request pipeline for hopr-strategy
+#
+# Validates PR metadata, runs code-quality checks and tests via shared
+# workflows, then builds the library.
+################################################################################
+name: PR
+on:
+  merge_group:
+    types: [checks_requested]
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+permissions:
+  contents: read
+  id-token: write # zizmor: ignore[excessive-permissions]
+concurrency:
+  group: ${{ github.event.pull_request.head.ref || github.ref_name }}-pr
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  # ── PR metadata ──────────────────────────────────────────────────────────────
+  validate-pr-title:
+    name: Validate title
+    if: github.event_name == 'pull_request'
+    runs-on: depot-ubuntu-24.04-2
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            fix
+            feat
+            build
+            chore
+            docs
+            style
+            refactor
+            perf
+            test
+          requireScope: false
+          ignoreLabels: |
+            bot
+            ignore-semantic-pull-request
+  label:
+    name: Add labels
+    if: github.event_name == 'pull_request'
+    runs-on: depot-ubuntu-24.04-2
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          disable-sudo: true
+          egress-policy: audit
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/labeler@77a4082b841706ac431479b7e2bb11216ffef250 # main on 20.02.2025
+        with:
+          sync-labels: true
+      - name: Add "external" label for forked PRs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
+            gh pr edit "$PR_NUMBER" --add-label "external"
+          fi
+  # ── Shared checks (lint, pre-commit, audit) ─────────────────────────────────
+  checks:
+    name: Check
+    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
+    with:
+      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      lint_command: "nix develop --command just quick"
+      audit_command: "nix run -L .#audit"
+      deps: true
+      runner_small: depot-ubuntu-24.04-2
+      runner_large: depot-ubuntu-24.04-4
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  # ── Shared tests (unit) ─────────────────────────────────────────────────────
+  tests:
+    name: Test
+    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-tests-v6.1.1
+    with:
+      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      enable_unit_tests: true
+      unit_test_command: "nix run -L .#test"
+      enable_unit_coverage: true
+      unit_coverage_command: "nix run .#coverage-unit"
+      enable_integration_tests: true
+      integration_test_command: "nix run -L .#test-integration"
+      test_timeout: 30
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  # ── Build: library ─────────────────────────────────────────────────────────
+  build-library:
+    name: Library ${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64-linux
+            runner: depot-ubuntu-24.04-4
+            required_label: ""
+          - architecture: aarch64-linux
+            runner: depot-ubuntu-24.04-arm-4
+            required_label: "binary:aarch64-linux"
+          - architecture: aarch64-darwin
+            runner: depot-macos-15
+            required_label: "binary:aarch64-darwin"
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      version_type: commit
+      architecture: ${{ matrix.architecture }}
+      build_file: Cargo.toml
+      package_name: hopr-strategy
+      runner: ${{ matrix.runner }}
+      enabled: ${{ matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label) }}
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}

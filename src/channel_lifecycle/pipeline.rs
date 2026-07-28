@@ -1423,8 +1423,6 @@ mod tests {
 
     #[tokio::test]
     async fn strategy_should_fund_channel_below_threshold() -> anyhow::Result<()> {
-        let stake_limit = HoprBalance::from(3_u32);
-        let fund_amount = HoprBalance::from(5_u32);
         let initial_balance = HoprBalance::from(2_u32);
 
         let c1 = ChannelEntry::builder()
@@ -1944,8 +1942,6 @@ mod tests {
 
         let cfg = ChannelLifecycleConfig {
             funding: FundingConfig {
-                initial_balance,
-                min_safe_balance_required: HoprBalance::from(1_u32),
                 stop_when_unfunded: true,
                 ..Default::default()
             },
@@ -1954,7 +1950,15 @@ mod tests {
 
         let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
 
-        let result = inner.try_open_channel(*ALICE, initial_balance);
+        // The PendingToClose guard fires before funding is consulted; supply a
+        // resolved funding mirroring the pre-rename test's balances.
+        let resolved = make_resolved(
+            HoprBalance::from(1_u32), // lower (unused in this path)
+            HoprBalance::from(8_u32), // topup (unused in this path)
+            initial_balance,
+            HoprBalance::from(1_u32), // min_safe
+        );
+        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved);
 
         // The PendingToClose guard must fire: no tx, in-flight marker cleared.
         assert!(

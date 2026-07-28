@@ -1,0 +1,30 @@
+---
+name: Zizmor
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths:
+      - ".github/**"
+  merge_group:
+    types: [checks_requested]
+concurrency:
+  group: ${{ github.event.pull_request.head.ref || github.ref_name }}-zizmor
+  cancel-in-progress: true
+permissions:
+  contents: read
+  security-events: write
+jobs:
+  zizmor:
+    uses: hoprnet/hopr-workflows/.github/workflows/checks-zizmor.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-zizmor-v1.1.1
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      runner: depot-ubuntu-24.04-4
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}

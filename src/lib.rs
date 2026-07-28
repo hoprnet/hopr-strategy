@@ -53,3 +53,7 @@ pub mod channel_finalizer;
 pub mod channel_lifecycle;
 pub mod errors;
 pub mod strategy;
+
+/// Test-support node adapters, shared with the integration-test crate.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;

@@ -166,8 +166,7 @@ mod tests {
     use futures_time::future::FutureExt;
     use hex_literal::hex;
     use hopr_api::{
-        chain::{ChainEvent, ChainEvents, HoprChainApi},
-        node::{ComponentStatus, ComponentStatusReporter, EventWaitResult, HasChainApi, NodeOnchainIdentity},
+        chain::{ChainEvent, ChainEvents},
         types::{
             crypto::{keypairs::Keypair, prelude::ChainKeypair},
             internal::prelude::{ChannelEntry, ChannelStatus},
@@ -178,6 +177,7 @@ mod tests {
     use lazy_static::lazy_static;
 
     use super::*;
+    use crate::testing::ChainNode;
 
     lazy_static! {
         static ref ALICE_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
@@ -189,42 +189,6 @@ mod tests {
         static ref CHARLIE: Address = hex!("250eefb2586ab0873befe90b905126810960ee7c").into();
         static ref DAVE: Address = hex!("68499f50ff68d523385dc60686069935d17d762a").into();
         static ref EUGENE: Address = hex!("0c1da65d269f89b05e3775bf8fcd21a138e8cbeb").into();
-    }
-
-    /// Wraps a chain API implementor as a minimal node for strategy tests.
-    struct ChainNode<C>(C);
-
-    impl<C> HasChainApi for ChainNode<C>
-    where
-        C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
-    {
-        type ChainApi = C;
-        type ChainError = <C as HoprChainApi>::ChainError;
-
-        fn identity(&self) -> &NodeOnchainIdentity {
-            static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
-            IDENTITY.get_or_init(NodeOnchainIdentity::default)
-        }
-
-        fn chain_api(&self) -> &C {
-            &self.0
-        }
-
-        fn status(&self) -> ComponentStatus {
-            self.0.component_status()
-        }
-
-        fn wait_for_on_chain_event<F>(
-            &self,
-            _predicate: F,
-            _context: String,
-            _timeout: std::time::Duration,
-        ) -> EventWaitResult<<C as HoprChainApi>::ChainError, <C as HoprChainApi>::ChainError>
-        where
-            F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
-        {
-            unimplemented!("tests do not call wait_for_on_chain_event")
-        }
     }
 
     #[tokio::test]
