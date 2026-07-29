@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.94"
-version      = "0.20.2"
+version      = "0.20.3"
 
 [lib]
 crate-type = ["rlib"]
@@ -110,7 +110,7 @@ hopr-api            = "1.16.0"
 hopr-bindings       = "4.10.0"
 hopr-strategy       = { path = "." }
 hopr-types          = "2.0"
-hopr-utils          = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false }
+hopr-utils          = { package = "hopr-utilities", version = "0.3.0", default-features = false }
 humantime-serde     = "1.1.1"
 insta               = "1.48.0"
 lazy_static         = "1.5.0"
