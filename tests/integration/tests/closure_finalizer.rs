@@ -21,16 +21,14 @@ use rstest::rstest;
 /// its closure deadline has elapsed and it is still within `max_closure_overdue`.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn closes_elapsed_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn closes_elapsed_channel(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
-        .open_channel_scenario(source, destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .open_channel_scenario(&source, &destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
         .await?;
 
-    fixture
-        .initiate_outgoing_channel_closure(source, destination, &scenario.source_safe.module_address)
-        .await?;
+    scenario.initiate_closure().await?;
     await_channel_where(
         &scenario.connector,
         scenario.source_addr,
@@ -70,16 +68,14 @@ async fn closes_elapsed_channel(#[future(awt)] fixture: IntegrationFixture) -> R
 /// left untouched (external intervention assumed).
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_channel_overdue_beyond_max(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn skips_channel_overdue_beyond_max(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
-        .open_channel_scenario(source, destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .open_channel_scenario(&source, &destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
         .await?;
 
-    fixture
-        .initiate_outgoing_channel_closure(source, destination, &scenario.source_safe.module_address)
-        .await?;
+    scenario.initiate_closure().await?;
     // Wait for the closure deadline to elapse.
     await_channel_where(
         &scenario.connector,
@@ -125,16 +121,14 @@ async fn skips_channel_overdue_beyond_max(#[future(awt)] fixture: IntegrationFix
 /// deadline so the test stays robust to the chain's closure notice period.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_channel_with_pending_deadline(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn skips_channel_with_pending_deadline(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
-        .open_channel_scenario(source, destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .open_channel_scenario(&source, &destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
         .await?;
 
-    fixture
-        .initiate_outgoing_channel_closure(source, destination, &scenario.source_safe.module_address)
-        .await?;
+    scenario.initiate_closure().await?;
     // Read the pending-close deadline so we can bound the observation window to
     // just before it elapses.
     let pending = await_channel_where(

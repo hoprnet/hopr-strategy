@@ -162,6 +162,7 @@ where
 mod tests {
     use std::{ops::Add, sync::Arc, time::SystemTime};
 
+    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
     use futures::StreamExt;
     use futures_time::future::FutureExt;
     use hex_literal::hex;
@@ -173,7 +174,6 @@ mod tests {
             primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
         },
     };
-    use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
     use lazy_static::lazy_static;
 
     use super::*;
@@ -242,11 +242,8 @@ mod tests {
             ])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&ALICE_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
-        let chain_connector = Arc::new(chain_connector);
+        let chain_connector =
+            Arc::new(create_test_blokli_connector(&ALICE_KP, blokli_sim, [1; Address::SIZE].into()).await?);
         let events = chain_connector.subscribe()?;
 
         let cfg = ClosureFinalizerStrategyConfig { max_closure_overdue };
@@ -285,10 +282,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&ALICE_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&ALICE_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 
         let strategy: Box<dyn crate::strategy::Strategy + Send> = super::ClosureFinalizerStrategy::new(

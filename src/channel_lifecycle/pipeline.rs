@@ -1037,6 +1037,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
     use anyhow::Context as _;
     use bytesize::ByteSize;
     use dashmap::DashMap;
@@ -1061,7 +1062,6 @@ mod tests {
             primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
         },
     };
-    use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
 
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
     // Private items (ChannelLifecycleStrategyInner) are accessible from descendant modules.
@@ -1443,10 +1443,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -1526,10 +1523,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let chain_connector = Arc::new(chain_connector);
         let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
 
@@ -1697,10 +1691,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
 
         // One channel per in-flight set tracked by the old instance.
@@ -1865,10 +1856,7 @@ mod tests {
             .with_channels([existing_channel])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -1933,10 +1921,7 @@ mod tests {
             .with_channels([existing_channel])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2013,10 +1998,7 @@ mod tests {
             .with_channels([existing_channel])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2075,10 +2057,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2165,10 +2144,7 @@ mod tests {
             .with_channels([ch])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2379,10 +2355,7 @@ mod tests {
             )
             .with_channels([ch])
             .build_dynamic_client([1; Address::SIZE].into());
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2460,10 +2433,7 @@ mod tests {
             )
             .with_channels([ch])
             .build_dynamic_client([1; Address::SIZE].into());
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2584,10 +2554,7 @@ mod tests {
             .with_closure_grace_period(Duration::from_secs(60))
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2664,10 +2631,7 @@ mod tests {
             .with_closure_grace_period(Duration::ZERO)
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 

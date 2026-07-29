@@ -395,6 +395,7 @@ where
 mod tests {
     use std::str::FromStr;
 
+    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
     use anyhow::Context;
     use futures::StreamExt;
     use futures_time::future::FutureExt;
@@ -410,7 +411,6 @@ mod tests {
             primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
         },
     };
-    use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
 
     use super::*;
     use crate::testing::ChainNode;
@@ -486,11 +486,8 @@ mod tests {
 
         let snapshot = blokli_sim.snapshot();
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
-        let chain_connector = Arc::new(chain_connector);
+        let chain_connector =
+            Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
         let events = chain_connector.subscribe()?;
 
         let cfg = AutoFundingStrategyConfig {
@@ -586,10 +583,7 @@ mod tests {
             .with_channels([c1, c2])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
         let events = chain_connector.subscribe()?;
@@ -644,10 +638,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
         let events = chain_connector.subscribe()?;
@@ -722,10 +713,7 @@ mod tests {
             .with_channels([c1, c2, c3])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
         let events = chain_connector.subscribe()?;
@@ -792,10 +780,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
         let _events = chain_connector.subscribe()?;
@@ -856,10 +841,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
         let _events = chain_connector.subscribe()?;
@@ -920,10 +902,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
         let _events = chain_connector.subscribe()?;
@@ -976,10 +955,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
 
         let afs = AutoFundingStrategyInner {
             cfg: AutoFundingStrategyConfig {
@@ -1021,10 +997,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
 
         let afs = AutoFundingStrategyInner {
             cfg: AutoFundingStrategyConfig {
@@ -1057,10 +1030,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 
         let strategy: Box<dyn crate::strategy::Strategy + Send> =
