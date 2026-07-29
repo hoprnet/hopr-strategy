@@ -130,9 +130,3 @@ ignored = ["humantime-serde"]
 
 [package.metadata.cargo-shear]
 ignored = ["humantime-serde"]
-
-# The nix dev shell on Linux resolves platform-specific deps differently from
-# macOS, making Cargo.lock appear modified before cargo-release checks git
-# status.  Harmless for a library crate — crates.io does not include Cargo.lock.
-[package.metadata.release]
-allow-dirty = ["Cargo.lock"]
