@@ -3228,7 +3228,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytesize",
- "futures",
  "hopr-api",
  "hopr-strategy",
  "rstest",

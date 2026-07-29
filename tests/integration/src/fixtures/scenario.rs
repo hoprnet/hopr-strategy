@@ -117,6 +117,8 @@ impl IntegrationFixture {
             )
             .with_safe_allowances([(source.address, opts.allowance), (destination.address, opts.allowance)])
             .with_channels([channel])
+            // Use a short grace period so closure deadline elapses within the test action timeout.
+            .with_closure_grace_period(Duration::from_secs(2))
             .build_dynamic_client(module_address());
 
         // Source and destination share the same state — clone the client.

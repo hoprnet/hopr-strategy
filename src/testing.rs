@@ -1568,7 +1568,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
                 })?;
             let channel = Self::convert_channel_model(&channel_model, src_addr, dst_addr)?;
             let channel_id = *channel.get_id();
-            self.channels.insert(channel_id, channel.clone());
+            self.channels.insert(channel_id, channel);
         }
 
         // Spawn a background task that forwards live graph updates as ChainEvents.
@@ -1618,8 +1618,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
                 accounts_cache.insert(dst.chain_addr, dst);
 
                 let channel_id = *new_channel.get_id();
-                let old_channel = channels_cache.get(&channel_id).map(|r| r.clone());
-                channels_cache.insert(channel_id, new_channel.clone());
+                let old_channel = channels_cache.get(&channel_id).map(|r| *r);
+                channels_cache.insert(channel_id, new_channel);
 
                 let event = match old_channel {
                     None => {
@@ -1944,7 +1944,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         &self,
         channel_id: &hopr_api::types::internal::prelude::ChannelId,
     ) -> Result<Option<hopr_api::types::internal::prelude::ChannelEntry>, Self::Error> {
-        Ok(self.channels.get(channel_id).map(|e| e.clone()))
+        Ok(self.channels.get(channel_id).map(|e| *e))
     }
 
     fn stream_channels<'a>(
@@ -1955,7 +1955,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .channels
             .iter()
             .filter(|e| selector.satisfies(e.value()))
-            .map(|e| e.value().clone())
+            .map(|e| *e.value())
             .collect();
         Ok(futures::stream::iter(entries).boxed())
     }
@@ -1989,7 +1989,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         let channel = self
             .channels
             .get(channel_id)
-            .map(|e| e.clone())
+            .map(|e| *e)
             .ok_or_else(|| anyhow::anyhow!("channel {channel_id} not found"))?;
 
         let tx_req = self.payload_gen()?.fund_channel(channel.destination, amount)?;
@@ -2006,7 +2006,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         let channel = self
             .channels
             .get(channel_id)
-            .map(|e| e.clone())
+            .map(|e| *e)
             .ok_or_else(|| anyhow::anyhow!("channel {channel_id} not found"))?;
 
         let tx_req = match channel.status {
@@ -2141,7 +2141,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .channels
             .iter()
             .filter_map(|e| {
-                let ch = e.value().clone();
+                let ch = *e.value();
                 match ch.status {
                     ChannelStatus::Open => Some(ChainEvent::ChannelOpened(ch)),
                     ChannelStatus::PendingToClose(_) => Some(ChainEvent::ChannelClosureInitiated(ch)),
@@ -2330,25 +2330,25 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         >,
         hopr_api::chain::TicketRedeemError<Self::Error>,
     > {
-        let verified_ticket = ticket.ticket.clone();
+        let verified_ticket = ticket.ticket;
         let tx_req = self
             .payload_gen()
             .map_err(|e| {
                 hopr_api::chain::TicketRedeemError::ProcessingError(
-                    verified_ticket.clone(),
+                    verified_ticket,
                     TestConnectorError::from(e),
                 )
             })?
             .redeem_ticket(ticket)
             .map_err(|e| {
                 hopr_api::chain::TicketRedeemError::ProcessingError(
-                    verified_ticket.clone(),
+                    verified_ticket,
                     TestConnectorError::from(anyhow::anyhow!("{e}")),
                 )
             })?;
 
         let chain_id = self.chain_id().map_err(|e| {
-            hopr_api::chain::TicketRedeemError::ProcessingError(verified_ticket.clone(), TestConnectorError::from(e))
+            hopr_api::chain::TicketRedeemError::ProcessingError(verified_ticket, TestConnectorError::from(e))
         })?;
         let chain_key = self.chain_key.clone();
         let nonce = self.nonce.clone();
@@ -2359,7 +2359,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
                 .await
                 .map_err(|e| {
                     hopr_api::chain::TicketRedeemError::ProcessingError(
-                        verified_ticket.clone(),
+                        verified_ticket,
                         TestConnectorError::from(e),
                     )
                 })?;
