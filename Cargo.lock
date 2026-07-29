@@ -3150,7 +3150,8 @@ dependencies = [
 [[package]]
 name = "hopr-api"
 version = "1.16.0"
-source = "git+https://github.com/hoprnet/hopr-api?branch=kauki%2Ffeat%2Fpacket%2Fpacket-payload-size#72ac9648ec73c0e73021ec50bf24f4b4f0b9faa7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f8c7f28951b250cc61b68d8d06aa2d73fb05f96d19380325fc235924768f579"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3187,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "0.20.1"
+version = "0.20.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
