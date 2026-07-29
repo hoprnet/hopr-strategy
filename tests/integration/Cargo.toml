@@ -7,7 +7,6 @@ version = "0.1.0"
 [dependencies]
 
 anyhow = { workspace = true }
-futures = { workspace = true }
 hopr-api = { workspace = true, features = ["node", "serde"] }
 hopr-strategy = { workspace = true, features = [
   "runtime-tokio",
