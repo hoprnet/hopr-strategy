@@ -195,7 +195,11 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
 impl FundingConfig {
     /// Resolve all data-capacity fields to wxHOPR amounts at the given ticket
     /// economics.  Called once per pipeline tick.
-    pub(crate) fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: WinningProbability) -> ResolvedFunding {
+    pub(crate) fn resolve<C: PacketTransport>(
+        &self,
+        price: HoprBalance,
+        win_prob: WinningProbability,
+    ) -> ResolvedFunding {
         let hops = self.assumed_hops;
         ResolvedFunding {
             initial_balance: capacity_to_balance::<C>(self.initial_capacity, price, win_prob, hops),
@@ -505,7 +509,10 @@ mod config_tests {
     fn zero_capacity_returns_zero() -> anyhow::Result<()> {
         let price = balance_from_wei(PRICE_WEI);
         let wp = WinningProbability::try_from(1.0f64).context("create win_prob")?;
-        assert_eq!(capacity_to_balance::<TestTransport>(ByteSize::b(0), price, wp, 3), HoprBalance::zero());
+        assert_eq!(
+            capacity_to_balance::<TestTransport>(ByteSize::b(0), price, wp, 3),
+            HoprBalance::zero()
+        );
         Ok(())
     }
 

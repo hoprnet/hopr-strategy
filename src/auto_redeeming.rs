@@ -401,9 +401,6 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use crate::testing::{
-        BlokliTestClient, BlokliTestStateBuilder, StaticState, TestChainConnector, create_test_blokli_connector,
-    };
     use futures::stream::BoxStream;
     use futures_time::future::FutureExt as TimeExt;
     use hex_literal::hex;
@@ -426,6 +423,9 @@ mod tests {
     };
 
     use super::*;
+    use crate::testing::{
+        BlokliTestClient, BlokliTestStateBuilder, StaticState, TestChainConnector, create_test_blokli_connector,
+    };
 
     mockall::mock! {
         pub TicketMgmt {}

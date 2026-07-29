@@ -19,10 +19,9 @@ use std::{
     time::Duration,
 };
 
-use blokli_client::api::types::RedeemedStats;
 use blokli_client::api::{
     AccountSelector as BlokliAccountSelector, BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient,
-    ChannelSelector, RedeemedStatsSelector, SafeSelector as BlokliSafeSelector,
+    ChannelSelector, RedeemedStatsSelector, SafeSelector as BlokliSafeSelector, types::RedeemedStats,
 };
 use futures::{StreamExt, stream::BoxStream};
 use hopr_api::{
@@ -33,9 +32,8 @@ use hopr_api::{
     },
     node::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus, ComponentStatusReporter,
-        PacketTransport,
         EventWaitResult, HasChainApi, HasGraphView, HasNetworkView, HasTicketManagement, NodeOnchainIdentity,
-        TicketEvent,
+        PacketTransport, TicketEvent,
     },
     tickets::{ChannelStats, RedemptionResult, TicketManagement},
     types::{

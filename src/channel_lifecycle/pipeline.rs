@@ -1037,7 +1037,6 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
     use anyhow::Context as _;
     use bytesize::ByteSize;
     use dashmap::DashMap;
@@ -1068,6 +1067,7 @@ mod tests {
     // Private items (ChannelLifecycleStrategyInner) are accessible from descendant modules.
     use super::super::ChannelLifecycleStrategyInner;
     use super::super::{config::ResolvedFunding, *};
+    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
 
     /// Build a [`ResolvedFunding`] directly from wxHOPR amounts for use in
     /// `try_open_channel` unit tests that bypass the pipeline.

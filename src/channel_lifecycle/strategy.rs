@@ -51,7 +51,14 @@ impl ChannelLifecycleStrategy {
     /// of the concrete node type.
     pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
     where
-        N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
+        N: HasChainApi
+            + HasNetworkView
+            + HasGraphView
+            + ActionableEventSource
+            + PacketTransport
+            + Send
+            + Sync
+            + 'static,
         N::ChainApi: ChainReadChannelOperations
             + ChainReadSafeOperations
             + ChainReadAccountOperations

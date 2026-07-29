@@ -395,7 +395,6 @@ where
 mod tests {
     use std::str::FromStr;
 
-    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
     use anyhow::Context;
     use futures::StreamExt;
     use futures_time::future::FutureExt;
@@ -413,7 +412,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::testing::ChainNode;
+    use crate::testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector};
 
     lazy_static::lazy_static! {
         static ref BOB_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(

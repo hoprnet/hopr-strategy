@@ -162,7 +162,6 @@ where
 mod tests {
     use std::{ops::Add, sync::Arc, time::SystemTime};
 
-    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
     use futures::StreamExt;
     use futures_time::future::FutureExt;
     use hex_literal::hex;
@@ -177,7 +176,7 @@ mod tests {
     use lazy_static::lazy_static;
 
     use super::*;
-    use crate::testing::ChainNode;
+    use crate::testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector};
 
     lazy_static! {
         static ref ALICE_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
