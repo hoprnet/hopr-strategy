@@ -946,6 +946,9 @@ impl<M1: BlokliTestStateMutator, M2: BlokliTestStateMutator> BlokliTestStateMuta
 }
 
 /// Builder for [`BlokliTestState`] using HOPR-native types.
+///
+/// TODO(hoprnet/hopr-strategy#14): move this builder and `TestChainConnector` to
+/// `hopr-utilities` (testing feature) so downstream crates don't have to duplicate them.
 #[derive(Clone)]
 pub struct BlokliTestStateBuilder(BlokliTestState);
 
