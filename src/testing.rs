@@ -1144,7 +1144,7 @@ impl BlokliTestStateBuilder {
                 (
                     const_hex::encode(addr),
                     blokli_client::api::types::SafeHoprAllowance {
-                        __typename: "SafeAllowance".into(),
+                        __typename: "SafeHoprAllowance".into(),
                         allowance: blokli_client::api::types::TokenValueString(allowance.to_string()),
                     },
                 )
@@ -1591,7 +1591,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             };
             futures::pin_mut!(graph_stream);
 
-            while let Ok(Some(entry)) = graph_stream.try_next().await {
+            loop {
+                let entry = match graph_stream.try_next().await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::error!("graph stream error in background event loop: {e}");
+                        break;
+                    }
+                };
                 let src = match Self::convert_account_model(entry.source) {
                     Ok(a) => a,
                     Err(e) => {
@@ -2334,10 +2342,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         let tx_req = self
             .payload_gen()
             .map_err(|e| {
-                hopr_api::chain::TicketRedeemError::ProcessingError(
-                    verified_ticket,
-                    TestConnectorError::from(e),
-                )
+                hopr_api::chain::TicketRedeemError::ProcessingError(verified_ticket, TestConnectorError::from(e))
             })?
             .redeem_ticket(ticket)
             .map_err(|e| {
@@ -2358,10 +2363,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             let receipt = Self::send_tx(&client, tx_req, chain_id, &chain_key, &nonce)
                 .await
                 .map_err(|e| {
-                    hopr_api::chain::TicketRedeemError::ProcessingError(
-                        verified_ticket,
-                        TestConnectorError::from(e),
-                    )
+                    hopr_api::chain::TicketRedeemError::ProcessingError(verified_ticket, TestConnectorError::from(e))
                 })?;
             Ok((verified_ticket, receipt))
         }))

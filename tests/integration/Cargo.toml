@@ -17,7 +17,7 @@ hopr-strategy = { workspace = true, features = [
   "testing",
 ] }
 rstest = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

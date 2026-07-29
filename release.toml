@@ -1,7 +1,0 @@
-# cargo-release configuration
-#
-# Cargo.lock is excluded from the dirty-file check: the nix dev shell on Linux
-# resolves platform-specific deps differently from macOS, causing the lock to be
-# updated during shell startup.  For a library crate this is harmless — cargo
-# publish does not include Cargo.lock.
-allow-dirty = ["Cargo.lock"]
