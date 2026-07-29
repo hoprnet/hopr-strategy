@@ -3,9 +3,9 @@ use std::{collections::HashSet, time::Duration};
 use bytesize::ByteSize;
 use hopr_api::{
     chain::WinningProbability,
+    node::PacketTransport,
     types::primitive::prelude::{Address, HoprBalance, U256, UnitaryFloatOps},
 };
-use hopr_crypto_packet::prelude::HoprPacket;
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use validator::Validate;
@@ -157,7 +157,7 @@ pub(crate) struct ResolvedFunding {
 /// Falls back to a `win_prob`-independent estimate (`price × packets × hops`)
 /// when `win_prob` is zero or converting it to f64 would produce a non-positive
 /// value, to avoid dividing by zero.
-pub(crate) fn capacity_to_balance(
+pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
     win_prob: WinningProbability,
@@ -169,7 +169,7 @@ pub(crate) fn capacity_to_balance(
     }
 
     // ceil(bytes / PAYLOAD_SIZE)
-    let payload = HoprPacket::PAYLOAD_SIZE as u64;
+    let payload = C::packet_payload_size() as u64;
     let packets = bytes.div_ceil(payload);
 
     // ticket_price_wei × packets × hops — saturating; overflow becomes U256::MAX
@@ -195,13 +195,13 @@ pub(crate) fn capacity_to_balance(
 impl FundingConfig {
     /// Resolve all data-capacity fields to wxHOPR amounts at the given ticket
     /// economics.  Called once per pipeline tick.
-    pub(crate) fn resolve(&self, price: HoprBalance, win_prob: WinningProbability) -> ResolvedFunding {
+    pub(crate) fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: WinningProbability) -> ResolvedFunding {
         let hops = self.assumed_hops;
         ResolvedFunding {
-            initial_balance: capacity_to_balance(self.initial_capacity, price, win_prob, hops),
-            topup_balance: capacity_to_balance(self.topup_capacity, price, win_prob, hops),
-            lower_balance_threshold: capacity_to_balance(self.lower_capacity_threshold, price, win_prob, hops),
-            min_safe_balance_required: capacity_to_balance(self.min_safe_capacity_required, price, win_prob, hops),
+            initial_balance: capacity_to_balance::<C>(self.initial_capacity, price, win_prob, hops),
+            topup_balance: capacity_to_balance::<C>(self.topup_capacity, price, win_prob, hops),
+            lower_balance_threshold: capacity_to_balance::<C>(self.lower_capacity_threshold, price, win_prob, hops),
+            min_safe_balance_required: capacity_to_balance::<C>(self.min_safe_capacity_required, price, win_prob, hops),
         }
     }
 }
@@ -458,6 +458,13 @@ mod config_tests {
 
     use super::*;
 
+    struct TestTransport;
+    impl PacketTransport for TestTransport {
+        fn packet_payload_size() -> usize {
+            1036
+        }
+    }
+
     #[test]
     fn all_named_profiles_have_valid_trust_weights() {
         for cfg in [
@@ -498,7 +505,7 @@ mod config_tests {
     fn zero_capacity_returns_zero() -> anyhow::Result<()> {
         let price = balance_from_wei(PRICE_WEI);
         let wp = WinningProbability::try_from(1.0f64).context("create win_prob")?;
-        assert_eq!(capacity_to_balance(ByteSize::b(0), price, wp, 3), HoprBalance::zero());
+        assert_eq!(capacity_to_balance::<TestTransport>(ByteSize::b(0), price, wp, 3), HoprBalance::zero());
         Ok(())
     }
 
@@ -507,8 +514,8 @@ mod config_tests {
         // capacity = 10 × PAYLOAD_SIZE → exactly 10 packets
         let price = balance_from_wei(PRICE_WEI);
         let wp = WinningProbability::try_from(1.0f64).context("create win_prob")?;
-        let capacity = ByteSize::b((HoprPacket::PAYLOAD_SIZE * 10) as u64);
-        let result = capacity_to_balance(capacity, price, wp, 3);
+        let capacity = ByteSize::b((1036_usize * 10) as u64);
+        let result = capacity_to_balance::<TestTransport>(capacity, price, wp, 3);
         // expected: PRICE_WEI * 10 packets * 3 hops / 1.0
         let expected = balance_from_wei(PRICE_WEI * 10 * 3);
         assert_eq!(result, expected, "exact 10 packets, win_prob=1.0");
@@ -521,9 +528,9 @@ mod config_tests {
         let price = balance_from_wei(PRICE_WEI);
         let wp_full = WinningProbability::try_from(1.0f64).context("create wp_full")?;
         let wp_half = WinningProbability::try_from(0.5f64).context("create wp_half")?;
-        let capacity = ByteSize::b((HoprPacket::PAYLOAD_SIZE * 10) as u64);
-        let full = capacity_to_balance(capacity, price, wp_full, 3);
-        let half = capacity_to_balance(capacity, price, wp_half, 3);
+        let capacity = ByteSize::b((1036_usize * 10) as u64);
+        let full = capacity_to_balance::<TestTransport>(capacity, price, wp_full, 3);
+        let half = capacity_to_balance::<TestTransport>(capacity, price, wp_half, 3);
         // half should be approximately double full
         let ratio = half.amount().low_u128() as f64 / full.amount().low_u128() as f64;
         assert!((ratio - 2.0).abs() < 0.01, "ratio={ratio}");
@@ -535,7 +542,7 @@ mod config_tests {
         // 1 byte → ceil(1 / PAYLOAD_SIZE) = 1 packet
         let price = balance_from_wei(PRICE_WEI);
         let wp = WinningProbability::try_from(1.0f64).context("create win_prob")?;
-        let result = capacity_to_balance(ByteSize::b(1), price, wp, 1);
+        let result = capacity_to_balance::<TestTransport>(ByteSize::b(1), price, wp, 1);
         let expected = balance_from_wei(PRICE_WEI * 1 * 1);
         assert_eq!(result, expected, "1 byte rounds up to 1 packet");
         Ok(())
@@ -545,9 +552,9 @@ mod config_tests {
     fn assumed_hops_scales_linearly() -> anyhow::Result<()> {
         let price = balance_from_wei(PRICE_WEI);
         let wp = WinningProbability::try_from(1.0f64).context("create win_prob")?;
-        let capacity = ByteSize::b(HoprPacket::PAYLOAD_SIZE as u64);
-        let h1 = capacity_to_balance(capacity, price, wp, 1);
-        let h3 = capacity_to_balance(capacity, price, wp, 3);
+        let capacity = ByteSize::b(1036_u64);
+        let h1 = capacity_to_balance::<TestTransport>(capacity, price, wp, 1);
+        let h3 = capacity_to_balance::<TestTransport>(capacity, price, wp, 3);
         assert_eq!(
             h3.amount(),
             h1.amount().saturating_mul(U256::from(3u64)),
@@ -563,24 +570,24 @@ mod config_tests {
         let cfg = FundingConfig::default();
         let price = balance_from_wei(PRICE_WEI);
         let wp = WinningProbability::try_from(1.0f64).context("create win_prob")?;
-        let resolved = cfg.resolve(price, wp);
+        let resolved = cfg.resolve::<TestTransport>(price, wp);
 
         // Each resolved balance must match what capacity_to_balance produces independently.
         assert_eq!(
             resolved.initial_balance,
-            capacity_to_balance(cfg.initial_capacity, price, wp, cfg.assumed_hops)
+            capacity_to_balance::<TestTransport>(cfg.initial_capacity, price, wp, cfg.assumed_hops)
         );
         assert_eq!(
             resolved.topup_balance,
-            capacity_to_balance(cfg.topup_capacity, price, wp, cfg.assumed_hops)
+            capacity_to_balance::<TestTransport>(cfg.topup_capacity, price, wp, cfg.assumed_hops)
         );
         assert_eq!(
             resolved.lower_balance_threshold,
-            capacity_to_balance(cfg.lower_capacity_threshold, price, wp, cfg.assumed_hops)
+            capacity_to_balance::<TestTransport>(cfg.lower_capacity_threshold, price, wp, cfg.assumed_hops)
         );
         assert_eq!(
             resolved.min_safe_balance_required,
-            capacity_to_balance(cfg.min_safe_capacity_required, price, wp, cfg.assumed_hops)
+            capacity_to_balance::<TestTransport>(cfg.min_safe_capacity_required, price, wp, cfg.assumed_hops)
         );
         Ok(())
     }

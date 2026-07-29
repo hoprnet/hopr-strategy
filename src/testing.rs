@@ -33,6 +33,7 @@ use hopr_api::{
     },
     node::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus, ComponentStatusReporter,
+        PacketTransport,
         EventWaitResult, HasChainApi, HasGraphView, HasNetworkView, HasTicketManagement, NodeOnchainIdentity,
         TicketEvent,
     },
@@ -184,6 +185,18 @@ where
 
     fn status(&self) -> ComponentStatus {
         ComponentStatus::Ready
+    }
+}
+
+impl<C: PacketTransport> PacketTransport for ChainNode<C> {
+    fn packet_payload_size() -> usize {
+        C::packet_payload_size()
+    }
+}
+
+impl<C: PacketTransport> PacketTransport for LifecycleNode<C> {
+    fn packet_payload_size() -> usize {
+        C::packet_payload_size()
     }
 }
 
@@ -2364,6 +2377,16 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::node::
 {
     fn component_status(&self) -> hopr_api::node::ComponentStatus {
         hopr_api::node::ComponentStatus::Ready
+    }
+}
+
+// ── PacketTransport ───────────────────────────────────────────────────────────
+
+impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::node::PacketTransport
+    for TestChainConnector<M>
+{
+    fn packet_payload_size() -> usize {
+        1036
     }
 }
 

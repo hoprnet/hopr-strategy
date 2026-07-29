@@ -20,7 +20,7 @@ use hopr_api::{
         EdgeImmediateProtocolObservable as _, EdgeLinkObservable as _, EdgeObservableRead as _, NetworkGraphView as _,
     },
     network::NetworkView as _,
-    node::{ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView},
+    node::{ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView, PacketTransport},
     types::{
         crypto::prelude::OffchainPublicKey,
         internal::prelude::{ChannelEntry, ChannelId, ChannelStatus},
@@ -47,7 +47,7 @@ const PEER_ADDR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 impl<N> ChannelLifecycleStrategyInner<N>
 where
-    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + Send + Sync + 'static,
+    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
     N::ChainApi: ChainReadChannelOperations
         + ChainReadSafeOperations
         + ChainReadAccountOperations
@@ -463,7 +463,7 @@ where
 
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
         // `None` when win_prob is unavailable; fund/open passes are skipped.
-        let funding = win_prob.map(|wp| self.cfg.funding.resolve(ticket_price, wp));
+        let funding = win_prob.map(|wp| self.cfg.funding.resolve::<N>(ticket_price, wp));
 
         // Share resolved economics with the event-driven funding handler so it
         // can reuse per-tick values rather than issuing fresh chain RPC calls.
@@ -1052,6 +1052,7 @@ mod tests {
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
             ComponentStatusReporter, EventWaitResult, HasChainApi, HasGraphView, HasNetworkView, NodeOnchainIdentity,
+            PacketTransport,
         },
         types::{
             crypto::{
@@ -1093,6 +1094,13 @@ mod tests {
         static ref BOB: Address = BOB_KP.public().to_address();
         static ref CHRIS: Address = hex!("b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234").into();
         static ref DAVE: Address = hex!("68499f50ff68d523385dc60686069935d17d762a").into();
+    }
+
+    struct TestTransport;
+    impl PacketTransport for TestTransport {
+        fn packet_payload_size() -> usize {
+            1036
+        }
     }
 
     /// Minimal node wrapper — same pattern as in auto_funding tests.
@@ -1392,6 +1400,12 @@ mod tests {
 
         fn status(&self) -> ComponentStatus {
             ComponentStatus::Ready
+        }
+    }
+
+    impl<C: PacketTransport> PacketTransport for ChainNode<C> {
+        fn packet_payload_size() -> usize {
+            C::packet_payload_size()
         }
     }
 
@@ -2122,7 +2136,7 @@ mod tests {
         let expected_topup = {
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
             let wp = WinningProbability::try_from(1.0f64).expect("valid win_prob");
-            capacity_to_balance(ByteSize::b(1), price, wp, 3) // topup_capacity = ByteSize::b(1)
+            capacity_to_balance::<TestTransport>(ByteSize::b(1), price, wp, 3) // topup_capacity = ByteSize::b(1)
         };
 
         // Channel starts at 0 balance — below any non-zero threshold.

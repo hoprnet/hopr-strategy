@@ -16,6 +16,7 @@ use hopr_api::{
     },
     node::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView,
+        PacketTransport,
     },
 };
 
@@ -50,7 +51,7 @@ impl ChannelLifecycleStrategy {
     /// of the concrete node type.
     pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
     where
-        N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + Send + Sync + 'static,
+        N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
         N::ChainApi: ChainReadChannelOperations
             + ChainReadSafeOperations
             + ChainReadAccountOperations
@@ -104,7 +105,7 @@ impl<N> Display for ChannelLifecycleStrategyInner<N> {
 #[async_trait]
 impl<N> StrategyTrait for ChannelLifecycleStrategyInner<N>
 where
-    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + Send + Sync + 'static,
+    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
     N::ChainApi: ChainReadChannelOperations
         + ChainReadSafeOperations
         + ChainReadAccountOperations
