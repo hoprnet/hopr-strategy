@@ -679,6 +679,13 @@ impl BlokliTestStateMutator for FullStateEmulator {
                     .values_mut()
                     .find(|c| c.source == source.keyid && c.destination == destination.keyid)
                 {
+                    if existing_channel.status == blokli_client::api::types::ChannelStatus::PendingToClose {
+                        return Err(blokli_client::errors::ErrorKind::MockClientError(anyhow::anyhow!(
+                            "cannot fund channel {sender} -> {dst_addr}: channel is PendingToClose"
+                        ))
+                        .into());
+                    }
+
                     if existing_channel.status == blokli_client::api::types::ChannelStatus::Closed {
                         existing_channel.status = blokli_client::api::types::ChannelStatus::Open;
                         existing_channel.ticket_index = blokli_client::api::types::Uint64("0".into());
@@ -1004,6 +1011,10 @@ impl BlokliTestStateBuilder {
     }
 
     /// Appends the initial [`AccountEntries`](AccountEntry) in the state.
+    ///
+    /// The `hopr_balance` is credited to the account's safe address if one is present.
+    /// For accounts without a safe, `hopr_balance` is ignored and the node address receives
+    /// a zero token balance (safe-only semantics mirror the on-chain model).
     #[must_use]
     pub fn with_accounts<
         I: IntoIterator<
@@ -1473,11 +1484,19 @@ type TestEventsChannel = (
     async_broadcast::InactiveReceiver<hopr_api::chain::ChainEvent>,
 );
 
+struct ParsedChainInfo {
+    chain_info: hopr_api::chain::ChainInfo,
+    domain_separators: hopr_api::chain::DomainSeparators,
+    ticket_win_prob: hopr_api::types::internal::prelude::WinningProbability,
+    ticket_price: hopr_api::types::primitive::prelude::HoprBalance,
+    closure_grace_period: std::time::Duration,
+}
+
 /// A minimal chain connector backed by a [`BlokliTestClient`] for use in unit tests.
 ///
 /// Wraps the test blokli client and implements all [`HoprChainApi`](hopr_api::chain::HoprChainApi)
 /// sub-traits with `Error = anyhow::Error`. Write operations that unit tests
-/// do not exercise return `unimplemented!()`.
+/// do not exercise return an error instead of panicking.
 pub struct TestChainConnector<M: BlokliTestStateMutator> {
     client: std::sync::Arc<BlokliTestClient<M>>,
     my_addr: hopr_api::types::primitive::prelude::Address,
@@ -1488,6 +1507,10 @@ pub struct TestChainConnector<M: BlokliTestStateMutator> {
     payload_gen: std::sync::Arc<std::sync::OnceLock<hopr_api::types::chain::payload::SafePayloadGenerator>>,
     /// chain_id, initialized on `connect()`.
     chain_id: std::sync::Arc<std::sync::OnceLock<u64>>,
+    /// Ticket price from chain info, populated on `connect()` for synchronous access.
+    ticket_price: std::sync::Arc<std::sync::OnceLock<hopr_api::types::primitive::prelude::HoprBalance>>,
+    /// Minimum winning probability from chain info, populated on `connect()` for synchronous access.
+    ticket_win_prob: std::sync::Arc<std::sync::OnceLock<hopr_api::types::internal::prelude::WinningProbability>>,
     /// Nonce counter for transaction sequencing.
     nonce: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Accounts cache: chain address → AccountEntry, populated on `connect()`.
@@ -1523,6 +1546,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             events: (tx, rx.deactivate()),
             payload_gen: Default::default(),
             chain_id: Default::default(),
+            ticket_price: Default::default(),
+            ticket_win_prob: Default::default(),
             nonce: Default::default(),
             accounts: Default::default(),
             channels: Default::default(),
@@ -1531,11 +1556,11 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
 
     /// Loads initial state via finite queries and spawns a background task for live event forwarding.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
-        // Fetch chain info to initialize the payload generator.
-        let chain_info = self.client.query_chain_info().await?;
-        let chain_id = chain_info.chain_id as u64;
+        // Fetch chain info to initialize the payload generator and cache ticket values.
+        let chain_info_raw = self.client.query_chain_info().await?;
+        let chain_id = chain_info_raw.chain_id as u64;
         let contract_addresses: hopr_api::types::chain::ContractAddresses =
-            serde_json::from_str(&chain_info.contract_addresses.0)
+            serde_json::from_str(&chain_info_raw.contract_addresses.0)
                 .map_err(|e| anyhow::anyhow!("invalid contract addresses: {e}"))?;
         let _ = self.chain_id.set(chain_id);
         let _ = self
@@ -1545,6 +1570,9 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
                 contract_addresses,
                 self.module_address,
             ));
+        let parsed = Self::parse_chain_info_model(chain_info_raw)?;
+        let _ = self.ticket_price.set(parsed.ticket_price);
+        let _ = self.ticket_win_prob.set(parsed.ticket_win_prob);
 
         // Load all accounts via a finite snapshot query and build a keyid→address map.
         let mut keyid_to_addr = std::collections::HashMap::<u32, hopr_api::types::primitive::prelude::Address>::new();
@@ -1736,15 +1764,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
         Ok(hopr_api::chain::ChainReceipt::from(receipt))
     }
 
-    fn parse_chain_info_model(
-        model: blokli_client::api::types::ChainInfo,
-    ) -> anyhow::Result<(
-        hopr_api::chain::ChainInfo,
-        hopr_api::chain::DomainSeparators,
-        hopr_api::types::internal::prelude::WinningProbability,
-        hopr_api::types::primitive::prelude::HoprBalance,
-        std::time::Duration,
-    )> {
+    fn parse_chain_info_model(model: blokli_client::api::types::ChainInfo) -> anyhow::Result<ParsedChainInfo> {
         let channel_closure_grace_period = std::time::Duration::from_secs(
             model
                 .channel_closure_grace_period
@@ -1783,13 +1803,13 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
                 .map_err(|e| anyhow::anyhow!("invalid contract addresses: {e}"))?,
         };
 
-        Ok((
+        Ok(ParsedChainInfo {
             chain_info,
             domain_separators,
             ticket_win_prob,
             ticket_price,
-            channel_closure_grace_period,
-        ))
+            closure_grace_period: channel_closure_grace_period,
+        })
     }
 
     fn payload_gen(&self) -> anyhow::Result<&hopr_api::types::chain::payload::SafePayloadGenerator> {
@@ -1860,7 +1880,9 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>,
         hopr_api::chain::AnnouncementError<Self::Error>,
     > {
-        unimplemented!("TestChainConnector::announce")
+        Err(hopr_api::chain::AnnouncementError::processing(anyhow::anyhow!(
+            "not supported by TestChainConnector"
+        )))
     }
 
     async fn withdraw<C: hopr_api::types::primitive::prelude::Currency + Send>(
@@ -1868,7 +1890,9 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         _balance: hopr_api::types::primitive::prelude::Balance<C>,
         _recipient: &hopr_api::types::primitive::prelude::Address,
     ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
-        unimplemented!("TestChainConnector::withdraw")
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "not supported by TestChainConnector"
+        )))
     }
 
     async fn withdraw_from_signer<C: hopr_api::types::primitive::prelude::Currency + Send>(
@@ -1877,7 +1901,9 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         _balance: hopr_api::types::primitive::prelude::Balance<C>,
         _recipient: &hopr_api::types::primitive::prelude::Address,
     ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
-        unimplemented!("TestChainConnector::withdraw_from_signer")
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "not supported by TestChainConnector"
+        )))
     }
 
     async fn register_safe(
@@ -2113,7 +2139,9 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         _owner: &hopr_api::types::primitive::prelude::Address,
         _safe_address: &hopr_api::types::primitive::prelude::Address,
     ) -> Result<hopr_api::types::primitive::prelude::Address, Self::Error> {
-        unimplemented!("TestChainConnector::predict_module_address")
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "not supported by TestChainConnector"
+        )))
     }
 }
 
@@ -2129,7 +2157,9 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         &'a self,
         _balance: hopr_api::types::primitive::prelude::HoprBalance,
     ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
-        unimplemented!("TestChainConnector::deploy_safe")
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "not supported by TestChainConnector"
+        )))
     }
 }
 
@@ -2230,19 +2260,19 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
 
     async fn domain_separators(&self) -> Result<hopr_api::chain::DomainSeparators, Self::Error> {
         let info = self.client.query_chain_info().await?;
-        Ok(Self::parse_chain_info_model(info)?.1)
+        Ok(Self::parse_chain_info_model(info)?.domain_separators)
     }
 
     async fn minimum_incoming_ticket_win_prob(
         &self,
     ) -> Result<hopr_api::types::internal::prelude::WinningProbability, Self::Error> {
         let info = self.client.query_chain_info().await?;
-        Ok(Self::parse_chain_info_model(info)?.2)
+        Ok(Self::parse_chain_info_model(info)?.ticket_win_prob)
     }
 
     async fn minimum_ticket_price(&self) -> Result<hopr_api::types::primitive::prelude::HoprBalance, Self::Error> {
         let info = self.client.query_chain_info().await?;
-        Ok(Self::parse_chain_info_model(info)?.3)
+        Ok(Self::parse_chain_info_model(info)?.ticket_price)
     }
 
     async fn key_binding_fee(&self) -> Result<hopr_api::types::primitive::prelude::HoprBalance, Self::Error> {
@@ -2255,12 +2285,12 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
 
     async fn channel_closure_notice_period(&self) -> Result<std::time::Duration, Self::Error> {
         let info = self.client.query_chain_info().await?;
-        Ok(Self::parse_chain_info_model(info)?.4)
+        Ok(Self::parse_chain_info_model(info)?.closure_grace_period)
     }
 
     async fn chain_info(&self) -> Result<hopr_api::chain::ChainInfo, Self::Error> {
         let info = self.client.query_chain_info().await?;
-        Ok(Self::parse_chain_info_model(info)?.0)
+        Ok(Self::parse_chain_info_model(info)?.chain_info)
     }
 
     async fn redemption_stats<A: Into<hopr_api::types::primitive::prelude::Address> + Send>(
@@ -2307,9 +2337,16 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         ),
         Self::Error,
     > {
-        // Return sensible defaults for tests
-        let win_prob = hopr_api::types::internal::prelude::WinningProbability::try_from_f64(1.0)?;
-        let price = hopr_api::types::primitive::prelude::HoprBalance::zero();
+        let win_prob = self
+            .ticket_win_prob
+            .get()
+            .copied()
+            .ok_or_else(|| TestConnectorError::from(anyhow::anyhow!("connector not connected")))?;
+        let price = self
+            .ticket_price
+            .get()
+            .cloned()
+            .ok_or_else(|| TestConnectorError::from(anyhow::anyhow!("connector not connected")))?;
         Ok((win_prob, price))
     }
 }

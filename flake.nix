@@ -239,12 +239,6 @@
               fi
               unset _github_token
               ${packages.pre-commit-check.shellHook}
-              # On Linux CI the nix dev-shell startup resolves platform-specific deps and
-              # writes them to Cargo.lock, which makes cargo-release's dirty check fail.
-              # Reset it when running in CI so the working tree is clean before publishing.
-              if [ -n "''${CI:-}" ]; then
-                git checkout -- Cargo.lock 2>/dev/null || true
-              fi
             '';
             extraPackages = with pkgs; [
               gh
