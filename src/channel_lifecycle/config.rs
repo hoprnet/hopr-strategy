@@ -157,7 +157,11 @@ pub(crate) struct ResolvedFunding {
 /// funding_wei = ticket_price_wei × packets × hops
 /// ```
 /// Returns [`HoprBalance::zero`] for zero capacity.
-pub(crate) fn capacity_to_balance<C: PacketTransport>(capacity: ByteSize, price: HoprBalance, hops: u32) -> HoprBalance {
+pub(crate) fn capacity_to_balance<C: PacketTransport>(
+    capacity: ByteSize,
+    price: HoprBalance,
+    hops: u32,
+) -> HoprBalance {
     let bytes = capacity.as_u64();
     if bytes == 0 {
         return HoprBalance::zero();
@@ -488,7 +492,10 @@ mod config_tests {
     #[test]
     fn zero_capacity_returns_zero() -> anyhow::Result<()> {
         let price = balance_from_wei(PRICE_WEI);
-        assert_eq!(capacity_to_balance::<TestTransport>(ByteSize::b(0), price, 3), HoprBalance::zero());
+        assert_eq!(
+            capacity_to_balance::<TestTransport>(ByteSize::b(0), price, 3),
+            HoprBalance::zero()
+        );
         Ok(())
     }
 

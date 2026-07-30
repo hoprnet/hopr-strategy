@@ -2722,4 +2722,114 @@ mod tests {
         );
         Ok(())
     }
+
+    /// When `minimum_ticket_price()` returns `Err`, the fund and open passes must be
+    /// skipped for the entire tick, but the close and finalize passes must still run.
+    ///
+    /// Regression: prior to the face-value fix the error path was shared between
+    /// win-prob and ticket price. After the refactor the gating is on ticket price
+    /// alone; this test ensures neither fund nor open fires when the price is
+    /// unavailable while finalize still fires.
+    #[tokio::test]
+    async fn pipeline_skips_fund_open_but_still_finalizes_when_ticket_price_unavailable() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+        let initial_balance = HoprBalance::from(2_u32);
+
+        // Open channel with balance below the threshold — would normally be funded.
+        let underfunded = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(2_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        // PendingToClose channel whose deadline has already passed — ready to finalize.
+        let pending = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(10_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::PendingToClose(
+                std::time::SystemTime::now() - Duration::from_secs(1),
+            ))
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([underfunded, pending])
+            .with_closure_grace_period(Duration::from_secs(60))
+            .build_dynamic_client(module_address);
+
+        // Clone before moving into the connector — BlokliTestClient clones share state.
+        let client_handle = blokli_sim.clone();
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        // Corrupt the ticket price so every subsequent query_chain_info() returns a
+        // value that parse_chain_info_model() cannot parse, causing minimum_ticket_price()
+        // to return Err for every tick.
+        client_handle.hidden_state_update(|state| {
+            state.chain_info.ticket_price = blokli_client::api::types::TokenValueString("invalid-price".into());
+        });
+
+        let cfg = ChannelLifecycleConfig {
+            tick_interval: Duration::from_millis(100),
+            jitter: Duration::ZERO,
+            funding: FundingConfig {
+                lower_capacity_threshold: ByteSize::b(1),
+                topup_capacity: ByteSize::b(1),
+                ..Default::default()
+            },
+            finalizer: FinalizerConfig {
+                enabled: true,
+                max_closure_overdue: Duration::ZERO,
+                ..Default::default()
+            },
+            restart: RestartGuardConfig {
+                startup_close_grace_period: Duration::ZERO,
+            },
+            ..Default::default()
+        };
+
+        let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let handle = tokio::spawn(async move {
+            let _ = strategy.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let channels: Vec<ChannelEntry> = connector
+            .stream_channels(ChannelSelector::default().with_source(*BOB))
+            .context("failed to stream channels")?
+            .collect()
+            .await;
+
+        // Fund pass must have been skipped: underfunded channel balance is unchanged.
+        assert!(
+            channels
+                .iter()
+                .all(|c| c.destination != *ALICE || c.balance == initial_balance),
+            "fund pass must be skipped when ticket price is unavailable; balance changed: {channels:?}"
+        );
+
+        // Finalize pass must still have run: channel past its deadline is no longer PendingToClose.
+        assert!(
+            !channels
+                .iter()
+                .any(|c| c.destination == *CHRIS && matches!(c.status, ChannelStatus::PendingToClose(_))),
+            "finalize pass must still run even when ticket price is unavailable; got {channels:?}"
+        );
+
+        Ok(())
+    }
 }
