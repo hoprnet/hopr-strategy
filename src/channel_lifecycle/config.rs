@@ -211,6 +211,17 @@ fn default_success_probability() -> f64 {
     0.999
 }
 
+fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::ValidationError> {
+    if let CapacitySizingMode::Probabilistic { success_probability } = mode {
+        if !(*success_probability >= 0.5001 && *success_probability <= 0.99999) {
+            return Err(validator::ValidationError::new(
+                "success_probability must be in (0.5001, 0.99999)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CapacitySizingMode {
     /// Returns `true` for modes that use the network's winning probability at
     /// runtime.  `Deterministic` returns `false` and skips the win_prob query.
@@ -292,6 +303,7 @@ pub struct FundingConfig {
     ///
     /// See [`CapacitySizingMode`] for the full tradeoff analysis.
     #[default(CapacitySizingMode::default())]
+    #[validate(custom(function = "validate_sizing_mode"))]
     pub sizing_mode: CapacitySizingMode,
 }
 
@@ -368,9 +380,7 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
         CapacitySizingMode::Probabilistic { success_probability } => {
             use statrs::distribution::{ContinuousCDF, Normal};
             let alpha = success_probability.clamp(0.5001, 0.99999);
-            let k = Normal::new(0.0, 1.0)
-                .expect("standard normal parameters are valid")
-                .inverse_cdf(alpha);
+            let k = Normal::standard().inverse_cdf(alpha);
             // mean + k · std-dev  (Binomial approximated by Normal via CLT)
             n * p + k * (n * p * (1.0 - p)).sqrt()
         }
@@ -685,11 +695,6 @@ mod config_tests {
     /// Expected stake in wei for `Deterministic` mode: N × hops × price_wei.
     fn det_stake(n_packets: u128, hops: u128) -> u128 {
         n_packets * hops * PRICE_WEI
-    }
-
-    /// Expected stake in wei for `Expected` mode: N × p × hops × price_wei.
-    fn exp_stake(n_packets: u128, win_prob: f64, hops: u128) -> u128 {
-        (n_packets as f64 * win_prob * hops as f64 * PRICE_WEI as f64) as u128
     }
 
     // ── Deterministic: stake = N × hops × price, win_prob irrelevant ─────────

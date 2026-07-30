@@ -448,29 +448,39 @@ where
         // ticket_price is always needed.  win_prob is only needed for Expected
         // and Probabilistic sizing modes; Deterministic skips the chain call and
         // uses 1.0 as a placeholder (it is ignored inside capacity_to_balance).
+        // When both are needed they are fetched concurrently.
         //
         // When either required value is unavailable the fund and open passes are
         // skipped; close and finalize still run.
-        let ticket_price = match chain.minimum_ticket_price().await {
-            Ok(price) => Some(price),
-            Err(e) => {
-                warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
-                None
-            }
-        };
-        let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
-
-        let win_prob: Option<f64> = if self.cfg.funding.sizing_mode.requires_win_prob() {
-            match chain.minimum_incoming_ticket_win_prob().await {
+        let (ticket_price, win_prob): (Option<_>, Option<f64>) = if self.cfg.funding.sizing_mode.requires_win_prob() {
+            let (price_res, wp_res) =
+                futures::join!(chain.minimum_ticket_price(), chain.minimum_incoming_ticket_win_prob());
+            let price = match price_res {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            let wp = match wp_res {
                 Ok(wp) => Some(wp.as_f64()),
                 Err(e) => {
                     warn!(%e, "channel-lifecycle: minimum_incoming_ticket_win_prob unavailable, skipping fund/open passes");
                     None
                 }
-            }
+            };
+            (price, wp)
         } else {
-            Some(1.0) // Deterministic: win_prob not used; 1.0 is the conventional placeholder
+            let price = match chain.minimum_ticket_price().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            (price, Some(1.0))
         };
+        let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
         // `None` when any required economic input is unavailable.
