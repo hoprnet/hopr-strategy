@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.94"
-version      = "0.21.0"
+version      = "0.22.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -48,6 +48,7 @@ lazy_static         = { workspace = true }
 serde               = { workspace = true, features = ["derive"] }
 serde_with          = { workspace = true }
 smart-default       = { workspace = true }
+statrs              = { workspace = true }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = ["derive"] }
@@ -79,6 +80,7 @@ hopr-api = { workspace = true, features = ["types-random"] }
 hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 insta = { workspace = true, features = ["redactions", "yaml"] }
 mockall = { workspace = true }
+rstest = { workspace = true }
 serde_json = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
 tokio = { workspace = true, features = [
@@ -119,6 +121,7 @@ serde               = "1.0.228"
 serde_json          = "1.0.150"
 serde_with          = "3.21.0"
 smart-default       = "0.7.1"
+statrs              = "0.18.0"
 test-log            = "0.2.21"
 thiserror           = "2.0.18"
 tokio               = "1.52.3"

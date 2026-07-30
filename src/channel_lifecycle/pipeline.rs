@@ -443,22 +443,50 @@ where
                 });
         }
 
-        // Fetch the ticket price once per tick — the sole economic input to the
-        // capacity-to-wxHOPR conversion and to the proactive-funding drain estimate.
-        // When it is unavailable the fund and open passes are skipped; close and
-        // finalize still run.
-        let ticket_price = match chain.minimum_ticket_price().await {
-            Ok(price) => Some(price),
-            Err(e) => {
-                warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
-                None
-            }
+        // Fetch ticket economics once per tick.
+        //
+        // ticket_price is always needed.  win_prob is only needed for Expected
+        // and Probabilistic sizing modes; Deterministic skips the chain call and
+        // uses 1.0 as a placeholder (it is ignored inside capacity_to_balance).
+        // When both are needed they are fetched concurrently.
+        //
+        // When either required value is unavailable the fund and open passes are
+        // skipped; close and finalize still run.
+        let (ticket_price, win_prob): (Option<_>, Option<f64>) = if self.cfg.funding.sizing_mode.requires_win_prob() {
+            let (price_res, wp_res) =
+                futures::join!(chain.minimum_ticket_price(), chain.minimum_incoming_ticket_win_prob());
+            let price = match price_res {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            let wp = match wp_res {
+                Ok(wp) => Some(wp.as_f64()),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_incoming_ticket_win_prob unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            (price, wp)
+        } else {
+            let price = match chain.minimum_ticket_price().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            (price, Some(1.0))
         };
         let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
-        // `None` when the ticket price is unavailable; fund/open passes are skipped.
-        let funding = ticket_price.map(|price| self.cfg.funding.resolve::<N>(price));
+        // `None` when any required economic input is unavailable.
+        let funding = ticket_price
+            .zip(win_prob)
+            .map(|(price, wp)| self.cfg.funding.resolve::<N>(price, wp));
 
         // Share resolved economics with the event-driven funding handler so it
         // can reuse per-tick values rather than issuing fresh chain RPC calls.
@@ -2124,11 +2152,13 @@ mod tests {
     async fn pipeline_funds_underfunded_channel_with_capacity_derived_wxhopr_amount() -> anyhow::Result<()> {
         use super::super::config::capacity_to_balance;
 
-        // Blokli defaults: ticket_price = "1 wxHOPR", assumed_hops = 3.
-        // capacity_to_balance(ByteSize::b(1), 1 wxHOPR, 3) = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR.
+        // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0, assumed_hops = 3.
+        // Deterministic sizing (win_prob ignored):
+        //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic) = 1 × 1 × 3 = 3 wxHOPR.
         let expected_topup = {
+            use super::super::config::CapacitySizingMode;
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
-            capacity_to_balance::<TestTransport>(ByteSize::b(1), price, 3) // topup_capacity = ByteSize::b(1)
+            capacity_to_balance::<TestTransport>(ByteSize::b(1), price, 1.0, 3, &CapacitySizingMode::Deterministic)
         };
 
         // Channel starts at 0 balance — below any non-zero threshold.
