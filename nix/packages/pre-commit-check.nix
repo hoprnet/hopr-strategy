@@ -88,6 +88,15 @@ pre-commit.lib.${system}.run {
       language = "system";
       pass_filenames = true;
     };
+
+    generate-metrics-docs = {
+      enable = true;
+      name = "METRICS.md must stay in sync with code";
+      entry = "bash .github/scripts/generate-metrics-docs.sh --fix";
+      files = "(METRICS\\.md|\\.rs)$";
+      pass_filenames = false;
+      language = "system";
+    };
   };
 
   # Exclude certain paths from pre-commit checks
