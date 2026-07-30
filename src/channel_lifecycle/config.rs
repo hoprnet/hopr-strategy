@@ -233,7 +233,7 @@ impl CapacitySizingMode {
 /// ```yaml
 /// initial_capacity: 1 GiB
 /// topup_capacity: 1 GiB
-/// lower_capacity_threshold: 128 MiB
+/// lower_capacity_threshold: 256 MiB
 /// min_safe_capacity_required: 1 GiB
 /// assumed_hops: 3
 /// sizing_mode:
@@ -264,8 +264,8 @@ pub struct FundingConfig {
     pub topup_capacity: ByteSize,
 
     /// The channel balance (expressed as data capacity) below which a top-up is
-    /// triggered.  Default: 128 MiB.
-    #[default(ByteSize::mib(128))]
+    /// triggered.  Default: 256 MiB.
+    #[default(ByteSize::mib(256))]
     pub lower_capacity_threshold: ByteSize,
 
     /// Minimum safe balance (expressed as data capacity) required before the
