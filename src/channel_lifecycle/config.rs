@@ -118,6 +118,21 @@ pub struct EligibilityConfig {
 ///   (triggering a top-up sooner, not loss).
 /// * **`Probabilistic`** (**default**) — adds a k·σ buffer; the channel carries its full configured capacity with
 ///   probability `success_probability`. Overhead over `Expected` is 19 % at 250 MB, 10 % at 1 GB, 4 % at 5 GB.
+///
+/// # Configuration (YAML)
+///
+/// ```yaml
+/// # Worst-case stake; skips the win_prob chain query each tick.
+/// sizing_mode: deterministic
+///
+/// # Mean-drain stake; most capital-efficient.
+/// sizing_mode: expected
+///
+/// # Statistical guarantee (default); adds k·σ above expected drain.
+/// sizing_mode:
+///   probabilistic:
+///     success_probability: 0.999
+/// ```
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapacitySizingMode {
@@ -130,6 +145,10 @@ pub enum CapacitySizingMode {
     /// Over-funds proportionally to `1 / win_prob` relative to the expected
     /// drain.  Use when capital efficiency is not a concern and you want zero
     /// sensitivity to win_prob fluctuations.
+    ///
+    /// ```yaml
+    /// sizing_mode: deterministic
+    /// ```
     Deterministic,
 
     /// `stake = N × win_prob × hops × ticket_price`
@@ -138,6 +157,10 @@ pub enum CapacitySizingMode {
     /// win_prob; approximately half of all fund cycles see the channel drain
     /// slightly faster than planned (triggers a top-up sooner, not message loss).
     /// Requires the win_prob chain query each tick.
+    ///
+    /// ```yaml
+    /// sizing_mode: expected
+    /// ```
     Expected,
 
     /// `stake = E[D] + k·σ[D]`  where k = Φ⁻¹(success_probability)
@@ -160,6 +183,12 @@ pub enum CapacitySizingMode {
     ///
     /// At `win_prob = 1.0` the variance term vanishes (σ = 0) and the formula
     /// collapses to `N × hops × ticket_price` — identical to `Deterministic`.
+    ///
+    /// ```yaml
+    /// sizing_mode:
+    ///   probabilistic:
+    ///     success_probability: 0.999
+    /// ```
     #[default]
     Probabilistic {
         /// Probability that the channel does **not** drain prematurely in any
@@ -201,28 +230,26 @@ impl CapacitySizingMode {
 ///
 /// # Quick-start defaults
 ///
-/// ```toml
-/// [funding]
-/// initial_capacity           = "1 GiB"
-/// topup_capacity             = "512 MiB"
-/// lower_capacity_threshold   = "512 MiB"
-/// min_safe_capacity_required = "512 MiB"
-/// assumed_hops               = 3
-///
-/// [funding.sizing_mode]
-/// mode                = "probabilistic"
-/// success_probability = 0.999
+/// ```yaml
+/// initial_capacity: 1 GiB
+/// topup_capacity: 1 GiB
+/// lower_capacity_threshold: 128 MiB
+/// min_safe_capacity_required: 1 GiB
+/// assumed_hops: 3
+/// sizing_mode:
+///   probabilistic:
+///     success_probability: 0.999
 /// ```
 ///
-/// With `ticket_price = 0.01 wxHOPR` and `win_prob = 0.01` this resolves to:
+/// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` this resolves to:
 ///
 /// ```text
-/// N_initial = ceil(1 GiB / 1036 B) = 1 025 165 packets
-/// E[D]      = 1 025 165 × 0.01 × 3 × 0.01 ≈ 307.6 wxHOPR
-/// σ[D]      = 3 × 0.01 × √(1 025 165 × 0.01 × 0.99) ≈ 0.953 wxHOPR
-/// stake     ≈ 307.6 + 3.09 × 0.953 ≈ 310.5 wxHOPR
+/// N_initial = ceil(1 GiB / 1036 B) = 1 036 431 packets
+/// E[D]      = 1 036 431 × 0.001 × 3 × 0.001 ≈ 3.11 wxHOPR
+/// σ[D]      = 3 × 0.001 × √(1 036 431 × 0.001 × 0.999) ≈ 0.097 wxHOPR
+/// stake     ≈ 3.11 + 3.09 × 0.097 ≈ 3.41 wxHOPR
 ///
-/// (Deterministic would lock 30 760 wxHOPR — 99× more)
+/// (Deterministic would lock 3 109 wxHOPR — ~912× more)
 /// ```
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 pub struct FundingConfig {
@@ -232,18 +259,18 @@ pub struct FundingConfig {
     pub initial_capacity: ByteSize,
 
     /// Data volume added to a channel's stake when it is topped up.
-    /// Default: 512 MiB.
-    #[default(ByteSize::mib(512))]
+    /// Default: 1 GiB.
+    #[default(ByteSize::gib(1))]
     pub topup_capacity: ByteSize,
 
     /// The channel balance (expressed as data capacity) below which a top-up is
-    /// triggered.  Default: 512 MiB.
-    #[default(ByteSize::mib(512))]
+    /// triggered.  Default: 128 MiB.
+    #[default(ByteSize::mib(128))]
     pub lower_capacity_threshold: ByteSize,
 
     /// Minimum safe balance (expressed as data capacity) required before the
-    /// strategy opens or funds any channel.  Default: 512 MiB.
-    #[default(ByteSize::mib(512))]
+    /// strategy opens or funds any channel.  Default: 1 GiB.
+    #[default(ByteSize::gib(1))]
     pub min_safe_capacity_required: ByteSize,
 
     /// When `true` the fund and open passes are skipped entirely if the safe
