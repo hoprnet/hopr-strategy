@@ -92,29 +92,33 @@ pub struct EligibilityConfig {
 /// The three modes differ only in how much safety buffer is added above the
 /// expected drain.
 ///
-/// # Modes at a glance (N = 100 000 pkts, win_prob = 0.01, hops = 3, tp = 0.01 wxHOPR)
+/// # Mode comparison for a typical FundingConfig
+///
+/// Common parameters: hops = 3, win_prob = 0.001 (ultralow), ticket_price = 0.001 wxHOPR (ultralow)
 ///
 /// ```text
-/// E[D]  = 100 000 × 0.01 × 3 × 0.01 = 30.000 wxHOPR
-/// σ[D]  = 3 × 0.01 × √(100 000 × 0.01 × 0.99) ≈ 0.944 wxHOPR
-///
-/// Deterministic        = 100 000 × 3 × 0.01 = 3 000 wxHOPR   (100× E[D])
-/// Expected             = 30.000 wxHOPR                        (= E[D])
-/// Probabilistic(0.999) ≈ 30 + 3.09 × 0.944 ≈ 32.9 wxHOPR    (+9.7 % vs. Expected)
+/// Config field            capacity    N (pkts)   Deterministic   Expected   Probabilistic(0.999)
+/// ─────────────────────────────────────────────────────────────────────────────────────────────
+/// lower_capacity_threshold  250 MB     253 035     759 wxHOPR    0.76 wxHOPR    0.91 wxHOPR
+/// initial_capacity            1 GB   1 036 431   3 109 wxHOPR    3.11 wxHOPR    3.41 wxHOPR
+/// topup_capacity              5 GB   5 182 152  15 547 wxHOPR   15.55 wxHOPR   16.21 wxHOPR
 /// ```
+///
+/// `Deterministic` over-funds by ~900× relative to `Probabilistic(0.999)` at these ultralow
+/// parameters.  The k·σ overhead shrinks as N grows (+19 % at 250 MB, +4 % at 5 GB), making
+/// `Probabilistic` indistinguishable from `Expected` at large capacities.
 ///
 /// At `win_prob = 1.0` all three modes are equal: σ = 0 and `E[D] = N × hops × tp`.
 ///
 /// # Choosing a mode
 ///
 /// * **`Deterministic`** — no chain queries for win_prob; always safe but
-///   massively over-funds at low win_prob (100× in the example above).
+///   massively over-funds at low win_prob (~900× in the example above).
 /// * **`Expected`** — most capital-efficient; ~50 % of cycles see the channel
 ///   drain slightly faster than planned (triggering a top-up sooner, not loss).
 /// * **`Probabilistic`** (**default**) — adds a k·σ buffer; the channel carries
 ///   its full configured capacity with probability `success_probability`.
-///   At the typical scale of 10 000–1 000 000 packets the buffer is 5–15 %
-///   above the mean — negligible waste, strong guarantee.
+///   Overhead over `Expected` is 19 % at 250 MB, 10 % at 1 GB, 4 % at 5 GB.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapacitySizingMode {
