@@ -116,7 +116,7 @@ pub struct EligibilityConfig {
 ///   At the typical scale of 10 000–1 000 000 packets the buffer is 5–15 %
 ///   above the mean — negligible waste, strong guarantee.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum CapacitySizingMode {
     /// `stake = N × hops × ticket_price`
     ///
@@ -1036,12 +1036,15 @@ mod config_tests {
     }
 
     #[test]
-    fn sizing_mode_serde_tag() -> anyhow::Result<()> {
-        let det: CapacitySizingMode = serde_json::from_str(r#"{"mode":"deterministic"}"#)?;
+    fn sizing_mode_serde_external_tag() -> anyhow::Result<()> {
+        // Unit variants round-trip as plain strings.
+        let det: CapacitySizingMode = serde_json::from_str(r#""deterministic""#)?;
         assert_eq!(det, CapacitySizingMode::Deterministic);
-        let exp: CapacitySizingMode = serde_json::from_str(r#"{"mode":"expected"}"#)?;
+        let exp: CapacitySizingMode = serde_json::from_str(r#""expected""#)?;
         assert_eq!(exp, CapacitySizingMode::Expected);
-        let prob: CapacitySizingMode = serde_json::from_str(r#"{"mode":"probabilistic","success_probability":0.99}"#)?;
+        // Struct variant uses {"probabilistic": {fields}} in JSON /
+        // `probabilistic:\n  success_probability: 0.999` in YAML.
+        let prob: CapacitySizingMode = serde_json::from_str(r#"{"probabilistic":{"success_probability":0.99}}"#)?;
         assert_eq!(
             prob,
             CapacitySizingMode::Probabilistic {
