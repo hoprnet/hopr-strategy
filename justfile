@@ -46,7 +46,6 @@ clean:
 
 # Run unit tests
 test:
-    ./.github/scripts/generate-metrics-docs.sh
     cargo test --workspace --exclude hopr-strategy-integration-tests --all-features --no-fail-fast
 
 # Run unit tests in single thread mode with output (integration crate excluded).
