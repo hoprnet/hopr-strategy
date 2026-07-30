@@ -18,12 +18,12 @@ use rstest::rstest;
 /// at or below `min_stake_threshold`, when the safe can afford the funding round.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [src, dst] = fixture.claim_accounts::<2>();
 
     let scenario = fixture
-        .open_channel_scenario(src, dst, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .open_channel_scenario(&src, &dst, ScenarioOpts::new("1 wxHOPR".parse()?)?)
         .await?;
     let initial_balance = scenario.initial.balance;
 
@@ -64,7 +64,7 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
 /// (see [`on_tick`](hopr_strategy::auto_funding) early-return).
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_funding_when_safe_below_funding_amount(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn skips_funding_when_safe_below_funding_amount(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [src, dst] = fixture.claim_accounts::<2>();
 
@@ -72,8 +72,8 @@ async fn skips_funding_when_safe_below_funding_amount(#[future(awt)] fixture: In
     // channel is opened, the safe cannot cover even a single funding round.
     let scenario = fixture
         .open_channel_scenario(
-            src,
-            dst,
+            &src,
+            &dst,
             ScenarioOpts {
                 source_funding: "2 wxHOPR".parse()?,
                 destination_funding: "2 wxHOPR".parse()?,

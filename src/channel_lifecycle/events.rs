@@ -8,7 +8,7 @@ use hopr_api::{
         ChainReadAccountOperations, ChainReadChannelOperations, ChainReadSafeOperations, ChainValues,
         ChainWriteChannelOperations,
     },
-    node::{ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView},
+    node::{ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView, PacketTransport},
     types::{
         internal::prelude::{ChannelDirection, ChannelEntry, ChannelStatus},
         primitive::prelude::Address,
@@ -19,7 +19,7 @@ use super::{ChannelLifecycleStrategyInner, ChannelObservation};
 
 impl<N> ChannelLifecycleStrategyInner<N>
 where
-    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + Send + Sync + 'static,
+    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
     N::ChainApi: ChainReadChannelOperations
         + ChainReadSafeOperations
         + ChainReadAccountOperations

@@ -20,12 +20,12 @@ use rstest::rstest;
 /// neutralised via target == min == 1, proactive + finalizer disabled).
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
 
     let scenario = fixture
-        .open_channel_scenario(source, destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .open_channel_scenario(&source, &destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
         .await?;
     let initial_balance = scenario.initial.balance;
 
@@ -70,7 +70,7 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
 /// channel is left untouched.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_funding_when_safe_below_required(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
+async fn skips_funding_when_safe_below_required(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
 
@@ -78,8 +78,8 @@ async fn skips_funding_when_safe_below_required(#[future(awt)] fixture: Integrat
     // balance sits below `min_safe_balance_required`.
     let scenario = fixture
         .open_channel_scenario(
-            source,
-            destination,
+            &source,
+            &destination,
             ScenarioOpts {
                 source_funding: "2 wxHOPR".parse()?,
                 destination_funding: "2 wxHOPR".parse()?,

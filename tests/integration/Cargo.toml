@@ -7,30 +7,7 @@ version = "0.1.0"
 [dependencies]
 
 anyhow = { workspace = true }
-blokli-client = { workspace = true, features = ["serde"] }
-chrono = { workspace = true, features = ["clock", "std"] }
-ctor = { workspace = true }
-futures = { workspace = true }
-hex = { workspace = true }
-hopli = { workspace = true }
 hopr-api = { workspace = true, features = ["node", "serde"] }
-hopr-bindings = { workspace = true }
-hopr-chain-connector = { workspace = true, features = ["runtime-tokio"] }
-hopr-types = { workspace = true, features = [
-  "chain",
-  "crypto",
-  "internal",
-  "primitive",
-] }
-rstest = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing = { workspace = true }
-url = { workspace = true, features = ["serde"] }
-
-[dev-dependencies]
-
-bytesize = { workspace = true }
 hopr-strategy = { workspace = true, features = [
   "runtime-tokio",
   "strategy-auto-funding",
@@ -39,7 +16,11 @@ hopr-strategy = { workspace = true, features = [
   "strategy-closure-finalizer",
   "testing",
 ] }
-test-log = { workspace = true, features = ["trace"] }
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tracing = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["hopli"]
+[dev-dependencies]
+
+bytesize = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
