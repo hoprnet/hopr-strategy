@@ -212,12 +212,12 @@ fn default_success_probability() -> f64 {
 }
 
 fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::ValidationError> {
-    if let CapacitySizingMode::Probabilistic { success_probability } = mode {
-        if !(*success_probability >= 0.5001 && *success_probability <= 0.99999) {
-            return Err(validator::ValidationError::new(
-                "success_probability must be in (0.5001, 0.99999)",
-            ));
-        }
+    if let CapacitySizingMode::Probabilistic { success_probability } = mode
+        && !(*success_probability >= 0.5001 && *success_probability <= 0.99999)
+    {
+        return Err(validator::ValidationError::new(
+            "success_probability must be in (0.5001, 0.99999)",
+        ));
     }
     Ok(())
 }
