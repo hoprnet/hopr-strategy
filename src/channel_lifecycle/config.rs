@@ -112,13 +112,12 @@ pub struct EligibilityConfig {
 ///
 /// # Choosing a mode
 ///
-/// * **`Deterministic`** — no chain queries for win_prob; always safe but
-///   massively over-funds at low win_prob (~900× in the example above).
-/// * **`Expected`** — most capital-efficient; ~50 % of cycles see the channel
-///   drain slightly faster than planned (triggering a top-up sooner, not loss).
-/// * **`Probabilistic`** (**default**) — adds a k·σ buffer; the channel carries
-///   its full configured capacity with probability `success_probability`.
-///   Overhead over `Expected` is 19 % at 250 MB, 10 % at 1 GB, 4 % at 5 GB.
+/// * **`Deterministic`** — no chain queries for win_prob; always safe but massively over-funds at low win_prob (~900×
+///   in the example above).
+/// * **`Expected`** — most capital-efficient; ~50 % of cycles see the channel drain slightly faster than planned
+///   (triggering a top-up sooner, not loss).
+/// * **`Probabilistic`** (**default**) — adds a k·σ buffer; the channel carries its full configured capacity with
+///   probability `success_probability`. Overhead over `Expected` is 19 % at 250 MB, 10 % at 1 GB, 4 % at 5 GB.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapacitySizingMode {
