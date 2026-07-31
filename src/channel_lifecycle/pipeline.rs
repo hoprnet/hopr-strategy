@@ -1478,7 +1478,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([c1])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -1558,7 +1559,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let chain_connector = Arc::new(chain_connector);
@@ -1726,7 +1728,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -1891,7 +1894,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([existing_channel])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -1956,7 +1960,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([existing_channel])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -2033,7 +2038,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([existing_channel])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -2092,7 +2098,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -2178,7 +2185,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([ch])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -2390,7 +2398,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([ch])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
@@ -2468,7 +2477,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([ch])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
@@ -2588,7 +2598,8 @@ mod tests {
             // 60 s notice period: old code would have computed overdue = 60 s,
             // preventing finalization for a channel only 1 s past its deadline.
             .with_closure_grace_period(Duration::from_secs(60))
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -2665,7 +2676,8 @@ mod tests {
             // Emulator floors at 2 s; we set 0 to get as close to that floor
             // as possible so the test completes in a few seconds.
             .with_closure_grace_period(Duration::ZERO)
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
@@ -2794,7 +2806,8 @@ mod tests {
             )
             .with_channels([underfunded, pending])
             .with_closure_grace_period(Duration::from_secs(60))
-            .build_dynamic_client(module_address);
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         // Clone before moving into the connector — BlokliTestClient clones share state.
         let client_handle = blokli_sim.clone();

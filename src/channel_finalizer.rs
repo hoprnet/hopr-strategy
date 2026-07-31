@@ -239,7 +239,8 @@ mod tests {
                     .epoch(1)
                     .build()?,
             ])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let chain_connector =
             Arc::new(create_test_blokli_connector(&ALICE_KP, blokli_sim, [1; Address::SIZE].into()).await?);
@@ -279,7 +280,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_channels([])
-            .build_dynamic_client([1; Address::SIZE].into());
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
 
         let chain_connector = create_test_blokli_connector(&ALICE_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
