@@ -445,14 +445,13 @@ where
 
         // Fetch ticket economics once per tick.
         //
-        // ticket_price is always needed.  win_prob is only needed for Expected
-        // and Probabilistic sizing modes; Deterministic skips the chain call and
-        // uses 1.0 as a placeholder (it is ignored inside capacity_to_balance).
-        // When both are needed they are fetched concurrently.
+        // Both ticket_price and win_prob are always needed: every sizing mode
+        // floors the stake at one winning ticket (`ticket_price × hops / win_prob`),
+        // which depends on win_prob.  They are fetched concurrently.
         //
-        // When either required value is unavailable the fund and open passes are
-        // skipped; close and finalize still run.
-        let (ticket_price, win_prob): (Option<_>, Option<f64>) = if self.cfg.funding.sizing_mode.requires_win_prob() {
+        // When either value is unavailable the fund and open passes are skipped;
+        // close and finalize still run.
+        let (ticket_price, win_prob): (Option<_>, Option<f64>) = {
             let (price_res, wp_res) =
                 futures::join!(chain.minimum_ticket_price(), chain.minimum_incoming_ticket_win_prob());
             let price = match price_res {
@@ -470,15 +469,6 @@ where
                 }
             };
             (price, wp)
-        } else {
-            let price = match chain.minimum_ticket_price().await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
-                    None
-                }
-            };
-            (price, Some(1.0))
         };
         let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
