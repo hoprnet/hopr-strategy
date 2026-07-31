@@ -28,6 +28,7 @@ testing = [
   "dep:serde_json",
   "dep:tokio",
   "hopr-api/types-with-bindings",
+  "hopr-utils/testing-blokli",
 ]
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
@@ -108,7 +109,7 @@ futures-time        = "3.1.0"
 hex-literal         = "1.1.0"
 hopr-api            = "1.16.0"
 hopr-strategy       = { path = "." }
-hopr-utils          = { package = "hopr-utilities", version = "0.4.0", default-features = false }
+hopr-utils          = { package = "hopr-utilities", version = "0.5.0", default-features = false }
 humantime-serde     = "1.1.1"
 insta               = "1.48.0"
 lazy_static         = "1.5.0"
