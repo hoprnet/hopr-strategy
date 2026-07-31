@@ -420,9 +420,11 @@ mod tests {
             primitive::prelude::{Address, BytesRepresentable, HoprBalance, UnitaryFloatOps, XDaiBalance},
         },
     };
-    use hopr_chain_connector::{HoprBlockchainSafeConnector, create_trustful_hopr_blokli_connector, testing::*};
 
     use super::*;
+    use crate::testing::{
+        BlokliTestClient, BlokliTestStateBuilder, StaticState, TestChainConnector, create_test_blokli_connector,
+    };
 
     mockall::mock! {
         pub TicketMgmt {}
@@ -481,7 +483,7 @@ mod tests {
             .build_static_client();
     }
 
-    type TestConnector = Arc<HoprBlockchainSafeConnector<BlokliTestClient<StaticState>>>;
+    type TestConnector = Arc<TestChainConnector<StaticState>>;
 
     fn generate_random_ack_ticket(index: u64, worth_packets: u32) -> anyhow::Result<RedeemableTicket> {
         let hk1 = HalfKey::random();
@@ -606,14 +608,7 @@ mod tests {
     async fn test_auto_redeeming_strategy_redeem() -> anyhow::Result<()> {
         let ack_ticket = generate_random_ack_ticket(0, 5)?;
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             minimum_redeem_ticket_value: 0.into(),
@@ -648,14 +643,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_auto_redeeming_strategy_redeem_on_tick() -> anyhow::Result<()> {
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             minimum_redeem_ticket_value: HoprBalance::from(*PRICE_PER_PACKET * 5),
@@ -699,14 +687,7 @@ mod tests {
         let mut channel = *CHANNEL_1;
         channel.status = ChannelStatus::PendingToClose(SystemTime::now().add(Duration::from_secs(100)));
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_all_on_close: true,
@@ -747,14 +728,7 @@ mod tests {
     async fn test_auto_redeeming_strategy_should_not_redeem_multiple_times_in_same_channel() -> anyhow::Result<()> {
         let ack_ticket_1 = generate_random_ack_ticket(0, 5)?;
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             minimum_redeem_ticket_value: 0.into(),
@@ -812,14 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_tick_returns_criteria_not_satisfied_when_redeem_on_winning_true() -> anyhow::Result<()> {
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_on_winning: true,
@@ -835,14 +802,7 @@ mod tests {
     async fn test_on_acknowledged_winning_ticket_skips_when_redeem_on_winning_false() -> anyhow::Result<()> {
         let ack_ticket = generate_random_ack_ticket(0, 5)?;
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_on_winning: false,
@@ -862,14 +822,7 @@ mod tests {
         // Ticket worth 1 packet, but minimum is 10 packets.
         let ack_ticket = generate_random_ack_ticket(0, 1)?;
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_on_winning: true,
@@ -889,14 +842,7 @@ mod tests {
     async fn test_on_own_channel_changed_skips_outgoing_direction() -> anyhow::Result<()> {
         let pending_status = ChannelStatus::PendingToClose(SystemTime::now().add(Duration::from_secs(100)));
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_all_on_close: true,
@@ -924,14 +870,7 @@ mod tests {
     async fn test_on_own_channel_changed_skips_when_redeem_all_on_close_false() -> anyhow::Result<()> {
         let pending_status = ChannelStatus::PendingToClose(SystemTime::now().add(Duration::from_secs(100)));
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_all_on_close: false,
@@ -957,14 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_own_channel_changed_returns_error_for_non_status_change() -> anyhow::Result<()> {
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_all_on_close: true,
@@ -991,14 +923,7 @@ mod tests {
     async fn test_on_own_channel_changed_skips_non_open_to_pending_transition() -> anyhow::Result<()> {
         let pending_status = ChannelStatus::PendingToClose(SystemTime::now().add(Duration::from_secs(100)));
 
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let cfg = AutoRedeemingStrategyConfig {
             redeem_all_on_close: true,
@@ -1027,14 +952,7 @@ mod tests {
     /// return a `Box<dyn Strategy + Send>` with the expected Display string.
     #[tokio::test]
     async fn test_build_returns_strategy_trait_object() -> anyhow::Result<()> {
-        let mut connector = create_trustful_hopr_blokli_connector(
-            &BOB,
-            Default::default(),
-            CHAIN_CLIENT.clone(),
-            [1u8; Address::SIZE].into(),
-        )
-        .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB, CHAIN_CLIENT.clone(), [1u8; Address::SIZE].into()).await?;
 
         let mock_tmgr = MockTicketMgmt::new();
         let node = Arc::new(TestNode {

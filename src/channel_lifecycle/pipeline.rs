@@ -20,7 +20,7 @@ use hopr_api::{
         EdgeImmediateProtocolObservable as _, EdgeLinkObservable as _, EdgeObservableRead as _, NetworkGraphView as _,
     },
     network::NetworkView as _,
-    node::{ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView},
+    node::{ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView, PacketTransport},
     types::{
         crypto::prelude::OffchainPublicKey,
         internal::prelude::{ChannelEntry, ChannelId, ChannelStatus},
@@ -47,7 +47,7 @@ const PEER_ADDR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 impl<N> ChannelLifecycleStrategyInner<N>
 where
-    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + Send + Sync + 'static,
+    N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
     N::ChainApi: ChainReadChannelOperations
         + ChainReadSafeOperations
         + ChainReadAccountOperations
@@ -443,27 +443,50 @@ where
                 });
         }
 
-        // Fetch ticket economics once per tick.  Both values are needed for
-        // the capacity-to-wxHOPR conversion and for the proactive-funding drain
-        // estimate.  When either value is unavailable the fund and open passes
-        // are skipped; close and finalize still run.
-        let ticket_price = chain.minimum_ticket_price().await.unwrap_or_else(|e| {
-            warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, using zero");
-            HoprBalance::zero()
-        });
-        let min_ticket_price_wei = ticket_price.amount().low_u128() as f64;
-
-        let win_prob = match chain.minimum_incoming_ticket_win_prob().await {
-            Ok(wp) => Some(wp),
-            Err(e) => {
-                warn!(%e, "channel-lifecycle: minimum_incoming_ticket_win_prob unavailable, skipping fund/open passes");
-                None
-            }
+        // Fetch ticket economics once per tick.
+        //
+        // ticket_price is always needed.  win_prob is only needed for Expected
+        // and Probabilistic sizing modes; Deterministic skips the chain call and
+        // uses 1.0 as a placeholder (it is ignored inside capacity_to_balance).
+        // When both are needed they are fetched concurrently.
+        //
+        // When either required value is unavailable the fund and open passes are
+        // skipped; close and finalize still run.
+        let (ticket_price, win_prob): (Option<_>, Option<f64>) = if self.cfg.funding.sizing_mode.requires_win_prob() {
+            let (price_res, wp_res) =
+                futures::join!(chain.minimum_ticket_price(), chain.minimum_incoming_ticket_win_prob());
+            let price = match price_res {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            let wp = match wp_res {
+                Ok(wp) => Some(wp.as_f64()),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_incoming_ticket_win_prob unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            (price, wp)
+        } else {
+            let price = match chain.minimum_ticket_price().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(%e, "channel-lifecycle: minimum_ticket_price unavailable, skipping fund/open passes");
+                    None
+                }
+            };
+            (price, Some(1.0))
         };
+        let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
-        // `None` when win_prob is unavailable; fund/open passes are skipped.
-        let funding = win_prob.map(|wp| self.cfg.funding.resolve(ticket_price, wp));
+        // `None` when any required economic input is unavailable.
+        let funding = ticket_price
+            .zip(win_prob)
+            .map(|(price, wp)| self.cfg.funding.resolve::<N>(price, wp));
 
         // Share resolved economics with the event-driven funding handler so it
         // can reuse per-tick values rather than issuing fresh chain RPC calls.
@@ -1046,11 +1069,12 @@ mod tests {
         PeerId,
         chain::{
             AccountSelector, ChainEvent, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations,
-            ChainWriteAccountOperations, ChannelSelector, HoprChainApi, WinningProbability,
+            ChainWriteAccountOperations, ChannelSelector, HoprChainApi,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
             ComponentStatusReporter, EventWaitResult, HasChainApi, HasGraphView, HasNetworkView, NodeOnchainIdentity,
+            PacketTransport,
         },
         types::{
             crypto::{
@@ -1061,12 +1085,12 @@ mod tests {
             primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
         },
     };
-    use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
 
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
     // Private items (ChannelLifecycleStrategyInner) are accessible from descendant modules.
     use super::super::ChannelLifecycleStrategyInner;
     use super::super::{config::ResolvedFunding, *};
+    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
 
     /// Build a [`ResolvedFunding`] directly from wxHOPR amounts for use in
     /// `try_open_channel` unit tests that bypass the pipeline.
@@ -1093,6 +1117,13 @@ mod tests {
         static ref BOB: Address = BOB_KP.public().to_address();
         static ref CHRIS: Address = hex!("b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234").into();
         static ref DAVE: Address = hex!("68499f50ff68d523385dc60686069935d17d762a").into();
+    }
+
+    struct TestTransport;
+    impl PacketTransport for TestTransport {
+        fn packet_payload_size() -> usize {
+            1036
+        }
     }
 
     /// Minimal node wrapper — same pattern as in auto_funding tests.
@@ -1395,6 +1426,12 @@ mod tests {
         }
     }
 
+    impl<C: PacketTransport> PacketTransport for ChainNode<C> {
+        fn packet_payload_size() -> usize {
+            C::packet_payload_size()
+        }
+    }
+
     async fn register_test_safe<C>(chain: &C, node_addr: Address) -> anyhow::Result<()>
     where
         C: HoprChainApi + ChainReadAccountOperations + ChainWriteAccountOperations,
@@ -1443,10 +1480,7 @@ mod tests {
             .with_channels([c1])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -1526,10 +1560,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        chain_connector.connect().await?;
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let chain_connector = Arc::new(chain_connector);
         let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
 
@@ -1697,10 +1728,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
 
         // One channel per in-flight set tracked by the old instance.
@@ -1865,10 +1893,7 @@ mod tests {
             .with_channels([existing_channel])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -1933,10 +1958,7 @@ mod tests {
             .with_channels([existing_channel])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2013,10 +2035,7 @@ mod tests {
             .with_channels([existing_channel])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2075,10 +2094,7 @@ mod tests {
             .with_channels([])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2122,12 +2138,11 @@ mod tests {
     /// correct wxHOPR **topup** amount via the live ticket economics fetched from
     /// the Blokli simulator, and the fund pass applies it to an underfunded channel.
     ///
-    /// The Blokli test sim defaults to `ticket_price = "1 wxHOPR"` and
-    /// `min_ticket_winning_probability = 1.0`.  With `assumed_hops = 3` and
-    /// `topup_capacity = 1 byte` (= 1 packet):
+    /// The Blokli test sim defaults to `ticket_price = "1 wxHOPR"`.  With
+    /// `assumed_hops = 3` and `topup_capacity = 1 byte` (= 1 packet):
     ///
     /// ```text
-    /// topup_balance = 1 packet × 1 wxHOPR × 3 hops / 1.0 = 3 wxHOPR
+    /// topup_balance = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR
     /// ```
     ///
     /// The channel starts with 0 balance (< resolved threshold), triggering a
@@ -2138,12 +2153,12 @@ mod tests {
         use super::super::config::capacity_to_balance;
 
         // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0, assumed_hops = 3.
-        // capacity_to_balance(ByteSize::b(1), 1 wxHOPR, 1.0, 3) = 3 wxHOPR.
-        // capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3 hops) = 3 wxHOPR.
+        // Deterministic sizing (win_prob ignored):
+        //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic) = 1 × 1 × 3 = 3 wxHOPR.
         let expected_topup = {
+            use super::super::config::CapacitySizingMode;
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
-            let wp = WinningProbability::try_from(1.0f64).expect("valid win_prob");
-            capacity_to_balance(ByteSize::b(1), price, wp, 3) // topup_capacity = ByteSize::b(1)
+            capacity_to_balance::<TestTransport>(ByteSize::b(1), price, 1.0, 3, &CapacitySizingMode::Deterministic)
         };
 
         // Channel starts at 0 balance — below any non-zero threshold.
@@ -2165,10 +2180,7 @@ mod tests {
             .with_channels([ch])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2379,10 +2391,7 @@ mod tests {
             )
             .with_channels([ch])
             .build_dynamic_client([1; Address::SIZE].into());
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2460,10 +2469,7 @@ mod tests {
             )
             .with_channels([ch])
             .build_dynamic_client([1; Address::SIZE].into());
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2584,10 +2590,7 @@ mod tests {
             .with_closure_grace_period(Duration::from_secs(60))
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2664,10 +2667,7 @@ mod tests {
             .with_closure_grace_period(Duration::ZERO)
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
-        connector.connect().await?;
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let connector = Arc::new(connector);
         register_test_safe(&*connector, *BOB).await?;
 
@@ -2750,6 +2750,116 @@ mod tests {
                 && matches!(c.status, ChannelStatus::Open | ChannelStatus::PendingToClose(_))),
             "channel must be fully Closed after the grace period; got {channels:?}"
         );
+        Ok(())
+    }
+
+    /// When `minimum_ticket_price()` returns `Err`, the fund and open passes must be
+    /// skipped for the entire tick, but the close and finalize passes must still run.
+    ///
+    /// Regression: prior to the face-value fix the error path was shared between
+    /// win-prob and ticket price. After the refactor the gating is on ticket price
+    /// alone; this test ensures neither fund nor open fires when the price is
+    /// unavailable while finalize still fires.
+    #[tokio::test]
+    async fn pipeline_skips_fund_open_but_still_finalizes_when_ticket_price_unavailable() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+        let initial_balance = HoprBalance::from(2_u32);
+
+        // Open channel with balance below the threshold — would normally be funded.
+        let underfunded = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(2_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        // PendingToClose channel whose deadline has already passed — ready to finalize.
+        let pending = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(10_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::PendingToClose(
+                std::time::SystemTime::now() - Duration::from_secs(1),
+            ))
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([underfunded, pending])
+            .with_closure_grace_period(Duration::from_secs(60))
+            .build_dynamic_client(module_address);
+
+        // Clone before moving into the connector — BlokliTestClient clones share state.
+        let client_handle = blokli_sim.clone();
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        // Corrupt the ticket price so every subsequent query_chain_info() returns a
+        // value that parse_chain_info_model() cannot parse, causing minimum_ticket_price()
+        // to return Err for every tick.
+        client_handle.hidden_state_update(|state| {
+            state.chain_info.ticket_price = blokli_client::api::types::TokenValueString("invalid-price".into());
+        });
+
+        let cfg = ChannelLifecycleConfig {
+            tick_interval: Duration::from_millis(100),
+            jitter: Duration::ZERO,
+            funding: FundingConfig {
+                lower_capacity_threshold: ByteSize::b(1),
+                topup_capacity: ByteSize::b(1),
+                ..Default::default()
+            },
+            finalizer: FinalizerConfig {
+                enabled: true,
+                max_closure_overdue: Duration::ZERO,
+                ..Default::default()
+            },
+            restart: RestartGuardConfig {
+                startup_close_grace_period: Duration::ZERO,
+            },
+            ..Default::default()
+        };
+
+        let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let handle = tokio::spawn(async move {
+            let _ = strategy.run().await;
+        });
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let channels: Vec<ChannelEntry> = connector
+            .stream_channels(ChannelSelector::default().with_source(*BOB))
+            .context("failed to stream channels")?
+            .collect()
+            .await;
+
+        // Fund pass must have been skipped: underfunded channel balance is unchanged.
+        assert!(
+            channels
+                .iter()
+                .all(|c| c.destination != *ALICE || c.balance == initial_balance),
+            "fund pass must be skipped when ticket price is unavailable; balance changed: {channels:?}"
+        );
+
+        // Finalize pass must still have run: channel past its deadline is no longer PendingToClose.
+        assert!(
+            !channels
+                .iter()
+                .any(|c| c.destination == *CHRIS && matches!(c.status, ChannelStatus::PendingToClose(_))),
+            "finalize pass must still run even when ticket price is unavailable; got {channels:?}"
+        );
+
         Ok(())
     }
 }

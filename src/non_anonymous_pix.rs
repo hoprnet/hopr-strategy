@@ -767,10 +767,10 @@ mod tests {
             primitive::prelude::{Address, HoprBalance, XDaiBalance},
         },
     };
-    use hopr_chain_connector::{create_trustful_hopr_blokli_connector, testing::BlokliTestStateBuilder};
     use tokio::time::timeout;
 
     use super::*;
+    use crate::testing::{BlokliTestStateBuilder, TestChainConnector};
 
     const TEST_PASSWORD_ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD";
 
@@ -889,12 +889,10 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             // Pre-set the deposit address balance to the target so the first poll succeeds.
-            .with_balances([(deposit_addr, target_deposit)])
+            .with_token_balances([(deposit_addr, target_deposit)])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let chain_connector = Arc::new(chain_connector);
 
@@ -960,14 +958,12 @@ mod tests {
             )
             // with_generated_accounts sets balances for each account's derived safe address,
             // but the test queries balance of BOB's raw chain address directly.
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_token_balances([(*BOB, HoprBalance::new_base(1000))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let chain_connector = Arc::new(chain_connector);
 
@@ -1046,9 +1042,7 @@ mod tests {
             )
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
 
         let cfg = NonAnonymousPixStrategyConfig {
@@ -1092,9 +1086,7 @@ mod tests {
             )
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
 
         let mut strategy = NonAnonymousPixStrategyInner::new(
@@ -1158,15 +1150,13 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             // Give the recovered address wxHOPR and enough xDai to cover sweep gas.
-            .with_balances([(recovered_address, recovered_initial_balance)])
-            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
+            .with_token_balances([(recovered_address, recovered_initial_balance)])
+            .with_native_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
@@ -1247,9 +1237,7 @@ mod tests {
             )
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 
@@ -1288,12 +1276,10 @@ mod tests {
                 XDaiBalance::new_base(1),
                 HoprBalance::new_base(1000),
             )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_token_balances([(*BOB, HoprBalance::new_base(1000))])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let chain_connector = Arc::new(chain_connector);
 
@@ -1363,9 +1349,7 @@ mod tests {
             )
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 
@@ -1408,13 +1392,11 @@ mod tests {
                 XDaiBalance::new_base(2),
                 HoprBalance::new_base(1000),
             )
-            .with_balances([(recovered_address, recovered_initial_balance)])
-            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
+            .with_token_balances([(recovered_address, recovered_initial_balance)])
+            .with_native_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
@@ -1494,12 +1476,10 @@ mod tests {
                 XDaiBalance::new_base(1),
                 HoprBalance::zero(),
             )
-            .with_balances([(recovered_address, HoprBalance::zero())])
+            .with_token_balances([(recovered_address, HoprBalance::zero())])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let chain_connector = Arc::new(chain_connector);
 
@@ -1563,13 +1543,11 @@ mod tests {
                 XDaiBalance::new_base(2),
                 HoprBalance::new_base(1000),
             )
-            .with_balances([(recovered_address, recovered_balance)])
-            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
+            .with_token_balances([(recovered_address, recovered_balance)])
+            .with_native_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
@@ -1642,9 +1620,7 @@ mod tests {
             )
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let chain_connector = Arc::new(chain_connector);
 
@@ -1703,16 +1679,14 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             // Give BOB enough xDai for registration + sweep gas
-            .with_balances([(*BOB, XDaiBalance::new_base(2))])
+            .with_native_balances([(*BOB, XDaiBalance::new_base(2))])
             // Give the recovered address wxHOPR and zero xDai
-            .with_balances([(recovered_address, recovered_initial_balance)])
+            .with_token_balances([(recovered_address, recovered_initial_balance)])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         register_test_safe(&chain_connector, *BOB).await?;
         let chain_connector = Arc::new(chain_connector);
@@ -1797,9 +1771,7 @@ mod tests {
             )
             .build_dynamic_client([1; Address::SIZE].into());
 
-        let mut chain_connector =
-            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
-                .await?;
+        let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
         chain_connector.connect().await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 

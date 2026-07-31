@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.94"
-version      = "0.20.0"
+version      = "0.22.1"
 
 [lib]
 crate-type = ["rlib"]
@@ -21,7 +21,14 @@ default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
 telemetry     = ["hopr-api/types-telemetry"]
 ## Exposes `crate::testing` node adapters to downstream test crates.
-testing = []
+testing = [
+  "dep:async-broadcast",
+  "dep:blokli-client",
+  "dep:const-hex",
+  "dep:serde_json",
+  "dep:tokio",
+  "hopr-api/types-with-bindings",
+]
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
 strategy-auto-redeeming    = []
@@ -42,16 +49,27 @@ lazy_static         = { workspace = true }
 serde               = { workspace = true, features = ["derive"] }
 serde_with          = { workspace = true }
 smart-default       = { workspace = true }
+statrs              = { workspace = true }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = ["derive"] }
 
-hopr-api           = { workspace = true, features = ["node", "serde"] }
-hopr-crypto-packet = { workspace = true }
-hopr-utils         = { workspace = true, default-features = false }
-moka               = { workspace = true, features = ["sync"] }
-multiaddr          = { workspace = true }
-parking_lot        = { workspace = true }
+hopr-api    = { workspace = true, features = ["node", "serde", "types-chain"] }
+hopr-utils  = { workspace = true, default-features = false }
+moka        = { workspace = true, features = ["sync"] }
+multiaddr   = { workspace = true }
+parking_lot = { workspace = true }
+
+# Optional deps enabled by the `testing` feature
+async-broadcast = { workspace = true, optional = true }
+blokli-client = { workspace = true, optional = true, features = ["testing"] }
+const-hex = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = [
+  "macros",
+  "rt",
+  "sync",
+] }
 
 # PIX (non-anonymous) strategy support — enabled via the `strategy-pix` feature.
 backon = { workspace = true, features = [
@@ -68,13 +86,10 @@ chrono = { workspace = true, default-features = false, features = [
 ] }
 hex-literal = { workspace = true }
 hopr-api = { workspace = true, features = ["types-random"] }
-hopr-chain-connector = { workspace = true, features = [
-  "runtime-tokio",
-  "testing",
-] }
 hopr-utils = { workspace = true, features = ["runtime-tokio"] }
 insta = { workspace = true, features = ["redactions", "yaml"] }
 mockall = { workspace = true }
+rstest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
@@ -89,51 +104,44 @@ members  = ["tests/integration"]
 resolver = "3"
 
 [workspace.dependencies]
-anyhow = "1.0.103"
-async-trait = "0.1.89"
-backon = { version = "1.6.0", default-features = false }
-blokli-client = "0.30.0"
-bytesize = { version = "2.4.0", features = ["serde"] }
-chacha20poly1305 = "0.10.1"
-chrono = { version = "0.4.45", default-features = false }
-ctor = "0.2"
-dashmap = "6.2.1"
-futures = "0.3.32"
+anyhow              = "1.0.104"
+async-broadcast     = "0.7.2"
+async-trait         = "0.1.91"
+backon              = { version = "1.6.0", default-features = false }
+blokli-client       = "0.30.2"
+bytesize            = { version = "2.4.2", features = ["serde"] }
+chacha20poly1305    = "0.10.1"
+chrono              = { version = "0.4.45", default-features = false }
+const-hex           = "1.19.1"
+dashmap             = "6.2.1"
+futures             = "0.3.33"
 futures-concurrency = "7.7.1"
-futures-time = "3.1.0"
-hex = "0.4.3"
-hex-literal = "1.1.0"
-hopli = { git = "https://github.com/hoprnet/hopli", branch = "main" }
-hopr-api = "1.15.0"
-hopr-bindings = "4.10.0"
-hopr-chain-connector = { git = "https://github.com/hoprnet/hoprnet", branch = "master" }
-hopr-crypto-packet = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false, features = [
-  "ed25519",
-] }
-hopr-strategy = { path = "." }
-hopr-types = "2.0"
-hopr-utils = { git = "https://github.com/hoprnet/hoprnet", branch = "master", default-features = false }
-humantime-serde = "1.1.1"
-insta = "1.48.0"
-lazy_static = "1.5.0"
-mockall = "0.15.0"
-moka = "0.12.15"
-multiaddr = "0.18.2"
-parking_lot = "0.12.5"
-redb = "4.1.0"
-rstest = "0.26.1"
-scrypt = "0.12.0"
-serde = "1.0.228"
-serde_json = "1.0.150"
-serde_with = "3.21.0"
-smart-default = "0.7.1"
-tempfile = "3.27.0"
-test-log = "0.2.21"
-thiserror = "2.0.18"
-tokio = "1.52.3"
-tracing = "0.1.44"
-url = "2.5.8"
-validator = "0.20.0"
+futures-time        = "3.1.0"
+hex-literal         = "1.1.0"
+hopr-api            = "1.16.0"
+hopr-strategy       = { path = "." }
+hopr-utils          = { package = "hopr-utilities", version = "0.5.0", default-features = false }
+humantime-serde     = "1.1.1"
+insta               = "1.48.0"
+lazy_static         = "1.5.0"
+mockall             = "0.15.0"
+moka                = "0.12.15"
+multiaddr           = "0.18.2"
+parking_lot         = "0.12.5"
+redb                = "4.1.0"
+rstest              = "0.26.1"
+scrypt              = "0.12.0"
+serde               = "1.0.229"
+serde_json          = "1.0.151"
+serde_with          = "3.21.0"
+smart-default       = "0.7.1"
+statrs              = "0.19.0"
+tempfile            = "3.27.0"
+test-log            = "0.2.21"
+thiserror           = "2.0.19"
+tokio               = "1.53.1"
+tracing             = "0.1.44"
+validator           = "0.21.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
