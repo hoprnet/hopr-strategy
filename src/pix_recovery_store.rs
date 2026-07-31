@@ -49,6 +49,10 @@
 //! It does **not** protect against:
 //! - An attacker who also has the config (the password comes from the same config file).
 //! - An attacker who can execute code as the node process (they can read the derived key from process memory).
+//! - An attacker who can read the node's process environment.  The password is passed via an environment variable,
+//!   which is readable through `/proc/<pid>/environ` by the same user and by root, is visible to anything that inspects
+//!   the process table, and is inherited by every child process the node spawns.  Keeping the password out of the
+//!   config file narrows the on-disk exposure; it does not eliminate exposure to a local attacker.
 //! - Side-channel or fault-analysis attacks.
 //!
 //! ## Recovery on restart
@@ -58,7 +62,7 @@
 //!
 //! The store is only opened in the Exit role (when
 //! [`NonAnonymousPixStrategyConfig::pix_recovery_db_path`] and
-//! [`NonAnonymousPixStrategyConfig::pix_recovery_password`] are both set).
+//! [`NonAnonymousPixStrategyConfig::pix_recovery_password_env`] are both set).
 
 use std::{num::NonZeroU32, path::Path, sync::Arc};
 
@@ -169,15 +173,12 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 
 // ── Encryption helpers ───────────────────────────────────────────────────────
 
-// `chacha20poly1305` 0.10 re-exports `generic-array` 0.14, whose `from_slice` is
-// deprecated pending the 1.x upgrade; these calls remain correct until then.
-#[allow(deprecated)]
 fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], PixRecoveryStoreError> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let nonce_bytes = random_bytes::<NONCE_SIZE>();
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
+        .encrypt(&nonce, plaintext.as_ref())
         .map_err(|_| PixRecoveryStoreError::Encryption)?;
     // ChaCha20Poly1305 output = plaintext_len + 16-byte tag = 48 bytes
     let mut out = [0u8; VALUE_SIZE];
@@ -186,13 +187,15 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], Pix
     Ok(out)
 }
 
-#[allow(deprecated)]
 fn decrypt(key: &[u8; 32], stored: &[u8; VALUE_SIZE]) -> Result<[u8; 32], PixRecoveryStoreError> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = Nonce::from_slice(&stored[..NONCE_SIZE]);
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    let nonce_arr: [u8; NONCE_SIZE] = stored[..NONCE_SIZE]
+        .try_into()
+        .map_err(|_| PixRecoveryStoreError::Decryption)?;
+    let nonce = Nonce::from(nonce_arr);
     let ciphertext = &stored[NONCE_SIZE..];
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| PixRecoveryStoreError::Decryption)?;
     Ok(plaintext
         .as_slice()
@@ -299,6 +302,7 @@ impl PixRecoveryStore {
                 Ok(id) => id,
                 Err(_) => continue,
             };
+            // The table is typed `[u8; VALUE_SIZE]`, so the length is already guaranteed.
             let stored: [u8; VALUE_SIZE] = value_bytes.value();
             let plaintext = match decrypt(&self.encryption_key, &stored) {
                 Ok(p) => p,

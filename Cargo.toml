@@ -27,7 +27,7 @@ strategy-auto-funding      = []
 strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
-strategy-pix               = ["dep:chacha20poly1305", "dep:redb", "dep:scrypt"]
+strategy-pix               = ["dep:backon", "dep:chacha20poly1305", "dep:redb", "dep:scrypt"]
 
 [dependencies]
 anyhow              = { workspace = true }
@@ -54,9 +54,12 @@ multiaddr          = { workspace = true }
 parking_lot        = { workspace = true }
 
 # PIX (non-anonymous) strategy support — enabled via the `strategy-pix` feature.
+backon = { workspace = true, features = [
+  "futures-timer-sleep",
+], optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
-redb             = { workspace = true, optional = true }
-scrypt           = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
 
 [dev-dependencies]
 chrono = { workspace = true, default-features = false, features = [
@@ -88,6 +91,7 @@ resolver = "3"
 [workspace.dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.89"
+backon = { version = "1.6.0", default-features = false }
 blokli-client = "0.30.0"
 bytesize = { version = "2.4.0", features = ["serde"] }
 chacha20poly1305 = "0.10.1"

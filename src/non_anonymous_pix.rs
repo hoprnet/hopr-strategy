@@ -12,13 +12,16 @@
 //! **DO NOT USE THIS STRATEGY IN PRODUCTION**
 
 use std::{
-    collections::HashSet,
     convert::identity,
     fmt::{Debug, Display, Formatter},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
+use backon::Retryable;
 use futures::{FutureExt, SinkExt, StreamExt, TryFutureExt};
 use futures_time::future::FutureExt as TimeExt;
 use hopr_api::{
@@ -27,16 +30,45 @@ use hopr_api::{
     node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixEvent},
     types::{crypto::prelude::Keypair, primitive::prelude::*},
 };
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 
+/// Default amount of xDai to send to a recovered stealth address for gas
+/// (0.01 xDai, i.e. 10^16 wei).
+fn default_gas_xdai() -> XDaiBalance {
+    "0.01 xdai".parse().expect("valid static xDai amount")
+}
+
+/// Default deadline for observing a deposit landing on a stealth address.
+///
+/// Matches the Exit's default `max_deposit_wait`, since tracking for longer than
+/// the Exit is prepared to wait cannot save the session.
+fn default_max_deposit_tracking_time() -> Duration {
+    Duration::from_secs(60)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Validate)]
 pub struct NonAnonymousPixStrategyConfig {
     pub price_per_byte: HoprBalance,
     pub max_ssa_allocation: HoprBalance,
+    /// How long to keep polling a stealth address for the expected deposit before
+    /// giving up.
+    ///
+    /// Should not exceed the Exit's `max_deposit_wait` (60 s by default): the Exit
+    /// kills the session once that elapses, so any tracking beyond it is wasted RPC
+    /// traffic. The two live in different crates and cannot be validated against each
+    /// other here.
+    #[serde(default = "default_max_deposit_tracking_time")]
     pub max_deposit_tracking_time: Duration,
+    /// Amount of xDai to send from the Safe to a recovered stealth address to
+    /// cover gas for the `withdraw_from_signer` sweep.  Must be non-zero to
+    /// enable the sweep; the Safe's xDai balance is checked before sending.
+    /// Default: 0.01 xDai.
+    #[serde(default = "default_gas_xdai")]
+    pub gas_xdai_per_sweep: XDaiBalance,
     /// If set, the strategy persists recovered private keys to `redb` at this
     /// path before withdrawing (Exit role).  `None` means in-memory only (Entry role).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,13 +88,12 @@ pub struct NonAnonymousPixStrategyConfig {
 /// runnable `Box<dyn StrategyTrait + Send>`.
 pub struct NonAnonymousPixStrategy {
     cfg: NonAnonymousPixStrategyConfig,
-    interval: Duration,
 }
 
 impl NonAnonymousPixStrategy {
     /// Create a new builder with the given configuration.
-    pub fn new(cfg: NonAnonymousPixStrategyConfig, interval: Duration) -> Self {
-        Self { cfg, interval }
+    pub fn new(cfg: NonAnonymousPixStrategyConfig) -> Self {
+        Self { cfg }
     }
 
     /// Wire in a node and return a running-ready strategy.
@@ -91,14 +122,11 @@ impl NonAnonymousPixStrategy {
             })
             .transpose()?;
 
-        Ok(Box::new(NonAnonymousPixStrategyInner {
-            cfg: self.cfg,
-            interval: self.interval,
+        Ok(Box::new(NonAnonymousPixStrategyInner::new(
+            self.cfg.clone(),
             node,
             recovery_store,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        }))
+        )))
     }
 }
 
@@ -106,35 +134,120 @@ impl NonAnonymousPixStrategy {
 struct NonAnonymousPixStrategyInner<N: HasChainApi> {
     node: Arc<N>,
     cfg: NonAnonymousPixStrategyConfig,
-    interval: Duration,
     /// Exit role only: persisted recovery store for [`PixEvent::PrivateKeyRecovered`].
     /// Entry role leaves this as `None`.
     recovery_store: Option<crate::pix_recovery_store::PixRecoveryStore>,
     /// Entry role only: IDs of deposit addresses already funded.
-    processed_deposits: HashSet<hopr_api::node::PixAddressId>,
-    /// Entry role only: addresses with an in-flight withdrawal.
-    in_flight_addresses: HashSet<Address>,
+    ///
+    /// Bounded by both capacity and TTL.  A TTL looks like it opens a window in
+    /// which a redelivered `NewDepositAddress` could withdraw twice — but LRU
+    /// eviction at the capacity bound opens exactly the same window already, and
+    /// does so at an unpredictable moment.  Making the window explicit and
+    /// time-bounded is strictly better than pretending it does not exist.
+    processed_deposits: Cache<hopr_api::node::PixAddressId, ()>,
+    /// In-flight sweep guard (both roles): prevents duplicate concurrent sweeps of
+    /// the same PixAddressId.  A key is inserted before each sweep attempt (inline,
+    /// retry, or replay) and removed when the sweep succeeds, fails, or gives up.
+    /// `moka::sync::Cache` is internally `Arc`-based, so cloning is cheap.
+    ///
+    /// The TTL is a safety net against a leaked guard permanently blocking an ID.
+    /// A duplicate sweep let through by expiry is harmless: `sweep_recovered`
+    /// re-reads the on-chain balance and no-ops when it is already zero.
+    in_flight_sweeps: Cache<hopr_api::node::PixAddressId, ()>,
+    /// In-flight withdrawal guard (Entry role): prevents parallel withdrawals to the
+    /// same destination address.  Inserted before the `withdraw` `.await` and removed
+    /// on success or failure.
+    in_flight_destinations: Cache<Address, ()>,
+    /// Number of live [`PixEvent::DepositAddressReceived`] polling tasks, capped at
+    /// [`MAX_CONCURRENT_DEPOSIT_TRACKERS`] so the strategy cannot spawn an unbounded
+    /// number of RPC pollers.
+    active_deposit_trackers: Arc<AtomicUsize>,
+}
+
+impl<N: HasChainApi> NonAnonymousPixStrategyInner<N> {
+    fn new(
+        cfg: NonAnonymousPixStrategyConfig,
+        node: Arc<N>,
+        recovery_store: Option<crate::pix_recovery_store::PixRecoveryStore>,
+    ) -> Self {
+        Self {
+            cfg,
+            node,
+            recovery_store,
+            processed_deposits: Cache::builder()
+                .max_capacity(PROCESSED_DEPOSITS_CAPACITY)
+                .time_to_live(PROCESSED_DEPOSITS_TTL)
+                .build(),
+            in_flight_sweeps: Cache::builder()
+                .max_capacity(IN_FLIGHT_GUARD_CAPACITY)
+                .time_to_live(IN_FLIGHT_GUARD_TTL)
+                .build(),
+            in_flight_destinations: Cache::builder()
+                .max_capacity(IN_FLIGHT_GUARD_CAPACITY)
+                .time_to_live(IN_FLIGHT_GUARD_TTL)
+                .build(),
+            active_deposit_trackers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+const MAX_SWEEP_RETRIES: usize = 5;
+
+/// Retry budget for the Entry-side deposit withdrawal.  Deliberately small: the Exit
+/// gives up on the deposit after `max_deposit_wait` (60 s by default), so a long
+/// backoff would outlive the session it is trying to save.
+const MAX_DEPOSIT_WITHDRAW_RETRIES: usize = 3;
+
+/// ~4 TB of traffic at the default 519 MiB SSA quota.
+const PROCESSED_DEPOSITS_CAPACITY: u64 = 8192;
+
+/// Long enough that no realistic redelivery of a `NewDepositAddress` falls outside it.
+const PROCESSED_DEPOSITS_TTL: Duration = Duration::from_secs(24 * 3600);
+
+const IN_FLIGHT_GUARD_CAPACITY: u64 = 1024;
+
+/// Comfortably longer than the worst-case `spawn_sweep_retry` backoff chain.
+const IN_FLIGHT_GUARD_TTL: Duration = Duration::from_secs(600);
+
+/// Upper bound on concurrent deposit-tracking tasks, and hence on the RPC polling rate
+/// this strategy generates.  Well above the 100-concurrent-session target profile.
+const MAX_CONCURRENT_DEPOSIT_TRACKERS: usize = 256;
+
+/// Releases a [`MAX_CONCURRENT_DEPOSIT_TRACKERS`] slot when the tracking task ends —
+/// on success, on failure, or when the timeout drops the future.
+struct DepositTrackerSlot(Arc<AtomicUsize>);
+
+impl DepositTrackerSlot {
+    /// Returns `None` when all slots are taken.
+    fn try_acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_CONCURRENT_DEPOSIT_TRACKERS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for DepositTrackerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl<N> NonAnonymousPixStrategyInner<N>
 where
     N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
 {
-    /// Periodic task logic.
-    async fn on_tick(&self) -> crate::errors::Result<()> {
-        tracing::debug!("PixStrategy tick");
-        Ok(())
-    }
-
     /// Handle PIX event.
     async fn on_pix_event(&mut self, event: PixEvent) -> crate::errors::Result<()> {
-        tracing::debug!("PixStrategy event");
+        tracing::debug!(?event, "PixStrategy event");
         match event {
             PixEvent::NewDepositAddress(new_deposit_address) => {
                 tracing::info!(?new_deposit_address, "new deposit address");
 
                 // Entry-side dedup: skip duplicates within the same strategy lifetime.
-                if self.processed_deposits.contains(&new_deposit_address.id) {
+                if self.processed_deposits.contains_key(&new_deposit_address.id) {
                     tracing::warn!(id = ?new_deposit_address.id, "duplicate NewDepositAddress event, skipping");
                     return Ok(());
                 }
@@ -145,34 +258,48 @@ where
                     return Err(StrategyError::CriteriaNotSatisfied);
                 }
 
-                let deposit_address: Address = new_deposit_address.address.try_into()?;
-
-                // Serialize concurrent withdrawals to the same deposit address.
-                if !self.in_flight_addresses.insert(deposit_address) {
-                    tracing::warn!(
-                        ?deposit_address,
-                        "withdrawal already in-flight, skipping duplicate event"
-                    );
+                // Prevent parallel withdrawals to the same destination address.
+                // The `processed_deposits` dedup above guards the PixAddressId, not the
+                // destination address — two events for different IDs on the same address
+                // could race when event processing becomes parallelized.
+                let dest_addr: Address = new_deposit_address.address.try_into()?;
+                if self.in_flight_destinations.contains_key(&dest_addr) {
+                    tracing::warn!(?dest_addr, "withdrawal already in flight to this destination, skipping");
                     return Ok(());
                 }
+                self.in_flight_destinations.insert(dest_addr, ());
 
-                let withdraw_result = self
-                    .node
-                    .chain_api()
-                    .withdraw(target_deposit, &deposit_address)
-                    .and_then(identity)
-                    .await;
+                // Retry transient RPC failures: an unfunded SSA is a dead session, and the
+                // Exit's kill switch will fire regardless of whose fault the failure was.
+                // The guard above is held across the whole retry chain.
+                let node = Arc::clone(&self.node);
+                let withdrawn = (|| {
+                    let node = Arc::clone(&node);
+                    async move {
+                        node.chain_api()
+                            .withdraw(target_deposit, &dest_addr)
+                            .and_then(identity)
+                            .await
+                            .map_err(StrategyError::other)
+                    }
+                })
+                .retry(backon::ExponentialBuilder::default().with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES))
+                .sleep(backon::FuturesTimerSleeper)
+                .notify(|error, dur| {
+                    tracing::warn!(%error, ?dur, ?dest_addr, "deposit withdrawal failed, retrying in");
+                })
+                .await;
 
-                self.in_flight_addresses.remove(&deposit_address);
-
-                if let Err(error) = withdraw_result {
-                    tracing::error!(%error, %target_deposit, ?new_deposit_address, "withdraw failed");
-                    return Err(StrategyError::other(error));
+                if let Err(error) = withdrawn {
+                    self.in_flight_destinations.invalidate(&dest_addr);
+                    tracing::error!(%error, %target_deposit, ?new_deposit_address, "withdraw failed after max retries");
+                    return Err(error);
                 }
 
                 // Mark completed only after the withdrawal succeeds so a transient
                 // failure doesn't permanently poison this ID.
-                self.processed_deposits.insert(new_deposit_address.id);
+                self.processed_deposits.insert(new_deposit_address.id, ());
+                self.in_flight_destinations.invalidate(&dest_addr);
                 tracing::info!(%target_deposit, ?new_deposit_address, "deposit successful");
             }
             PixEvent::DepositAddressReceived(deposit_address_recv) => {
@@ -188,34 +315,57 @@ where
                 let max_tracking_time = self.cfg.max_deposit_tracking_time;
                 let target_for_filter = target_deposit;
 
-                let mut stream = futures_time::stream::interval(
-                    futures_time::time::Duration::from(max_tracking_time / 10).max(Duration::from_secs(1).into()),
-                )
-                .then(move |_| {
-                    let node_clone = node_clone.clone();
-                    async move { node_clone.chain_api().balance(deposit_addr).await }
-                })
-                .filter_map(move |result| {
-                    let target = target_for_filter;
-                    async move {
-                        match result {
-                            Ok(balance) if balance >= target => Some(balance),
-                            Ok(_) => {
-                                // Still below target — keep polling.
-                                None
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, %target, "deposit balance poll failed");
-                                None
+                // Bound the number of live pollers, and hence the RPC rate: every tracker
+                // issues one `balance` call per `poll_interval` for up to `max_tracking_time`.
+                let Some(tracker_slot) = DepositTrackerSlot::try_acquire(&self.active_deposit_trackers) else {
+                    tracing::error!(
+                        ?pix_id,
+                        max = MAX_CONCURRENT_DEPOSIT_TRACKERS,
+                        "too many concurrent deposit trackers, not tracking this deposit"
+                    );
+                    return Err(StrategyError::CriteriaNotSatisfied);
+                };
+
+                let poll_interval = (max_tracking_time / 10).max(Duration::from_secs(1));
+
+                // Decorrelate the polling phase across trackers.  Without this, sessions
+                // established in the same instant align their polls into one burst every
+                // `poll_interval` for the whole tracking window.
+                let phase_jitter = Duration::from_millis(hopr_api::types::crypto_random::random_integer(
+                    0,
+                    Some(poll_interval.as_millis() as u64),
+                ));
+
+                let mut stream = futures_time::stream::interval(poll_interval.into())
+                    .then(move |_| {
+                        let node_clone = node_clone.clone();
+                        async move { node_clone.chain_api().balance(deposit_addr).await }
+                    })
+                    .filter_map(move |result| {
+                        let target = target_for_filter;
+                        async move {
+                            match result {
+                                Ok(balance) if balance >= target => Some(balance),
+                                Ok(_) => {
+                                    // Still below target — keep polling.
+                                    None
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, %target, "deposit balance poll failed");
+                                    None
+                                }
                             }
                         }
-                    }
-                })
-                .boxed();
+                    })
+                    .boxed();
 
-                tracing::info!(%target_deposit, ?max_tracking_time, "tracking until deposit");
+                tracing::info!(%target_deposit, ?max_tracking_time, ?poll_interval, "tracking until deposit");
                 hopr_utils::runtime::prelude::spawn(
                     async move {
+                        // Held for the lifetime of the task; dropped on completion, on
+                        // failure, and when the timeout below drops this future.
+                        let _tracker_slot = tracker_slot;
+
                         // Check balance immediately (first poll) to avoid the sub-second
                         // first-poll delay inherent to stream::interval. Both the immediate
                         // check and the interval polling are inside the timeout guard so a
@@ -230,6 +380,7 @@ where
                         let deposit = if let Some(balance) = immediate {
                             balance
                         } else {
+                            futures_time::task::sleep(phase_jitter.into()).await;
                             match stream.next().await {
                                 Some(balance) => balance,
                                 None => {
@@ -267,44 +418,52 @@ where
                     return Err(StrategyError::other(error));
                 }
 
-                let chain_key =
-                    ChainKeypair::from_secret(private_key_recovered.secret.0.as_ref()).map_err(StrategyError::other)?;
+                // Prevent duplicate concurrent sweeps for the same PixAddressId.
+                if self.in_flight_sweeps.contains_key(&private_key_recovered.id) {
+                    tracing::warn!(?private_key_recovered.id, "sweep already in flight, skipping");
+                    return Ok(());
+                }
+                self.in_flight_sweeps.insert(private_key_recovered.id, ());
 
-                let safe_address = self.node.identity().safe_address;
-
-                let recovered_balance: HoprBalance = self
-                    .node
-                    .chain_api()
-                    .balance(chain_key.public().to_address())
-                    .await
-                    .map_err(StrategyError::other)?;
-                tracing::info!(%recovered_balance, address = %chain_key.public().to_address(), "recovered deposit balance");
-
-                if recovered_balance.is_zero() {
-                    // Already swept; just clean up the store entry.
-                    if let Some(ref store) = self.recovery_store
-                        && let Err(error) = store.remove(&private_key_recovered.id)
-                    {
-                        tracing::warn!(%error, ?private_key_recovered.id, "failed to remove zero-balance entry from store");
+                let chain_key = match ChainKeypair::from_secret(private_key_recovered.secret.0.as_ref()) {
+                    Ok(chain_key) => chain_key,
+                    Err(error) => {
+                        // Release the guard before bailing out.  Leaving it set would block
+                        // this ID from ever being swept again in this process — including by
+                        // the startup replay path, which consults the same guard.
+                        self.in_flight_sweeps.invalidate(&private_key_recovered.id);
+                        tracing::error!(%error, ?private_key_recovered.id, "failed to reconstruct chain key");
+                        return Err(StrategyError::other(error));
                     }
-                } else {
-                    self.node
-                        .chain_api()
-                        .withdraw_from_signer(&chain_key, recovered_balance, &safe_address)
-                        .await
-                        .map_err(StrategyError::other)?
-                        .await
-                        .map_err(StrategyError::other)?;
+                };
 
-                    // Delete the entry now that the deposit has been withdrawn, so the
-                    // recovery store doesn't accumulate entries unboundedly over time.
-                    if let Some(ref store) = self.recovery_store
-                        && let Err(error) = store.remove(&private_key_recovered.id)
-                    {
-                        tracing::warn!(%error, ?private_key_recovered.id, "failed to remove recovered key from store");
+                let store = self.recovery_store.clone();
+                let ck_for_spawn = chain_key.clone();
+                let in_flight = self.in_flight_sweeps.clone();
+                match sweep_recovered(
+                    Arc::clone(&self.node),
+                    self.cfg.clone(),
+                    store.clone(),
+                    private_key_recovered.id,
+                    &chain_key,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        in_flight.invalidate(&private_key_recovered.id);
+                        tracing::info!(?private_key_recovered.id, "deposit withdrawn");
                     }
-
-                    tracing::info!(%recovered_balance, address = %chain_key.public().to_address(),  "deposit withdrawn");
+                    Err(error) => {
+                        tracing::error!(%error, ?private_key_recovered.id, "live sweep failed — spawning background retry");
+                        spawn_sweep_retry(
+                            private_key_recovered.id,
+                            ck_for_spawn,
+                            Arc::clone(&self.node),
+                            self.cfg.clone(),
+                            store,
+                            in_flight,
+                        );
+                    }
                 }
             }
         }
@@ -313,6 +472,7 @@ where
     }
 
     /// Replay recovery entries whose on-chain balance is still non-zero (crash recovery).
+    /// Entries whose sweep fails are retried in a background task with exponential backoff.
     async fn replay_pending_recoveries(&self, store: &crate::pix_recovery_store::PixRecoveryStore) {
         let entries = match store.iter() {
             Ok(entries) => entries,
@@ -328,52 +488,201 @@ where
 
         tracing::info!(count = entries.len(), "replaying pending private key recoveries");
 
+        let node = Arc::clone(&self.node);
+        let cfg = self.cfg.clone();
+        let store = store.clone();
+
         for (id, secret) in entries {
-            match ChainKeypair::from_secret(secret.0.as_ref()) {
-                Ok(chain_key) => {
-                    let balance: HoprBalance =
-                        match self.node.chain_api().balance(chain_key.public().to_address()).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::error!(%e, ?id, "failed to query balance during recovery replay");
-                                continue;
-                            }
-                        };
+            // Replay is sequential (spawns detached on error), so a duplicate
+            // entry in the store cannot race itself.  The guard catches races with
+            // the live PrivateKeyRecovered handler.
+            if self.in_flight_sweeps.contains_key(&id) {
+                tracing::warn!(?id, "sweep already in flight for recovery replay entry, skipping");
+                continue;
+            }
+            self.in_flight_sweeps.insert(id, ());
 
-                    if balance.is_zero() {
-                        // Already swept in a prior run; drop the stale secret.
-                        if let Err(error) = store.remove(&id) {
-                            tracing::warn!(%error, ?id, "failed to remove zero-balance entry from store");
-                        }
-                        continue;
-                    }
+            let node = Arc::clone(&node);
+            let cfg = cfg.clone();
+            let store = store.clone();
+            let in_flight = self.in_flight_sweeps.clone();
 
-                    tracing::info!(%balance, ?id, "replaying withdrawal for pending recovery");
-
-                    let withdraw_fut = match self
-                        .node
-                        .chain_api()
-                        .withdraw_from_signer(&chain_key, balance, &self.node.identity().safe_address)
-                        .await
-                    {
-                        Ok(fut) => fut,
-                        Err(error) => {
-                            tracing::error!(%error, ?id, "recovery replay: withdraw_from_signer call failed");
-                            continue;
-                        }
-                    };
-                    if let Err(error) = withdraw_fut.await {
-                        tracing::error!(%error, ?id, "recovery replay withdrawal failed");
-                    } else if let Err(error) = store.remove(&id) {
-                        tracing::warn!(%error, ?id, "failed to remove replayed key from store");
-                    }
-                }
+            let chain_key = match ChainKeypair::from_secret(secret.0.as_ref()) {
+                Ok(k) => k,
                 Err(error) => {
                     tracing::error!(%error, ?id, "failed to reconstruct chain key during recovery replay");
+                    in_flight.invalidate(&id);
+                    continue;
+                }
+            };
+
+            let balance: HoprBalance = match node.chain_api().balance(chain_key.public().to_address()).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(%e, ?id, "failed to query balance during recovery replay");
+                    spawn_sweep_retry(id, chain_key, node, cfg, Some(store), in_flight);
+                    continue;
+                }
+            };
+
+            if balance.is_zero() {
+                // Already swept in a prior run; drop the stale secret.
+                in_flight.invalidate(&id);
+                if let Err(error) = store.remove(&id) {
+                    tracing::warn!(%error, ?id, "failed to remove zero-balance entry from store");
+                }
+                continue;
+            }
+
+            // Try the sweep inline.  On failure, spawn a background retry task.
+            // Clone chain_key beforehand so it's available for the spawn on error.
+            let ck_for_spawn = chain_key.clone();
+            match sweep_recovered(node.clone(), cfg.clone(), Some(store.clone()), id, &chain_key).await {
+                Ok(()) => {
+                    in_flight.invalidate(&id);
+                }
+                Err(error) => {
+                    tracing::error!(%error, ?id, "recovery replay failed — spawning background retry");
+                    spawn_sweep_retry(id, ck_for_spawn, node, cfg, Some(store), in_flight);
                 }
             }
         }
     }
+}
+
+/// Sweep a single recovery: query the live on-chain balance, fund gas, withdraw
+/// from signer, optionally remove from store.  Uses the current balance rather
+/// than a caller-supplied snapshot to avoid racing with out-of-band sweeps.
+async fn sweep_recovered<N: HasChainApi + ?Sized>(
+    node: Arc<N>,
+    cfg: NonAnonymousPixStrategyConfig,
+    store: Option<crate::pix_recovery_store::PixRecoveryStore>,
+    id: hopr_api::node::PixAddressId,
+    chain_key: &ChainKeypair,
+) -> Result<(), StrategyError> {
+    let recovered_address = chain_key.public().to_address();
+
+    let balance: HoprBalance = node
+        .chain_api()
+        .balance(recovered_address)
+        .await
+        .map_err(StrategyError::other)?;
+
+    if balance.is_zero() {
+        tracing::trace!(?id, %recovered_address, "recovered address has zero balance: already swept");
+        if let Some(ref store) = store {
+            let _ = store.remove(&id);
+        }
+        return Ok(());
+    }
+
+    fund_sweep_gas_impl(&*node, &cfg, recovered_address).await?;
+
+    let safe_address = node.identity().safe_address;
+    node.chain_api()
+        .withdraw_from_signer(chain_key, balance, &safe_address)
+        .await
+        .map_err(StrategyError::other)?
+        .await
+        .map_err(StrategyError::other)?;
+
+    if let Some(ref store) = store {
+        let _ = store.remove(&id);
+    }
+
+    tracing::info!(%balance, %recovered_address, "deposit withdrawn");
+    Ok(())
+}
+
+/// Spawn a background task that retries [`sweep_recovered`] with exponential backoff.
+fn spawn_sweep_retry(
+    id: hopr_api::node::PixAddressId,
+    chain_key: ChainKeypair,
+    node: Arc<impl HasChainApi + ActionableEventSource + Send + Sync + 'static>,
+    cfg: NonAnonymousPixStrategyConfig,
+    store: Option<crate::pix_recovery_store::PixRecoveryStore>,
+    in_flight_sweeps: Cache<hopr_api::node::PixAddressId, ()>,
+) {
+    hopr_utils::runtime::prelude::spawn(async move {
+        let recovered_address = chain_key.public().to_address();
+
+        (|| sweep_recovered(Arc::clone(&node), cfg.clone(), store.clone(), id, &chain_key))
+            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
+            .sleep(backon::FuturesTimerSleeper)
+            .when(|_| {
+                // Retry all errors up to MAX_SWEEP_RETRIES; CriteriaNotSatisfied
+                // (insufficient xDai) may resolve on retry when another sweep
+                // completes and returns gas to the Safe.
+                true
+            })
+            .notify(|e, dur| {
+                tracing::warn!(%e, ?dur, ?id, "sweep retry in");
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(%e, ?id, %recovered_address, "sweep failed after max retries, giving up");
+                // Leave the entry in the store for manual recovery.
+            });
+
+        // Release the in-flight guard on completion (success or final failure).
+        in_flight_sweeps.invalidate(&id);
+    });
+}
+
+/// Shared implementation of `fund_sweep_gas` usable from spawned tasks.
+async fn fund_sweep_gas_impl<N: HasChainApi + ?Sized>(
+    node: &N,
+    cfg: &NonAnonymousPixStrategyConfig,
+    recovered_address: Address,
+) -> crate::errors::Result<()> {
+    if cfg.gas_xdai_per_sweep.is_zero() {
+        return Ok(());
+    }
+
+    // Query the recovered address's current native balance.  If it already has
+    // enough xDai for gas, don't send any more.
+    let recovered_xdai: XDaiBalance = node
+        .chain_api()
+        .balance(recovered_address)
+        .await
+        .map_err(StrategyError::other)?;
+
+    if recovered_xdai >= cfg.gas_xdai_per_sweep {
+        tracing::trace!(%recovered_address, balance = %recovered_xdai, "recovered address already has enough xDai for sweep gas");
+        return Ok(());
+    }
+
+    let deficit = cfg.gas_xdai_per_sweep - recovered_xdai;
+
+    let safe_xdai: XDaiBalance = node
+        .chain_api()
+        .balance(node.identity().safe_address)
+        .await
+        .map_err(StrategyError::other)?;
+
+    if safe_xdai < deficit {
+        tracing::warn!(
+            safe = %node.identity().safe_address,
+            deficit = %deficit,
+            available = %safe_xdai,
+            "insufficient xDai in safe to fund sweep gas"
+        );
+        return Err(StrategyError::CriteriaNotSatisfied);
+    }
+
+    node.chain_api()
+        .withdraw(deficit, &recovered_address)
+        .and_then(identity)
+        .await
+        .map_err(StrategyError::other)?;
+
+    tracing::info!(
+        amount = %deficit,
+        %recovered_address,
+        "funded sweep gas from safe"
+    );
+
+    Ok(())
 }
 
 impl<N: HasChainApi> Debug for NonAnonymousPixStrategyInner<N> {
@@ -394,46 +703,24 @@ where
     N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
 {
     async fn run(&mut self) -> crate::errors::Result<()> {
-        enum Event {
-            Tick,
-            Pix(PixEvent),
-        }
-
-        // Run the first scan immediately at startup without waiting for the initial interval.
-        if let Err(error) = self.on_tick().await
-            && !matches!(error, StrategyError::CriteriaNotSatisfied)
-        {
-            tracing::error!(%error, "pix tick failed");
-        }
+        // Subscribe to the event stream before replaying pending recoveries so
+        // that any PIX events emitted during startup recovery are captured by
+        // the stream rather than missed.
+        let mut event_stream = self
+            .node
+            .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Pix]))
+            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
+            .filter_map(|event| futures::future::ready(event.try_as_pix()));
 
         // Startup recovery: replay persisted keys whose on-chain balance is still non-zero.
+        // Failed entries are retried in the background with exponential backoff.
         if let Some(ref store) = self.recovery_store {
             self.replay_pending_recoveries(store).await;
         }
 
-        let tick_stream = futures_time::stream::interval(self.interval.into()).map(|_| Event::Tick);
-        let event_stream = self
-            .node
-            .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Pix]))
-            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
-            .filter_map(|event| futures::future::ready(event.try_as_pix().map(Event::Pix)));
-
-        let mut combined = futures_concurrency::stream::Merge::merge((tick_stream, event_stream));
-
-        while let Some(event) = combined.next().await {
-            match event {
-                Event::Tick => {
-                    if let Err(error) = self.on_tick().await
-                        && !matches!(error, StrategyError::CriteriaNotSatisfied)
-                    {
-                        tracing::error!(%error, "pix tick failed");
-                    }
-                }
-                Event::Pix(event) => {
-                    if let Err(error) = self.on_pix_event(event).await {
-                        tracing::error!(%error, "pix event failed");
-                    }
-                }
+        while let Some(event) = event_stream.next().await {
+            if let Err(error) = self.on_pix_event(event).await {
+                tracing::error!(%error, "pix event failed");
             }
         }
 
@@ -615,18 +902,13 @@ mod tests {
             price_per_byte,
             max_ssa_allocation,
             max_deposit_tracking_time: StdDuration::from_secs(5),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         };
 
-        let mut strategy = NonAnonymousPixStrategyInner {
-            cfg,
-            interval: StdDuration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+        let mut strategy =
+            NonAnonymousPixStrategyInner::new(cfg, Arc::new(ChainNode(Arc::clone(&chain_connector))), None);
 
         let event = PixEvent::DepositAddressReceived(PixDepositAddressReceived {
             id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
@@ -693,18 +975,13 @@ mod tests {
             price_per_byte,
             max_ssa_allocation,
             max_deposit_tracking_time: Duration::from_secs(5),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         };
 
-        let mut strategy = NonAnonymousPixStrategyInner {
-            cfg,
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+        let mut strategy =
+            NonAnonymousPixStrategyInner::new(cfg, Arc::new(ChainNode(Arc::clone(&chain_connector))), None);
 
         let bob_balance_before = strategy
             .get_balance(*BOB)
@@ -741,7 +1018,9 @@ mod tests {
             "deposit address should have received the withdrawal"
         );
 
-        insta::assert_yaml_snapshot!(*snapshot.refresh());
+        insta::assert_yaml_snapshot!(*snapshot.refresh(), {
+            ".chain_info.contract_addresses" => "[contract_addresses]",
+        });
 
         Ok(())
     }
@@ -776,18 +1055,12 @@ mod tests {
             price_per_byte,
             max_ssa_allocation,
             max_deposit_tracking_time: Duration::from_secs(5),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         };
 
-        let mut strategy = NonAnonymousPixStrategyInner {
-            cfg,
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::new(chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+        let mut strategy = NonAnonymousPixStrategyInner::new(cfg, Arc::new(ChainNode(Arc::new(chain_connector))), None);
 
         let event = PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
             id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
@@ -804,12 +1077,66 @@ mod tests {
         Ok(())
     }
 
+    /// A secret that cannot be turned into a keypair must release the in-flight sweep
+    /// guard on its way out.  Leaving the guard set would permanently block that
+    /// `PixAddressId` from being swept for the lifetime of the process, including by
+    /// the startup replay path, which consults the same guard.
+    #[test_log::test(tokio::test)]
+    async fn test_unusable_secret_releases_the_in_flight_sweep_guard() -> anyhow::Result<()> {
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+
+        let mut strategy = NonAnonymousPixStrategyInner::new(
+            NonAnonymousPixStrategyConfig {
+                price_per_byte: HoprBalance::new_base(1),
+                max_ssa_allocation: HoprBalance::new_base(100),
+                max_deposit_tracking_time: default_max_deposit_tracking_time(),
+                gas_xdai_per_sweep: XDaiBalance::zero(),
+                pix_recovery_db_path: None,
+                pix_recovery_password_env: None,
+            },
+            Arc::new(ChainNode(Arc::new(chain_connector))),
+            None,
+        );
+
+        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+
+        // All-ones is above the secp256k1 group order, so `from_secret` rejects it.
+        let event = PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
+            id,
+            secret: hopr_api::node::PixDepositSecret([0xffu8; 32].into()),
+        });
+
+        assert!(
+            strategy.on_pix_event(event).await.is_err(),
+            "an unusable secret should surface as an error"
+        );
+        assert!(
+            !strategy.in_flight_sweeps.contains_key(&id),
+            "the in-flight sweep guard must not survive a keypair-construction failure"
+        );
+
+        Ok(())
+    }
+
     /// PixEvent::PrivateKeyRecovered reads the balance of the recovered keypair's
-    /// raw chain address, then calls `withdraw_from_signer` to sweep the full balance
-    /// to the node's own safe address.
+    /// raw chain address, then funds gas from the safe and calls
+    /// `withdraw_from_signer` to sweep the full balance to the node's own safe.
     ///
     /// Verifies the recovered address ends at 0 wxHOPR and the safe receives the
-    /// full recovered balance (50 wxHOPR). The blokli snapshot records the final state.
+    /// full recovered balance (50 wxHOPR). The recovered address is NOT pre-funded
+    /// with xDai; the gas is sent by the strategy via `fund_sweep_gas`.
     #[test_log::test(tokio::test)]
     async fn test_private_key_recovered_withdraws_to_safe() -> anyhow::Result<()> {
         // Construct a deterministic keypair to simulate a recovered private key.
@@ -825,14 +1152,14 @@ mod tests {
 
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS, &recovered_address],
+                &[&*ALICE, &*BOB, &*CHRIS],
                 false,
-                XDaiBalance::new_base(1),
-                recovered_initial_balance,
+                XDaiBalance::new_base(2), // 2 xDai — 1 for sweep gas + buffer for registration fees
+                HoprBalance::new_base(1000),
             )
-            // with_generated_accounts sets balances for each account's derived safe address,
-            // but the test queries balance of the recovered address directly.
+            // Give the recovered address wxHOPR and enough xDai to cover sweep gas.
             .with_balances([(recovered_address, recovered_initial_balance)])
+            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
@@ -848,18 +1175,14 @@ mod tests {
             price_per_byte,
             max_ssa_allocation,
             max_deposit_tracking_time: std::time::Duration::from_secs(5),
+            // Use the default 0.01 xDai — BOB has 1 xDai from with_generated_accounts.
+            gas_xdai_per_sweep: default_gas_xdai(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         };
 
-        let mut strategy = NonAnonymousPixStrategyInner {
-            cfg,
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+        let mut strategy =
+            NonAnonymousPixStrategyInner::new(cfg, Arc::new(ChainNode(Arc::clone(&chain_connector))), None);
 
         let safe_address = strategy.node.identity().safe_address;
 
@@ -891,7 +1214,9 @@ mod tests {
             "safe should have received the full recovered balance"
         );
 
-        insta::assert_yaml_snapshot!(*snapshot.refresh());
+        insta::assert_yaml_snapshot!(*snapshot.refresh(), {
+            ".chain_info.contract_addresses" => "[contract_addresses]",
+        });
 
         Ok(())
     }
@@ -902,6 +1227,7 @@ mod tests {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
             max_deposit_tracking_time: std::time::Duration::from_secs(60),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         };
@@ -927,17 +1253,16 @@ mod tests {
         chain_connector.connect().await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 
-        let strategy: Box<dyn crate::strategy::Strategy + Send> = NonAnonymousPixStrategy::new(
-            NonAnonymousPixStrategyConfig {
+        let strategy: Box<dyn crate::strategy::Strategy + Send> =
+            NonAnonymousPixStrategy::new(NonAnonymousPixStrategyConfig {
                 price_per_byte: HoprBalance::new_base(1),
                 max_ssa_allocation: HoprBalance::new_base(100),
                 max_deposit_tracking_time: Duration::from_secs(60),
+                gas_xdai_per_sweep: XDaiBalance::zero(),
                 pix_recovery_db_path: None,
                 pix_recovery_password_env: None,
-            },
-            Duration::from_secs(60),
-        )
-        .build(node)?;
+            })
+            .build(node)?;
 
         assert_eq!(strategy.to_string(), "non_anonymous_pix");
         fn assert_send<T: Send>(_: T) {}
@@ -976,18 +1301,13 @@ mod tests {
             price_per_byte,
             max_ssa_allocation,
             max_deposit_tracking_time: Duration::from_secs(5),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         };
 
-        let mut strategy = NonAnonymousPixStrategyInner {
-            cfg,
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+        let mut strategy =
+            NonAnonymousPixStrategyInner::new(cfg, Arc::new(ChainNode(Arc::clone(&chain_connector))), None);
 
         let bob_before = strategy.get_balance(*BOB).await?;
 
@@ -1049,17 +1369,16 @@ mod tests {
         chain_connector.connect().await?;
         let node = Arc::new(ChainNode(Arc::new(chain_connector)));
 
-        let strategy: Box<dyn crate::strategy::Strategy + Send> = NonAnonymousPixStrategy::new(
-            NonAnonymousPixStrategyConfig {
+        let strategy: Box<dyn crate::strategy::Strategy + Send> =
+            NonAnonymousPixStrategy::new(NonAnonymousPixStrategyConfig {
                 price_per_byte: HoprBalance::new_base(1),
                 max_ssa_allocation: HoprBalance::new_base(100),
                 max_deposit_tracking_time: Duration::from_secs(60),
+                gas_xdai_per_sweep: XDaiBalance::zero(),
                 pix_recovery_db_path: Some(db_path.clone()),
                 pix_recovery_password_env: Some(TEST_PASSWORD_ENV.into()),
-            },
-            Duration::from_secs(60),
-        )
-        .build(node)?;
+            })
+            .build(node)?;
 
         assert!(db_path.exists(), "recovery db should be created on build");
         assert_eq!(strategy.to_string(), "non_anonymous_pix");
@@ -1084,12 +1403,13 @@ mod tests {
 
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS, &recovered_address],
+                &[&*ALICE, &*BOB, &*CHRIS],
                 false,
-                XDaiBalance::new_base(1),
-                recovered_initial_balance,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
             )
             .with_balances([(recovered_address, recovered_initial_balance)])
+            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector =
@@ -1103,6 +1423,7 @@ mod tests {
             price_per_byte,
             max_ssa_allocation,
             max_deposit_tracking_time: std::time::Duration::from_secs(5),
+            gas_xdai_per_sweep: default_gas_xdai(),
             pix_recovery_db_path: Some(db_path.clone()),
             pix_recovery_password_env: Some(TEST_PASSWORD_ENV.into()),
         };
@@ -1112,15 +1433,13 @@ mod tests {
             "test-password",
         )?);
 
-        let mut strategy = NonAnonymousPixStrategyInner {
-            cfg: cfg.clone(),
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
+        let mut strategy = NonAnonymousPixStrategyInner::new(
+            cfg.clone(),
+            Arc::new(ChainNode(Arc::clone(&chain_connector))),
             recovery_store,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+        );
 
+        #[allow(clippy::disallowed_names)]
         let event_id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
 
         let event = PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
@@ -1194,20 +1513,18 @@ mod tests {
 
         assert!(store.contains(&entry_id).unwrap(), "entry should exist before replay");
 
-        let strategy = NonAnonymousPixStrategyInner {
-            cfg: NonAnonymousPixStrategyConfig {
+        let strategy = NonAnonymousPixStrategyInner::new(
+            NonAnonymousPixStrategyConfig {
                 price_per_byte,
                 max_ssa_allocation,
                 max_deposit_tracking_time: std::time::Duration::from_secs(5),
+                gas_xdai_per_sweep: XDaiBalance::zero(), // balance is zero — no gas needed
                 pix_recovery_db_path: Some(db_path.clone()),
                 pix_recovery_password_env: Some(TEST_PASSWORD_ENV.into()),
             },
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None, // not needed for the test — we pass store directly
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+            Arc::new(ChainNode(Arc::clone(&chain_connector))),
+            None, // not needed for the test — we pass the store directly
+        );
 
         // No need to call on_tick or register a safe — balance is zero so replay
         // won't attempt a withdrawal.
@@ -1241,12 +1558,13 @@ mod tests {
 
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS, &recovered_address],
+                &[&*ALICE, &*BOB, &*CHRIS],
                 false,
-                XDaiBalance::new_base(1),
-                recovered_balance,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
             )
             .with_balances([(recovered_address, recovered_balance)])
+            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector =
@@ -1266,20 +1584,18 @@ mod tests {
 
         assert!(store.contains(&entry_id).unwrap(), "entry should exist before replay");
 
-        let strategy = NonAnonymousPixStrategyInner {
-            cfg: NonAnonymousPixStrategyConfig {
+        let strategy = NonAnonymousPixStrategyInner::new(
+            NonAnonymousPixStrategyConfig {
                 price_per_byte,
                 max_ssa_allocation,
                 max_deposit_tracking_time: std::time::Duration::from_secs(5),
+                gas_xdai_per_sweep: default_gas_xdai(),
                 pix_recovery_db_path: Some(db_path.clone()),
                 pix_recovery_password_env: Some(TEST_PASSWORD_ENV.into()),
             },
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+            Arc::new(ChainNode(Arc::clone(&chain_connector))),
+            None,
+        );
 
         strategy.replay_pending_recoveries(&store).await;
 
@@ -1342,20 +1658,18 @@ mod tests {
 
         assert!(store.contains(&entry_id).unwrap(), "entry should exist before replay");
 
-        let strategy = NonAnonymousPixStrategyInner {
-            cfg: NonAnonymousPixStrategyConfig {
+        let strategy = NonAnonymousPixStrategyInner::new(
+            NonAnonymousPixStrategyConfig {
                 price_per_byte,
                 max_ssa_allocation,
                 max_deposit_tracking_time: std::time::Duration::from_secs(5),
+                gas_xdai_per_sweep: XDaiBalance::zero(),
                 pix_recovery_db_path: Some(db_path.clone()),
                 pix_recovery_password_env: Some(TEST_PASSWORD_ENV.into()),
             },
-            interval: Duration::from_secs(60),
-            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
-            recovery_store: None,
-            processed_deposits: HashSet::new(),
-            in_flight_addresses: HashSet::new(),
-        };
+            Arc::new(ChainNode(Arc::clone(&chain_connector))),
+            None,
+        );
 
         strategy.replay_pending_recoveries(&store).await;
 
@@ -1364,6 +1678,143 @@ mod tests {
             store.contains(&entry_id).unwrap(),
             "entry should remain in recovery store after balance query failure"
         );
+
+        Ok(())
+    }
+
+    /// PrivateKeyRecovered handler exercises the deficit-calculation path in
+    /// `fund_sweep_gas_impl`: the recovered address has wxHOPR but NO xDai,
+    /// so the strategy must send gas from the safe before sweeping.
+    #[test_log::test(tokio::test)]
+    async fn test_private_key_recovered_without_xdai_funds_gas_from_safe() -> anyhow::Result<()> {
+        let recovered_kp = ChainKeypair::from_secret(&hex!(
+            "e555e08c3c2d47f89df2c6d3e5e7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4dd"
+        ))
+        .expect("recovered keypair should be valid");
+        let recovered_address = recovered_kp.public().to_address();
+
+        let recovered_initial_balance = HoprBalance::new_base(50);
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &recovered_address],
+                false,
+                XDaiBalance::new_base(0), // give each generated account 0 xDai initially
+                HoprBalance::new_base(1000),
+            )
+            // Give BOB enough xDai for registration + sweep gas
+            .with_balances([(*BOB, XDaiBalance::new_base(2))])
+            // Give the recovered address wxHOPR and zero xDai
+            .with_balances([(recovered_address, recovered_initial_balance)])
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let snapshot = blokli_sim.snapshot();
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        register_test_safe(&chain_connector, *BOB).await?;
+        let chain_connector = Arc::new(chain_connector);
+
+        let mut strategy = NonAnonymousPixStrategyInner::new(
+            NonAnonymousPixStrategyConfig {
+                price_per_byte: HoprBalance::new_base(1),
+                max_ssa_allocation: HoprBalance::new_base(100),
+                max_deposit_tracking_time: std::time::Duration::from_secs(5),
+                gas_xdai_per_sweep: default_gas_xdai(), // 0.01 xDai — deficit must be funded from safe
+                pix_recovery_db_path: None,
+                pix_recovery_password_env: None,
+            },
+            Arc::new(ChainNode(Arc::clone(&chain_connector))),
+            None,
+        );
+
+        let safe_address = strategy.node.identity().safe_address;
+
+        let event = PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+            secret: hopr_api::node::PixDepositSecret(recovered_kp.secret().clone()),
+        });
+
+        strategy.on_pix_event(event).await?;
+
+        // Recovered keypair's wxHOPR balance should be zero after withdrawal.
+        let recovered_balance = strategy
+            .get_balance(recovered_address)
+            .await
+            .context("get recovered address balance after withdraw")?;
+        assert_eq!(
+            recovered_balance,
+            HoprBalance::zero(),
+            "recovered keypair's balance should be zero after withdrawal"
+        );
+
+        // Safe should have received the full recovered wxHOPR balance.
+        let safe_balance = strategy
+            .get_balance(safe_address)
+            .await
+            .context("get safe balance after withdraw")?;
+        assert_eq!(
+            safe_balance, recovered_initial_balance,
+            "safe should have received the full recovered balance"
+        );
+
+        insta::assert_yaml_snapshot!(*snapshot.refresh(), {
+            ".chain_info.contract_addresses" => "[contract_addresses]",
+        });
+
+        Ok(())
+    }
+
+    /// Build with only one of pix_recovery_db_path / pix_recovery_password_env must
+    /// silently succeed (config validation passes; the error occurs at build() time).
+    #[test]
+    fn test_build_fails_when_only_one_recovery_config_set() {
+        let cfg = NonAnonymousPixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            max_deposit_tracking_time: std::time::Duration::from_secs(60),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
+            pix_recovery_db_path: Some(std::path::PathBuf::from("/tmp/test.db")),
+            pix_recovery_password_env: None,
+        };
+        assert!(matches!(cfg.validate(), Ok(())), "config validation passes");
+    }
+
+    /// Build with pix_recovery_db_path set but missing password env must fail.
+    #[tokio::test]
+    async fn test_build_fails_when_password_env_var_missing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir().context("tempdir")?;
+        let db_path = dir.path().join("pix_recovery.db");
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client([1; Address::SIZE].into());
+
+        let mut chain_connector =
+            create_trustful_hopr_blokli_connector(&BOB_KP, Default::default(), blokli_sim, [1; Address::SIZE].into())
+                .await?;
+        chain_connector.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(chain_connector)));
+
+        // Use a password env var that doesn't exist.
+        let result = NonAnonymousPixStrategy::new(NonAnonymousPixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            max_deposit_tracking_time: Duration::from_secs(60),
+            gas_xdai_per_sweep: XDaiBalance::zero(),
+            pix_recovery_db_path: Some(db_path),
+            pix_recovery_password_env: Some("HOPRD_NONEXISTENT_VAR".into()),
+        })
+        .build(node);
+
+        assert!(result.is_err(), "build should fail when password env var is missing");
 
         Ok(())
     }
