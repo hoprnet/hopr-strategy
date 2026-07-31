@@ -24,7 +24,6 @@ telemetry     = ["hopr-api/types-telemetry"]
 testing = [
   "dep:async-broadcast",
   "dep:blokli-client",
-  "dep:const-hex",
   "dep:serde_json",
   "dep:tokio",
   "hopr-api/types-with-bindings",
@@ -63,7 +62,6 @@ parking_lot = { workspace = true }
 # Optional deps enabled by the `testing` feature
 async-broadcast = { workspace = true, optional = true }
 blokli-client = { workspace = true, optional = true, features = ["testing"] }
-const-hex = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
   "macros",
