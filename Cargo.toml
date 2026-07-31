@@ -128,4 +128,3 @@ validator           = "0.21.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
-

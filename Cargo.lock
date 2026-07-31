@@ -3235,7 +3235,6 @@ dependencies = [
  "blokli-client",
  "bytesize",
  "chrono",
- "const-hex",
  "dashmap",
  "futures",
  "futures-concurrency",
