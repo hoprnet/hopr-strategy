@@ -173,9 +173,9 @@ pub enum CapacitySizingMode {
     /// ticket_price = 0.01 wxHOPR.
     ///
     /// ```text
-    /// E[D]  = N × h × tp                       = 30.000 wxHOPR
-    /// σ[D]  = tp × √(N × h × (1−p)/p)           ≈ 29.85 wxHOPR
-    /// stake ≈ 30 + 3.09 × 29.85                ≈ 122.2 wxHOPR
+    /// E[D]  = N × h × tp                       = 3,000 wxHOPR
+    /// σ[D]  = tp × √(N × h × (1−p)/p)           ≈ 54.50 wxHOPR
+    /// stake ≈ 3,000 + 3.09 × 54.50             ≈ 3,168 wxHOPR
     /// ```
     ///
     /// At `win_prob = 1.0` the variance term vanishes and the formula collapses
@@ -321,7 +321,7 @@ pub(crate) struct ResolvedFunding {
 ///
 /// ```text
 /// N     = ceil(capacity_bytes / packet_payload_size())
-/// p     = win_prob  (clamped to (0, 1])
+/// p     = win_prob  (clamped to [ε, 1])
 /// h     = hops
 /// tp    = ticket_price
 ///
@@ -344,8 +344,8 @@ pub(crate) struct ResolvedFunding {
 /// tp = 0.01 wxHOPR,  h = 3
 ///
 /// N = 100 000, p = 0.01:  floor = 3 wxHOPR
-///     Deterministic  = max(3, 30)                    = 30 wxHOPR
-///     Probabilistic  = max(3, 30 + 3.09 × 29.85)     ≈ 122 wxHOPR
+///     Deterministic  = max(3, 3,000)                 = 3,000 wxHOPR
+///     Probabilistic  = max(3, 3,000 + 3.09 × 54.50)  ≈ 3,168 wxHOPR
 ///
 /// N = 10, p = 1e-4:  floor = tp·h/p = 300 wxHOPR  (dominates)
 ///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (floor binds)
@@ -364,7 +364,16 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
 
     let payload = C::packet_payload_size() as u64;
     let n = bytes.div_ceil(payload) as f64;
-    let p = win_prob.clamp(f64::MIN_POSITIVE, 1.0_f64);
+    // Clamp win_prob into [f64::EPSILON, 1.0].  Zero, negative, or NaN inputs
+    // would otherwise make the one-ticket floor `tp × h / p` diverge to
+    // `f64::INFINITY` and saturate the stake to `u128::MAX`.  `f64::MIN_POSITIVE`
+    // is too small a lower bound — `tp × h / p` overflows f64 — so `f64::EPSILON`
+    // is used as the effective floor on the win probability.
+    let p = if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    };
     let h = hops as f64;
     let price_f64 = price.amount().low_u128() as f64;
 
@@ -998,6 +1007,20 @@ mod config_tests {
         let floor = floor_wei(PRICE_WEI, 3, p);
         assert!(got > 0, "must not underflow to zero");
         assert_close(got, floor, "p=1e-9");
+    }
+
+    /// Regression: a degenerate win_prob (zero, negative, NaN, -∞) must not blow
+    /// the one-ticket floor `tp·hops/p` up to `f64::INFINITY` and saturate the
+    /// stake to `u128::MAX`.  win_prob is clamped into `[f64::EPSILON, 1.0]`, so
+    /// such inputs resolve to the large-but-finite floor at `p = f64::EPSILON`.
+    #[test]
+    fn degenerate_win_prob_is_clamped_not_saturated() {
+        let floor_at_eps = floor_wei(PRICE_WEI, 3, f64::EPSILON);
+        for p in [0.0_f64, -1.0, f64::NAN, f64::NEG_INFINITY] {
+            let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
+            assert!(got < u128::MAX, "p={p}: must not saturate to u128::MAX");
+            assert_close(got, floor_at_eps, &format!("p={p} clamped to ε"));
+        }
     }
 
     // ── Live-network regression: jura & rotsee (default Deterministic) ───────
