@@ -102,18 +102,15 @@ impl IntegrationFixture {
             .build()
             .context("failed to build initial channel")?;
 
+        // Pass both addresses in a single call since `with_generated_accounts`
+        // assigns key IDs sequentially starting from 0 and cannot be called twice
+        // (the second call would reuse key ID 0 and panic).
         let client = BlokliTestStateBuilder::default()
             .with_generated_accounts(
-                &[&source.address],
+                &[&source.address, &destination.address],
                 true,
                 XDaiBalance::new_base(1u32),
                 opts.source_funding,
-            )
-            .with_generated_accounts(
-                &[&destination.address],
-                true,
-                XDaiBalance::new_base(1u32),
-                opts.destination_funding,
             )
             .with_safe_allowances([(source.address, opts.allowance), (destination.address, opts.allowance)])
             .with_channels([channel])
