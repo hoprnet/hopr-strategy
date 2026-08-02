@@ -3306,7 +3306,6 @@ dependencies = [
  "bytesize",
  "chacha20poly1305",
  "chrono",
- "const-hex",
  "dashmap",
  "futures",
  "futures-concurrency",
@@ -3414,9 +3413,12 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a474fc7b7c21f62689d148928cd178fca6d169cf4a9162a6d2c5f9a6a35d75d6"
 dependencies = [
+ "anyhow",
  "auto_impl",
+ "blokli-client",
  "const-hex",
  "futures",
+ "hopr-api",
  "indexmap 2.14.0",
  "serde_json",
  "tokio",
