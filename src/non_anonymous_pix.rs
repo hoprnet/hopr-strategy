@@ -36,6 +36,61 @@ use validator::Validate;
 
 use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 
+// PIX lifecycle instrumentation.
+//
+// One SSA cycle walks Entry → Exit through all of these: the Entry deposits
+// (`deposits_total`), the Exit observes the deposit and defuses its kill switch
+// (`deposit_tracking_total{outcome="confirmed"}`), collects enough shares to reconstruct
+// the stealth key (`keys_recovered_total`), and sweeps the funds into its Safe
+// (`sweeps_total`). A healthy session keeps all four rising together; a gap between any
+// two localises the stall to one stage.
+//
+// Amounts are deliberately not accumulated into counters: `SimpleCounter` is
+// integer-valued and a per-SSA deposit is a fractional wxHOPR quantity. The recovered
+// total is anyway readable on-chain from the Safe balance, so only the most recent sweep
+// is exposed, as a gauge.
+#[cfg(all(feature = "telemetry", not(test)))]
+lazy_static::lazy_static! {
+    static ref METRIC_PIX_DEPOSITS: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_deposits_total",
+            "Count of SSA deposits successfully sent by the Entry",
+        ).unwrap();
+    static ref METRIC_PIX_DEPOSITS_REJECTED: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_deposits_rejected_total",
+            "Count of SSA deposits refused because they exceed max_ssa_allocation",
+        ).unwrap();
+    static ref METRIC_PIX_DEPOSITS_FAILED: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_deposits_failed_total",
+            "Count of SSA deposits that failed after exhausting retries",
+        ).unwrap();
+    /// `confirmed` means the Exit saw the deposit in time and the session survives;
+    /// `timeout` means its PIX kill switch is about to fire.
+    static ref METRIC_PIX_DEPOSIT_TRACKING: hopr_api::types::telemetry::MultiCounter =
+        hopr_api::types::telemetry::MultiCounter::new(
+            "hopr_strategy_pix_deposit_tracking_total",
+            "Outcomes of the Exit waiting for an SSA deposit to land",
+            &["outcome"],
+        ).unwrap();
+    static ref METRIC_PIX_KEYS_RECOVERED: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_keys_recovered_total",
+            "Count of SSA stealth address private keys reconstructed by the Exit",
+        ).unwrap();
+    static ref METRIC_PIX_SWEEPS: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_sweeps_total",
+            "Count of recovered SSA deposits swept into the Exit's Safe",
+        ).unwrap();
+    static ref METRIC_PIX_LAST_SWEEP: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_pix_last_sweep_hopr",
+            "wxHOPR moved by the most recent SSA sweep, in base units",
+        ).unwrap();
+}
+
 /// Default amount of xDai to send to a recovered stealth address for gas
 /// (0.01 xDai, i.e. 10^16 wei).
 fn default_gas_xdai() -> XDaiBalance {
@@ -255,6 +310,8 @@ where
                 let target_deposit = self.cfg.price_per_byte * new_deposit_address.quota;
                 if target_deposit > self.cfg.max_ssa_allocation {
                     tracing::warn!(%target_deposit, max_deposit = %self.cfg.max_ssa_allocation, "target deposit too high");
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_PIX_DEPOSITS_REJECTED.increment();
                     return Err(StrategyError::CriteriaNotSatisfied);
                 }
 
@@ -293,6 +350,8 @@ where
                 if let Err(error) = withdrawn {
                     self.in_flight_destinations.invalidate(&dest_addr);
                     tracing::error!(%error, %target_deposit, ?new_deposit_address, "withdraw failed after max retries");
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_PIX_DEPOSITS_FAILED.increment();
                     return Err(error);
                 }
 
@@ -301,6 +360,8 @@ where
                 self.processed_deposits.insert(new_deposit_address.id, ());
                 self.in_flight_destinations.invalidate(&dest_addr);
                 tracing::info!(%target_deposit, ?new_deposit_address, "deposit successful");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_DEPOSITS.increment();
             }
             PixEvent::DepositAddressReceived(deposit_address_recv) => {
                 tracing::info!(?deposit_address_recv, "deposit address received");
@@ -399,15 +460,28 @@ where
                         }
                     }
                     .timeout(futures_time::time::Duration::from(max_tracking_time))
-                    .inspect(|res| match res {
-                        Ok(Ok(_)) => tracing::info!("deposit tracking completed"),
-                        Ok(Err(error)) => tracing::error!(%error, "deposit tracking failed:"),
-                        Err(_) => tracing::error!("deposit tracking timed out"),
+                    .inspect(|res| {
+                        #[cfg(all(feature = "telemetry", not(test)))]
+                        METRIC_PIX_DEPOSIT_TRACKING.increment_by(
+                            &[match res {
+                                Ok(Ok(_)) => "confirmed",
+                                Ok(Err(_)) => "failed",
+                                Err(_) => "timeout",
+                            }],
+                            1,
+                        );
+                        match res {
+                            Ok(Ok(_)) => tracing::info!("deposit tracking completed"),
+                            Ok(Err(error)) => tracing::error!(%error, "deposit tracking failed:"),
+                            Err(_) => tracing::error!("deposit tracking timed out"),
+                        }
                     }),
                 );
             }
             PixEvent::PrivateKeyRecovered(private_key_recovered) => {
                 tracing::info!(?private_key_recovered, "private key recovered");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_KEYS_RECOVERED.increment();
 
                 // Exit-side persistence: write to redb before withdrawing so the key
                 // survives crashes and can be replayed on restart.
@@ -591,6 +665,15 @@ async fn sweep_recovered<N: HasChainApi + ?Sized>(
     }
 
     tracing::info!(%balance, %recovered_address, "deposit withdrawn");
+    #[cfg(all(feature = "telemetry", not(test)))]
+    {
+        METRIC_PIX_SWEEPS.increment();
+        // `amount_in_base_units` is the only lossless wxHOPR rendering; a wei-valued
+        // integer counter would overflow after a few SSAs.
+        if let Ok(hopr) = balance.amount_in_base_units().parse::<f64>() {
+            METRIC_PIX_LAST_SWEEP.set(hopr);
+        }
+    }
     Ok(())
 }
 
