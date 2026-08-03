@@ -3296,11 +3296,12 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
  "async-trait",
+ "auto_impl",
  "backon",
  "blokli-client",
  "bytesize",

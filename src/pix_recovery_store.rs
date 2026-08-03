@@ -69,13 +69,13 @@ use std::{num::NonZeroU32, path::Path, sync::Arc};
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use hopr_api::{
     node::{PixAddressId, PixDepositSecret},
-    types::{crypto_random::random_bytes, internal::prelude::HoprPseudonym},
+    types::{crypto_random::random_bytes, internal::prelude::HoprPseudonym, primitive::traits::BytesRepresentable},
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use scrypt::{Params as ScryptParams, scrypt};
 
 // Key = pseudonym (10 bytes) + ssa_index (4 bytes)
-const KEY_SIZE: usize = 10 + 4;
+const KEY_SIZE: usize = HoprPseudonym::SIZE + 4;
 
 // Value = nonce (12 bytes) + ciphertext (32 + 16 tag)
 const NONCE_SIZE: usize = 12;
@@ -156,17 +156,19 @@ fn decode_key(bytes: &[u8; KEY_SIZE]) -> Result<PixAddressId, PixRecoveryStoreEr
     let pseudonym = HoprPseudonym::from(
         <[u8; 10]>::try_from(&bytes[..10]).map_err(|_| PixRecoveryStoreError::CorruptKey("pseudonym slice".into()))?,
     );
+
     let ssa_index_bytes: [u8; 4] =
         <[u8; 4]>::try_from(&bytes[10..14]).map_err(|_| PixRecoveryStoreError::CorruptKey("ssa index slice".into()))?;
     let ssa_index = NonZeroU32::new(u32::from_be_bytes(ssa_index_bytes))
         .ok_or_else(|| PixRecoveryStoreError::CorruptKey("zero ssa index".into()))?;
+
     Ok((pseudonym, ssa_index))
 }
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
-    #[allow(deprecated)]
-    scrypt(password.as_bytes(), salt, &ScryptParams::recommended(), &mut key)
+
+    scrypt(password.as_bytes(), salt, &ScryptParams::RECOMMENDED, &mut key)
         .expect("scrypt with 32-byte output must succeed");
     key
 }
@@ -177,9 +179,11 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], Pix
     let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let nonce_bytes = random_bytes::<NONCE_SIZE>();
     let nonce = Nonce::from(nonce_bytes);
+
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_ref())
         .map_err(|_| PixRecoveryStoreError::Encryption)?;
+
     // ChaCha20Poly1305 output = plaintext_len + 16-byte tag = 48 bytes
     let mut out = [0u8; VALUE_SIZE];
     out[..NONCE_SIZE].copy_from_slice(&nonce_bytes);
@@ -193,10 +197,12 @@ fn decrypt(key: &[u8; 32], stored: &[u8; VALUE_SIZE]) -> Result<[u8; 32], PixRec
         .try_into()
         .map_err(|_| PixRecoveryStoreError::Decryption)?;
     let nonce = Nonce::from(nonce_arr);
+
     let ciphertext = &stored[NONCE_SIZE..];
     let plaintext = cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|_| PixRecoveryStoreError::Decryption)?;
+
     Ok(plaintext
         .as_slice()
         .try_into()
@@ -244,6 +250,7 @@ impl PixRecoveryStore {
         let key = encode_key(id);
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(PIX_RECOVERED_KEYS)?;
+
         Ok(table.get(key)?.is_some())
     }
 
@@ -264,6 +271,7 @@ impl PixRecoveryStore {
             table.insert(key, stored)?.is_none()
         };
         write_tx.commit()?;
+
         Ok(was_inserted)
     }
 

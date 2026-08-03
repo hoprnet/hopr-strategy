@@ -14,7 +14,14 @@
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="f0e0df96-0d76-489e-96b7-f35d78f04da0" name="Changes" comment="" />
+    <list default="true" id="f0e0df96-0d76-489e-96b7-f35d78f04da0" name="Changes" comment="chore: add idea files">
+      <change afterPath="$PROJECT_DIR$/src/pix/mod.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.lock" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.lock" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/pix_recovery_store.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/pix_recovery_store.rs" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -23,6 +30,14 @@
   <component name="EmbeddingIndexingInfo">
     <option name="cachedIndexableFilesCount" value="66" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
+  </component>
+  <component name="ExecutionTargetManager" SELECTED_TARGET="RsBuildProfile:dev" />
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Rust File" />
+      </list>
+    </option>
   </component>
   <component name="Git.Settings">
     <option name="RECENT_BRANCH_BY_REPOSITORY">
@@ -39,11 +54,73 @@
     <commands />
     <urls />
   </component>
+  <component name="NextEditCompletionFeaturesState">
+    <decayedCancelled>
+      <entry key="MS100" value="1.076144377265878" />
+      <entry key="MS500" value="4.145713937220561" />
+      <entry key="S2" value="15.120965995201281" />
+      <entry key="S5" value="26.669277057413346" />
+      <entry key="S10" value="35.8469325499728" />
+      <entry key="S30" value="62.921367565140116" />
+      <entry key="S60" value="104.26444688632145" />
+      <entry key="M2" value="157.67542573864796" />
+      <entry key="M5" value="272.1320200974515" />
+      <entry key="M10" value="477.7240024007085" />
+      <entry key="M15" value="653.5998665405211" />
+      <entry key="M30" value="969.1416989982146" />
+      <entry key="H1" value="1216.3610803985855" />
+      <entry key="H2" value="1372.576190752495" />
+      <entry key="H4" value="1460.58887787648" />
+      <entry key="D1" value="1539.5568363547704" />
+      <entry key="W1" value="1553.6373449847304" />
+    </decayedCancelled>
+    <decayedSelected>
+      <entry key="MS100" value="0.0" />
+      <entry key="MS500" value="4.620502076264523E-245" />
+      <entry key="S2" value="1.3707947117635608E-61" />
+      <entry key="S5" value="6.843751664435252E-25" />
+      <entry key="S10" value="1.2021659494691243E-12" />
+      <entry key="S30" value="2.405619313596392E-4" />
+      <entry key="S60" value="0.040475405562930944" />
+      <entry key="M2" value="0.7117844344223263" />
+      <entry key="M5" value="5.941495480777134" />
+      <entry key="M10" value="15.236205678156661" />
+      <entry key="M15" value="22.264528271938428" />
+      <entry key="M30" value="34.21574720797286" />
+      <entry key="H1" value="43.397324710809634" />
+      <entry key="H2" value="49.187325958957395" />
+      <entry key="H4" value="52.45337459073878" />
+      <entry key="D1" value="55.38824485270968" />
+      <entry key="W1" value="55.912084659635156" />
+    </decayedSelected>
+    <decayedShown>
+      <entry key="MS100" value="0.8850585704480822" />
+      <entry key="MS500" value="3.964666998708556" />
+      <entry key="S2" value="14.95230285473412" />
+      <entry key="S5" value="26.55391460452864" />
+      <entry key="S10" value="35.76943148460634" />
+      <entry key="S30" value="62.86992241531129" />
+      <entry key="S60" value="104.26099145841467" />
+      <entry key="M2" value="158.34809029476222" />
+      <entry key="M5" value="278.0055665610036" />
+      <entry key="M10" value="492.86588259357677" />
+      <entry key="M15" value="675.7691058471231" />
+      <entry key="M30" value="1003.2821266903082" />
+      <entry key="H1" value="1259.71024057125" />
+      <entry key="H2" value="1421.7361600473257" />
+      <entry key="H4" value="1513.0276572053153" />
+      <entry key="D1" value="1594.942512005341" />
+      <entry key="W1" value="1609.5490591402981" />
+    </decayedShown>
+  </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 5,
   &quot;fromUser&quot;: false
 }</component>
   <component name="ProjectId" id="3HHBFYOIOADx70hK9tPYBGW4LGY" />
+  <component name="ProjectLevelVcsManager">
+    <OptionsSetting value="false" id="Update" />
+  </component>
   <component name="ProjectViewState">
     <option name="autoscrollFromSource" value="true" />
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -74,6 +151,26 @@
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
+  <component name="RunManager">
+    <configuration name="Build" type="CargoCommandRunConfiguration" factoryName="Cargo Command" nameIsGenerated="true">
+      <option name="buildProfileId" value="dev" />
+      <option name="command" value="build --all-features" />
+      <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+      <envs />
+      <option name="emulateTerminal" value="true" />
+      <option name="channel" value="DEFAULT" />
+      <option name="requiredFeatures" value="true" />
+      <option name="allFeatures" value="false" />
+      <option name="withSudo" value="false" />
+      <option name="buildTarget" value="REMOTE" />
+      <option name="backtrace" value="SHORT" />
+      <option name="isRedirectInput" value="false" />
+      <option name="redirectInputPath" value="" />
+      <method v="2">
+        <option name="CARGO.BUILD_TASK_PROVIDER" enabled="true" />
+      </method>
+    </configuration>
+  </component>
   <component name="RustProjectSettings">
     <option name="toolchainHomeDirectory" value="$USER_HOME$/.cargo/bin" />
   </component>
@@ -85,11 +182,24 @@
       <option name="presentableId" value="Default" />
       <updated>1785515011201</updated>
       <workItem from="1785515012596" duration="2605000" />
-      <workItem from="1785744816711" duration="603000" />
+      <workItem from="1785744816711" duration="3619000" />
     </task>
+    <task id="LOCAL-00001" summary="chore: add idea files">
+      <option name="closed" value="true" />
+      <created>1785746792086</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1785746792086</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="chore: add idea files" />
+    <option name="LAST_COMMIT_MESSAGE" value="chore: add idea files" />
   </component>
 </project>
