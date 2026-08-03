@@ -30,11 +30,17 @@ testing = [
   "hopr-utils/testing-blokli",
 ]
 ## Strategy features — each enables one strategy implementation.
-strategy-auto-funding      = []
-strategy-auto-redeeming    = []
+strategy-auto-funding = []
+strategy-auto-redeeming = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
-strategy-pix               = ["dep:auto_impl", "dep:backon", "dep:chacha20poly1305", "dep:redb", "dep:scrypt"]
+strategy-pix = [
+  "dep:auto_impl",
+  "dep:backon",
+  "dep:chacha20poly1305",
+  "dep:redb",
+  "dep:scrypt",
+]
 
 [dependencies]
 anyhow              = { workspace = true }
