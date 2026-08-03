@@ -135,42 +135,20 @@ impl PixStrategy {
     }
 
     /// Build with the default [`NonAnonymousDepositPool`].
-    pub fn build<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
+    pub fn build_non_anonymous<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
     {
-        let pool = Arc::new(NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
+        let pool = NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone());
         let safe_address = node.identity().safe_address;
-        let recovery_store = open_recovery_store(
-            self.cfg.pix_recovery_db_path.as_ref(),
-            self.cfg.pix_recovery_password_env.as_ref(),
-        )?;
 
-        Ok(Box::new(PixStrategyInner {
-            pool,
-            node,
-            cfg: self.cfg,
-            safe_address,
-            recovery_store,
-            processed_deposits: Cache::builder()
-                .max_capacity(PROCESSED_DEPOSITS_CAPACITY)
-                .time_to_live(PROCESSED_DEPOSITS_TTL)
-                .build(),
-            in_flight_sweeps: Cache::builder()
-                .max_capacity(IN_FLIGHT_GUARD_CAPACITY)
-                .time_to_live(IN_FLIGHT_GUARD_TTL)
-                .build(),
-            in_flight_destinations: Cache::builder()
-                .max_capacity(IN_FLIGHT_GUARD_CAPACITY)
-                .time_to_live(IN_FLIGHT_GUARD_TTL)
-                .build(),
-        }))
+        self.build_with_pool(pool, node, safe_address)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
     pub fn build_with_pool<D, N>(
         self,
-        pool: Arc<D>,
+        pool: D,
         node: Arc<N>,
         safe_address: Address,
     ) -> Result<Box<dyn StrategyTrait + Send>>
@@ -232,7 +210,7 @@ fn open_recovery_store(
 
 /// The generic PIX strategy runner.
 struct PixStrategyInner<D: DepositPool, N> {
-    pool: Arc<D>,
+    pool: D,
     node: Arc<N>,
     cfg: PixStrategyConfig,
     safe_address: Address,
@@ -245,7 +223,7 @@ struct PixStrategyInner<D: DepositPool, N> {
 #[cfg(test)]
 impl<D: DepositPool, N> PixStrategyInner<D, N> {
     fn new(
-        pool: Arc<D>,
+        pool: D,
         node: Arc<N>,
         cfg: PixStrategyConfig,
         safe_address: Address,
@@ -890,7 +868,7 @@ mod tests {
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
         })
-        .build(Arc::new(ChainNode(Arc::new(cc))))?;
+        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))))?;
         assert_eq!(s.to_string(), "pix");
         fn assert_send<T: Send>(_: &T) {}
         assert_send(&s);
@@ -965,7 +943,7 @@ mod tests {
             pix_recovery_db_path: Some(db.clone()),
             pix_recovery_password_env: Some(TEST_PASSWORD_ENV.to_string()),
         })
-        .build(Arc::new(ChainNode(Arc::new(cc))))?;
+        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))))?;
         assert!(db.exists());
         // SAFETY: single-threaded test, cleanup.
         unsafe { std::env::remove_var(TEST_PASSWORD_ENV) };
@@ -1045,7 +1023,7 @@ mod tests {
             pix_recovery_db_path: Some("/tmp/nonexistent/pix.redb".into()),
             pix_recovery_password_env: None,
         })
-        .build(Arc::new(ChainNode(Arc::new(cc))));
+        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))));
         assert!(matches!(r, Err(StrategyError::CriteriaNotSatisfied)));
         Ok(())
     }
@@ -1072,7 +1050,7 @@ mod tests {
             pix_recovery_db_path: Some("/tmp/nonexistent/pix.redb".into()),
             pix_recovery_password_env: Some(ev.to_string()),
         })
-        .build(Arc::new(ChainNode(Arc::new(cc))));
+        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))));
         assert!(r.is_err());
         Ok(())
     }
