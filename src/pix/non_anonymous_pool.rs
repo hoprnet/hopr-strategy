@@ -18,12 +18,12 @@ use backon::Retryable;
 use futures::{StreamExt, TryFutureExt, future::BoxFuture};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations},
+    chain::{ChainValues, ChainWriteAccountOperations, DepositPool},
     node::{HasChainApi, PixDepositAddress, PixDepositSecret},
     types::{crypto::prelude::Keypair, primitive::prelude::*},
 };
 
-use crate::{errors::StrategyError, pix::DepositPool};
+use crate::errors::StrategyError;
 
 // ---------------------------------------------------------------------------
 // Config

@@ -21,6 +21,7 @@ use std::{
 
 use futures::{SinkExt, StreamExt};
 use hopr_api::{
+    chain::DepositPool,
     node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixEvent},
     types::primitive::prelude::*,
 };
@@ -30,7 +31,7 @@ use validator::Validate;
 
 use crate::{
     errors::{Result, StrategyError},
-    pix::{DepositPool, non_anonymous_pool::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
+    pix::{non_anonymous_pool::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
     strategy::Strategy as StrategyTrait,
 };
 
