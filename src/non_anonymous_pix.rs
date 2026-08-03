@@ -972,7 +972,7 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             // Pre-set the deposit address balance to the target so the first poll succeeds.
-            .with_token_balances([(deposit_addr, target_deposit)])
+            .with_balances([(deposit_addr, target_deposit)])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
@@ -1041,7 +1041,7 @@ mod tests {
             )
             // with_generated_accounts sets balances for each account's derived safe address,
             // but the test queries balance of BOB's raw chain address directly.
-            .with_token_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
@@ -1233,8 +1233,8 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             // Give the recovered address wxHOPR and enough xDai to cover sweep gas.
-            .with_token_balances([(recovered_address, recovered_initial_balance)])
-            .with_native_balances([(recovered_address, XDaiBalance::new_base(1))])
+            .with_balances([(recovered_address, recovered_initial_balance)])
+            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
@@ -1359,7 +1359,7 @@ mod tests {
                 XDaiBalance::new_base(1),
                 HoprBalance::new_base(1000),
             )
-            .with_token_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
@@ -1475,8 +1475,8 @@ mod tests {
                 XDaiBalance::new_base(2),
                 HoprBalance::new_base(1000),
             )
-            .with_token_balances([(recovered_address, recovered_initial_balance)])
-            .with_native_balances([(recovered_address, XDaiBalance::new_base(1))])
+            .with_balances([(recovered_address, recovered_initial_balance)])
+            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
@@ -1559,7 +1559,7 @@ mod tests {
                 XDaiBalance::new_base(1),
                 HoprBalance::zero(),
             )
-            .with_token_balances([(recovered_address, HoprBalance::zero())])
+            .with_balances([(recovered_address, HoprBalance::zero())])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
@@ -1626,8 +1626,8 @@ mod tests {
                 XDaiBalance::new_base(2),
                 HoprBalance::new_base(1000),
             )
-            .with_token_balances([(recovered_address, recovered_balance)])
-            .with_native_balances([(recovered_address, XDaiBalance::new_base(1))])
+            .with_balances([(recovered_address, recovered_balance)])
+            .with_balances([(recovered_address, XDaiBalance::new_base(1))])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let mut chain_connector = TestChainConnector::new(blokli_sim, *BOB, BOB_KP.clone(), [1; Address::SIZE].into());
@@ -1762,9 +1762,9 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             // Give BOB enough xDai for registration + sweep gas
-            .with_native_balances([(*BOB, XDaiBalance::new_base(2))])
+            .with_balances([(*BOB, XDaiBalance::new_base(2))])
             // Give the recovered address wxHOPR and zero xDai
-            .with_token_balances([(recovered_address, recovered_initial_balance)])
+            .with_balances([(recovered_address, recovered_initial_balance)])
             .build_dynamic_client([1; Address::SIZE].into());
 
         let snapshot = blokli_sim.snapshot();
