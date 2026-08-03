@@ -1,3 +1,6 @@
+pub mod non_anonymous;
+pub mod strategy;
+
 use futures::{StreamExt, stream::FuturesUnordered, future::BoxFuture};
 use hopr_api::{Address, HoprBalance, node::{PixDepositAddress, PixDepositSecret}};
 
@@ -25,7 +28,9 @@ pub trait DepositPool {
     async fn deposit_funds_to(&self, dst: PixDepositAddress, amount: HoprBalance) -> Result<Self::Receipt, Self::Error>;
 
     /// Returns a future that resolves once `min_amount` has been deposited to the `dst` [`PixDepositAddress`].
-    fn notify_deposit(&self, dst: PixDepositAddress, min_amount: HoprBalance) -> Result<BoxFuture<'_, (PixDepositAddress, HoprBalance)>, Self::Error>;
+    ///
+    /// The returned future is `'static` so it can be spawned independently of the borrow on `&self`.
+    fn notify_deposit(&self, dst: PixDepositAddress, min_amount: HoprBalance) -> Result<BoxFuture<'static, (PixDepositAddress, HoprBalance)>, Self::Error>;
 
     /// Performs withdrawal of a previously made deposit using its [`PixDepositSecret`] to the
     /// `dst` Ethereum address.

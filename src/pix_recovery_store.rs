@@ -61,8 +61,8 @@
 //! is still non-zero is reprocessed, providing crash recovery.
 //!
 //! The store is only opened in the Exit role (when
-//! [`NonAnonymousPixStrategyConfig::pix_recovery_db_path`] and
-//! [`NonAnonymousPixStrategyConfig::pix_recovery_password_env`] are both set).
+//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] and
+//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env`] are both set).
 
 use std::{num::NonZeroU32, path::Path, sync::Arc};
 
