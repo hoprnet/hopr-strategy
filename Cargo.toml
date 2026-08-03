@@ -24,10 +24,10 @@ telemetry     = ["hopr-api/types-telemetry"]
 testing = [
   "dep:async-broadcast",
   "dep:blokli-client",
-  "dep:const-hex",
   "dep:serde_json",
   "dep:tokio",
   "hopr-api/types-with-bindings",
+  "hopr-utils/testing-blokli",
 ]
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
@@ -64,7 +64,6 @@ parking_lot = { workspace = true }
 # Optional deps enabled by the `testing` feature
 async-broadcast = { workspace = true, optional = true }
 blokli-client = { workspace = true, optional = true, features = ["testing"] }
-const-hex = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
   "macros",
@@ -114,7 +113,6 @@ blokli-client       = "0.30.2"
 bytesize            = { version = "2.4.2", features = ["serde"] }
 chacha20poly1305    = "0.10.1"
 chrono              = { version = "0.4.45", default-features = false }
-const-hex           = "1.19.1"
 dashmap             = "6.2.1"
 futures             = "0.3.33"
 futures-concurrency = "7.7.1"
@@ -146,7 +144,4 @@ tracing             = "0.1.44"
 validator           = "0.21.0"
 
 [package.metadata.cargo-machete]
-ignored = ["humantime-serde"]
-
-[package.metadata.cargo-shear]
 ignored = ["humantime-serde"]
