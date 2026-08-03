@@ -41,8 +41,8 @@ pub trait DepositPool {
     async fn withdraw_multiple_deposits(&self, keys: &[PixDepositSecret], dst: Address) -> Result<Vec<Result<Self::Receipt, Self::Error>>, Self::Error>
     where Self: Clone + Send + Sync
     {
-        let futures = keys.to_vec()
-            .into_iter()
+        let futures = keys.iter()
+            .cloned()
             .map(|key| {
                 let this = self.clone();
                 async move {
