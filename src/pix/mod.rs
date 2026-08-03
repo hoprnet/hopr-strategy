@@ -1,4 +1,4 @@
-pub mod non_anonymous;
+pub mod non_anonymous_pool;
 pub mod recovery_store;
 pub mod strategy;
 
@@ -19,6 +19,9 @@ use hopr_api::{
 ///
 /// The operations MUST fail if used with `PixDepositAddress`/`PixDepositSecret` which are internally
 /// not compatible with the underlying pool's deposit address representation.
+///
+/// The implementations should take care of all the retry/reliabililty of the operations, so the
+/// caller can assume that the operations will do best effort to succeed.
 // TODO: this going to be moved to hopr-api eventually
 #[async_trait::async_trait]
 #[auto_impl::auto_impl(&, Box, Arc)]

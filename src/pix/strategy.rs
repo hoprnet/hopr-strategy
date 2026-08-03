@@ -30,7 +30,7 @@ use validator::Validate;
 
 use crate::{
     errors::{Result, StrategyError},
-    pix::{DepositPool, non_anonymous::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
+    pix::{DepositPool, non_anonymous_pool::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
     strategy::Strategy as StrategyTrait,
 };
 
@@ -101,7 +101,7 @@ pub struct PixStrategyConfig {
     pub max_ssa_allocation: HoprBalance,
     /// Configuration for the default non-anonymous deposit pool.
     #[serde(default)]
-    pub pool: crate::pix::non_anonymous::NonAnonymousDepositPoolConfig,
+    pub pool: crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig,
     /// If set, recovered private keys are persisted to redb at this path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_db_path: Option<std::path::PathBuf>,
@@ -541,7 +541,7 @@ mod tests {
     use super::{PixStrategy, PixStrategyConfig, PixStrategyInner};
     use crate::{
         errors::StrategyError,
-        pix::{non_anonymous::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
+        pix::{non_anonymous_pool::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
         testing::{BlokliTestStateBuilder, TestChainConnector},
     };
 
@@ -632,8 +632,8 @@ mod tests {
         Ok(())
     }
 
-    fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::non_anonymous::NonAnonymousDepositPoolConfig {
-        crate::pix::non_anonymous::NonAnonymousDepositPoolConfig {
+    fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
+        crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
             max_deposit_tracking_time: t,
             gas_xdai_per_sweep: g,
         }
