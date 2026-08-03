@@ -1,4 +1,5 @@
 pub mod non_anonymous;
+pub mod recovery_store;
 pub mod strategy;
 
 use futures::{StreamExt, stream::FuturesUnordered, future::BoxFuture};

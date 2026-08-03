@@ -33,7 +33,7 @@ use validator::Validate;
 use crate::{
     errors::{Result, StrategyError},
     pix::{DepositPool, non_anonymous::NonAnonymousDepositPool},
-    pix_recovery_store::PixRecoveryStore,
+    pix::recovery_store::PixRecoveryStore,
     strategy::Strategy as StrategyTrait,
 };
 
@@ -552,7 +552,7 @@ mod tests {
     use crate::errors::StrategyError;
     use crate::pix::DepositPool;
     use crate::pix::non_anonymous::NonAnonymousDepositPool;
-    use crate::pix_recovery_store::PixRecoveryStore;
+    use crate::pix::recovery_store::PixRecoveryStore;
     use crate::testing::{BlokliTestStateBuilder, TestChainConnector};
     use hopr_api::node::ActionableEventSource;
 

@@ -52,8 +52,6 @@ pub mod channel_finalizer;
 #[cfg(feature = "strategy-channel-lifecycle")]
 pub mod channel_lifecycle;
 pub mod errors;
-#[cfg(feature = "strategy-pix")]
-pub mod pix_recovery_store;
 pub mod strategy;
 
 /// Test-support node adapters, shared with the integration-test crate.
