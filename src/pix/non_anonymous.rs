@@ -15,15 +15,12 @@ use std::{
 };
 
 use backon::Retryable;
-use futures::{FutureExt, StreamExt, TryFutureExt, future::BoxFuture};
+use futures::{StreamExt, TryFutureExt, future::BoxFuture};
 use hopr_api::{
     ChainKeypair,
     chain::{ChainValues, ChainWriteAccountOperations},
     node::{HasChainApi, PixDepositAddress, PixDepositSecret},
-    types::{
-        crypto::prelude::Keypair,
-        primitive::prelude::*,
-    },
+    types::{crypto::prelude::Keypair, primitive::prelude::*},
 };
 
 use crate::{errors::StrategyError, pix::DepositPool};
@@ -245,10 +242,7 @@ where
                 Ok(())
             }
         })
-        .retry(
-            backon::ExponentialBuilder::default()
-                .with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES),
-        )
+        .retry(backon::ExponentialBuilder::default().with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES))
         .sleep(backon::FuturesTimerSleeper)
         .notify(|error, dur| {
             tracing::warn!(%error, ?dur, ?dest_addr, "deposit withdrawal failed, retrying in");
@@ -264,9 +258,7 @@ where
     ) -> Result<BoxFuture<'static, (PixDepositAddress, HoprBalance)>, Self::Error> {
         let deposit_addr: Address = dst.try_into()?;
 
-        let Some(tracker_slot) =
-            DepositTrackerSlot::try_acquire(&self.active_deposit_trackers)
-        else {
+        let Some(tracker_slot) = DepositTrackerSlot::try_acquire(&self.active_deposit_trackers) else {
             return Err(StrategyError::CriteriaNotSatisfied);
         };
 
@@ -280,19 +272,12 @@ where
 
             let poll_interval = (max_tracking / 10).max(Duration::from_secs(1));
 
-            let phase_jitter = Duration::from_millis(
-                hopr_api::types::crypto_random::random_integer(
-                    0,
-                    Some(poll_interval.as_millis() as u64),
-                ),
-            );
+            let phase_jitter = Duration::from_millis(hopr_api::types::crypto_random::random_integer(
+                0,
+                Some(poll_interval.as_millis() as u64),
+            ));
 
-            let immediate = node
-                .chain_api()
-                .balance(address)
-                .await
-                .ok()
-                .filter(|b| *b >= target);
+            let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
                 return (dst, balance);
@@ -317,10 +302,7 @@ where
                 })
                 .boxed();
 
-            let balance = stream
-                .next()
-                .await
-                .expect("interval stream never terminates");
+            let balance = stream.next().await.expect("interval stream never terminates");
 
             (dst, balance)
         }))
@@ -336,8 +318,7 @@ where
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        let chain_key =
-            ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
+        let chain_key = ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
         let node = Arc::clone(&self.node);
         let cfg = self.cfg.clone();
 
@@ -350,10 +331,7 @@ where
                 Ok(())
             }
         })
-        .retry(
-            backon::ExponentialBuilder::default()
-                .with_max_times(MAX_SWEEP_RETRIES),
-        )
+        .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
         .sleep(backon::FuturesTimerSleeper)
         .notify(|error, dur| {
             tracing::warn!(%error, ?dur, "sweep failed, retrying in");
