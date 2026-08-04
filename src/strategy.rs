@@ -9,7 +9,8 @@
 //! the others.
 use std::fmt::{Debug, Display, Formatter};
 
-use async_trait::async_trait;
+use futures::StreamExt as _;
+use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
 
 use crate::errors::Result;
 
@@ -21,7 +22,7 @@ use crate::errors::Result;
 ///
 /// Any type implementing this trait can be composed into a [`MultiStrategy`] without
 /// any changes to this crate.
-#[async_trait]
+#[async_trait::async_trait]
 pub trait Strategy: Display + Send {
     /// Run the strategy. Returns only on cancellation or fatal error.
     async fn run(&mut self) -> Result<()>;
@@ -64,14 +65,9 @@ impl Display for MultiStrategy {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl Strategy for MultiStrategy {
     async fn run(&mut self) -> Result<()> {
-        #[cfg(feature = "runtime-tokio")]
-        use futures::StreamExt as _;
-        #[cfg(feature = "runtime-tokio")]
-        use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
-
         let strategies = std::mem::take(&mut self.strategies);
 
         if strategies.is_empty() {
@@ -83,47 +79,45 @@ impl Strategy for MultiStrategy {
         // Spawn each sub-strategy as an abortable task.
         // Keeping all AbortHandles in a RAII guard ensures every sub-task is cancelled
         // when MultiStrategy is dropped (graceful shutdown).
-        #[cfg(feature = "runtime-tokio")]
-        {
-            let mut join_handles = Vec::new();
-            let mut abort_handles: Vec<AbortHandle> = Vec::new();
-            for mut s in strategies {
-                let proc = hopr_utils::runtime::diagnostics::instrument(
-                    async move { s.run().await },
-                    "multi_strategy_sub_task",
-                    module_path!(),
-                    file!(),
-                    line!(),
-                );
-                let (proc, abort_handle) = abortable(proc);
-                join_handles.push(spawn(proc));
-                abort_handles.push(abort_handle);
-            }
 
-            struct AbortGuard(Vec<AbortHandle>);
-            impl Drop for AbortGuard {
-                fn drop(&mut self) {
-                    for h in &self.0 {
-                        h.abort();
-                    }
+        let mut join_handles = Vec::new();
+        let mut abort_handles: Vec<AbortHandle> = Vec::new();
+        for mut s in strategies {
+            let proc = hopr_utils::runtime::diagnostics::instrument(
+                async move { s.run().await },
+                "multi_strategy_sub_task",
+                module_path!(),
+                file!(),
+                line!(),
+            );
+            let (proc, abort_handle) = abortable(proc);
+            join_handles.push(spawn(proc));
+            abort_handles.push(abort_handle);
+        }
+
+        struct AbortGuard(Vec<AbortHandle>);
+        impl Drop for AbortGuard {
+            fn drop(&mut self) {
+                for h in &self.0 {
+                    h.abort();
                 }
             }
-            let _guard = AbortGuard(abort_handles);
+        }
+        let _guard = AbortGuard(abort_handles);
 
-            // Process completions as they arrive. Sub-strategies are fully isolated:
-            // a failure in one is logged but does not affect the others.
-            let mut pending: futures::stream::FuturesUnordered<_> = join_handles.into_iter().collect();
+        // Process completions as they arrive. Sub-strategies are fully isolated:
+        // a failure in one is logged but does not affect the others.
+        let mut pending: futures::stream::FuturesUnordered<_> = join_handles.into_iter().collect();
 
-            while let Some(join_result) = pending.next().await {
-                let strategy_result = match join_result {
-                    Err(e) => Err(crate::errors::StrategyError::Other(e.into())),
-                    Ok(Ok(result)) => result,
-                    Ok(Err(_aborted)) => continue, // aborted by the guard — expected during shutdown
-                };
+        while let Some(join_result) = pending.next().await {
+            let strategy_result = match join_result {
+                Err(e) => Err(crate::errors::StrategyError::Other(e.into())),
+                Ok(Ok(result)) => result,
+                Ok(Err(_aborted)) => continue, // aborted by the guard — expected during shutdown
+            };
 
-                if let Err(e) = strategy_result {
-                    tracing::warn!(%e, "sub-strategy failed");
-                }
+            if let Err(e) = strategy_result {
+                tracing::warn!(%e, "sub-strategy failed");
             }
         }
 
@@ -147,7 +141,7 @@ mod tests {
             write!(f, "ok")
         }
     }
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Strategy for OkStrategy {
         async fn run(&mut self) -> Result<()> {
             Ok(())
@@ -160,7 +154,7 @@ mod tests {
             write!(f, "fail")
         }
     }
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Strategy for FailStrategy {
         async fn run(&mut self) -> Result<()> {
             Err(StrategyError::Other(anyhow::anyhow!("error")))
@@ -176,7 +170,7 @@ mod tests {
             write!(f, "external")
         }
     }
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Strategy for ExternalStrategy {
         async fn run(&mut self) -> Result<()> {
             self.ran = true;
