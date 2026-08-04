@@ -88,15 +88,17 @@ pub struct EligibilityConfig {
 /// face_value = ticket_price × hops / win_prob
 /// ```
 ///
-/// i.e. the sender must lock `ticket_price / win_prob` **per hop** — a large,
-/// indivisible amount that is redeemed with probability `win_prob`.  Modelling
-/// each of the `N × h` per-hop tickets as an independent Bernoulli(`win_prob`)
-/// draw, the total channel drain `D` for `N` packets is a scaled Binomial:
+/// i.e. per packet the sender issues **one** aggregated multi-hop ticket of face
+/// value `ticket_price × hops / win_prob` against this channel (not `h`
+/// independent tickets) — a large, indivisible amount redeemed with probability
+/// `win_prob`.  The winning tickets over `N` packets are therefore a single
+/// `Binomial(N, win_prob)`, and the total channel drain `D` is that count scaled
+/// by one face value:
 ///
 /// ```text
-/// D    = (ticket_price / win_prob) × Binomial(N × h, win_prob)
-/// E[D] = N × h × ticket_price                                  (win-prob independent)
-/// σ[D] = ticket_price × √(N × h × (1 − win_prob) / win_prob)
+/// D    = (ticket_price × hops / win_prob) × Binomial(N, win_prob)
+/// E[D] = N × hops × ticket_price                              (win-prob independent)
+/// σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)
 /// ```
 ///
 /// Note `E[D]` does **not** depend on `win_prob`: lower win-prob means rarer but
@@ -159,7 +161,7 @@ pub enum CapacitySizingMode {
     /// `stake = max( ticket_price × hops / win_prob ,  E[D] + k·σ[D] )`
     /// where `k = Φ⁻¹(success_probability)`,
     /// `E[D] = N × hops × ticket_price` and
-    /// `σ[D] = ticket_price × √(N × hops × (1 − win_prob) / win_prob)`.
+    /// `σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)`.
     ///
     /// Adds `k` standard deviations on top of the mean drain so the channel
     /// carries its full configured capacity between top-ups with probability
@@ -174,8 +176,8 @@ pub enum CapacitySizingMode {
     ///
     /// ```text
     /// E[D]  = N × h × tp                       = 3,000 wxHOPR
-    /// σ[D]  = tp × √(N × h × (1−p)/p)           ≈ 54.50 wxHOPR
-    /// stake ≈ 3,000 + 3.09 × 54.50             ≈ 3,168 wxHOPR
+    /// σ[D]  = h × tp × √(N × (1−p)/p)           ≈ 94.39 wxHOPR
+    /// stake ≈ 3,000 + 3.09 × 94.39             ≈ 3,292 wxHOPR
     /// ```
     ///
     /// At `win_prob = 1.0` the variance term vanishes and the formula collapses
@@ -327,7 +329,7 @@ pub(crate) struct ResolvedFunding {
 ///
 /// floor = tp × h / p                         one full-path winning ticket
 /// E[D]  = N × h × tp                          mean drain (win-prob independent)
-/// σ[D]  = tp × √(N × h × (1 − p) / p)         Binomial std-dev, scaled by tp/p per win
+/// σ[D]  = tp × h × √(N × (1 − p) / p)         (tp·h/p) × Binomial(N, p) std-dev
 ///
 /// Deterministic:    stake = max(floor, E[D])
 /// Probabilistic(α): stake = max(floor, E[D] + k·σ[D])   k = Φ⁻¹(α)
@@ -345,7 +347,7 @@ pub(crate) struct ResolvedFunding {
 ///
 /// N = 100 000, p = 0.01:  floor = 3 wxHOPR
 ///     Deterministic  = max(3, 3,000)                 = 3,000 wxHOPR
-///     Probabilistic  = max(3, 3,000 + 3.09 × 54.50)  ≈ 3,168 wxHOPR
+///     Probabilistic  = max(3, 3,000 + 3.09 × 94.39)  ≈ 3,292 wxHOPR
 ///
 /// N = 10, p = 1e-4:  floor = tp·h/p = 300 wxHOPR  (dominates)
 ///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (floor binds)
@@ -387,9 +389,11 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
             use statrs::distribution::{ContinuousCDF, Normal};
             let alpha = success_probability.clamp(0.5001, 0.99999);
             let k = Normal::standard().inverse_cdf(alpha);
-            // σ[D] = tp × √(N·h·(1−p)/p): each winning ticket drains tp/p, so the
-            // Binomial variance N·h·p·(1−p) is scaled by (tp/p)².
-            let sigma = price_f64 * (n * h * (1.0 - p) / p).sqrt();
+            // σ[D] = tp·h × √(N·(1−p)/p).  Each packet issues ONE aggregated
+            // multi-hop ticket of face value tp·h/p (not h independent tickets),
+            // so the number of winning tickets is Binomial(N, p) and the drain is
+            // (tp·h/p)·Binomial(N, p).  Var = (tp·h/p)²·N·p(1−p) ⇒ σ = tp·h·√(N(1−p)/p).
+            let sigma = price_f64 * h * (n * (1.0 - p) / p).sqrt();
             mean_drain + k * sigma
         }
     };
@@ -398,8 +402,11 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
     // full-path ticket of face value tp × h / p, or it cannot relay at all.
     let floor = price_f64 * h / p;
 
+    // Round up: the one-ticket floor is a strict safety guarantee (the on-chain
+    // face value is integer wei), so a downward-truncating cast could yield a
+    // stake one wei below face value and still trip `OutOfFunds`.
     let stake_f64 = target.max(floor).max(0.0);
-    HoprBalance::from(U256::from(stake_f64 as u128))
+    HoprBalance::from(U256::from(stake_f64.ceil() as u128))
 }
 
 impl FundingConfig {
@@ -909,7 +916,7 @@ mod config_tests {
     }
 
     /// Above the floor, Probabilistic matches mean + k·σ with the corrected σ
-    /// (`σ = tp·√(N·h·(1−p)/p)`), verified against an independent computation.
+    /// (`σ = tp·h·√(N·(1−p)/p)`), verified against an independent computation.
     #[rstest]
     #[case(0.5, 0.999)]
     #[case(0.1, 0.999)]
@@ -919,7 +926,7 @@ mod config_tests {
         let n = 10_000_000u128; // large N so the buffer keeps us above the floor
         let cap = ByteSize::b(PAYLOAD * n as u64);
         let mean = mean_wei(n, 3, PRICE_WEI) as f64;
-        let sigma = PRICE_WEI as f64 * (n as f64 * 3.0 * (1.0 - p) / p).sqrt();
+        let sigma = PRICE_WEI as f64 * 3.0 * (n as f64 * (1.0 - p) / p).sqrt();
         let want = (mean + z_score(alpha) * sigma) as u128;
         let got = stake_wei(cap, PRICE_WEI, p, 3, &prob(alpha));
         assert_close(got, want, &format!("p={p} alpha={alpha}"));
@@ -936,6 +943,27 @@ mod config_tests {
         let s_lo = stake_wei(cap, PRICE_WEI, 0.1, 3, &prob(lo));
         let s_hi = stake_wei(cap, PRICE_WEI, 0.1, 3, &prob(hi));
         assert!(s_hi > s_lo, "alpha {hi} must exceed {lo}: {s_hi} vs {s_lo}");
+    }
+
+    /// Regression: the variance buffer scales **linearly** with hops.  Each
+    /// packet issues one aggregated ticket of face value `tp·h/p`, so both the
+    /// mean drain and `σ = tp·h·√(N·(1−p)/p)` scale with `h` — the buffer at
+    /// `h = 3` must be ≈ 3× the buffer at `h = 1`.  The prior `σ = tp·√(N·h·…)`
+    /// scaled the buffer by only `√3 ≈ 1.73` and would fail this assertion.
+    #[test]
+    fn probabilistic_buffer_scales_linearly_with_hops() {
+        let n = 10_000_000u128;
+        let cap = ByteSize::b(PAYLOAD * n as u64);
+        let p = 0.01;
+        let buffer = |h: u32| {
+            let mean = mean_wei(n, h, PRICE_WEI);
+            stake_wei(cap, PRICE_WEI, p, h, &prob(0.999)).saturating_sub(mean) as f64
+        };
+        let ratio = buffer(3) / buffer(1);
+        assert!(
+            (ratio - 3.0).abs() < 0.02,
+            "buffer(3)/buffer(1) = {ratio:.4}, expected ≈ 3.0 (√h would give ≈ 1.73)"
+        );
     }
 
     /// The variance buffer grows as win_prob falls (rarer, larger payouts).

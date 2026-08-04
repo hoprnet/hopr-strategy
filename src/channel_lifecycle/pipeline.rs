@@ -2150,8 +2150,9 @@ mod tests {
         use super::super::config::capacity_to_balance;
 
         // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0, assumed_hops = 3.
-        // Deterministic sizing (win_prob ignored):
-        //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic) = 1 × 1 × 3 = 3 wxHOPR.
+        // Deterministic sizing (win_prob still sets the one-ticket floor):
+        //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic)
+        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR.
         let expected_topup = {
             use super::super::config::CapacitySizingMode;
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
