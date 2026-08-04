@@ -7,15 +7,22 @@ use std::{
 use anyhow::Result;
 use hopr_api::types::{
     crypto::prelude::{ChainKeypair, Keypair},
-    primitive::prelude::Address,
+    primitive::prelude::{Address, BytesRepresentable},
 };
 use rstest::fixture;
 
+mod pix;
 mod scenario;
 
+pub use pix::{PixScenario, PixScenarioOpts, deposit_secret, pix_address_id};
 pub use scenario::{
     ChannelParty, ChannelScenario, ScenarioOpts, assert_channel_never, await_channel, await_channel_where,
 };
+
+/// Address of the Safe module every scenario deploys its node against.
+pub(crate) fn module_address() -> Address {
+    Address::new(&[1u8; Address::SIZE])
+}
 
 /// Simple test account with a deterministic keypair.
 pub struct TestAccount {

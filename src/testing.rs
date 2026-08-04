@@ -32,7 +32,7 @@ use hopr_api::{
     node::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus, ComponentStatusReporter,
         EventWaitResult, HasChainApi, HasGraphView, HasNetworkView, HasTicketManagement, NodeOnchainIdentity,
-        PacketTransport, TicketEvent,
+        PacketTransport, PixEvent, TicketEvent,
     },
     tickets::{ChannelStats, RedemptionResult, TicketManagement},
     types::{
@@ -606,6 +606,103 @@ where
             Some(injected) => Ok(futures::stream::select(chain, injected).boxed()),
             None => Ok(chain.boxed()),
         }
+    }
+}
+
+/// Chain-only node with a caller-supplied on-chain identity and an injectable
+/// PIX event stream, as required by the PIX strategy.
+///
+/// Unlike the other adapters, the [`NodeOnchainIdentity`] is held per instance
+/// rather than served from a `static` cell. The PIX strategy captures
+/// `identity().safe_address` at build time as the sweep destination, so a shared
+/// identity would make every test in a binary sweep into the first test's safe.
+pub struct PixNode<C> {
+    chain: C,
+    identity: NodeOnchainIdentity,
+    /// Sender for events injected via [`PixNode::inject_pix`].
+    injected_tx: futures::channel::mpsc::UnboundedSender<ActionableEvent>,
+    /// Receiver, taken on the first `subscribe_to_actionable_events` call and
+    /// merged into the actionable-event stream.
+    injected_rx: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<ActionableEvent>>>,
+}
+
+impl<C> PixNode<C> {
+    pub fn new(chain: C, identity: NodeOnchainIdentity) -> Self {
+        let (injected_tx, injected_rx) = futures::channel::mpsc::unbounded();
+        Self {
+            chain,
+            identity,
+            injected_tx,
+            injected_rx: Mutex::new(Some(injected_rx)),
+        }
+    }
+
+    /// Emits a PIX actionable event, mirroring what the real node's event source
+    /// produces. The unbounded channel buffers it, so injecting before the
+    /// strategy has subscribed is safe.
+    pub fn inject_pix(&self, event: PixEvent) {
+        let _ = self.injected_tx.unbounded_send(ActionableEvent::Pix(event));
+    }
+}
+
+impl<C> HasChainApi for PixNode<C>
+where
+    C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
+{
+    type ChainApi = C;
+    type ChainError = <C as HoprChainApi>::ChainError;
+
+    fn identity(&self) -> &NodeOnchainIdentity {
+        &self.identity
+    }
+
+    fn chain_api(&self) -> &C {
+        &self.chain
+    }
+
+    fn status(&self) -> ComponentStatus {
+        self.chain.component_status()
+    }
+
+    fn wait_for_on_chain_event<F>(
+        &self,
+        _predicate: F,
+        _context: String,
+        _timeout: Duration,
+    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
+    where
+        F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
+    {
+        unimplemented!("tests do not call wait_for_on_chain_event")
+    }
+}
+
+impl<C> ActionableEventSource for PixNode<C>
+where
+    C: ChainEvents + Send + Sync + 'static,
+{
+    fn subscribe_to_actionable_events(
+        &self,
+        _filter: Option<&[ActionableEventDiscriminant]>,
+    ) -> Result<BoxStream<'static, ActionableEvent>, String> {
+        let chain = self
+            .chain
+            .subscribe()
+            .map_err(|error| error.to_string())?
+            .map(ActionableEvent::Chain);
+        // Merge in injected PIX events on the first subscription. Chain events stay
+        // in the stream deliberately: the real event source is unfiltered too, and
+        // the strategy discards non-PIX variants itself.
+        match self.injected_rx.lock().expect("injected event lock poisoned").take() {
+            Some(injected) => Ok(futures::stream::select(chain, injected).boxed()),
+            None => Ok(chain.boxed()),
+        }
+    }
+}
+
+impl<C: PacketTransport> PacketTransport for PixNode<C> {
+    fn packet_payload_size() -> usize {
+        C::packet_payload_size()
     }
 }
 
