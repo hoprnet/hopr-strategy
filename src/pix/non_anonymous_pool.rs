@@ -17,8 +17,8 @@ use std::{
 use futures::{StreamExt, TryFutureExt, future::BoxFuture};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations, DepositPool},
-    node::{HasChainApi, PixDepositAddress, PixDepositSecret},
+    chain::{ChainValues, ChainWriteAccountOperations, DepositPool, PixDepositAddress, PixDepositSecret},
+    node::HasChainApi,
     types::{crypto::prelude::Keypair, primitive::prelude::*},
 };
 

@@ -68,7 +68,8 @@ use std::{num::NonZeroU32, path::Path, sync::Arc};
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use hopr_api::{
-    node::{PixAddressId, PixDepositSecret},
+    chain::PixDepositSecret,
+    node::PixAddressId,
     types::{crypto_random::random_bytes, internal::prelude::HoprPseudonym, primitive::traits::BytesRepresentable},
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};

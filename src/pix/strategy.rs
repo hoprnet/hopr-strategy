@@ -821,7 +821,7 @@ mod tests {
         assert!(
             s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
                 id,
-                secret: hopr_api::node::PixDepositSecret(
+                secret: hopr_api::chain::PixDepositSecret(
                     hex!("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").into()
                 ),
             }))
@@ -869,7 +869,7 @@ mod tests {
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
             id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
-            secret: hopr_api::node::PixDepositSecret(rk.into()),
+            secret: hopr_api::chain::PixDepositSecret(rk.into()),
         }))
         .await?;
         assert!(hopr_balance(&*cc, ra).await?.is_zero());
@@ -1032,10 +1032,10 @@ mod tests {
         s.recovery_store
             .as_ref()
             .unwrap()
-            .insert(&id, &hopr_api::node::PixDepositSecret(rk.into()))?;
+            .insert(&id, &hopr_api::chain::PixDepositSecret(rk.into()))?;
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
             id,
-            secret: hopr_api::node::PixDepositSecret(rk.into()),
+            secret: hopr_api::chain::PixDepositSecret(rk.into()),
         }))
         .await?;
         assert!(!s.recovery_store.as_ref().unwrap().contains(&id)?);
