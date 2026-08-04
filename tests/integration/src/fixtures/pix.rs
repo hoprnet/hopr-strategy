@@ -10,8 +10,8 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use hopr_api::{
-    chain::{AccountSelector, ChainReadAccountOperations, ChainValues},
-    node::{NodeOnchainIdentity, PixAddressId, PixDepositSecret, PixEvent},
+    chain::{AccountSelector, ChainReadAccountOperations, ChainValues, PixDepositSecret},
+    node::{NodeOnchainIdentity, PixAddressId, PixEvent},
     types::{
         internal::prelude::HoprPseudonym,
         primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},

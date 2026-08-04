@@ -3276,7 +3276,6 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "async-trait",
- "auto_impl",
  "backon",
  "blokli-client",
  "bytesize",
