@@ -13,6 +13,7 @@ use std::{
     },
     time::Duration,
 };
+
 use futures::{StreamExt, TryFutureExt, future::BoxFuture};
 use hopr_api::{
     ChainKeypair,
@@ -296,8 +297,7 @@ where
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        let chain_key =
-            ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
+        let chain_key = ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
 
         sweep_single(Arc::clone(&self.node), &self.cfg, &chain_key, dst).await?;
         Ok(())

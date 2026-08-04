@@ -294,17 +294,12 @@ where
 
                 let pool = &self.pool;
                 let pix_addr = new_deposit_address.address;
-                let result = (move || {
-                    async move {
-                        pool.deposit_funds_to(pix_addr, target_deposit)
-                            .await
-                            .map_err(Into::into)
-                    }
+                let result = (move || async move {
+                    pool.deposit_funds_to(pix_addr, target_deposit)
+                        .await
+                        .map_err(Into::into)
                 })
-                .retry(
-                    backon::ExponentialBuilder::default()
-                        .with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES),
-                )
+                .retry(backon::ExponentialBuilder::default().with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES))
                 .sleep(backon::FuturesTimerSleeper)
                 .notify(|error, dur| {
                     tracing::warn!(%error, ?dur, "deposit withdrawal failed, retrying in");
@@ -397,10 +392,7 @@ where
                             .map_err(Into::into)
                     }
                 })
-                .retry(
-                    backon::ExponentialBuilder::default()
-                        .with_max_times(MAX_SWEEP_RETRIES),
-                )
+                .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
                 .sleep(backon::FuturesTimerSleeper)
                 .notify(|error, dur| {
                     tracing::warn!(%error, ?dur, "sweep failed, retrying in");
@@ -463,10 +455,7 @@ where
                         .map_err(Into::into)
                 }
             })
-            .retry(
-                backon::ExponentialBuilder::default()
-                    .with_max_times(MAX_SWEEP_RETRIES),
-            )
+            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
             .sleep(backon::FuturesTimerSleeper)
             .notify(|error, dur| {
                 tracing::warn!(%error, ?dur, "recovery replay sweep failed, retrying in");
