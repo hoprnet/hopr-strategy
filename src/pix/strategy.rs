@@ -19,6 +19,7 @@ use std::{
     time::Duration,
 };
 
+use backon::Retryable;
 use futures::{SinkExt, StreamExt};
 use hopr_api::{
     chain::DepositPool,
@@ -119,6 +120,12 @@ const PROCESSED_DEPOSITS_CAPACITY: u64 = 8192;
 const PROCESSED_DEPOSITS_TTL: Duration = Duration::from_secs(24 * 3600);
 const IN_FLIGHT_GUARD_CAPACITY: u64 = 1024;
 const IN_FLIGHT_GUARD_TTL: Duration = Duration::from_secs(600);
+
+/// Retry budget for the Entry-side deposit withdrawal.
+const MAX_DEPOSIT_WITHDRAW_RETRIES: usize = 3;
+
+/// Retry budget for the Exit-side sweep of a deposit address.
+const MAX_SWEEP_RETRIES: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -285,11 +292,24 @@ where
                 }
                 self.in_flight_destinations.insert(dest_addr, ());
 
-                let result = self
-                    .pool
-                    .deposit_funds_to(new_deposit_address.address, target_deposit)
-                    .await
-                    .map_err(Into::into);
+                let pool = &self.pool;
+                let pix_addr = new_deposit_address.address;
+                let result = (move || {
+                    async move {
+                        pool.deposit_funds_to(pix_addr, target_deposit)
+                            .await
+                            .map_err(Into::into)
+                    }
+                })
+                .retry(
+                    backon::ExponentialBuilder::default()
+                        .with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES),
+                )
+                .sleep(backon::FuturesTimerSleeper)
+                .notify(|error, dur| {
+                    tracing::warn!(%error, ?dur, "deposit withdrawal failed, retrying in");
+                })
+                .await;
 
                 if let Err(error) = result {
                     self.in_flight_destinations.invalidate(&dest_addr);
@@ -332,7 +352,7 @@ where
                     .await;
 
                     match result {
-                        Ok((_, balance)) => {
+                        Ok((_addr, balance)) => {
                             if let Some(mut notifier) = deposit_updated {
                                 let _ = notifier.send((pix_id, balance)).await;
                             }
@@ -366,12 +386,28 @@ where
                 }
                 self.in_flight_sweeps.insert(private_key_recovered.id, ());
 
-                match self
-                    .pool
-                    .withdraw_deposit(&private_key_recovered.secret, self.safe_address, None)
-                    .await
-                    .map_err(Into::into)
-                {
+                let pool = &self.pool;
+                let safe_address = self.safe_address;
+                let secret = private_key_recovered.secret;
+                let sweep_result = (move || {
+                    let local_secret = secret.clone();
+                    async move {
+                        pool.withdraw_deposit(&local_secret, safe_address, None)
+                            .await
+                            .map_err(Into::into)
+                    }
+                })
+                .retry(
+                    backon::ExponentialBuilder::default()
+                        .with_max_times(MAX_SWEEP_RETRIES),
+                )
+                .sleep(backon::FuturesTimerSleeper)
+                .notify(|error, dur| {
+                    tracing::warn!(%error, ?dur, "sweep failed, retrying in");
+                })
+                .await;
+
+                match sweep_result {
                     Ok(_) => {
                         self.in_flight_sweeps.invalidate(&private_key_recovered.id);
                         if let Some(ref store) = self.recovery_store {
@@ -416,12 +452,28 @@ where
             }
             self.in_flight_sweeps.insert(id, ());
 
-            match self
-                .pool
-                .withdraw_deposit(&secret, self.safe_address, None)
-                .await
-                .map_err(Into::into)
-            {
+            let pool = &self.pool;
+            let safe_address = self.safe_address;
+            let local_secret = secret;
+            let sweep_result = (move || {
+                let secret = local_secret.clone();
+                async move {
+                    pool.withdraw_deposit(&secret, safe_address, None)
+                        .await
+                        .map_err(Into::into)
+                }
+            })
+            .retry(
+                backon::ExponentialBuilder::default()
+                    .with_max_times(MAX_SWEEP_RETRIES),
+            )
+            .sleep(backon::FuturesTimerSleeper)
+            .notify(|error, dur| {
+                tracing::warn!(%error, ?dur, "recovery replay sweep failed, retrying in");
+            })
+            .await;
+
+            match sweep_result {
                 Ok(_) => {
                     self.in_flight_sweeps.invalidate(&id);
                     if let Err(error) = store.remove(&id) {

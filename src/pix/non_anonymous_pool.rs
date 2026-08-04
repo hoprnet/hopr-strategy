@@ -13,8 +13,6 @@ use std::{
     },
     time::Duration,
 };
-
-use backon::Retryable;
 use futures::{StreamExt, TryFutureExt, future::BoxFuture};
 use hopr_api::{
     ChainKeypair,
@@ -63,14 +61,6 @@ impl Default for NonAnonymousDepositPoolConfig {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Retry budget for the Entry-side deposit withdrawal.  Deliberately small: the
-/// Exit gives up on the deposit after `max_deposit_wait` (60 s by default), so
-/// a long backoff would outlive the session it is trying to save.
-const MAX_DEPOSIT_WITHDRAW_RETRIES: usize = 3;
-
-/// Retry budget for the Exit-side sweep of a deposit address.
-const MAX_SWEEP_RETRIES: usize = 5;
 
 /// Upper bound on concurrent deposit-tracking polling tasks, and hence on the
 /// RPC polling rate this pool generates.
@@ -231,23 +221,14 @@ where
     ) -> Result<Self::Receipt, Self::Error> {
         let dest_addr: Address = dst.try_into()?;
 
-        (|| {
-            let node = Arc::clone(&self.node);
-            async move {
-                node.chain_api()
-                    .withdraw(amount, &dest_addr)
-                    .and_then(identity)
-                    .await
-                    .map_err(StrategyError::other)?;
-                Ok(())
-            }
-        })
-        .retry(backon::ExponentialBuilder::default().with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES))
-        .sleep(backon::FuturesTimerSleeper)
-        .notify(|error, dur| {
-            tracing::warn!(%error, ?dur, ?dest_addr, "deposit withdrawal failed, retrying in");
-        })
-        .await
+        self.node
+            .chain_api()
+            .withdraw(amount, &dest_addr)
+            .and_then(identity)
+            .await
+            .map_err(StrategyError::other)?;
+
+        Ok(())
     }
 
     /// Returns a future that resolves once `min_amount` has been deposited to `dst`.
@@ -309,33 +290,16 @@ where
     }
 
     /// Withdraw a deposit (or sweep the recovered address).
-    ///
-    /// Retries the full sweep (balance check, gas funding, transfer) with
-    /// exponential backoff, up to [`MAX_SWEEP_RETRIES`] attempts.
     async fn withdraw_deposit(
         &self,
         key: &PixDepositSecret,
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        let chain_key = ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
-        let node = Arc::clone(&self.node);
-        let cfg = self.cfg.clone();
+        let chain_key =
+            ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
 
-        (|| {
-            let node = Arc::clone(&node);
-            let chain_key = chain_key.clone();
-            let cfg = cfg.clone();
-            async move {
-                sweep_single(node, &cfg, &chain_key, dst).await?;
-                Ok(())
-            }
-        })
-        .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
-        .sleep(backon::FuturesTimerSleeper)
-        .notify(|error, dur| {
-            tracing::warn!(%error, ?dur, "sweep failed, retrying in");
-        })
-        .await
+        sweep_single(Arc::clone(&self.node), &self.cfg, &chain_key, dst).await?;
+        Ok(())
     }
 }
