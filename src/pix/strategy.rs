@@ -102,6 +102,11 @@ pub struct PixStrategyConfig {
     #[serde(default)]
     pub pool: NonAnonymousDepositPoolConfig,
     /// If set, recovered private keys are persisted to redb at this path.
+    ///
+    /// Strongly recommended in production. A `PrivateKeyRecovered` event can arrive before
+    /// its deposit has been confirmed on-chain, in which case the sweep is retried and then
+    /// abandoned. Without a recovery store there is nothing to replay on the next start, and
+    /// the recovered key — the only means of moving those funds — is lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_db_path: Option<std::path::PathBuf>,
     /// Environment variable for the recovery store encryption password.
@@ -563,7 +568,11 @@ where
         }
     }
 
-    /// Replay recovery entries whose on-chain balance is still non-zero.
+    /// Re-attempt the sweep for every persisted recovery entry.
+    ///
+    /// Entries are swept sequentially. An entry whose deposit address is still empty fails
+    /// with [`StrategyError::CriteriaNotSatisfied`] and is deliberately left in the store, so
+    /// a deposit that lands later is picked up by a subsequent start rather than lost.
     async fn replay_pending_recoveries(&self, store: &PixRecoveryStore) {
         let entries = match store.iter() {
             Ok(entries) => entries,
@@ -1271,6 +1280,104 @@ mod tests {
         assert!(hopr_balance(&*cc, ra).await?.is_zero());
         // SAFETY: single-threaded test, cleanup.
         unsafe { std::env::remove_var(TEST_PASSWORD_ENV) };
+        Ok(())
+    }
+
+    /// The pool must refuse to sweep an address that holds nothing instead of reporting a
+    /// zero-value success, so the caller cannot mistake "the deposit has not landed" for
+    /// "the deposit has been withdrawn".
+    #[test_log::test(tokio::test)]
+    async fn test_sweep_of_empty_deposit_address_is_rejected() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            // The deposit address exists on-chain but is still empty.
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(cc)));
+        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+
+        let result = pool
+            .withdraw_deposit(&hopr_api::chain::PixDepositSecret(rk.into()), *BOB, None)
+            .await;
+
+        assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)));
+        Ok(())
+    }
+
+    /// Regression: a `PrivateKeyRecovered` that arrives before its deposit has landed must
+    /// leave the persisted key in place. Dropping it would strand the deposit permanently —
+    /// the recovered key is the only means of ever moving those funds.
+    ///
+    /// Exhausts the sweep retry budget, so this test spends ~31s in backoff.
+    #[test_log::test(tokio::test)]
+    async fn test_recovery_entry_survives_sweep_of_empty_deposit_address() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = PixRecoveryStore::open(dir.path().join("pix.redb"), "test_password")?;
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            // The deposit address exists on-chain but is still empty.
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        register_test_safe(&connector, *BOB).await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = Arc::new(NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            pool: pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            // Flush immediately: this test asserts on the outcome of the sweep itself.
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+        };
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, Some(store));
+        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+
+        // `flush_withdrawals` logs the failure rather than propagating it, so the event
+        // itself reports success — what matters is that the key was not discarded.
+        s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
+            id,
+            secret: hopr_api::chain::PixDepositSecret(rk.into()),
+        }))
+        .await?;
+
+        assert!(
+            s.recovery_store.as_ref().unwrap().contains(&id)?,
+            "the recovered key must stay persisted so a later start can retry the sweep"
+        );
+        assert!(
+            !s.in_flight_sweeps.contains_key(&id),
+            "the in-flight guard must be released after the sweep is abandoned"
+        );
         Ok(())
     }
 

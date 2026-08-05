@@ -164,6 +164,11 @@ async fn fund_sweep_gas(
 
 /// Sweep the full balance from a recovered stealth address into the destination.
 /// Called inside a retry closure (takes `Arc` to avoid borrow issues).
+///
+/// An empty address is reported as [`StrategyError::CriteriaNotSatisfied`], **not** as a
+/// zero-value success. A recovered key whose deposit has not landed yet must stay
+/// pending: reporting success would let the caller drop the key (and with it the only
+/// means of ever moving those funds) while the deposit is still in flight.
 async fn sweep_single(
     node: Arc<impl HasChainApi>,
     cfg: &NonAnonymousDepositPoolConfig,
@@ -179,7 +184,11 @@ async fn sweep_single(
         .map_err(StrategyError::other)?;
 
     if balance.is_zero() {
-        return Ok(HoprBalance::zero());
+        tracing::warn!(
+            %recovered_address,
+            "nothing to sweep: deposit address is empty, the deposit may not have landed yet"
+        );
+        return Err(StrategyError::CriteriaNotSatisfied);
     }
 
     fund_sweep_gas(&*node, cfg.gas_xdai_per_sweep, recovered_address).await?;
@@ -283,6 +292,9 @@ where
     }
 
     /// Withdraw a deposit (or sweep the recovered address).
+    ///
+    /// Fails with [`StrategyError::CriteriaNotSatisfied`] when the address holds nothing,
+    /// so that a key recovered before its deposit landed is retried rather than discarded.
     async fn withdraw_deposit(
         &self,
         key: &PixDepositSecret,
