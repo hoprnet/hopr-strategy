@@ -221,7 +221,12 @@ fn open_recovery_store(
                 .map_err(StrategyError::other)
         }
         (None, None) => Ok(None),
-        _ => Err(StrategyError::CriteriaNotSatisfied),
+        (Some(_), None) => Err(StrategyError::Other(anyhow::anyhow!(
+            "pix_recovery_password_env must be set when pix_recovery_db_path is set"
+        ))),
+        (None, Some(_)) => Err(StrategyError::Other(anyhow::anyhow!(
+            "pix_recovery_db_path must be set when pix_recovery_password_env is set"
+        ))),
     }
 }
 
@@ -338,11 +343,8 @@ where
 
                 let notify_fut = match self.pool.notify_deposit(deposit_address_recv.address, target_deposit) {
                     Ok(fut) => fut,
-                    Err(_) => {
-                        tracing::error!(
-                            ?pix_id,
-                            "too many concurrent deposit trackers, not tracking this deposit"
-                        );
+                    Err(error) => {
+                        tracing::error!(%error, ?pix_id, "cannot track this deposit");
                         return Err(StrategyError::CriteriaNotSatisfied);
                     }
                 };
@@ -375,8 +377,6 @@ where
             }
             PixEvent::PrivateKeyRecovered(private_key_recovered) => {
                 tracing::info!(?private_key_recovered, "private key recovered");
-                #[cfg(all(feature = "telemetry", not(test)))]
-                METRIC_PIX_KEYS_RECOVERED.increment();
 
                 if let Some(ref store) = self.recovery_store
                     && let Err(error) = store.insert(&private_key_recovered.id, &private_key_recovered.secret)
@@ -390,6 +390,11 @@ where
                     return Ok(());
                 }
                 self.in_flight_sweeps.insert(private_key_recovered.id, ());
+
+                // Counted past the duplicate guard so a repeated event for the same SSA does
+                // not inflate the total.
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_KEYS_RECOVERED.increment();
 
                 self.withdrawal_buffer
                     .push((private_key_recovered.id, private_key_recovered.secret));
@@ -511,8 +516,10 @@ where
             match result {
                 Ok(_) => {
                     self.in_flight_sweeps.invalidate(&id);
-                    if let Some(ref store) = self.recovery_store {
-                        let _ = store.remove(&id);
+                    if let Some(ref store) = self.recovery_store
+                        && let Err(error) = store.remove(&id)
+                    {
+                        tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
                     }
                     tracing::info!(?id, "single withdrawal flushed successfully");
                     #[cfg(all(feature = "telemetry", not(test)))]
@@ -544,19 +551,23 @@ where
 
             match result {
                 Ok(results) => {
+                    let mut swept = 0u64;
                     for (i, id) in ids.iter().enumerate() {
-                        if results.get(i).map_or(false, |r| r.is_ok()) {
-                            self.in_flight_sweeps.invalidate(id);
-                            if let Some(ref store) = self.recovery_store {
-                                let _ = store.remove(id);
+                        self.in_flight_sweeps.invalidate(id);
+                        if results.get(i).is_some_and(|r| r.is_ok()) {
+                            swept += 1;
+                            if let Some(ref store) = self.recovery_store
+                                && let Err(error) = store.remove(id)
+                            {
+                                tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
                             }
-                        } else {
-                            self.in_flight_sweeps.invalidate(id);
                         }
                     }
-                    tracing::info!(count, "batch withdrawal flushed");
+                    // Only the items that actually moved funds are counted; the rest keep their
+                    // persisted key for a later retry.
+                    tracing::info!(count, swept, "batch withdrawal flushed");
                     #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_SWEEPS.increment_by(count as u64);
+                    METRIC_PIX_SWEEPS.increment_by(swept);
                 }
                 Err(error) => {
                     for id in &ids {
@@ -706,11 +717,11 @@ where
                     _ = &mut sleep => {
                         // At least one deadline elapsed — flush ready buffers.
                         let now = tokio::time::Instant::now();
-                        if deposit_flush_at.map_or(false, |d| d <= now) {
+                        if deposit_flush_at.is_some_and(|d| d <= now) {
                             self.flush_deposits().await;
                             deposit_flush_at = None;
                         }
-                        if withdrawal_flush_at.map_or(false, |d| d <= now) {
+                        if withdrawal_flush_at.is_some_and(|d| d <= now) {
                             self.flush_withdrawals().await;
                             withdrawal_flush_at = None;
                         }
@@ -779,7 +790,10 @@ mod tests {
         testing::{BlokliTestStateBuilder, TestChainConnector},
     };
 
-    const TEST_PASSWORD_ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD";
+    /// Owned exclusively by `test_build_with_recovery_path_opens_store`. Tests share one
+    /// process environment and run on several threads, so a name used by two tests can be
+    /// unset by one while the other still needs it.
+    const BUILD_PASSWORD_ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_BUILD";
 
     lazy_static::lazy_static! {
         static ref BOB_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
@@ -1203,9 +1217,9 @@ mod tests {
     async fn test_build_with_recovery_path_opens_store() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("pix.redb");
-        // SAFETY: single-threaded test, no concurrent access to the environment
-        // for this variable.
-        unsafe { std::env::set_var(TEST_PASSWORD_ENV, "test_password") };
+        // SAFETY: `BUILD_PASSWORD_ENV` is touched by this test alone, so no other test
+        // thread can observe or clobber it.
+        unsafe { std::env::set_var(BUILD_PASSWORD_ENV, "test_password") };
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],
@@ -1221,23 +1235,23 @@ mod tests {
             max_ssa_allocation: HoprBalance::new_base(100),
             pool: Default::default(),
             pix_recovery_db_path: Some(db.clone()),
-            pix_recovery_password_env: Some(TEST_PASSWORD_ENV.to_string()),
+            pix_recovery_password_env: Some(BUILD_PASSWORD_ENV.to_string()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
         })
         .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))))?;
         assert!(db.exists());
-        // SAFETY: single-threaded test, cleanup.
-        unsafe { std::env::remove_var(TEST_PASSWORD_ENV) };
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(BUILD_PASSWORD_ENV) };
         Ok(())
     }
 
     #[test_log::test(tokio::test)]
     async fn test_private_key_recovered_with_recovery_store() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        // SAFETY: single-threaded test, no concurrent access to this variable.
-        unsafe { std::env::set_var(TEST_PASSWORD_ENV, "test_password") };
-        let store = PixRecoveryStore::open(&dir.path().join("pix.redb"), "test_password")?;
+        // No environment variable here: the store is opened directly and the config leaves
+        // `pix_recovery_password_env` unset.
+        let store = PixRecoveryStore::open(dir.path().join("pix.redb"), "test_password")?;
         let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
         let rkp = ChainKeypair::from_secret(&rk)?;
         let ra = rkp.public().to_address();
@@ -1284,8 +1298,6 @@ mod tests {
         s.flush_withdrawals().await;
         assert!(!s.recovery_store.as_ref().unwrap().contains(&id)?);
         assert!(hopr_balance(&*cc, ra).await?.is_zero());
-        // SAFETY: single-threaded test, cleanup.
-        unsafe { std::env::remove_var(TEST_PASSWORD_ENV) };
         Ok(())
     }
 
@@ -1409,7 +1421,14 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         })
         .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))));
-        assert!(matches!(r, Err(StrategyError::CriteriaNotSatisfied)));
+        // The message must name the field that is missing, not just report a failed criterion.
+        let error = r
+            .err()
+            .context("build should reject a half-configured recovery store")?;
+        assert!(
+            error.to_string().contains("pix_recovery_password_env"),
+            "unhelpful error: {error}"
+        );
         Ok(())
     }
 

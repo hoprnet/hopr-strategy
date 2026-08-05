@@ -32,10 +32,6 @@ fn default_gas_xdai() -> XDaiBalance {
     "0.01 xdai".parse().expect("valid static xDai amount")
 }
 
-fn default_max_deposit_tracking_time() -> Duration {
-    Duration::from_secs(60)
-}
-
 /// Configuration for [`NonAnonymousDepositPool`].
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
 pub struct NonAnonymousDepositPoolConfig {
