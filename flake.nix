@@ -31,7 +31,7 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v1.2.0";
+    nix-lib.url = "github:hoprnet/nix-lib/v1.3.0";
 
     # Rust build system
     crane.url = "github:ipetkov/crane";
@@ -181,16 +181,11 @@
                 ''
               );
             };
-            # Strategy integration tests against the self-contained Blokli-Anvil
-            # image (anvil + contract deployment + bloklid in one container).
-            # Requires docker on the host. The `tests/integration` crate is a
-            # detached workspace, so it is built via its own manifest.
             test-integration = {
               type = "app";
               program = toString (
                 pkgs.writeShellScript "test-integration" ''
-                  export BLOKLI_TEST_REMOTE_IMAGE="''${BLOKLI_TEST_REMOTE_IMAGE:-europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil:latest}"
-                  nix develop --command ${pkgs.just}/bin/just test-integration
+                  nix build -L .#integration-tests
                 ''
               );
             };
@@ -340,7 +335,7 @@
               type = "app";
               program = toString (
                 pkgs.writeShellScript "coverage-unit" ''
-                  nix develop .#coverage -c cargo llvm-cov --all-features --lib --lcov --output-path coverage.lcov
+                  nix build -L .#coverage -o coverage.lcov
                 ''
               );
             };
