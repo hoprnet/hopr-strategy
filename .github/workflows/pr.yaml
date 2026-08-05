@@ -87,7 +87,7 @@ jobs:
     uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
-      lint_command: "nix build -L .#clippy"
+      lint_command: "nix develop --command just quick"
       audit_command: "nix run -L .#audit"
       deps: true
       runner_small: depot-ubuntu-24.04-2
@@ -124,7 +124,7 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@3d291616a704bea189af1f16cefc25e26d2857c0 # build-library-v3.2.0
     permissions:
       contents: read
       id-token: write
@@ -133,6 +133,7 @@ jobs:
       version_type: commit
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
+      build_command: "nix build -L .#lib-hopr-strategy-${{ matrix.architecture }}"
       package_name: hopr-strategy
       runner: ${{ matrix.runner }}
       enabled: ${{ matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label) }}

@@ -158,6 +158,24 @@
                 config
                 ;
             };
+
+            # Cacheable equivalent of `just quick`: formatting, Clippy, and
+            # cargo check. linkFarm makes each validation an explicit input so
+            # Cachix can restore their independent outputs.
+            quick = pkgs.linkFarm "quick" [
+              {
+                name = "format";
+                path = config.treefmt.build.check self;
+              }
+              {
+                name = "clippy";
+                path = hoprStrategyPackages.clippy;
+              }
+              {
+                name = "check";
+                path = hoprStrategyPackages.check;
+              }
+            ];
           };
 
           utilityApps = {

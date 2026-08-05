@@ -10,8 +10,9 @@ default:
 # Quick Workflows
 # ============================================================================
 
-# Quick check - format, clippy, and check
-quick: fmt clippy check
+# Quick check - format, clippy, and check through cacheable Nix derivations
+quick:
+    nix build -L .#quick
 
 # Development build and test cycle - format, check, and test
 dev: fmt check test
