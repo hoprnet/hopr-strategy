@@ -12,7 +12,7 @@ default:
 
 # Quick check - format, clippy, and check through cacheable Nix derivations
 quick:
-    nix build -L .#quick
+    env -u LD_LIBRARY_PATH nix build -L .#quick
 
 # Development build and test cycle - format, check, and test
 dev: fmt check test

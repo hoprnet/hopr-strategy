@@ -245,6 +245,11 @@
             treefmtWrapper = config.treefmt.build.wrapper;
             treefmtPrograms = pkgs.lib.attrValues config.treefmt.build.programs;
             shellHook = ''
+              # Runner-provided Nix binaries must not load libraries from this
+              # shell's newer glibc closure.
+              _hopr_ld_library_path="''${LD_LIBRARY_PATH-}"
+              unset LD_LIBRARY_PATH
+
               echo "Running pre-commit checks..."
               _github_token="''${GITHUB_TOKEN:-''${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}}"
               if [ -n "$_github_token" ]; then
@@ -252,6 +257,13 @@
               fi
               unset _github_token
               ${packages.pre-commit-check.shellHook}
+
+              if [ -n "$_hopr_ld_library_path" ]; then
+                export LD_LIBRARY_PATH="$_hopr_ld_library_path"
+              else
+                unset LD_LIBRARY_PATH
+              fi
+              unset _hopr_ld_library_path
             '';
             extraPackages = with pkgs; [
               gh
