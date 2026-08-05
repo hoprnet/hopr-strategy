@@ -31,7 +31,7 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v1.2.0";
+    nix-lib.url = "github:hoprnet/nix-lib/v1.3.0";
 
     # Rust build system
     crane.url = "github:ipetkov/crane";
@@ -158,6 +158,24 @@
                 config
                 ;
             };
+
+            # Cacheable equivalent of `just quick`: formatting, Clippy, and
+            # cargo check. linkFarm makes each validation an explicit input so
+            # Cachix can restore their independent outputs.
+            quick = pkgs.linkFarm "quick" [
+              {
+                name = "format";
+                path = config.treefmt.build.check self;
+              }
+              {
+                name = "clippy";
+                path = hoprStrategyPackages.clippy;
+              }
+              {
+                name = "check";
+                path = hoprStrategyPackages.check;
+              }
+            ];
           };
 
           utilityApps = {
@@ -181,16 +199,11 @@
                 ''
               );
             };
-            # Strategy integration tests against the self-contained Blokli-Anvil
-            # image (anvil + contract deployment + bloklid in one container).
-            # Requires docker on the host. The `tests/integration` crate is a
-            # detached workspace, so it is built via its own manifest.
             test-integration = {
               type = "app";
               program = toString (
                 pkgs.writeShellScript "test-integration" ''
-                  export BLOKLI_TEST_REMOTE_IMAGE="''${BLOKLI_TEST_REMOTE_IMAGE:-europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil:latest}"
-                  nix develop --command ${pkgs.just}/bin/just test-integration
+                  nix build -L .#integration-tests
                 ''
               );
             };
@@ -232,6 +245,11 @@
             treefmtWrapper = config.treefmt.build.wrapper;
             treefmtPrograms = pkgs.lib.attrValues config.treefmt.build.programs;
             shellHook = ''
+              # Runner-provided Nix binaries must not load libraries from this
+              # shell's newer glibc closure.
+              _hopr_ld_library_path="''${LD_LIBRARY_PATH-}"
+              unset LD_LIBRARY_PATH
+
               echo "Running pre-commit checks..."
               _github_token="''${GITHUB_TOKEN:-''${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}}"
               if [ -n "$_github_token" ]; then
@@ -239,6 +257,13 @@
               fi
               unset _github_token
               ${packages.pre-commit-check.shellHook}
+
+              if [ -n "$_hopr_ld_library_path" ]; then
+                export LD_LIBRARY_PATH="$_hopr_ld_library_path"
+              else
+                unset LD_LIBRARY_PATH
+              fi
+              unset _hopr_ld_library_path
             '';
             extraPackages = with pkgs; [
               gh
@@ -340,7 +365,7 @@
               type = "app";
               program = toString (
                 pkgs.writeShellScript "coverage-unit" ''
-                  nix develop .#coverage -c cargo llvm-cov --all-features --lib --lcov --output-path coverage.lcov
+                  nix build -L .#coverage -o coverage.lcov
                 ''
               );
             };
