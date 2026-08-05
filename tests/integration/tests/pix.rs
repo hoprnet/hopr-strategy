@@ -35,6 +35,8 @@ fn pix_config(
         },
         pix_recovery_db_path: None,
         pix_recovery_password_env: None,
+        deposit_buffer_period: Duration::ZERO,
+        withdrawal_buffer_period: Duration::ZERO,
     }
 }
 

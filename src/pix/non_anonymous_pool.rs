@@ -37,26 +37,18 @@ fn default_max_deposit_tracking_time() -> Duration {
 }
 
 /// Configuration for [`NonAnonymousDepositPool`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
 pub struct NonAnonymousDepositPoolConfig {
     /// How long to keep polling a stealth address for the expected deposit before
     /// giving up.  Default: 60 seconds.
-    #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
+    #[default(Duration::from_secs(60))]
+    #[serde(with = "humantime_serde", default)]
     pub max_deposit_tracking_time: Duration,
 
     /// Amount of xDai to send from the Safe to a recovered stealth address that
     /// has run out of gas for the withdrawal sweep.  Default: 0.01 xDai.
     #[serde(default = "default_gas_xdai")]
     pub gas_xdai_per_sweep: XDaiBalance,
-}
-
-impl Default for NonAnonymousDepositPoolConfig {
-    fn default() -> Self {
-        Self {
-            max_deposit_tracking_time: default_max_deposit_tracking_time(),
-            gas_xdai_per_sweep: default_gas_xdai(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
