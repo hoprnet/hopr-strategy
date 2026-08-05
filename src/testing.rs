@@ -14,7 +14,10 @@ use std::{
     collections::HashSet,
     io,
     str::FromStr,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -765,8 +768,12 @@ pub struct TestChainConnector<M: BlokliTestStateMutator> {
     ticket_price: std::sync::Arc<std::sync::OnceLock<hopr_api::types::primitive::prelude::HoprBalance>>,
     /// Minimum winning probability from chain info, populated on `connect()` for synchronous access.
     ticket_win_prob: std::sync::Arc<std::sync::OnceLock<hopr_api::types::internal::prelude::WinningProbability>>,
-    /// Nonce counter for transaction sequencing.
-    nonce: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Nonce counters for transaction sequencing, one per signing address.
+    ///
+    /// Keyed by signer because `withdraw_from_signer` signs with a caller-supplied key: a
+    /// single shared counter would hand that key a nonce advanced by the connector's own
+    /// transactions, and then reuse a nonce for the connector.
+    nonces: std::sync::Arc<dashmap::DashMap<hopr_api::types::primitive::prelude::Address, Arc<AtomicU64>>>,
     /// Accounts cache: chain address → AccountEntry, populated on `connect()`.
     accounts: std::sync::Arc<
         dashmap::DashMap<
@@ -802,7 +809,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             chain_id: Default::default(),
             ticket_price: Default::default(),
             ticket_win_prob: Default::default(),
-            nonce: Default::default(),
+            nonces: Default::default(),
             accounts: Default::default(),
             channels: Default::default(),
         }
@@ -1005,12 +1012,20 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             .build()?)
     }
 
+    /// Nonce counter for `signer`, created on first use.
+    ///
+    /// Always pair this with the key that actually signs the transaction — see the note on
+    /// [`TestChainConnector::nonces`].
+    fn nonce_for(&self, signer: &hopr_api::types::primitive::prelude::Address) -> Arc<AtomicU64> {
+        self.nonces.entry(*signer).or_default().clone()
+    }
+
     async fn send_tx(
         client: &BlokliTestClient<M>,
         tx_req: hopr_api::types::chain::payload::TransactionRequest,
         chain_id: u64,
         chain_key: &hopr_api::types::crypto::prelude::ChainKeypair,
-        nonce: &std::sync::atomic::AtomicU64,
+        nonce: &AtomicU64,
     ) -> anyhow::Result<hopr_api::chain::ChainReceipt> {
         let n = nonce.fetch_add(1, Ordering::Relaxed);
         let signed = tx_req.sign_and_encode_to_eip2718(n, chain_id, None, chain_key).await?;
@@ -1153,7 +1168,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         let client = self.client.clone();
         let chain_id = self.chain_id().map_err(TestConnectorError::from)?;
         let chain_key = self.chain_key.clone();
-        let nonce = self.nonce.clone();
+        let nonce = self.nonce_for(&self.my_addr);
 
         Ok(Box::pin(async move {
             Self::send_tx(&client, tx_req, chain_id, &chain_key, &nonce)
@@ -1176,11 +1191,12 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
 
         let client = self.client.clone();
         let chain_id = self.chain_id().map_err(TestConnectorError::from)?;
-        let nonce = self.nonce.clone();
+        // The caller's key signs this one, so it needs that key's own nonce sequence.
+        let nonce = self.nonce_for(&signer.public().to_address());
         let signer = signer.clone();
 
         Ok(Box::pin(async move {
-            let n = nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = nonce.fetch_add(1, Ordering::Relaxed);
             let signed = tx_req
                 .sign_and_encode_to_eip2718(n, chain_id, None, &signer)
                 .await
@@ -1241,7 +1257,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .chain_id()
             .map_err(hopr_api::chain::SafeRegistrationError::processing)?;
         let chain_key = self.chain_key.clone();
-        let nonce = self.nonce.clone();
+        let nonce = self.nonce_for(&self.my_addr);
         Ok(Box::pin(async move {
             Self::send_tx(&client, tx_req, chain_id, &chain_key, &nonce)
                 .await
@@ -1296,9 +1312,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         amount: hopr_api::types::primitive::prelude::HoprBalance,
     ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
         let tx_req = self.payload_gen()?.fund_channel(*dst, amount)?;
-        let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
-            .await
-            .map_err(TestConnectorError::from)?;
+        let receipt = Self::send_tx(
+            &self.client,
+            tx_req,
+            self.chain_id()?,
+            &self.chain_key,
+            &self.nonce_for(&self.my_addr),
+        )
+        .await
+        .map_err(TestConnectorError::from)?;
         Ok(Box::pin(async move { Ok(receipt) }))
     }
 
@@ -1314,9 +1336,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .ok_or_else(|| anyhow::anyhow!("channel {channel_id} not found"))?;
 
         let tx_req = self.payload_gen()?.fund_channel(channel.destination, amount)?;
-        let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
-            .await
-            .map_err(TestConnectorError::from)?;
+        let receipt = Self::send_tx(
+            &self.client,
+            tx_req,
+            self.chain_id()?,
+            &self.chain_key,
+            &self.nonce_for(&self.my_addr),
+        )
+        .await
+        .map_err(TestConnectorError::from)?;
         Ok(Box::pin(async move { Ok(receipt) }))
     }
 
@@ -1340,9 +1368,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             ChannelStatus::Closed => return Err(anyhow::anyhow!("channel {channel_id} is already closed").into()),
         };
 
-        let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
-            .await
-            .map_err(TestConnectorError::from)?;
+        let receipt = Self::send_tx(
+            &self.client,
+            tx_req,
+            self.chain_id()?,
+            &self.chain_key,
+            &self.nonce_for(&self.my_addr),
+        )
+        .await
+        .map_err(TestConnectorError::from)?;
         Ok(Box::pin(async move { Ok(receipt) }))
     }
 }
@@ -1680,7 +1714,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             hopr_api::chain::TicketRedeemError::ProcessingError(verified_ticket, TestConnectorError::from(e))
         })?;
         let chain_key = self.chain_key.clone();
-        let nonce = self.nonce.clone();
+        let nonce = self.nonce_for(&self.my_addr);
         let client = self.client.clone();
 
         Ok(Box::pin(async move {
