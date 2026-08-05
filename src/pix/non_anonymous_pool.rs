@@ -216,12 +216,36 @@ where
     type Receipt = ();
 
     /// Deposit funds from the node's Safe to a deposit address.
+    ///
+    /// The transfer is not idempotent, and the caller retries this operation: if a previous
+    /// attempt was submitted but its confirmation was lost, re-sending would deposit `amount`
+    /// a second time and the Safe would lose the surplus. An address that already holds
+    /// `amount` is therefore reported as success without sending anything.
+    ///
+    /// The guarantee is balance-based rather than transaction-based, so a third party funding
+    /// the same address also satisfies the check. A failed balance read is propagated instead
+    /// of being ignored — a retry after an unreadable balance is exactly the case this guard
+    /// exists for.
     async fn deposit_funds_to(
         &self,
         dst: PixDepositAddress,
         amount: HoprBalance,
     ) -> Result<Self::Receipt, Self::Error> {
         let dest_addr: Address = dst.try_into()?;
+
+        let current: HoprBalance = self
+            .node
+            .chain_api()
+            .balance(dest_addr)
+            .await
+            .map_err(StrategyError::other)?;
+        if current >= amount {
+            tracing::debug!(
+                %dest_addr, %current, %amount,
+                "deposit address is already funded, not sending another transfer"
+            );
+            return Ok(());
+        }
 
         self.node
             .chain_api()

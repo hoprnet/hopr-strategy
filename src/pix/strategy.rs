@@ -938,6 +938,9 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            // `deposit_funds_to` reads the destination balance before transferring, and the
+            // stub chain has no entry for an address that was never funded.
+            .with_balances([(da, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let snap = sim.snapshot();
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
@@ -1156,6 +1159,9 @@ mod tests {
                 HoprBalance::new_base(1000),
             )
             .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            // `deposit_funds_to` reads the destination balance before transferring, and the
+            // stub chain has no entry for an address that was never funded.
+            .with_balances([(da, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
@@ -1449,6 +1455,9 @@ mod tests {
                 start_balance,
             )
             .with_balances([(*BOB, start_balance)])
+            // `deposit_funds_to` reads the destination balance before transferring, and the
+            // stub chain has no entry for an address that was never funded.
+            .with_balances([(da1, HoprBalance::zero()), (da2, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
