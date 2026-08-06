@@ -78,57 +78,61 @@ pub struct EligibilityConfig {
 /// How the strategy converts a data-capacity [`ByteSize`] to a wxHOPR channel
 /// stake at runtime.
 ///
-/// Each packet sent through an h-hop path causes one Bernoulli(win_prob) trial
-/// per hop: a ticket of face value `ticket_price` is redeemed with probability
-/// `win_prob`, draining that amount from the channel balance (§3.2).  The total
-/// drain for N packets therefore follows a scaled Binomial distribution:
+/// # Ticket economics
+///
+/// A packet relayed over an `h`-hop path is paid for with probabilistic
+/// tickets.  On-chain (`HoprTicketFactory`), a single winning ticket's face
+/// value is
 ///
 /// ```text
-/// D ~ Binomial(N, win_prob) × hops × ticket_price
-/// E[D] = N × win_prob × hops × ticket_price
-/// σ[D] = hops × ticket_price × √(N × win_prob × (1 − win_prob))
+/// face_value = ticket_price × hops / win_prob
 /// ```
 ///
-/// The three modes differ only in how much safety buffer is added above the
-/// expected drain.
-///
-/// # Mode comparison for a typical FundingConfig
-///
-/// Common parameters: hops = 3, win_prob = 0.001 (ultralow), ticket_price = 0.001 wxHOPR (ultralow)
+/// i.e. per packet the sender issues **one** aggregated multi-hop ticket of face
+/// value `ticket_price × hops / win_prob` against this channel (not `h`
+/// independent tickets) — a large, indivisible amount redeemed with probability
+/// `win_prob`.  The winning tickets over `N` packets are therefore a single
+/// `Binomial(N, win_prob)`, and the total channel drain `D` is that count scaled
+/// by one face value:
 ///
 /// ```text
-/// Config field            capacity    N (pkts)   Deterministic   Expected   Probabilistic(0.999)
-/// ─────────────────────────────────────────────────────────────────────────────────────────────
-/// lower_capacity_threshold  250 MB     253 035     759 wxHOPR    0.76 wxHOPR    0.91 wxHOPR
-/// initial_capacity            1 GB   1 036 431   3 109 wxHOPR    3.11 wxHOPR    3.41 wxHOPR
-/// topup_capacity              5 GB   5 182 152  15 547 wxHOPR   15.55 wxHOPR   16.21 wxHOPR
+/// D    = (ticket_price × hops / win_prob) × Binomial(N, win_prob)
+/// E[D] = N × hops × ticket_price                              (win-prob independent)
+/// σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)
 /// ```
 ///
-/// `Deterministic` over-funds by ~900× relative to `Probabilistic(0.999)` at these ultralow
-/// parameters.  The k·σ overhead shrinks as N grows (+19 % at 250 MB, +4 % at 5 GB), making
-/// `Probabilistic` indistinguishable from `Expected` at large capacities.
+/// Note `E[D]` does **not** depend on `win_prob`: lower win-prob means rarer but
+/// proportionally larger payouts, so the mean drain is unchanged while the
+/// variance grows as `1 / win_prob`.
 ///
-/// At `win_prob = 1.0` all three modes are equal: σ = 0 and `E[D] = N × hops × tp`.
+/// # The one-winning-ticket floor (applies to every mode)
 ///
-/// # Choosing a mode
+/// A channel cannot even *issue* a ticket whose face value exceeds its balance
+/// — the factory returns `OutOfFunds`.  Every resolved stake is therefore
+/// floored at a single full-path winning ticket:
 ///
-/// * **`Deterministic`** — no chain queries for win_prob; always safe but massively over-funds at low win_prob (~900×
-///   in the example above).
-/// * **`Expected`** — most capital-efficient; ~50 % of cycles see the channel drain slightly faster than planned
-///   (triggering a top-up sooner, not loss).
-/// * **`Probabilistic`** (**default**) — adds a k·σ buffer; the channel carries its full configured capacity with
-///   probability `success_probability`. Overhead over `Expected` is 19 % at 250 MB, 10 % at 1 GB, 4 % at 5 GB.
+/// ```text
+/// stake = max( ticket_price × hops / win_prob ,  <mode term> )
+/// ```
+///
+/// Without this floor, at HOPR's production win-probs (1e-4 … 1e-6) a stake
+/// sized to the *mean* drain can be smaller than one ticket, leaving the
+/// channel unable to relay a single packet.  The floor guarantees every field —
+/// initial, top-up, and lower threshold — always covers ≥ 1 winning ticket.
+///
+/// # Modes
+///
+/// Both modes are floored as above; they differ only in the buffer added above
+/// the mean drain.  At `win_prob = 1.0` the variance vanishes (`σ = 0`) and both
+/// collapse to `N × hops × ticket_price`.
 ///
 /// # Configuration (YAML)
 ///
 /// ```yaml
-/// # Worst-case stake; skips the win_prob chain query each tick.
+/// # Mean-drain stake (default); floored at one winning ticket.
 /// sizing_mode: deterministic
 ///
-/// # Mean-drain stake; most capital-efficient.
-/// sizing_mode: expected
-///
-/// # Statistical guarantee (default); adds k·σ above expected drain.
+/// # Statistical guarantee; adds k·σ above the mean drain.
 /// sizing_mode:
 ///   probabilistic:
 ///     success_probability: 0.999
@@ -136,60 +140,54 @@ pub struct EligibilityConfig {
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapacitySizingMode {
-    /// `stake = N × hops × ticket_price`
+    /// `stake = max( ticket_price × hops / win_prob ,  N × hops × ticket_price )`
     ///
-    /// Hard worst-case guarantee: the channel never empties prematurely
-    /// regardless of win_prob (equivalent to assuming every ticket wins).
-    /// Does **not** require the win_prob chain query each tick.
+    /// Sizes the stake to the **expected** drain `N × hops × ticket_price`,
+    /// floored at one winning ticket.  The main term is independent of
+    /// `win_prob`, so the stake is insensitive to win-prob fluctuations; the
+    /// floor is the only win-prob-dependent part.
     ///
-    /// Over-funds proportionally to `1 / win_prob` relative to the expected
-    /// drain.  Use when capital efficiency is not a concern and you want zero
-    /// sensitivity to win_prob fluctuations.
+    /// This is the **default**.  Because payouts are lumpy, roughly half of all
+    /// fund cycles see the channel drain slightly faster than the mean — this
+    /// triggers a top-up sooner (handled by proactive funding), never message
+    /// loss, as long as the balance stays above the one-ticket floor.
     ///
     /// ```yaml
     /// sizing_mode: deterministic
     /// ```
+    #[default]
     Deterministic,
 
-    /// `stake = N × win_prob × hops × ticket_price`
+    /// `stake = max( ticket_price × hops / win_prob ,  E[D] + k·σ[D] )`
+    /// where `k = Φ⁻¹(success_probability)`,
+    /// `E[D] = N × hops × ticket_price` and
+    /// `σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)`.
     ///
-    /// Sizes the stake exactly to the expected drain.  Capital-efficient at low
-    /// win_prob; approximately half of all fund cycles see the channel drain
-    /// slightly faster than planned (triggers a top-up sooner, not message loss).
-    /// Requires the win_prob chain query each tick.
+    /// Adds `k` standard deviations on top of the mean drain so the channel
+    /// carries its full configured capacity between top-ups with probability
+    /// `success_probability`.  Costs more capital than `Deterministic` and, at
+    /// low win-prob, the `1 / win_prob` variance makes the buffer large — use
+    /// when premature top-ups must be minimised on high-value paths.
     ///
-    /// ```yaml
-    /// sizing_mode: expected
-    /// ```
-    Expected,
-
-    /// `stake = E[D] + k·σ[D]`  where k = Φ⁻¹(success_probability)
-    ///
-    /// Adds `k` Binomial standard deviations on top of the expected drain,
-    /// guaranteeing the channel carries its full configured capacity with
-    /// probability `success_probability`.  Requires the win_prob chain query
-    /// each tick.
-    ///
-    /// # Worked example — default settings (k ≈ 3.09)
+    /// # Worked example — default confidence (k ≈ 3.09)
     ///
     /// Parameters: N = 100 000 packets, win_prob = 0.01, hops = 3,
     /// ticket_price = 0.01 wxHOPR.
     ///
     /// ```text
-    /// E[D]  = 30.000 wxHOPR
-    /// σ[D]  ≈  0.944 wxHOPR
-    /// stake ≈ 30 + 3.09 × 0.944 ≈ 32.9 wxHOPR   (Deterministic would be 3 000)
+    /// E[D]  = N × h × tp                       = 3,000 wxHOPR
+    /// σ[D]  = h × tp × √(N × (1−p)/p)           ≈ 94.39 wxHOPR
+    /// stake ≈ 3,000 + 3.09 × 94.39             ≈ 3,292 wxHOPR
     /// ```
     ///
-    /// At `win_prob = 1.0` the variance term vanishes (σ = 0) and the formula
-    /// collapses to `N × hops × ticket_price` — identical to `Deterministic`.
+    /// At `win_prob = 1.0` the variance term vanishes and the formula collapses
+    /// to `N × hops × ticket_price` — identical to `Deterministic`.
     ///
     /// ```yaml
     /// sizing_mode:
     ///   probabilistic:
     ///     success_probability: 0.999
     /// ```
-    #[default]
     Probabilistic {
         /// Probability that the channel does **not** drain prematurely in any
         /// given fund cycle.  Must be in the range `(0.5, 1.0)`.
@@ -198,7 +196,7 @@ pub enum CapacitySizingMode {
         /// |--------|-------------|-------|
         /// | 0.841  | 1.0  | one-sigma; adequate for large N |
         /// | 0.977  | 2.0  | two-sigma |
-        /// | 0.999  | 3.09 | **default**; recommended for most deployments |
+        /// | 0.999  | 3.09 | recommended for most deployments |
         /// | 0.9999 | 3.72 | four-nines; use for very small N or mission-critical paths |
         #[serde(default = "default_success_probability")]
         #[default = 0.999]
@@ -222,14 +220,6 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
     Ok(())
 }
 
-impl CapacitySizingMode {
-    /// Returns `true` for modes that use the network's winning probability at
-    /// runtime.  `Deterministic` returns `false` and skips the win_prob query.
-    pub(crate) fn requires_win_prob(&self) -> bool {
-        !matches!(self, Self::Deterministic)
-    }
-}
-
 /// Initial and top-up capacities for channel funding expressed as human-readable
 /// data volumes, plus the [`CapacitySizingMode`] that controls how those volumes
 /// are converted to wxHOPR stakes at runtime.
@@ -247,21 +237,21 @@ impl CapacitySizingMode {
 /// lower_capacity_threshold: 256 MiB
 /// min_safe_capacity_required: 1 GiB
 /// assumed_hops: 3
-/// sizing_mode:
-///   probabilistic:
-///     success_probability: 0.999
+/// sizing_mode: deterministic
 /// ```
 ///
-/// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` this resolves to:
+/// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` the default
+/// `Deterministic` mode resolves `initial_capacity` to:
 ///
 /// ```text
-/// N_initial = ceil(1 GiB / 1036 B) = 1 036 431 packets
-/// E[D]      = 1 036 431 × 0.001 × 3 × 0.001 ≈ 3.11 wxHOPR
-/// σ[D]      = 3 × 0.001 × √(1 036 431 × 0.001 × 0.999) ≈ 0.097 wxHOPR
-/// stake     ≈ 3.11 + 3.09 × 0.097 ≈ 3.41 wxHOPR
-///
-/// (Deterministic would lock 3 109 wxHOPR — ~912× more)
+/// N_initial = ceil(1 GiB / 1036 B)          = 1 036 431 packets
+/// E[D]      = N × hops × tp = 1 036 431 × 3 × 0.001 ≈ 3 109 wxHOPR
+/// floor     = tp × hops / p = 0.001 × 3 / 0.001     = 3 wxHOPR
+/// stake     = max(floor, E[D])              ≈ 3 109 wxHOPR   (mean drain; floor inert)
 /// ```
+///
+/// The floor only binds for tiny capacities (`N < 1 / win_prob`), where it lifts
+/// the stake up to one winning ticket so the channel can still relay.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 pub struct FundingConfig {
     /// Data volume a newly opened channel's stake should be able to carry.
@@ -299,7 +289,7 @@ pub struct FundingConfig {
     pub assumed_hops: u32,
 
     /// How each capacity field is converted to a wxHOPR stake.
-    /// Default: `Probabilistic { success_probability: 0.999 }`.
+    /// Default: `Deterministic` (mean drain, floored at one winning ticket).
     ///
     /// See [`CapacitySizingMode`] for the full tradeoff analysis.
     #[default(CapacitySizingMode::default())]
@@ -333,28 +323,34 @@ pub(crate) struct ResolvedFunding {
 ///
 /// ```text
 /// N     = ceil(capacity_bytes / packet_payload_size())
-/// p     = win_prob  (clamped to (0, 1])
+/// p     = win_prob  (clamped to [ε, 1])
 /// h     = hops
 /// tp    = ticket_price
 ///
-/// Deterministic:        stake = N × h × tp
-/// Expected:             stake = N × p × h × tp
-/// Probabilistic(α):     stake = N × p × h × tp + k × h × tp × √(N × p × (1−p))
-///                               where k = Φ⁻¹(α)  (standard-normal quantile)
+/// floor = tp × h / p                         one full-path winning ticket
+/// E[D]  = N × h × tp                          mean drain (win-prob independent)
+/// σ[D]  = tp × h × √(N × (1 − p) / p)         (tp·h/p) × Binomial(N, p) std-dev
+///
+/// Deterministic:    stake = max(floor, E[D])
+/// Probabilistic(α): stake = max(floor, E[D] + k·σ[D])   k = Φ⁻¹(α)
 /// ```
 ///
-/// `win_prob` is ignored for `Deterministic` (pass any value; `1.0` is
-/// conventional).  Returns [`HoprBalance::zero`] for zero capacity.
+/// The `max(floor, …)` guarantees the stake always covers at least one winning
+/// ticket, so the channel can always issue the next ticket regardless of how
+/// small the capacity is or how low `win_prob` is.  Returns
+/// [`HoprBalance::zero`] only for zero capacity.
 ///
 /// # Examples
 ///
 /// ```text
-/// tp = 0.01 wxHOPR,  h = 3,  N = 10 packets (= 10 × 1036 B capacity)
+/// tp = 0.01 wxHOPR,  h = 3
 ///
-/// p = 1.00 → Deterministic = Expected = Probabilistic = 0.30 wxHOPR
-/// p = 0.50 → Expected ≈ 0.150 wxHOPR,  Probabilistic(0.999) ≈ 0.191 wxHOPR
-/// p = 0.01 → Expected ≈ 0.003 wxHOPR,  Probabilistic(0.999) ≈ 0.012 wxHOPR
-///             Deterministic stays 0.30 wxHOPR (100× expected drain)
+/// N = 100 000, p = 0.01:  floor = 3 wxHOPR
+///     Deterministic  = max(3, 3,000)                 = 3,000 wxHOPR
+///     Probabilistic  = max(3, 3,000 + 3.09 × 94.39)  ≈ 3,292 wxHOPR
+///
+/// N = 10, p = 1e-4:  floor = tp·h/p = 300 wxHOPR  (dominates)
+///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (floor binds)
 /// ```
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
@@ -370,35 +366,55 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
 
     let payload = C::packet_payload_size() as u64;
     let n = bytes.div_ceil(payload) as f64;
-    let p = win_prob.clamp(f64::MIN_POSITIVE, 1.0_f64);
+    // Clamp win_prob into [f64::EPSILON, 1.0].  Zero, negative, or NaN inputs
+    // would otherwise make the one-ticket floor `tp × h / p` diverge to
+    // `f64::INFINITY` and saturate the stake to `u128::MAX`.  `f64::MIN_POSITIVE`
+    // is too small a lower bound — `tp × h / p` overflows f64 — so `f64::EPSILON`
+    // is used as the effective floor on the win probability.
+    let p = if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    };
     let h = hops as f64;
+    let price_f64 = price.amount().low_u128() as f64;
 
-    // Effective number of winning tickets the stake must cover.
-    let effective_wins: f64 = match mode {
-        CapacitySizingMode::Deterministic => n,
-        CapacitySizingMode::Expected => n * p,
+    // Mean drain E[D] = N × h × tp — the same for every mode, independent of p.
+    let mean_drain = n * h * price_f64;
+
+    // Mode-specific term above the mean.
+    let target: f64 = match mode {
+        CapacitySizingMode::Deterministic => mean_drain,
         CapacitySizingMode::Probabilistic { success_probability } => {
             use statrs::distribution::{ContinuousCDF, Normal};
             let alpha = success_probability.clamp(0.5001, 0.99999);
             let k = Normal::standard().inverse_cdf(alpha);
-            // mean + k · std-dev  (Binomial approximated by Normal via CLT)
-            n * p + k * (n * p * (1.0 - p)).sqrt()
+            // σ[D] = tp·h × √(N·(1−p)/p).  Each packet issues ONE aggregated
+            // multi-hop ticket of face value tp·h/p (not h independent tickets),
+            // so the number of winning tickets is Binomial(N, p) and the drain is
+            // (tp·h/p)·Binomial(N, p).  Var = (tp·h/p)²·N·p(1−p) ⇒ σ = tp·h·√(N(1−p)/p).
+            let sigma = price_f64 * h * (n * (1.0 - p) / p).sqrt();
+            mean_drain + k * sigma
         }
     };
 
-    // stake = effective_wins × hops × ticket_price  (saturating; overflow → U256::MAX)
-    let price_f64 = price.amount().low_u128() as f64;
-    let stake_f64 = (effective_wins * h * price_f64).max(0.0);
-    HoprBalance::from(U256::from(stake_f64 as u128))
+    // One-winning-ticket floor: the channel must always be able to issue a
+    // full-path ticket of face value tp × h / p, or it cannot relay at all.
+    let floor = price_f64 * h / p;
+
+    // Round up: the one-ticket floor is a strict safety guarantee (the on-chain
+    // face value is integer wei), so a downward-truncating cast could yield a
+    // stake one wei below face value and still trip `OutOfFunds`.
+    let stake_f64 = target.max(floor).max(0.0);
+    HoprBalance::from(U256::from(stake_f64.ceil() as u128))
 }
 
 impl FundingConfig {
     /// Resolve all data-capacity fields to wxHOPR amounts at the given ticket
     /// economics.  Called once per pipeline tick.
     ///
-    /// `win_prob` must be in `(0, 1]`; it is ignored for
-    /// [`CapacitySizingMode::Deterministic`] (pass `1.0` as the conventional
-    /// placeholder).
+    /// `win_prob` must be in `(0, 1]`.  Every mode uses it to compute the
+    /// one-winning-ticket floor, so it is always required.
     pub(crate) fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: f64) -> ResolvedFunding {
         let hops = self.assumed_hops;
         let mode = &self.sizing_mode;
@@ -683,339 +699,442 @@ mod config_tests {
         }
     }
 
-    // ── capacity_to_balance: parameterised unit tests ────────────────────────
+    // ── capacity_to_balance: helpers ─────────────────────────────────────────
+
+    const PAYLOAD: u64 = 1036;
+    /// 0.01 wxHOPR in wei (10^16).
+    const PRICE_WEI: u128 = 10_000_000_000_000_000;
 
     fn balance_from_wei(wei: u128) -> HoprBalance {
         HoprBalance::from(U256::from(wei))
     }
 
-    /// 0.01 wxHOPR in wei  (10^16)
-    const PRICE_WEI: u128 = 10_000_000_000_000_000;
-
-    /// Expected stake in wei for `Deterministic` mode: N × hops × price_wei.
-    fn det_stake(n_packets: u128, hops: u128) -> u128 {
-        n_packets * hops * PRICE_WEI
+    fn packets(bytes: u64) -> u128 {
+        bytes.div_ceil(PAYLOAD) as u128
     }
 
-    // ── Deterministic: stake = N × hops × price, win_prob irrelevant ─────────
-
-    /// Vary packet count — Deterministic stake grows linearly with N.
-    #[rstest]
-    #[case(1,  1, 1 * 1 * PRICE_WEI)]
-    #[case(10, 1, 10 * 1 * PRICE_WEI)]
-    #[case(100, 1, 100 * 1 * PRICE_WEI)]
-    #[case(1000, 1, 1000 * 1 * PRICE_WEI)]
-    fn deterministic_scales_with_packet_count(#[case] n_pkts: u64, #[case] hops: u32, #[case] expected_wei: u128) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n_pkts);
-        let result = capacity_to_balance::<TestTransport>(cap, price, 0.5, hops, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), expected_wei, "n={n_pkts}");
+    /// One full-path winning ticket face value in wei: `tp × hops / p`.
+    fn floor_wei(tp_wei: u128, hops: u32, p: f64) -> u128 {
+        (tp_wei as f64 * hops as f64 / p) as u128
     }
 
-    /// Vary hop count — Deterministic stake grows linearly with hops.
-    #[rstest]
-    #[case(1, 10 * 1 * PRICE_WEI)]
-    #[case(2, 10 * 2 * PRICE_WEI)]
-    #[case(3, 10 * 3 * PRICE_WEI)]
-    fn deterministic_scales_with_hops(#[case] hops: u32, #[case] expected_wei: u128) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10); // 10 packets
-        let result = capacity_to_balance::<TestTransport>(cap, price, 0.01, hops, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), expected_wei, "hops={hops}");
+    /// Mean drain in wei: `N × hops × tp`.
+    fn mean_wei(n: u128, hops: u32, tp_wei: u128) -> u128 {
+        n * hops as u128 * tp_wei
     }
 
-    /// Vary win_prob — Deterministic must be invariant.
+    /// Φ⁻¹(alpha) — the z-score used by `Probabilistic`.
+    fn z_score(alpha: f64) -> f64 {
+        use statrs::distribution::{ContinuousCDF, Normal};
+        Normal::standard().inverse_cdf(alpha)
+    }
+
+    fn stake_wei(cap: ByteSize, tp_wei: u128, p: f64, hops: u32, mode: &CapacitySizingMode) -> u128 {
+        capacity_to_balance::<TestTransport>(cap, balance_from_wei(tp_wei), p, hops, mode)
+            .amount()
+            .low_u128()
+    }
+
+    /// Assert `got ≈ want` with a 1e-9 relative + 4 wei absolute tolerance
+    /// (accounts for the f64 round-trip inside `capacity_to_balance`).
+    fn assert_close(got: u128, want: u128, ctx: &str) {
+        let hi = got.max(want);
+        let lo = got.min(want);
+        let tol = (hi / 1_000_000_000).max(4);
+        assert!(
+            hi - lo <= tol,
+            "{ctx}: got {got} want {want} (diff {}, tol {tol})",
+            hi - lo
+        );
+    }
+
+    const DET: CapacitySizingMode = CapacitySizingMode::Deterministic;
+    fn prob(alpha: f64) -> CapacitySizingMode {
+        CapacitySizingMode::Probabilistic {
+            success_probability: alpha,
+        }
+    }
+
+    // Live-network parameters used across regression tests.
+    const JURA_TP: u128 = 10_000_000_000_000; // 1e13 wei = 1e-5 wxHOPR
+    const JURA_P: f64 = 4.0e-6; // 288230376143 / (2^56 - 1)
+    const ROTSEE_TP: u128 = 100; // 1e-16 wxHOPR
+    const ROTSEE_P: f64 = 1.25e-4; // 9007199254735 / (2^56 - 1)
+
+    // ── Deterministic: stake = max(floor, N × hops × tp) ─────────────────────
+
+    /// Above the floor, Deterministic equals the mean drain and grows linearly
+    /// with packet count.  (p = 0.5 keeps the floor small.)
     #[rstest]
-    #[case(0.001)]
+    #[case(10)]
+    #[case(100)]
+    #[case(1_000)]
+    #[case(100_000)]
+    fn deterministic_equals_mean_drain_above_floor(#[case] n_pkts: u64) {
+        let cap = ByteSize::b(PAYLOAD * n_pkts);
+        let got = stake_wei(cap, PRICE_WEI, 0.5, 3, &DET);
+        assert_close(got, mean_wei(n_pkts as u128, 3, PRICE_WEI), &format!("n={n_pkts}"));
+    }
+
+    /// Above the floor, Deterministic scales linearly with hops.
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn deterministic_scales_with_hops(#[case] hops: u32) {
+        let cap = ByteSize::b(PAYLOAD * 100_000);
+        let got = stake_wei(cap, PRICE_WEI, 0.5, hops, &DET);
+        assert_close(got, mean_wei(100_000, hops, PRICE_WEI), &format!("hops={hops}"));
+    }
+
+    /// The mean-drain term is win-prob independent: as long as it stays above the
+    /// floor (N > 1/p), varying win_prob leaves the stake unchanged.
+    #[rstest]
     #[case(0.01)]
     #[case(0.1)]
     #[case(0.5)]
     #[case(1.0)]
-    fn deterministic_invariant_to_win_prob(#[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10);
-        let result = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), det_stake(10, 3), "win_prob={win_prob}");
+    fn deterministic_mean_invariant_to_win_prob_above_floor(#[case] p: f64) {
+        // N = 1e6 ≫ 1/p for every p above, so the floor never binds.
+        let cap = ByteSize::b(PAYLOAD * 1_000_000);
+        let got = stake_wei(cap, PRICE_WEI, p, 3, &DET);
+        assert_close(got, mean_wei(1_000_000, 3, PRICE_WEI), &format!("p={p}"));
     }
 
-    /// Sub-packet capacity is always rounded up to 1 packet.
+    /// Sub-packet capacity rounds up to exactly one packet.
     #[rstest]
     #[case(1)]
     #[case(500)]
     #[case(1035)]
-    fn deterministic_sub_packet_rounds_up(#[case] bytes: u64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let result =
-            capacity_to_balance::<TestTransport>(ByteSize::b(bytes), price, 1.0, 1, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), PRICE_WEI, "bytes={bytes}");
+    fn sub_packet_rounds_up_to_one_packet(#[case] bytes: u64) {
+        // p = 1.0 → floor = tp·h = mean for N=1, so stake = tp·h.
+        let got = stake_wei(ByteSize::b(bytes), PRICE_WEI, 1.0, 1, &DET);
+        assert_eq!(got, PRICE_WEI, "bytes={bytes}");
     }
 
-    // ── Expected: stake = N × p × hops × price ───────────────────────────────
+    // ── The one-winning-ticket floor (the core fix) ──────────────────────────
 
-    /// Vary win_prob — Expected stake scales linearly with p.
+    /// When the capacity is worth less than one winning ticket (`N < 1/p`), the
+    /// floor binds and the stake equals exactly one full-path ticket face value.
     #[rstest]
-    // (win_prob, n_packets, hops) → expected wei (integer truncation)
-    #[case(1.0,  10, 3, (10.0 * 1.0 * 3.0 * PRICE_WEI as f64) as u128)]
-    #[case(0.5,  10, 3, (10.0 * 0.5 * 3.0 * PRICE_WEI as f64) as u128)]
-    #[case(0.1,  10, 3, (10.0 * 0.1 * 3.0 * PRICE_WEI as f64) as u128)]
-    #[case(0.01, 10, 3, (10.0 * 0.01 * 3.0 * PRICE_WEI as f64) as u128)]
-    fn expected_scales_with_win_prob(
-        #[case] win_prob: f64,
-        #[case] n: u64,
-        #[case] hops: u32,
-        #[case] expected_wei: u128,
-    ) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n);
-        let result = capacity_to_balance::<TestTransport>(cap, price, win_prob, hops, &CapacitySizingMode::Expected);
-        // Allow 1 wei truncation error from f64 arithmetic
-        let diff = result.amount().low_u128().abs_diff(expected_wei);
+    // (n_pkts, p) chosen so N·h·tp < tp·h/p  ⟺  N < 1/p
+    #[case(1, 1.0e-4)]
+    #[case(10, 1.0e-4)]
+    #[case(1_000, 4.0e-6)] // jura-like: 1/p = 250 000 ≫ 1 000
+    #[case(1, 1.0e-9)]
+    fn floor_binds_below_one_ticket(#[case] n_pkts: u64, #[case] p: f64) {
+        let cap = ByteSize::b(PAYLOAD * n_pkts);
+        let want_floor = floor_wei(PRICE_WEI, 3, p);
+        let got = stake_wei(cap, PRICE_WEI, p, 3, &DET);
+        assert_close(got, want_floor, &format!("n={n_pkts} p={p}"));
+        // And it must be ≥ one ticket by construction.
         assert!(
-            diff <= 1,
-            "win_prob={win_prob}: got {} expected {} (diff={diff})",
-            result.amount().low_u128(),
-            expected_wei
+            got >= want_floor - 4,
+            "n={n_pkts} p={p}: {got} below one ticket {want_floor}"
         );
     }
 
-    /// Expected at win_prob=1.0 must equal Deterministic.
-    #[rstest]
-    #[case(1, 1)]
-    #[case(10, 1)]
-    #[case(100, 3)]
-    #[case(1000, 2)]
-    fn expected_at_full_prob_equals_deterministic(#[case] n_pkts: u64, #[case] hops: u32) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n_pkts);
-        let det = capacity_to_balance::<TestTransport>(cap, price, 1.0, hops, &CapacitySizingMode::Deterministic);
-        let exp = capacity_to_balance::<TestTransport>(cap, price, 1.0, hops, &CapacitySizingMode::Expected);
-        // 1 wei tolerance for f64 rounding at large N
-        let diff = det.amount().low_u128().abs_diff(exp.amount().low_u128());
-        assert!(
-            diff <= 1,
-            "n={n_pkts} hops={hops}: Deterministic={det} Expected={exp} diff={diff}"
-        );
+    /// Both modes always fund at least one winning ticket, for any capacity,
+    /// win_prob and ticket price — the invariant the floor guarantees.
+    #[test]
+    fn never_below_one_winning_ticket() {
+        let ps = [1.0, 0.5, 0.1, 1e-2, 1e-3, ROTSEE_P, JURA_P, 1e-8];
+        let tps = [1u128, 100, PRICE_WEI, JURA_TP, 1_000_000_000_000_000_000];
+        let caps = [
+            ByteSize::b(1),
+            ByteSize::b(PAYLOAD),
+            ByteSize::mib(256),
+            ByteSize::gib(1),
+        ];
+        for &p in &ps {
+            for &tp in &tps {
+                for &cap in &caps {
+                    let floor = floor_wei(tp, 3, p);
+                    for mode in [DET, prob(0.999)] {
+                        let got = stake_wei(cap, tp, p, 3, &mode);
+                        assert!(
+                            got + 4 >= floor,
+                            "{mode:?} p={p} tp={tp} cap={cap:?}: stake {got} < one ticket {floor}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
-    // ── Probabilistic: stake = μ + k·σ ───────────────────────────────────────
+    /// The floor is applied independently to every FundingConfig field, so even
+    /// with 1-byte capacities every resolved balance covers one winning ticket.
+    #[test]
+    fn floor_applies_to_all_four_fields() {
+        let cfg = FundingConfig {
+            initial_capacity: ByteSize::b(1),
+            topup_capacity: ByteSize::b(1),
+            lower_capacity_threshold: ByteSize::b(1),
+            min_safe_capacity_required: ByteSize::b(1),
+            ..FundingConfig::default()
+        };
+        let floor = floor_wei(JURA_TP, 3, JURA_P);
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(JURA_TP), JURA_P);
+        for (name, bal) in [
+            ("initial", r.initial_balance),
+            ("topup", r.topup_balance),
+            ("lower_threshold", r.lower_balance_threshold),
+            ("min_safe", r.min_safe_balance_required),
+        ] {
+            assert_close(bal.amount().low_u128(), floor, name);
+        }
+    }
 
-    /// At win_prob=1.0 variance is 0 → Probabilistic == Deterministic (±1 wei).
+    // ── Probabilistic: stake = max(floor, mean + k·σ) ────────────────────────
+
+    /// At win_prob = 1.0 the variance vanishes → Probabilistic == Deterministic.
     #[rstest]
     #[case(0.841)]
     #[case(0.977)]
     #[case(0.999)]
     #[case(0.9999)]
-    fn probabilistic_at_full_prob_equals_deterministic(#[case] alpha: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 100);
-        let mode = CapacitySizingMode::Probabilistic {
-            success_probability: alpha,
-        };
-        let prob = capacity_to_balance::<TestTransport>(cap, price, 1.0, 3, &mode);
-        let det = capacity_to_balance::<TestTransport>(cap, price, 1.0, 3, &CapacitySizingMode::Deterministic);
-        let diff = prob.amount().low_u128().abs_diff(det.amount().low_u128());
-        assert!(
-            diff <= 1,
-            "alpha={alpha}: Probabilistic={prob} Deterministic={det} diff={diff}"
-        );
+    fn probabilistic_equals_deterministic_at_full_prob(#[case] alpha: f64) {
+        let cap = ByteSize::b(PAYLOAD * 100_000);
+        let p = stake_wei(cap, PRICE_WEI, 1.0, 3, &prob(alpha));
+        let d = stake_wei(cap, PRICE_WEI, 1.0, 3, &DET);
+        assert_close(p, d, &format!("alpha={alpha}"));
     }
 
-    /// Probabilistic > Expected for any win_prob < 1 (k > 0 adds a buffer).
+    /// Probabilistic ≥ Deterministic for every win_prob (same floor, non-negative
+    /// buffer).  This is the corrected ordering: the buffer sits *above* the mean.
     #[rstest]
-    #[case(0.001)]
-    #[case(0.01)]
+    #[case(1e-3)]
+    #[case(1e-2)]
     #[case(0.1)]
     #[case(0.5)]
-    fn probabilistic_exceeds_expected(#[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10_000); // large N so σ is significant
-        let mode = CapacitySizingMode::Probabilistic {
-            success_probability: 0.999,
-        };
-        let prob = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &mode);
-        let exp = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Expected);
-        assert!(
-            prob > exp,
-            "win_prob={win_prob}: Probabilistic={prob} must exceed Expected={exp}"
-        );
+    #[case(1.0)]
+    fn probabilistic_at_least_deterministic(#[case] p: f64) {
+        let cap = ByteSize::b(PAYLOAD * 1_000_000);
+        let pr = stake_wei(cap, PRICE_WEI, p, 3, &prob(0.999));
+        let d = stake_wei(cap, PRICE_WEI, p, 3, &DET);
+        assert!(pr + 4 >= d, "p={p}: Probabilistic {pr} must be ≥ Deterministic {d}");
     }
 
-    /// Probabilistic < Deterministic at low win_prob (the key property).
+    /// Above the floor, Probabilistic matches mean + k·σ with the corrected σ
+    /// (`σ = tp·h·√(N·(1−p)/p)`), verified against an independent computation.
     #[rstest]
-    #[case(0.001)]
-    #[case(0.01)]
-    #[case(0.05)]
-    #[case(0.1)]
-    fn probabilistic_below_deterministic_at_low_prob(#[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10_000);
-        let mode = CapacitySizingMode::Probabilistic {
-            success_probability: 0.999,
-        };
-        let prob = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &mode);
-        let det = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Deterministic);
-        assert!(
-            prob < det,
-            "win_prob={win_prob}: Probabilistic={prob} must be < Deterministic={det}"
-        );
+    #[case(0.5, 0.999)]
+    #[case(0.1, 0.999)]
+    #[case(0.01, 0.999)]
+    #[case(0.01, 0.9999)]
+    fn probabilistic_matches_mean_plus_k_sigma(#[case] p: f64, #[case] alpha: f64) {
+        let n = 10_000_000u128; // large N so the buffer keeps us above the floor
+        let cap = ByteSize::b(PAYLOAD * n as u64);
+        let mean = mean_wei(n, 3, PRICE_WEI) as f64;
+        let sigma = PRICE_WEI as f64 * 3.0 * (n as f64 * (1.0 - p) / p).sqrt();
+        let want = (mean + z_score(alpha) * sigma) as u128;
+        let got = stake_wei(cap, PRICE_WEI, p, 3, &prob(alpha));
+        assert_close(got, want, &format!("p={p} alpha={alpha}"));
     }
 
-    /// Higher confidence → larger stake (monotone in alpha).
+    /// Higher confidence → larger stake (monotone in alpha), above the floor.
     #[rstest]
-    #[case(0.5, 0.9)]
+    #[case(0.6, 0.9)]
     #[case(0.9, 0.99)]
     #[case(0.99, 0.999)]
     #[case(0.999, 0.9999)]
-    fn probabilistic_monotone_in_confidence(#[case] alpha_lo: f64, #[case] alpha_hi: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10_000);
-        let lo = capacity_to_balance::<TestTransport>(
-            cap,
-            price,
-            0.1,
-            3,
-            &CapacitySizingMode::Probabilistic {
-                success_probability: alpha_lo,
-            },
-        );
-        let hi = capacity_to_balance::<TestTransport>(
-            cap,
-            price,
-            0.1,
-            3,
-            &CapacitySizingMode::Probabilistic {
-                success_probability: alpha_hi,
-            },
-        );
+    fn probabilistic_monotone_in_confidence(#[case] lo: f64, #[case] hi: f64) {
+        let cap = ByteSize::b(PAYLOAD * 10_000_000);
+        let s_lo = stake_wei(cap, PRICE_WEI, 0.1, 3, &prob(lo));
+        let s_hi = stake_wei(cap, PRICE_WEI, 0.1, 3, &prob(hi));
+        assert!(s_hi > s_lo, "alpha {hi} must exceed {lo}: {s_hi} vs {s_lo}");
+    }
+
+    /// Regression: the variance buffer scales **linearly** with hops.  Each
+    /// packet issues one aggregated ticket of face value `tp·h/p`, so both the
+    /// mean drain and `σ = tp·h·√(N·(1−p)/p)` scale with `h` — the buffer at
+    /// `h = 3` must be ≈ 3× the buffer at `h = 1`.  The prior `σ = tp·√(N·h·…)`
+    /// scaled the buffer by only `√3 ≈ 1.73` and would fail this assertion.
+    #[test]
+    fn probabilistic_buffer_scales_linearly_with_hops() {
+        let n = 10_000_000u128;
+        let cap = ByteSize::b(PAYLOAD * n as u64);
+        let p = 0.01;
+        let buffer = |h: u32| {
+            let mean = mean_wei(n, h, PRICE_WEI);
+            stake_wei(cap, PRICE_WEI, p, h, &prob(0.999)).saturating_sub(mean) as f64
+        };
+        let ratio = buffer(3) / buffer(1);
         assert!(
-            hi > lo,
-            "alpha_hi={alpha_hi} must give larger stake than alpha_lo={alpha_lo}"
+            (ratio - 3.0).abs() < 0.02,
+            "buffer(3)/buffer(1) = {ratio:.4}, expected ≈ 3.0 (√h would give ≈ 1.73)"
         );
     }
 
-    /// Vary hops — all three modes scale linearly with hops.
-    #[rstest]
-    #[case(CapacitySizingMode::Deterministic, 0.5)]
-    #[case(CapacitySizingMode::Expected, 0.5)]
-    #[case(CapacitySizingMode::Probabilistic { success_probability: 0.999 }, 0.5)]
-    fn all_modes_scale_linearly_with_hops(#[case] mode: CapacitySizingMode, #[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 1000);
-        let h1 = capacity_to_balance::<TestTransport>(cap, price, win_prob, 1, &mode);
-        let h2 = capacity_to_balance::<TestTransport>(cap, price, win_prob, 2, &mode);
-        let h3 = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &mode);
-        // Linear: h2 ≈ 2×h1, h3 ≈ 3×h1 (within 2 wei for f64 rounding in prob mode)
-        let diff2 = h2.amount().low_u128().abs_diff(h1.amount().low_u128() * 2);
-        let diff3 = h3.amount().low_u128().abs_diff(h1.amount().low_u128() * 3);
-        assert!(diff2 <= 2, "{mode:?}: 2-hop={h2} should be 2×1-hop={h1} (diff={diff2})");
-        assert!(diff3 <= 2, "{mode:?}: 3-hop={h3} should be 3×1-hop={h1} (diff={diff3})");
+    /// The variance buffer grows as win_prob falls (rarer, larger payouts).
+    #[test]
+    fn probabilistic_buffer_grows_as_win_prob_falls() {
+        let cap = ByteSize::b(PAYLOAD * 10_000_000);
+        let mean = mean_wei(10_000_000, 3, PRICE_WEI);
+        let buffer = |p: f64| stake_wei(cap, PRICE_WEI, p, 3, &prob(0.999)).saturating_sub(mean);
+        assert!(buffer(0.001) > buffer(0.01), "buffer must grow as p falls");
+        assert!(buffer(0.01) > buffer(0.1));
     }
 
-    // ── Ordering invariant: Expected ≤ Probabilistic ≤ Deterministic ─────────
+    // ── Sanity sweep across all probabilities and ticket prices ──────────────
 
-    /// For all win_prob ∈ (0,1): Expected ≤ Probabilistic(0.999) ≤ Deterministic.
-    #[rstest]
-    #[case(0.001, 1_000)]
-    #[case(0.01, 10_000)]
-    #[case(0.1, 100_000)]
-    #[case(0.5, 1_000_000)]
-    fn ordering_expected_le_probabilistic_le_deterministic(#[case] win_prob: f64, #[case] n_pkts: u64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n_pkts);
-        let exp = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Expected);
-        let prob = capacity_to_balance::<TestTransport>(
-            cap,
-            price,
-            win_prob,
-            3,
-            &CapacitySizingMode::Probabilistic {
-                success_probability: 0.999,
-            },
+    /// Cross-product sanity check: for every (win_prob, ticket_price, mode) the
+    /// resolved default config is well-formed — finite, ≥ one winning ticket on
+    /// every field, initial ≥ lower threshold, and Probabilistic ≥ Deterministic.
+    #[test]
+    fn sanity_grid_all_probs_and_prices() {
+        let ps = [1.0, 0.5, 0.1, 1e-2, 1e-3, ROTSEE_P, JURA_P, 1e-7];
+        let tps = [1u128, 100, PRICE_WEI, JURA_TP, 1_000_000_000_000_000_000];
+        for &p in &ps {
+            for &tp in &tps {
+                let floor = floor_wei(tp, 3, p);
+                let cfg = FundingConfig::default();
+                let det = cfg.resolve::<TestTransport>(balance_from_wei(tp), p);
+                let pr_cfg = FundingConfig {
+                    sizing_mode: prob(0.999),
+                    ..FundingConfig::default()
+                };
+                let pr = pr_cfg.resolve::<TestTransport>(balance_from_wei(tp), p);
+
+                for (name, d, q) in [
+                    ("initial", det.initial_balance, pr.initial_balance),
+                    ("topup", det.topup_balance, pr.topup_balance),
+                    ("lower", det.lower_balance_threshold, pr.lower_balance_threshold),
+                    ("min_safe", det.min_safe_balance_required, pr.min_safe_balance_required),
+                ] {
+                    let dw = d.amount().low_u128();
+                    let qw = q.amount().low_u128();
+                    assert!(dw + 4 >= floor, "det {name} p={p} tp={tp}: {dw} < ticket {floor}");
+                    assert!(qw + 4 >= floor, "prob {name} p={p} tp={tp}: {qw} < ticket {floor}");
+                    assert!(qw + 4 >= dw, "prob<det {name} p={p} tp={tp}: {qw} < {dw}");
+                }
+                // initial (1 GiB) must dominate the lower threshold (256 MiB).
+                assert!(
+                    det.initial_balance >= det.lower_balance_threshold,
+                    "initial < lower p={p} tp={tp}"
+                );
+            }
+        }
+    }
+
+    /// Win_prob = 1.0 edge: floor = tp·hops, mean = N·hops·tp, and for N ≥ 1 the
+    /// mean dominates, so every field equals its mean drain.
+    #[test]
+    fn edge_win_prob_one() {
+        let n = packets(ByteSize::gib(1).as_u64());
+        let got = stake_wei(ByteSize::gib(1), PRICE_WEI, 1.0, 3, &DET);
+        assert_close(got, mean_wei(n, 3, PRICE_WEI), "p=1.0");
+    }
+
+    /// Extreme-low win_prob edge: floor = tp·hops/p is enormous but computed
+    /// without overflowing to zero, and the stake equals it.
+    #[test]
+    fn edge_extreme_low_win_prob_uses_floor() {
+        let p = 1e-9;
+        let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
+        let floor = floor_wei(PRICE_WEI, 3, p);
+        assert!(got > 0, "must not underflow to zero");
+        assert_close(got, floor, "p=1e-9");
+    }
+
+    /// Regression: a degenerate win_prob (zero, negative, NaN, -∞) must not blow
+    /// the one-ticket floor `tp·hops/p` up to `f64::INFINITY` and saturate the
+    /// stake to `u128::MAX`.  win_prob is clamped into `[f64::EPSILON, 1.0]`, so
+    /// such inputs resolve to the large-but-finite floor at `p = f64::EPSILON`.
+    #[test]
+    fn degenerate_win_prob_is_clamped_not_saturated() {
+        let floor_at_eps = floor_wei(PRICE_WEI, 3, f64::EPSILON);
+        for p in [0.0_f64, -1.0, f64::NAN, f64::NEG_INFINITY] {
+            let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
+            assert!(got < u128::MAX, "p={p}: must not saturate to u128::MAX");
+            assert_close(got, floor_at_eps, &format!("p={p} clamped to ε"));
+        }
+    }
+
+    // ── Live-network regression: jura & rotsee (default Deterministic) ───────
+
+    /// jura (staging): tp = 1e13 wei, win_prob = 4e-6.  Documents the exact
+    /// default-Deterministic stakes and confirms each covers ≥ 1 winning ticket
+    /// (face value = 7.5 wxHOPR = 7.5e18 wei).
+    #[test]
+    fn jura_default_deterministic_stakes() {
+        let cfg = FundingConfig::default();
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(JURA_TP), JURA_P);
+        let floor = floor_wei(JURA_TP, 3, JURA_P); // 7.5e18
+        assert_close(floor, 7_500_000_000_000_000_000, "jura 1-ticket floor");
+
+        // initial / topup / min_safe = 1 GiB → mean drain ≈ 31.09 wxHOPR.
+        let n_gib = packets(ByteSize::gib(1).as_u64()); // 1_036_431
+        assert_close(
+            r.initial_balance.amount().low_u128(),
+            mean_wei(n_gib, 3, JURA_TP),
+            "jura initial",
         );
-        let det = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Deterministic);
-        assert!(
-            exp <= prob,
-            "win_prob={win_prob}: Expected={exp} must be ≤ Probabilistic={prob}"
+        assert_close(
+            r.initial_balance.amount().low_u128(),
+            31_092_930_000_000_000_000,
+            "jura initial ≈ 31.09 wxHOPR",
+        );
+        // lower threshold = 256 MiB → ≈ 7.77 wxHOPR, still ≥ one ticket (7.5).
+        let n_256 = packets(ByteSize::mib(256).as_u64()); // 259_108
+        assert_close(
+            r.lower_balance_threshold.amount().low_u128(),
+            mean_wei(n_256, 3, JURA_TP),
+            "jura lower",
         );
         assert!(
-            prob <= det,
-            "win_prob={win_prob}: Probabilistic={prob} must be ≤ Deterministic={det}"
+            r.lower_balance_threshold.amount().low_u128() >= floor,
+            "jura lower must cover ≥ 1 winning ticket"
         );
     }
 
-    // ── FundingConfig::resolve ───────────────────────────────────────────────
+    /// rotsee (development): tp = 100 wei, win_prob = 1.25e-4.  Face value =
+    /// 2.4e6 wei; every default field sits far above it.
+    #[test]
+    fn rotsee_default_deterministic_stakes() {
+        let cfg = FundingConfig::default();
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(ROTSEE_TP), ROTSEE_P);
+        let floor = floor_wei(ROTSEE_TP, 3, ROTSEE_P); // 2_400_000 wei
+        assert_close(floor, 2_400_000, "rotsee 1-ticket floor");
+
+        let n_gib = packets(ByteSize::gib(1).as_u64());
+        assert_close(
+            r.initial_balance.amount().low_u128(),
+            mean_wei(n_gib, 3, ROTSEE_TP),
+            "rotsee initial",
+        );
+        assert_close(
+            r.initial_balance.amount().low_u128(),
+            310_929_300,
+            "rotsee initial (wei)",
+        );
+        let n_256 = packets(ByteSize::mib(256).as_u64());
+        assert_close(
+            r.lower_balance_threshold.amount().low_u128(),
+            mean_wei(n_256, 3, ROTSEE_TP),
+            "rotsee lower",
+        );
+        assert!(r.lower_balance_threshold.amount().low_u128() >= floor);
+    }
+
+    // ── FundingConfig::resolve, defaults, validation, serde ──────────────────
 
     #[test]
     fn resolve_maps_all_four_fields() {
         let cfg = FundingConfig::default();
         let price = balance_from_wei(PRICE_WEI);
-        let win_prob = 0.5_f64;
-        let resolved = cfg.resolve::<TestTransport>(price, win_prob);
-
-        assert_eq!(
-            resolved.initial_balance,
-            capacity_to_balance::<TestTransport>(
-                cfg.initial_capacity,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-        assert_eq!(
-            resolved.topup_balance,
-            capacity_to_balance::<TestTransport>(
-                cfg.topup_capacity,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-        assert_eq!(
-            resolved.lower_balance_threshold,
-            capacity_to_balance::<TestTransport>(
-                cfg.lower_capacity_threshold,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-        assert_eq!(
-            resolved.min_safe_balance_required,
-            capacity_to_balance::<TestTransport>(
-                cfg.min_safe_capacity_required,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-    }
-
-    // ── defaults & validation ────────────────────────────────────────────────
-
-    #[test]
-    fn default_sizing_mode_is_probabilistic_999() {
-        match FundingConfig::default().sizing_mode {
-            CapacitySizingMode::Probabilistic { success_probability } => {
-                assert!((success_probability - 0.999).abs() < 1e-9);
-            }
-            other => panic!("expected Probabilistic, got {other:?}"),
-        }
+        let p = 0.5_f64;
+        let r = cfg.resolve::<TestTransport>(price, p);
+        let cap = |c| capacity_to_balance::<TestTransport>(c, price, p, cfg.assumed_hops, &cfg.sizing_mode);
+        assert_eq!(r.initial_balance, cap(cfg.initial_capacity));
+        assert_eq!(r.topup_balance, cap(cfg.topup_capacity));
+        assert_eq!(r.lower_balance_threshold, cap(cfg.lower_capacity_threshold));
+        assert_eq!(r.min_safe_balance_required, cap(cfg.min_safe_capacity_required));
     }
 
     #[test]
-    fn requires_win_prob_returns_false_only_for_deterministic() {
-        assert!(!CapacitySizingMode::Deterministic.requires_win_prob());
-        assert!(CapacitySizingMode::Expected.requires_win_prob());
-        assert!(
-            CapacitySizingMode::Probabilistic {
-                success_probability: 0.999
-            }
-            .requires_win_prob()
-        );
+    fn default_sizing_mode_is_deterministic() {
+        assert_eq!(FundingConfig::default().sizing_mode, CapacitySizingMode::Deterministic);
     }
 
     #[test]
@@ -1037,8 +1156,6 @@ mod config_tests {
         assert_eq!(FundingConfig::default().assumed_hops, 3);
     }
 
-    // ── Serde round-trips ─────────────────────────────────────────────────────
-
     #[test]
     fn funding_config_serde_roundtrip_probabilistic() -> anyhow::Result<()> {
         let cfg = FundingConfig {
@@ -1048,9 +1165,7 @@ mod config_tests {
             min_safe_capacity_required: ByteSize::gib(2),
             stop_when_unfunded: false,
             assumed_hops: 2,
-            sizing_mode: CapacitySizingMode::Probabilistic {
-                success_probability: 0.9999,
-            },
+            sizing_mode: prob(0.9999),
         };
         let json = serde_json::to_string(&cfg).context("serialize")?;
         let back: FundingConfig = serde_json::from_str(&json).context("deserialize")?;
@@ -1072,13 +1187,8 @@ mod config_tests {
 
     #[test]
     fn sizing_mode_serde_external_tag() -> anyhow::Result<()> {
-        // Unit variants round-trip as plain strings.
         let det: CapacitySizingMode = serde_json::from_str(r#""deterministic""#)?;
         assert_eq!(det, CapacitySizingMode::Deterministic);
-        let exp: CapacitySizingMode = serde_json::from_str(r#""expected""#)?;
-        assert_eq!(exp, CapacitySizingMode::Expected);
-        // Struct variant uses {"probabilistic": {fields}} in JSON /
-        // `probabilistic:\n  success_probability: 0.999` in YAML.
         let prob: CapacitySizingMode = serde_json::from_str(r#"{"probabilistic":{"success_probability":0.99}}"#)?;
         assert_eq!(
             prob,
