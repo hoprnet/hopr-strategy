@@ -1,24 +1,25 @@
-//! Higher-level scenario setup shared by the strategy integration tests: build a
-//! stub state with two accounts and an open channel between them, connect a node,
-//! and the polling helpers used to observe channel state transitions.
+//! Higher-level scenario setup shared by the strategy integration tests: onboard
+//! two accounts, open a channel between them, connect a node, and the polling
+//! helpers used to observe channel state transitions.
 
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use blokli_client::api::types::Safe;
 use hopr_api::{
-    chain::{ChainReadChannelOperations, ChainWriteChannelOperations},
-    types::{
-        crypto::prelude::Keypair,
-        internal::prelude::ChannelEntry,
-        primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
-    },
+    chain::ChainReadChannelOperations,
+    types::{crypto::prelude::Keypair, internal::prelude::ChannelEntry, primitive::prelude::Address},
 };
-use hopr_strategy::testing::{BlokliTestStateBuilder, create_test_blokli_connector, register_test_safe};
+// Onboarding/channel fixture methods live in the `hopr-types` (1.x) type-world,
+// which is distinct from `hopr-api`'s bundled `hopr-types`; funding amounts must
+// use this one to match those signatures.
+use hopr_types::primitive::prelude::HoprBalance;
 
-use super::{IntegrationFixture, TestAccount, poll_stable, poll_until};
+use super::{IntegrationFixture, poll_stable, poll_until};
 use crate::{
+    anvil::AnvilAccount,
     constants::{SAFE_ALLOWANCE, SAFE_FUNDING},
-    strategy_node::NodeConnector,
+    strategy_node::{NodeConnector, connect_node, node_chain_keypair},
 };
 
 /// Which end of the channel the scenario attaches its node connector to.
@@ -51,106 +52,57 @@ impl ScenarioOpts {
     }
 }
 
-/// A fully set up scenario with an open source→destination channel.
-/// Both source and destination connectors share the same `BlokliTestClient` state.
+/// A fully onboarded, open `source -> destination` channel that is already
+/// visible to the connected node.
 pub struct ChannelScenario {
-    /// Node connector for the "connect_as" party (main test subject).
     pub connector: Arc<NodeConnector>,
-    /// Node connector for the source (used to initiate closure from source side).
-    source_connector: Arc<NodeConnector>,
+    pub source_safe: Safe,
+    pub destination_safe: Safe,
     pub source_addr: Address,
     pub destination_addr: Address,
     pub initial: ChannelEntry,
 }
 
-impl ChannelScenario {
-    /// Initiates outgoing channel closure from the source side.
-    /// The source_connector submits `initiate_outgoing_channel_closure`; the main
-    /// connector's background task receives `ChannelClosureInitiated` automatically.
-    pub async fn initiate_closure(&self) -> Result<()> {
-        let channel = self
-            .source_connector
-            .channel_by_parties(&self.source_addr, &self.destination_addr)?
-            .context("channel not found for closure initiation")?;
-        let confirmation = self.source_connector.close_channel(channel.get_id()).await?;
-        confirmation.await?;
-        Ok(())
-    }
-}
-
-fn module_address() -> Address {
-    Address::new(&[1u8; Address::SIZE])
-}
-
 impl IntegrationFixture {
-    /// Builds initial stub state with both accounts and an open channel, connects a
-    /// node to the requested party, and waits until the channel is visible to it.
+    /// Onboards both accounts (safe deploy + announce), approves the source safe
+    /// module, opens a `source -> destination` channel, connects a node to the
+    /// requested party, and waits until the channel is visible to it.
     pub async fn open_channel_scenario(
         &self,
-        source: &TestAccount,
-        destination: &TestAccount,
+        source: &AnvilAccount,
+        destination: &AnvilAccount,
         opts: ScenarioOpts,
     ) -> Result<ChannelScenario> {
-        use hopr_api::types::internal::prelude::{ChannelBuilder, ChannelStatus};
+        let source_safe = self
+            .deploy_safe_and_announce(source, opts.source_funding)
+            .await
+            .context("failed to onboard scenario source")?;
+        let destination_safe = self
+            .deploy_safe_and_announce(destination, opts.destination_funding)
+            .await
+            .context("failed to onboard scenario destination")?;
+        self.approve(source, opts.allowance, &source_safe.module_address)
+            .await
+            .context("failed to approve scenario source safe module")?;
+        self.open_channel(source, destination, opts.stake, &source_safe.module_address)
+            .await
+            .context("failed to open scenario channel")?;
 
-        let channel = ChannelBuilder::default()
-            .between(source.address, destination.address)
-            .balance(opts.stake)
-            .ticket_index(0u64)
-            .status(ChannelStatus::Open)
-            .epoch(0u32)
-            .build()
-            .context("failed to build initial channel")?;
-
-        // Pass both addresses in a single call since `with_generated_accounts`
-        // assigns key IDs sequentially starting from 0 and cannot be called twice
-        // (the second call would reuse key ID 0 and panic).
-        let client = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&source.address, &destination.address],
-                true,
-                XDaiBalance::new_base(1u32),
-                opts.source_funding,
-            )
-            .with_safe_allowances([(source.address, opts.allowance), (destination.address, opts.allowance)])
-            .with_channels([channel])
-            // Use a short grace period so closure deadline elapses within the test action timeout.
-            .with_closure_grace_period(Duration::from_secs(2))
-            .build_dynamic_client(module_address());
-
-        // Source and destination share the same state — clone the client.
-        let source_client = client.clone();
-        let dest_client = client;
-
-        let (main_client, main_kp) = match opts.connect_as {
-            ChannelParty::Source => (source_client.clone(), &source.keypair),
-            ChannelParty::Destination => (dest_client.clone(), &destination.keypair),
+        let (secret, module) = match opts.connect_as {
+            ChannelParty::Source => (source.secret_bytes(), &source_safe.module_address),
+            ChannelParty::Destination => (destination.secret_bytes(), &destination_safe.module_address),
         };
-
-        let connector = create_test_blokli_connector(main_kp, main_client, module_address())
+        let connector = connect_node(self.client().clone(), &secret, Address::from_str(module)?)
             .await
-            .context("failed to connect main node")?;
-        register_test_safe(&connector, main_kp.public().to_address())
-            .await
-            .context("failed to register main node safe")?;
-        let connector = Arc::new(connector);
+            .context("failed to connect scenario node")?;
 
-        let source_connector = create_test_blokli_connector(&source.keypair, source_client, module_address())
-            .await
-            .context("failed to connect source node")?;
-        // Only register source safe if main connector is not already the source node.
-        if main_kp.public().to_address() != source.address {
-            register_test_safe(&source_connector, source.address)
-                .await
-                .context("failed to register source node safe")?;
-        }
-        let source_connector = Arc::new(source_connector);
+        let source_addr = node_chain_keypair(&source.secret_bytes())?.public().to_address();
+        let destination_addr = node_chain_keypair(&destination.secret_bytes())?.public().to_address();
 
-        // Wait for the channel to be visible in the main connector's cache.
         let initial = await_channel(
             &connector,
-            source.address,
-            destination.address,
+            source_addr,
+            destination_addr,
             self.timeouts().visibility,
             "scenario channel visible",
         )
@@ -159,9 +111,10 @@ impl IntegrationFixture {
 
         Ok(ChannelScenario {
             connector,
-            source_connector,
-            source_addr: source.address,
-            destination_addr: destination.address,
+            source_safe,
+            destination_safe,
+            source_addr,
+            destination_addr,
             initial,
         })
     }
@@ -179,10 +132,14 @@ pub async fn await_channel_where<P>(
 where
     P: Fn(&ChannelEntry) -> bool + Clone + Send + 'static,
 {
-    poll_until(description, timeout, Duration::from_millis(100), || {
+    poll_until(description, timeout, Duration::from_millis(500), || {
         let connector = connector.clone();
         let predicate = predicate.clone();
-        async move { Ok(connector.channel_by_parties(&from, &to)?.filter(|c| predicate(c))) }
+        async move {
+            Ok(connector
+                .channel_by_parties(&from, &to)?
+                .filter(|channel| predicate(channel)))
+        }
     })
     .await
 }
@@ -210,10 +167,14 @@ pub async fn assert_channel_never<P>(
 where
     P: Fn(&ChannelEntry) -> bool + Clone + Send + 'static,
 {
-    poll_stable(description, window, Duration::from_millis(100), || {
+    poll_stable(description, window, Duration::from_secs(1), || {
         let connector = connector.clone();
         let predicate = predicate.clone();
-        async move { Ok(connector.channel_by_parties(&from, &to)?.filter(|c| predicate(c))) }
+        async move {
+            Ok(connector
+                .channel_by_parties(&from, &to)?
+                .filter(|channel| predicate(channel)))
+        }
     })
     .await
 }

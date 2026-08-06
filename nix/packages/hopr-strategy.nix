@@ -78,18 +78,11 @@ in
 
   clippy = clippyDerivation;
 
-  integration-tests = builders.local.callPackage nixLib.mkRustPackage (
-    (mkHoprStrategyBuildArgs {
-      src = sources.test;
-      depsSrc = sources.deps;
-    })
-    // {
-      cargoToml = ./../../tests/integration/Cargo.toml;
-      runNextest = true;
-      prependPackageName = false;
-      cargoExtraArgs = "-p hopr-strategy-integration-tests";
-    }
-  );
+  # Cacheable nextest archive. The archive is built in the Nix sandbox, while
+  # `nix run .#test-integration` executes it on the host where Docker is usable.
+  integration-tests = builders.local.callPackage ./integration-tests.nix {
+    inherit sources rev;
+  };
 
   # Run the unit-test suite under cargo-llvm-cov and expose the LCOV report as
   # the derivation output so CI can restore both dependencies and results from

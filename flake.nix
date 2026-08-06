@@ -203,7 +203,11 @@
               type = "app";
               program = toString (
                 pkgs.writeShellScript "test-integration" ''
-                  nix build -L .#integration-tests
+                  export BLOKLI_TEST_REMOTE_IMAGE="''${BLOKLI_TEST_REMOTE_IMAGE:-europe-west3-docker.pkg.dev/hoprassociation/docker-images/bloklid-anvil:latest}"
+                  exec ${pkgs.cargo-nextest}/bin/cargo-nextest nextest run \
+                    --archive-file "${packages.integration-tests}/integration-tests.tar.zst" \
+                    --workspace-remap "$PWD" \
+                    "$@"
                 ''
               );
             };
