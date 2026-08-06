@@ -2,9 +2,12 @@
   craneLib,
   cargo-nextest,
   libiconv,
+  lib,
   llvmPackages,
+  mold,
   openssl,
   pkg-config,
+  stdenv,
   sources,
   rev,
   ...
@@ -24,7 +27,8 @@ let
       llvmPackages.bintools
       pkg-config
       libiconv
-    ];
+    ]
+    ++ lib.optionals stdenv.buildPlatform.isLinux [ mold ];
     buildInputs = [ openssl ];
   };
 
