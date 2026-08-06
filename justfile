@@ -57,7 +57,8 @@ test-debug:
 nextest:
     cargo nextest run --workspace --exclude hopr-strategy-integration-tests --all-features
 
-# Run strategy integration tests.
+# Run strategy integration tests against the Blokli-Anvil Docker image.
+# Set BLOKLI_TEST_REMOTE_IMAGE to override the default image.
 test-integration:
     cargo test --manifest-path tests/integration/Cargo.toml -- --nocapture
 

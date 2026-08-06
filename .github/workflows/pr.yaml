@@ -104,7 +104,9 @@ jobs:
       enable_unit_coverage: true
       unit_coverage_command: "nix build -L .#coverage -o coverage.lcov"
       enable_integration_tests: true
-      integration_test_command: "nix build -L .#integration-tests"
+      # Build a cacheable nextest archive in Nix, then execute it on the host
+      # so the suite can access Docker and launch bloklid-anvil.
+      integration_test_command: "nix run -L .#test-integration"
       test_timeout: 30
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
