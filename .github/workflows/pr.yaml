@@ -100,12 +100,11 @@ jobs:
     uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-tests-v6.1.1
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
-      enable_unit_tests: true
-      unit_test_command: "nix run -L .#test"
+      enable_unit_tests: false
       enable_unit_coverage: true
-      unit_coverage_command: "nix run .#coverage-unit"
+      unit_coverage_command: "nix build -L .#coverage -o coverage.lcov"
       enable_integration_tests: true
-      integration_test_command: "nix run -L .#test-integration"
+      integration_test_command: "nix build -L .#integration-tests"
       test_timeout: 30
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -125,7 +124,7 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@3d291616a704bea189af1f16cefc25e26d2857c0 # build-library-v3.2.0
     permissions:
       contents: read
       id-token: write
@@ -134,6 +133,7 @@ jobs:
       version_type: commit
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
+      build_command: "nix build -L .#lib-hopr-strategy-${{ matrix.architecture }}"
       package_name: hopr-strategy
       runner: ${{ matrix.runner }}
       enabled: ${{ matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label) }}
