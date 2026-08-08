@@ -19,12 +19,34 @@ let
     {
       inherit src depsSrc rev;
       cargoToml = ./../../Cargo.toml;
+      cargoExtraArgs = "--all-features";
     };
 
   localArgs = mkHoprStrategyBuildArgs {
     src = sources.main;
     depsSrc = sources.deps;
   };
+
+  clippyDerivation = builders.local.callPackage nixLib.mkRustLibrary (
+    localArgs
+    // {
+      runClippy = true;
+    }
+  );
+
+  # Reuse Clippy's dev-profile dependency artifacts for the standalone
+  # `cargo check` validation performed by `just quick`.
+  checkDerivation = clippyDerivation.overrideAttrs (_: {
+    pname = "hopr-strategy-check";
+    buildPhase = ''
+      runHook preBuild
+      cargo check --all-features
+      runHook postBuild
+    '';
+    installPhase = ''
+      mkdir -p "$out"
+    '';
+  });
 
   mkHoprStrategyPlatformPackages =
     platform:
@@ -52,11 +74,33 @@ in
 {
   lib-hopr-strategy = builders.local.callPackage nixLib.mkRustLibrary localArgs;
 
-  clippy = builders.local.callPackage nixLib.mkRustLibrary (
-    localArgs
+  check = checkDerivation;
+
+  clippy = clippyDerivation;
+
+  integration-tests = builders.local.callPackage nixLib.mkRustPackage (
+    (mkHoprStrategyBuildArgs {
+      src = sources.test;
+      depsSrc = sources.deps;
+    })
     // {
-      runClippy = true;
+      cargoToml = ./../../tests/integration/Cargo.toml;
+      runNextest = true;
+      prependPackageName = false;
+      cargoExtraArgs = "-p hopr-strategy-integration-tests";
     }
   );
+
+  # Run the unit-test suite under cargo-llvm-cov and expose the LCOV report as
+  # the derivation output so CI can restore both dependencies and results from
+  # the binary cache.
+  coverage = builders.localCoverage.callPackage nixLib.mkRustPackage {
+    src = sources.test;
+    depsSrc = sources.deps;
+    cargoToml = ./../../Cargo.toml;
+    inherit rev;
+    runCoverage = true;
+    cargoExtraArgs = "--all-features --lib";
+  };
 }
 // hoprStrategyPlatformPackages

@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build-library:
     name: Build Library
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@45221eb1aadfc5c46751306c5c7d6d291c8a24b3 # build-library-v3.1.2
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@3d291616a704bea189af1f16cefc25e26d2857c0 # build-library-v3.2.0
     permissions:
       contents: read
       id-token: write
@@ -28,6 +28,7 @@ jobs:
       version_type: release
       architecture: x86_64-linux
       build_file: Cargo.toml
+      build_command: "nix build -L .#lib-hopr-strategy-x86_64-linux"
       package_name: hopr-strategy
       runner: depot-ubuntu-24.04-4
     secrets:

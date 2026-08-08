@@ -10,8 +10,9 @@ default:
 # Quick Workflows
 # ============================================================================
 
-# Quick check - format, clippy, and check
-quick: fmt clippy check
+# Quick check - format, clippy, and check through cacheable Nix derivations
+quick:
+    env -u LD_LIBRARY_PATH nix build -L .#quick
 
 # Development build and test cycle - format, check, and test
 dev: fmt check test
@@ -56,8 +57,7 @@ test-debug:
 nextest:
     cargo nextest run --workspace --exclude hopr-strategy-integration-tests --all-features
 
-# Run strategy integration tests against a Blokli-Anvil docker stack.
-# Requires docker running on the host + a pullable bloklid image (set BLOKLI_TEST_REMOTE_IMAGE).
+# Run strategy integration tests.
 test-integration:
     cargo test --manifest-path tests/integration/Cargo.toml -- --nocapture
 
