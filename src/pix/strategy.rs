@@ -151,13 +151,19 @@ impl PixStrategy {
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
     {
-        let pool = NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone());
+        // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
+        // `DepositPool` is auto-implemented for `Arc<D>`.
+        let pool = Arc::new(NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
         let safe_address = node.identity().safe_address;
 
         self.build_with_pool(pool, node, safe_address)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
+    ///
+    /// `D` must be [`Clone`] so the startup recovery replay can run in its own task. A pool
+    /// that is not cloneable is used by wrapping it in an [`Arc`], which [`DepositPool`]
+    /// implements for.
     pub fn build_with_pool<D, N>(
         self,
         pool: D,
@@ -165,7 +171,7 @@ impl PixStrategy {
         safe_address: Address,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
-        D: DepositPool + Send + Sync + 'static,
+        D: DepositPool + Clone + Send + Sync + 'static,
         D::Error: Into<StrategyError>,
         N: ActionableEventSource + Send + Sync + 'static,
     {
@@ -549,53 +555,66 @@ where
             }
         }
     }
+}
 
-    /// Re-attempt the sweep for every persisted recovery entry.
-    ///
-    /// Entries are swept sequentially. An entry whose deposit address is still empty fails
-    /// with [`StrategyError::CriteriaNotSatisfied`] and is deliberately left in the store, so
-    /// a deposit that lands later is picked up by a subsequent start rather than lost.
-    async fn replay_pending_recoveries(&self, store: &PixRecoveryStore) {
-        let entries = match store.iter() {
-            Ok(entries) => entries,
-            Err(error) => {
-                tracing::error!(%error, "failed to iterate recovery store on startup");
-                return;
-            }
-        };
-
-        if entries.is_empty() {
+/// Re-attempt the sweep for every persisted recovery entry.
+///
+/// Entries are swept sequentially. An entry whose deposit address is still empty fails
+/// with [`StrategyError::CriteriaNotSatisfied`] and is deliberately left in the store, so
+/// a deposit that lands later is picked up by a subsequent start rather than lost.
+///
+/// This is a free function rather than a method so that [`StrategyTrait::run`] can spawn it:
+/// each sweep carries the pool's own retry budget, and running the whole store inline would
+/// stop the strategy consuming PIX events for as long as that takes. `in_flight_sweeps` is a
+/// [`Cache`], whose clones share state, so the guard still excludes a concurrent sweep of the
+/// same id from the event loop.
+async fn replay_pending_recoveries<D>(
+    pool: D,
+    store: PixRecoveryStore,
+    in_flight_sweeps: Cache<PixAddressId, ()>,
+    safe_address: Address,
+) where
+    D: DepositPool,
+    D::Error: Into<StrategyError>,
+{
+    let entries = match store.iter() {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::error!(%error, "failed to iterate recovery store on startup");
             return;
         }
+    };
 
-        tracing::info!(count = entries.len(), "replaying pending private key recoveries");
+    if entries.is_empty() {
+        return;
+    }
 
-        for (id, secret) in entries {
-            if self.in_flight_sweeps.contains_key(&id) {
-                tracing::warn!(?id, "sweep already in flight for recovery replay entry, skipping");
-                continue;
+    tracing::info!(count = entries.len(), "replaying pending private key recoveries");
+
+    for (id, secret) in entries {
+        if in_flight_sweeps.contains_key(&id) {
+            tracing::warn!(?id, "sweep already in flight for recovery replay entry, skipping");
+            continue;
+        }
+        in_flight_sweeps.insert(id, ());
+
+        let sweep_result = pool
+            .withdraw_deposit(&secret, safe_address, None)
+            .await
+            .map_err(Into::<StrategyError>::into);
+
+        match sweep_result {
+            Ok(_) => {
+                in_flight_sweeps.invalidate(&id);
+                if let Err(error) = store.remove(&id) {
+                    tracing::warn!(%error, ?id, "failed to remove swept entry from store");
+                }
+                tracing::info!(?id, "recovery replay completed");
             }
-            self.in_flight_sweeps.insert(id, ());
-
-            let sweep_result = self
-                .pool
-                .withdraw_deposit(&secret, self.safe_address, None)
-                .await
-                .map_err(Into::<StrategyError>::into);
-
-            match sweep_result {
-                Ok(_) => {
-                    self.in_flight_sweeps.invalidate(&id);
-                    if let Err(error) = store.remove(&id) {
-                        tracing::warn!(%error, ?id, "failed to remove swept entry from store");
-                    }
-                    tracing::info!(?id, "recovery replay completed");
-                }
-                Err(error) => {
-                    tracing::error!(%error, ?id, "recovery replay failed after max retries, giving up");
-                    self.in_flight_sweeps.invalidate(&id);
-                    // Leave the entry in the store for manual recovery.
-                }
+            Err(error) => {
+                tracing::error!(%error, ?id, "recovery replay failed after max retries, giving up");
+                in_flight_sweeps.invalidate(&id);
+                // Leave the entry in the store for manual recovery.
             }
         }
     }
@@ -624,10 +643,17 @@ impl<D: DepositPool, N> Debug for PixStrategyInner<D, N> {
 #[async_trait::async_trait]
 impl<D, N> StrategyTrait for PixStrategyInner<D, N>
 where
-    D: DepositPool + Send + Sync + 'static,
+    D: DepositPool + Clone + Send + Sync + 'static,
     D::Error: Into<StrategyError>,
     N: ActionableEventSource + Send + Sync + 'static,
 {
+    /// Consume PIX events until the stream ends.
+    ///
+    /// Any persisted recovery entries are replayed in a task of their own rather than before
+    /// the loop: a store holding many stranded entries would otherwise take the pool's full
+    /// retry budget per entry with no PIX events consumed. The task is aborted once the loop
+    /// exits — an interrupted replay loses nothing, because an entry is removed from the store
+    /// only after its funds have moved.
     async fn run(&mut self) -> Result<()> {
         let mut event_stream = self
             .node
@@ -635,9 +661,14 @@ where
             .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
             .filter_map(|event| futures::future::ready(event.try_as_pix()));
 
-        if let Some(ref store) = self.recovery_store {
-            self.replay_pending_recoveries(store).await;
-        }
+        let replay = self.recovery_store.clone().map(|store| {
+            hopr_utils::runtime::prelude::spawn(replay_pending_recoveries(
+                self.pool.clone(),
+                store,
+                self.in_flight_sweeps.clone(),
+                self.safe_address,
+            ))
+        });
 
         // Debounce deadlines. `None` = not armed (no items buffered).
         let mut deposit_flush_at: Option<tokio::time::Instant> = None;
@@ -707,6 +738,10 @@ where
         // Flush any remaining buffered items.
         self.flush_deposits().await;
         self.flush_withdrawals().await;
+
+        if let Some(replay) = replay {
+            replay.abort();
+        }
 
         Ok(())
     }
@@ -1442,6 +1477,91 @@ mod tests {
                 "batch item {i} must have been swept"
             );
         }
+        Ok(())
+    }
+
+    /// Regression: the startup replay must not stall event consumption.
+    ///
+    /// The store holds one entry whose deposit address is empty, so its sweep burns the pool's
+    /// whole retry budget — tens of seconds. A `NewDepositAddress` injected while that is in
+    /// flight must still be served promptly. Replaying inline, as `run` used to, would make
+    /// this deposit wait for the replay to give up first.
+    #[test_log::test(tokio::test)]
+    async fn test_startup_replay_does_not_block_event_consumption() -> anyhow::Result<()> {
+        use crate::{strategy::Strategy as _, testing::PixNode};
+
+        let da: Address = [0x43u8; 20].into();
+        let quota = 20u64;
+        let expected = HoprBalance::new_base(quota);
+
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let dir = tempfile::tempdir()?;
+        let store = PixRecoveryStore::open(dir.path().join("pix.redb"), "test_password")?;
+        let stranded = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+        store.insert(&stranded, &hopr_api::chain::PixDepositSecret(rk.into()))?;
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(da, HoprBalance::zero())])
+            // The stranded entry's address stays empty for the whole test.
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let cc = Arc::new(cc);
+        let node = Arc::new(PixNode::new(
+            Arc::clone(&cc),
+            NodeOnchainIdentity {
+                node_address: *BOB,
+                safe_address: *BOB,
+                module_address: MODULE_ADDRESS.into(),
+            },
+        ));
+        // The default sweep budget, so the replay stays busy far longer than the assertion
+        // below is willing to wait.
+        let pool = Arc::new(NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 5),
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            pool: pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 5),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+        };
+        let mut s = PixStrategyInner::new(pool, Arc::clone(&node), cfg, *BOB, Some(store));
+
+        let running = tokio::spawn(async move { s.run().await });
+        node.inject_pix(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+            address: da.into(),
+            quota,
+        }));
+
+        let landed = timeout(StdDuration::from_secs(10), async {
+            loop {
+                if hopr_balance(&*cc, da).await.is_ok_and(|b| b == expected) {
+                    return;
+                }
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        running.abort();
+        landed.context("the deposit was not served while the recovery replay was still running")?;
         Ok(())
     }
 
