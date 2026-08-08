@@ -23,7 +23,7 @@ use futures::{SinkExt, StreamExt};
 use hopr_api::{
     chain::{DepositPool, PixDepositAddress, PixDepositSecret},
     node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixAddressId, PixEvent},
-    types::primitive::prelude::*,
+    types::primitive::prelude::{Address, HoprBalance},
 };
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};

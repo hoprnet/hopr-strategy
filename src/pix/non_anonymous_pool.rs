@@ -20,7 +20,10 @@ use hopr_api::{
     ChainKeypair,
     chain::{ChainValues, ChainWriteAccountOperations, DepositPool, PixDepositAddress, PixDepositSecret},
     node::HasChainApi,
-    types::{crypto::prelude::Keypair, primitive::prelude::*},
+    types::{
+        crypto::prelude::Keypair,
+        primitive::prelude::{Address, HoprBalance, XDaiBalance},
+    },
 };
 
 use crate::errors::StrategyError;
@@ -51,6 +54,25 @@ fn default_max_sweep_retries() -> usize {
 /// [`Default`] and a config file that omits the field agree. A bare
 /// `#[serde(default)]` would fall back to the *field type's* `Default`
 /// (zero) rather than to the documented value.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hopr_strategy::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig;
+///
+/// // Override one budget and inherit the documented defaults for the rest.
+/// let cfg = NonAnonymousDepositPoolConfig {
+///     max_sweep_retries: 8,
+///     ..Default::default()
+/// };
+///
+/// assert_eq!(cfg.max_sweep_retries, 8);
+/// assert_eq!(cfg.max_deposit_retries, 3);
+/// assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(60));
+/// assert_eq!(cfg.gas_xdai_per_sweep, "0.01 xdai".parse().unwrap());
+/// ```
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
 pub struct NonAnonymousDepositPoolConfig {
     /// How long to keep polling a stealth address for the expected deposit before
@@ -124,6 +146,26 @@ impl Drop for DepositTrackerSlot {
 ///
 /// Every deposit and withdrawal is performed via the chain API — fully
 /// transparent and visible to all.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use hopr_api::{chain::DepositPool, node::HasChainApi, types::primitive::prelude::HoprBalance};
+/// use hopr_strategy::pix::non_anonymous_pool::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+///
+/// async fn deposit<N>(node: Arc<N>, dst: hopr_api::chain::PixDepositAddress) -> anyhow::Result<()>
+/// where
+///     N: HasChainApi + Send + Sync + 'static,
+/// {
+///     let pool = NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default());
+///
+///     // The pool owns the retries; a single call is best effort by itself.
+///     pool.deposit_funds_to(dst, HoprBalance::new_base(20)).await?;
+///     Ok(())
+/// }
+/// ```
 pub struct NonAnonymousDepositPool<N: HasChainApi> {
     node: Arc<N>,
     cfg: NonAnonymousDepositPoolConfig,
@@ -131,6 +173,20 @@ pub struct NonAnonymousDepositPool<N: HasChainApi> {
 }
 
 impl<N: HasChainApi> NonAnonymousDepositPool<N> {
+    /// Creates a pool that funds deposit addresses from `node`'s Safe.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::node::HasChainApi;
+    /// use hopr_strategy::pix::non_anonymous_pool::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    ///
+    /// fn build<N: HasChainApi>(node: Arc<N>) -> NonAnonymousDepositPool<N> {
+    ///     NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default())
+    /// }
+    /// ```
     pub fn new(node: Arc<N>, cfg: NonAnonymousDepositPoolConfig) -> Self {
         Self {
             node,
