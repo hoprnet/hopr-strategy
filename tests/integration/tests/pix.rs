@@ -32,6 +32,7 @@ fn pix_config(
         pool: NonAnonymousDepositPoolConfig {
             max_deposit_tracking_time,
             gas_xdai_per_sweep: XDaiBalance::zero(),
+            ..Default::default()
         },
         pix_recovery_db_path: None,
         pix_recovery_password_env: None,

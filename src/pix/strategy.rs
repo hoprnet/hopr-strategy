@@ -19,7 +19,6 @@ use std::{
     time::Duration,
 };
 
-use backon::Retryable;
 use futures::{SinkExt, StreamExt};
 use hopr_api::{
     chain::{DepositPool, PixDepositAddress, PixDepositSecret},
@@ -132,12 +131,6 @@ const PROCESSED_DEPOSITS_CAPACITY: u64 = 8192;
 const PROCESSED_DEPOSITS_TTL: Duration = Duration::from_secs(24 * 3600);
 const IN_FLIGHT_GUARD_CAPACITY: u64 = 1024;
 const IN_FLIGHT_GUARD_TTL: Duration = Duration::from_secs(600);
-
-/// Retry budget for the Entry-side deposit withdrawal.
-const MAX_DEPOSIT_WITHDRAW_RETRIES: usize = 3;
-
-/// Retry budget for the Exit-side sweep of a deposit address.
-const MAX_SWEEP_RETRIES: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -349,6 +342,10 @@ where
                     }
                 };
 
+                // The bound on tracking has to live here rather than in the pool: the future
+                // `notify_deposit` returns resolves to a plain `(address, balance)` with no
+                // failure channel, so an implementation has no way to report "timed out".
+                // Moving this down needs a `hopr-api` change to the trait's return type.
                 let max_tracking_time = self.cfg.pool.max_deposit_tracking_time;
 
                 hopr_utils::runtime::prelude::spawn(async move {
@@ -411,6 +408,9 @@ where
     }
 
     /// Flush the buffered deposits using single or batch [`DepositPool`] methods.
+    ///
+    /// Retries are the pool's responsibility, so an error here means the pool already
+    /// exhausted its own budget and the deposit is abandoned for this flush.
     async fn flush_deposits(&mut self) {
         if self.deposit_buffer.is_empty() {
             return;
@@ -422,16 +422,10 @@ where
 
         if count == 1 {
             let (id, pix_addr, dest_addr, amount) = batch.into_iter().next().unwrap();
-            let result = (move || {
-                let addr = pix_addr;
-                async move { pool.deposit_funds_to(addr, amount).await.map_err(Into::into) }
-            })
-            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES))
-            .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, ?dur, "deposit withdrawal failed, retrying in");
-            })
-            .await;
+            let result = pool
+                .deposit_funds_to(pix_addr, amount)
+                .await
+                .map_err(Into::<StrategyError>::into);
 
             match result {
                 Ok(_) => {
@@ -452,16 +446,10 @@ where
             let deposits: Vec<(PixDepositAddress, HoprBalance)> =
                 batch.iter().map(|(_, addr, _, amount)| (*addr, *amount)).collect();
 
-            let result = (move || {
-                let deps = deposits.clone();
-                async move { pool.deposit_funds_to_multiple(deps).await.map_err(Into::into) }
-            })
-            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_DEPOSIT_WITHDRAW_RETRIES))
-            .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, ?dur, "batch deposit failed, retrying in");
-            })
-            .await;
+            let result = pool
+                .deposit_funds_to_multiple(deposits)
+                .await
+                .map_err(Into::<StrategyError>::into);
 
             match result {
                 Ok(_receipts) => {
@@ -486,6 +474,9 @@ where
     }
 
     /// Flush the buffered withdrawals using single or batch [`DepositPool`] methods.
+    ///
+    /// Retries are the pool's responsibility. An entry that still fails keeps its persisted
+    /// key so a later start can try again — see [`Self::replay_pending_recoveries`].
     async fn flush_withdrawals(&mut self) {
         if self.withdrawal_buffer.is_empty() {
             return;
@@ -498,20 +489,10 @@ where
 
         if count == 1 {
             let (id, secret) = batch.into_iter().next().unwrap();
-            let result = (move || {
-                let sec = secret.clone();
-                async move {
-                    pool.withdraw_deposit(&sec, safe_address, None)
-                        .await
-                        .map_err(Into::into)
-                }
-            })
-            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
-            .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, ?dur, "sweep failed, retrying in");
-            })
-            .await;
+            let result = pool
+                .withdraw_deposit(&secret, safe_address, None)
+                .await
+                .map_err(Into::<StrategyError>::into);
 
             match result {
                 Ok(_) => {
@@ -534,20 +515,10 @@ where
             let keys: Vec<PixDepositSecret> = batch.iter().map(|(_, secret)| secret.clone()).collect();
             let ids: Vec<PixAddressId> = batch.iter().map(|(id, _)| *id).collect();
 
-            let result = (move || {
-                let k = keys.clone();
-                async move {
-                    pool.withdraw_multiple_deposits(&k, safe_address)
-                        .await
-                        .map_err(Into::into)
-                }
-            })
-            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
-            .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, ?dur, "batch sweep failed, retrying in");
-            })
-            .await;
+            let result = pool
+                .withdraw_multiple_deposits(&keys, safe_address)
+                .await
+                .map_err(Into::<StrategyError>::into);
 
             match result {
                 Ok(results) => {
@@ -606,23 +577,11 @@ where
             }
             self.in_flight_sweeps.insert(id, ());
 
-            let pool = &self.pool;
-            let safe_address = self.safe_address;
-            let local_secret = secret;
-            let sweep_result = (move || {
-                let secret = local_secret.clone();
-                async move {
-                    pool.withdraw_deposit(&secret, safe_address, None)
-                        .await
-                        .map_err(Into::into)
-                }
-            })
-            .retry(backon::ExponentialBuilder::default().with_max_times(MAX_SWEEP_RETRIES))
-            .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, ?dur, "recovery replay sweep failed, retrying in");
-            })
-            .await;
+            let sweep_result = self
+                .pool
+                .withdraw_deposit(&secret, self.safe_address, None)
+                .await
+                .map_err(Into::<StrategyError>::into);
 
             match sweep_result {
                 Ok(_) => {
@@ -880,10 +839,26 @@ mod tests {
         Ok(())
     }
 
+    /// Pool config with the retry budgets zeroed.
+    ///
+    /// Every test using this helper asserts on the outcome of a single attempt, so retrying
+    /// would only add real backoff sleeps to the suite. Tests that are *about* retrying use
+    /// [`pool_cfg_with_retries`].
     fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
+        pool_cfg_with_retries(t, g, 0, 0)
+    }
+
+    fn pool_cfg_with_retries(
+        t: StdDuration,
+        g: XDaiBalance,
+        max_deposit_retries: usize,
+        max_sweep_retries: usize,
+    ) -> crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
         crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
             max_deposit_tracking_time: t,
             gas_xdai_per_sweep: g,
+            max_deposit_retries,
+            max_sweep_retries,
         }
     }
 
@@ -1327,11 +1302,146 @@ mod tests {
         let node = Arc::new(ChainNode(Arc::new(cc)));
         let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
 
+        let started = std::time::Instant::now();
         let result = pool
             .withdraw_deposit(&hopr_api::chain::PixDepositSecret(rk.into()), *BOB, None)
             .await;
 
         assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)));
+        assert!(
+            started.elapsed() < StdDuration::from_secs(1),
+            "a zero retry budget must fail on the first attempt, without any backoff"
+        );
+        Ok(())
+    }
+
+    /// A sweep whose deposit has not landed yet must keep trying: the pool owns the retry, so
+    /// a deposit that arrives during the backoff is swept without the caller doing anything.
+    #[test_log::test(tokio::test)]
+    async fn test_sweep_retries_until_the_deposit_lands() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let deposit = HoprBalance::new_base(5);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            // Funds the transfer that makes the deposit land mid-retry.
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            // The deposit address has gas but no wxHOPR yet.
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(
+            node,
+            pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 3),
+        );
+
+        // The deposit lands after the first attempt has already failed.
+        let funder = Arc::clone(&cc);
+        let landing = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(300)).await;
+            funder.withdraw(deposit, &ra).await?.await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let result = pool
+            .withdraw_deposit(&hopr_api::chain::PixDepositSecret(rk.into()), *CHRIS, None)
+            .await;
+        landing.await??;
+
+        assert!(
+            result.is_ok(),
+            "the sweep must succeed once the deposit lands: {result:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, ra).await?,
+            HoprBalance::zero(),
+            "the deposit address must be emptied by the sweep"
+        );
+        Ok(())
+    }
+
+    /// Regression: the batch sweep must retry each item.
+    ///
+    /// `withdraw_multiple_deposits` defaults to a `join_all` over `withdraw_deposit` and returns
+    /// `Ok(Vec<Result<..>>)` — it never reports an outer error, so a retry wrapped around the
+    /// *batch* can never fire. Only a retry inside `withdraw_deposit` covers these.
+    #[test_log::test(tokio::test)]
+    async fn test_batch_sweep_retries_each_item_independently() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let deposit = HoprBalance::new_base(5);
+        let rks = [
+            hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+            hex!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"),
+        ];
+        let ras = rks
+            .iter()
+            .map(|rk| Ok(ChainKeypair::from_secret(rk)?.public().to_address()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            // Funds the transfers that make the deposits land mid-retry.
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            // Both deposit addresses have gas but no wxHOPR yet.
+            .with_balances(ras.iter().map(|ra| (*ra, HoprBalance::zero())))
+            .with_balances(ras.iter().map(|ra| (*ra, XDaiBalance::new_base(1))))
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(
+            node,
+            pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 3),
+        );
+
+        let funder = Arc::clone(&cc);
+        let funded = ras.clone();
+        let landing = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(300)).await;
+            for ra in funded {
+                funder.withdraw(deposit, &ra).await?.await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let keys: Vec<_> = rks
+            .iter()
+            .map(|rk| hopr_api::chain::PixDepositSecret((*rk).into()))
+            .collect();
+        let results = pool.withdraw_multiple_deposits(&keys, *CHRIS).await?;
+        landing.await??;
+
+        assert_eq!(results.len(), 2);
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                result.is_ok(),
+                "batch item {i} must be retried until it succeeds: {result:?}"
+            );
+            assert_eq!(
+                hopr_balance(&*cc, ras[i]).await?,
+                HoprBalance::zero(),
+                "batch item {i} must have been swept"
+            );
+        }
         Ok(())
     }
 
@@ -1339,7 +1449,8 @@ mod tests {
     /// leave the persisted key in place. Dropping it would strand the deposit permanently —
     /// the recovered key is the only means of ever moving those funds.
     ///
-    /// Exhausts the sweep retry budget, so this test spends ~31s in backoff.
+    /// The pool's sweep budget is zeroed so the abandonment happens on the first attempt;
+    /// what the budget is set to does not change the outcome being asserted here.
     #[test_log::test(tokio::test)]
     async fn test_recovery_entry_survives_sweep_of_empty_deposit_address() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

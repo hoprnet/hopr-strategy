@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use backon::Retryable;
 use futures::{StreamExt, TryFutureExt, future::BoxFuture};
 use hopr_api::{
     ChainKeypair,
@@ -32,19 +33,54 @@ fn default_gas_xdai() -> XDaiBalance {
     "0.01 xdai".parse().expect("valid static xDai amount")
 }
 
+fn default_max_deposit_tracking_time() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_max_deposit_retries() -> usize {
+    3
+}
+
+fn default_max_sweep_retries() -> usize {
+    5
+}
+
 /// Configuration for [`NonAnonymousDepositPool`].
+///
+/// Every field names its own default through a function, so that
+/// [`Default`] and a config file that omits the field agree. A bare
+/// `#[serde(default)]` would fall back to the *field type's* `Default`
+/// (zero) rather than to the documented value.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
 pub struct NonAnonymousDepositPoolConfig {
     /// How long to keep polling a stealth address for the expected deposit before
     /// giving up.  Default: 60 seconds.
-    #[default(Duration::from_secs(60))]
-    #[serde(with = "humantime_serde", default)]
+    #[default(default_max_deposit_tracking_time())]
+    #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
     pub max_deposit_tracking_time: Duration,
 
     /// Amount of xDai to send from the Safe to a recovered stealth address that
     /// has run out of gas for the withdrawal sweep.  Default: 0.01 xDai.
+    #[default(default_gas_xdai())]
     #[serde(default = "default_gas_xdai")]
     pub gas_xdai_per_sweep: XDaiBalance,
+
+    /// Attempts *in addition to* the first for a deposit transfer.  Default: 3.
+    ///
+    /// Retrying is safe because [`DepositPool::deposit_funds_to`] re-reads the
+    /// destination balance before each transfer.
+    #[default(default_max_deposit_retries())]
+    #[serde(default = "default_max_deposit_retries")]
+    pub max_deposit_retries: usize,
+
+    /// Attempts *in addition to* the first for a withdrawal sweep.  Default: 5.
+    ///
+    /// The budget is deliberately larger than [`Self::max_deposit_retries`]: a sweep
+    /// of an address whose deposit has not landed yet fails, and each retry is another
+    /// chance for the deposit to arrive.
+    #[default(default_max_sweep_retries())]
+    #[serde(default = "default_max_sweep_retries")]
+    pub max_sweep_retries: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +143,51 @@ impl<N: HasChainApi> NonAnonymousDepositPool<N> {
 // ---------------------------------------------------------------------------
 // Private helpers (free functions to avoid borrowing self across retry)
 // ---------------------------------------------------------------------------
+
+/// Backoff shared by every retried pool operation.
+///
+/// Jitter matters here: without it, a batch whose items all fail against the same
+/// unhealthy RPC endpoint re-fires in lockstep on every attempt.
+fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
+    backon::ExponentialBuilder::default()
+        .with_max_times(max_times)
+        .with_jitter()
+}
+
+/// A single deposit attempt.  Called inside a retry loop (takes `Arc` to avoid borrow issues).
+///
+/// The transfer is not idempotent, so the destination balance is re-read before every
+/// attempt: if a previous attempt was submitted but its confirmation was lost, re-sending
+/// would deposit `amount` a second time and the Safe would lose the surplus.
+///
+/// A failed balance read is propagated instead of being ignored — a retry after an
+/// unreadable balance is exactly the case this guard exists for.
+async fn deposit_once(
+    node: Arc<impl HasChainApi>,
+    dest_addr: Address,
+    amount: HoprBalance,
+) -> Result<(), StrategyError> {
+    let current: HoprBalance = node
+        .chain_api()
+        .balance(dest_addr)
+        .await
+        .map_err(StrategyError::other)?;
+    if current >= amount {
+        tracing::debug!(
+            %dest_addr, %current, %amount,
+            "deposit address is already funded, not sending another transfer"
+        );
+        return Ok(());
+    }
+
+    node.chain_api()
+        .withdraw(amount, &dest_addr)
+        .and_then(identity)
+        .await
+        .map_err(StrategyError::other)?;
+
+    Ok(())
+}
 
 /// Ensure the recovered stealth address has enough xDai for gas.
 async fn fund_sweep_gas(
@@ -211,46 +292,32 @@ where
     type Error = StrategyError;
     type Receipt = ();
 
-    /// Deposit funds from the node's Safe to a deposit address.
+    /// Deposit funds from the node's Safe to a deposit address, retrying up to
+    /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
     ///
-    /// The transfer is not idempotent, and the caller retries this operation: if a previous
-    /// attempt was submitted but its confirmation was lost, re-sending would deposit `amount`
-    /// a second time and the Safe would lose the surplus. An address that already holds
-    /// `amount` is therefore reported as success without sending anything.
+    /// What makes the retry safe is that every attempt re-reads the destination balance and
+    /// reports success without sending anything if it already holds `amount`; a submitted
+    /// transfer whose confirmation was lost is therefore not sent twice. The guarantee is
+    /// balance-based rather than transaction-based, so a third party funding the same
+    /// address also satisfies the check.
     ///
-    /// The guarantee is balance-based rather than transaction-based, so a third party funding
-    /// the same address also satisfies the check. A failed balance read is propagated instead
-    /// of being ignored — a retry after an unreadable balance is exactly the case this guard
-    /// exists for.
+    /// Converting `dst` is deterministic, so it happens once, outside the retry loop:
+    /// an address that cannot be parsed will not parse on the next attempt either.
     async fn deposit_funds_to(
         &self,
         dst: PixDepositAddress,
         amount: HoprBalance,
     ) -> Result<Self::Receipt, Self::Error> {
         let dest_addr: Address = dst.try_into()?;
+        let node = &self.node;
 
-        let current: HoprBalance = self
-            .node
-            .chain_api()
-            .balance(dest_addr)
+        (move || deposit_once(Arc::clone(node), dest_addr, amount))
+            .retry(retry_policy(self.cfg.max_deposit_retries))
+            .sleep(backon::FuturesTimerSleeper)
+            .notify(|error, dur| {
+                tracing::warn!(%error, %dest_addr, ?dur, "deposit failed, retrying in");
+            })
             .await
-            .map_err(StrategyError::other)?;
-        if current >= amount {
-            tracing::debug!(
-                %dest_addr, %current, %amount,
-                "deposit address is already funded, not sending another transfer"
-            );
-            return Ok(());
-        }
-
-        self.node
-            .chain_api()
-            .withdraw(amount, &dest_addr)
-            .and_then(identity)
-            .await
-            .map_err(StrategyError::other)?;
-
-        Ok(())
     }
 
     /// Returns a future that resolves once `min_amount` has been deposited to `dst`.
@@ -311,10 +378,16 @@ where
         }))
     }
 
-    /// Withdraw a deposit (or sweep the recovered address).
+    /// Withdraw a deposit (or sweep the recovered address), retrying up to
+    /// [`NonAnonymousDepositPoolConfig::max_sweep_retries`] times.
     ///
-    /// Fails with [`StrategyError::CriteriaNotSatisfied`] when the address holds nothing,
-    /// so that a key recovered before its deposit landed is retried rather than discarded.
+    /// An address that holds nothing fails with [`StrategyError::CriteriaNotSatisfied`], so a
+    /// key recovered before its deposit landed is retried rather than discarded — and each
+    /// retry is another chance for the deposit to arrive. Once the budget is exhausted the
+    /// error is returned so the caller can keep the key for a later attempt.
+    ///
+    /// Reconstructing the keypair is deterministic, so it happens once, outside the retry
+    /// loop: a secret that is not a valid scalar will never become one.
     async fn withdraw_deposit(
         &self,
         key: &PixDepositSecret,
@@ -322,8 +395,15 @@ where
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         let chain_key = ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
+        let (node, cfg, chain_key) = (&self.node, &self.cfg, &chain_key);
 
-        sweep_single(Arc::clone(&self.node), &self.cfg, &chain_key, dst).await?;
-        Ok(())
+        (move || sweep_single(Arc::clone(node), cfg, chain_key, dst))
+            .retry(retry_policy(cfg.max_sweep_retries))
+            .sleep(backon::FuturesTimerSleeper)
+            .notify(|error, dur| {
+                tracing::warn!(%error, %dst, ?dur, "sweep failed, retrying in");
+            })
+            .await
+            .map(|_| ())
     }
 }
