@@ -9,8 +9,8 @@
 //! the others.
 use std::fmt::{Debug, Display, Formatter};
 
-use async_trait::async_trait;
-use tracing::warn;
+use futures::StreamExt as _;
+use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
 
 use crate::errors::Result;
 
@@ -22,7 +22,7 @@ use crate::errors::Result;
 ///
 /// Any type implementing this trait can be composed into a [`MultiStrategy`] without
 /// any changes to this crate.
-#[async_trait]
+#[async_trait::async_trait]
 pub trait Strategy: Display + Send {
     /// Run the strategy. Returns only on cancellation or fatal error.
     async fn run(&mut self) -> Result<()>;
@@ -65,12 +65,9 @@ impl Display for MultiStrategy {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl Strategy for MultiStrategy {
     async fn run(&mut self) -> Result<()> {
-        use futures::StreamExt as _;
-        use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
-
         let strategies = std::mem::take(&mut self.strategies);
 
         if strategies.is_empty() {
@@ -82,6 +79,7 @@ impl Strategy for MultiStrategy {
         // Spawn each sub-strategy as an abortable task.
         // Keeping all AbortHandles in a RAII guard ensures every sub-task is cancelled
         // when MultiStrategy is dropped (graceful shutdown).
+
         let mut join_handles = Vec::new();
         let mut abort_handles: Vec<AbortHandle> = Vec::new();
         for mut s in strategies {
@@ -119,9 +117,12 @@ impl Strategy for MultiStrategy {
             };
 
             if let Err(e) = strategy_result {
-                warn!(%e, "sub-strategy failed");
+                tracing::warn!(%e, "sub-strategy failed");
             }
         }
+
+        #[cfg(not(feature = "runtime-tokio"))]
+        let _ = strategies;
 
         Ok(())
     }
@@ -140,7 +141,7 @@ mod tests {
             write!(f, "ok")
         }
     }
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Strategy for OkStrategy {
         async fn run(&mut self) -> Result<()> {
             Ok(())
@@ -153,7 +154,7 @@ mod tests {
             write!(f, "fail")
         }
     }
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Strategy for FailStrategy {
         async fn run(&mut self) -> Result<()> {
             Err(StrategyError::Other(anyhow::anyhow!("error")))
@@ -169,7 +170,7 @@ mod tests {
             write!(f, "external")
         }
     }
-    #[async_trait]
+    #[async_trait::async_trait]
     impl Strategy for ExternalStrategy {
         async fn run(&mut self) -> Result<()> {
             self.ran = true;

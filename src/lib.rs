@@ -57,3 +57,6 @@ pub mod strategy;
 /// Test-support node adapters, shared with the integration-test crate.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+
+#[cfg(feature = "strategy-pix")]
+pub mod pix;

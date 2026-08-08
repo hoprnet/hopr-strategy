@@ -10,12 +10,12 @@ use hopr_api::{
     types::{
         crypto::prelude::Keypair,
         internal::prelude::ChannelEntry,
-        primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
+        primitive::prelude::{Address, HoprBalance, XDaiBalance},
     },
 };
 use hopr_strategy::testing::{BlokliTestStateBuilder, create_test_blokli_connector, register_test_safe};
 
-use super::{IntegrationFixture, TestAccount, poll_stable, poll_until};
+use super::{IntegrationFixture, TestAccount, module_address, poll_stable, poll_until};
 use crate::{
     constants::{SAFE_ALLOWANCE, SAFE_FUNDING},
     strategy_node::NodeConnector,
@@ -76,10 +76,6 @@ impl ChannelScenario {
         confirmation.await?;
         Ok(())
     }
-}
-
-fn module_address() -> Address {
-    Address::new(&[1u8; Address::SIZE])
 }
 
 impl IntegrationFixture {
