@@ -10,6 +10,9 @@ pub enum StrategyError {
     #[error("strategy could not perform action because action of the same type is on-going")]
     InProgress,
 
+    #[error("invalid strategy configuration: {0}")]
+    InvalidConfiguration(String),
+
     #[error("non-specific strategy error: {0}")]
     Other(anyhow::Error),
 

@@ -1438,20 +1438,21 @@ impl SelectorProfile {
 /// Unknown keys are rejected rather than ignored, so a misspelled field is a
 /// load-time error instead of a silent fallback to the default.
 ///
-/// # Validation is the caller's responsibility
+/// # Defaulting is not validation
 ///
-/// Defaulting and validation are separate concerns: deserialization fills in
-/// every unspecified field but does **not** check the constraints declared on
-/// this type and its nested sections (`funding.assumed_hops` ∈ `[1, 3]`,
-/// `funding.sizing_mode`'s `success_probability` bounds). Nested sections are
-/// marked `#[validate(nested)]`, so a single
+/// Deserialization fills in every unspecified field but does **not** check the
+/// constraints declared on this type and its nested sections
+/// (`funding.assumed_hops` ∈ `[1, 3]`, `funding.sizing_mode`'s
+/// `success_probability` bounds). Those are enforced when the strategy is built:
+/// [`ChannelLifecycleStrategy::build`] returns
+/// [`StrategyError::InvalidConfiguration`](crate::errors::StrategyError::InvalidConfiguration)
+/// rather than panicking.
+///
+/// A config loader that wants to reject a bad file before constructing anything
+/// can validate up front instead. The nested sections are marked
+/// `#[validate(nested)]`, so one
 /// [`Validate::validate`](validator::Validate::validate) call on this struct
-/// covers all of them — but nothing in this crate invokes it.
-///
-/// Call it where the surrounding configuration is constructed or deserialized,
-/// or immediately before
-/// [`ChannelLifecycleStrategy::new`](crate::channel_lifecycle::ChannelLifecycleStrategy::new),
-/// and report the failure through the enclosing error type:
+/// covers the whole tree:
 ///
 /// ```
 /// # use hopr_strategy::channel_lifecycle::ChannelLifecycleConfig;
@@ -1463,6 +1464,8 @@ impl SelectorProfile {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// [`ChannelLifecycleStrategy::build`]: crate::channel_lifecycle::ChannelLifecycleStrategy::build
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

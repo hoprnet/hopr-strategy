@@ -35,16 +35,20 @@ use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 /// then [`build`](ChannelLifecycleStrategy::build) to wire in a node and obtain
 /// a runnable `Box<dyn Strategy + Send>`.
 ///
-/// # Configuration is not validated here
+/// # Where configuration is validated
 ///
-/// Neither `new` nor `build` validates the config. Deserialization fills in
-/// defaults but does not enforce the field constraints declared on
-/// [`ChannelLifecycleConfig`] (e.g. `funding.assumed_hops` ∈ `[1, 3]`,
-/// `funding.sizing_mode` bounds), so the caller is responsible for running
-/// [`Validate::validate`](validator::Validate::validate) on the config —
-/// at the point the top-level configuration is constructed or deserialized,
-/// or immediately before constructing this builder — and for surfacing the
-/// error through its own error type.
+/// Deserialization fills in defaults but does not enforce the field constraints
+/// declared on [`ChannelLifecycleConfig`] (e.g. `funding.assumed_hops` ∈
+/// `[1, 3]`, `funding.sizing_mode`'s `success_probability` bounds).
+/// [`build`](ChannelLifecycleStrategy::build) checks them and returns
+/// [`StrategyError::InvalidConfiguration`] — never panics — so a bad operator
+/// config surfaces as an error at wiring time rather than aborting the process.
+///
+/// Callers are free to validate earlier as well: because the nested sections are
+/// marked `#[validate(nested)]`, a single
+/// [`Validate::validate`](validator::Validate::validate) call on the top-level
+/// config covers the whole tree, which lets a config loader reject a bad file
+/// before any strategy is constructed.
 pub struct ChannelLifecycleStrategy {
     cfg: ChannelLifecycleConfig,
 }
@@ -52,10 +56,8 @@ pub struct ChannelLifecycleStrategy {
 impl ChannelLifecycleStrategy {
     /// Create a new builder with the given configuration.
     ///
-    /// The config is taken as-is; see the [type-level note] on validating it
-    /// beforehand.
-    ///
-    /// [type-level note]: ChannelLifecycleStrategy#configuration-is-not-validated-here
+    /// The config is taken as-is; it is validated by
+    /// [`build`](ChannelLifecycleStrategy::build).
     pub fn new(cfg: ChannelLifecycleConfig) -> Self {
         Self { cfg }
     }
@@ -65,7 +67,13 @@ impl ChannelLifecycleStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints, or if a `Custom` selector profile's inner
+    /// trust weights do not sum to ~1.0.
+    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi
             + HasNetworkView
@@ -85,17 +93,22 @@ impl ChannelLifecycleStrategy {
             + Sync
             + 'static,
     {
+        use validator::Validate as _;
+        self.cfg
+            .validate()
+            .map_err(|e| StrategyError::InvalidConfiguration(e.to_string()))?;
+
         let selector: Arc<dyn super::selector::Selector> = match self.cfg.selector.multi_objective_config() {
             Some(mo_cfg) => {
                 mo_cfg
                     .validate_trust_weights()
-                    .expect("invalid selector config: trust inner weights must sum to ~1.0");
+                    .map_err(StrategyError::InvalidConfiguration)?;
                 Arc::new(MultiObjectiveSelector::new(mo_cfg))
             }
             None => Arc::new(DefaultSelector),
         };
 
-        Box::new(ChannelLifecycleStrategyInner {
+        Ok(Box::new(ChannelLifecycleStrategyInner {
             cfg: self.cfg,
             node,
             selector,
@@ -109,7 +122,7 @@ impl ChannelLifecycleStrategy {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-        })
+        }))
     }
 }
 
