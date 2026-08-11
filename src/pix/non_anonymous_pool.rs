@@ -15,18 +15,81 @@ use std::{
 };
 
 use backon::Retryable;
-use futures::{StreamExt, TryFutureExt, future::BoxFuture};
+use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations, DepositPool, PixDepositAddress, PixDepositSecret},
+    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool},
     node::HasChainApi,
     types::{
         crypto::prelude::Keypair,
         primitive::prelude::{Address, HoprBalance, XDaiBalance},
     },
 };
+use subtle::{Choice, ConstantTimeEq};
 
 use crate::errors::StrategyError;
+
+// ---------------------------------------------------------------------------
+// Pool key
+// ---------------------------------------------------------------------------
+
+/// A [`ChainKeypair`] presented with its Ethereum address as the public part.
+///
+/// [`DepositPool`] is generic over the keypair and takes `K::Public` as the deposit address, while
+/// the PIX event delivers a `PixDepositAddress` whose `Eth` variant holds an [`Address`].
+/// `ChainKeypair::Public` is a `PublicKey`, and an `Address` is a *hash* of one — there is no way
+/// back. A pool parameterised on `ChainKeypair` directly could therefore never be handed a
+/// destination derived from an event, which is the only place destinations come from.
+///
+/// An address is also exactly what a plain `HoprToken.transfer` needs, so it is the honest public
+/// part for a non-anonymous deposit key rather than a workaround. Implementing the foreign
+/// [`Keypair`] trait is allowed because the newtype is local.
+///
+/// The address is stored rather than derived on demand because [`Keypair::public`] returns a
+/// reference.
+#[derive(Clone)]
+pub struct EthDepositKey(ChainKeypair, Address);
+
+impl EthDepositKey {
+    /// The underlying chain keypair, which is what actually signs a transfer.
+    pub fn chain_key(&self) -> &ChainKeypair {
+        &self.0
+    }
+}
+
+impl From<ChainKeypair> for EthDepositKey {
+    fn from(value: ChainKeypair) -> Self {
+        let address = value.public().to_address();
+        Self(value, address)
+    }
+}
+
+impl ConstantTimeEq for EthDepositKey {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.ct_eq(&other.0)
+    }
+}
+
+impl Keypair for EthDepositKey {
+    type Public = Address;
+    type SecretLen = hopr_api::types::primitive::typenum::U32;
+
+    fn random() -> Self {
+        ChainKeypair::random().into()
+    }
+
+    fn from_secret(bytes: &[u8]) -> hopr_api::types::crypto::errors::Result<Self> {
+        Ok(ChainKeypair::from_secret(bytes)?.into())
+    }
+
+    fn secret(&self) -> &hopr_api::types::crypto::utils::SecretValue<Self::SecretLen> {
+        self.0.secret()
+    }
+
+    fn public(&self) -> &Self::Public {
+        &self.1
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -341,7 +404,7 @@ async fn sweep_single(
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
-impl<N> DepositPool for NonAnonymousDepositPool<N>
+impl<N> DepositPool<EthDepositKey> for NonAnonymousDepositPool<N>
 where
     N: HasChainApi + Send + Sync + 'static,
 {
@@ -357,14 +420,8 @@ where
     /// balance-based rather than transaction-based, so a third party funding the same
     /// address also satisfies the check.
     ///
-    /// Converting `dst` is deterministic, so it happens once, outside the retry loop:
-    /// an address that cannot be parsed will not parse on the next attempt either.
-    async fn deposit_funds_to(
-        &self,
-        dst: PixDepositAddress,
-        amount: HoprBalance,
-    ) -> Result<Self::Receipt, Self::Error> {
-        let dest_addr: Address = dst.try_into()?;
+    async fn deposit_funds_to(&self, dst: Address, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
+        let dest_addr = dst;
         let node = &self.node;
 
         (move || deposit_once(Arc::clone(node), dest_addr, amount))
@@ -376,13 +433,19 @@ where
             .await
     }
 
-    /// Returns a future that resolves once `min_amount` has been deposited to `dst`.
+    /// Returns a future that resolves once `min_amount` has been deposited to `dst`, or with an
+    /// error once [`NonAnonymousDepositPoolConfig::max_deposit_tracking_time`] elapses.
+    ///
+    /// The deadline lives here rather than with the caller because the returned future now has a
+    /// failure channel to report it through. It previously did not, so the bound had to be
+    /// imposed from outside — which meant the caller reached into this pool's own config to find
+    /// out what the bound should be.
     fn notify_deposit(
         &self,
-        dst: PixDepositAddress,
+        dst: Address,
         min_amount: HoprBalance,
-    ) -> Result<BoxFuture<'static, (PixDepositAddress, HoprBalance)>, Self::Error> {
-        let deposit_addr: Address = dst.try_into()?;
+    ) -> Result<DepositNotification<'static, Address, Self::Error>, Self::Error> {
+        let deposit_addr = dst;
 
         let Some(tracker_slot) = DepositTrackerSlot::try_acquire(&self.active_deposit_trackers) else {
             return Err(StrategyError::CriteriaNotSatisfied);
@@ -406,7 +469,7 @@ where
             let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
-                return (dst, balance);
+                return Ok((dst, balance));
             }
 
             futures_time::task::sleep(phase_jitter.into()).await;
@@ -428,9 +491,25 @@ where
                 })
                 .boxed();
 
-            let balance = stream.next().await.expect("interval stream never terminates");
-
-            (dst, balance)
+            // The stream itself never terminates, so this is the only thing that ends the wait
+            // other than the deposit landing.
+            match futures_time::future::FutureExt::timeout(
+                stream.next(),
+                futures_time::time::Duration::from(max_tracking),
+            )
+            .await
+            {
+                Ok(Some(balance)) => Ok((dst, balance)),
+                Ok(None) => Err(StrategyError::other(anyhow::anyhow!(
+                    "deposit balance stream ended unexpectedly"
+                ))),
+                Err(_) => {
+                    tracing::warn!(%address, %target, ?max_tracking, "gave up waiting for the deposit");
+                    Err(StrategyError::other(anyhow::anyhow!(
+                        "deposit to {address} did not reach {target} within {max_tracking:?}"
+                    )))
+                }
+            }
         }))
     }
 
@@ -442,16 +521,15 @@ where
     /// retry is another chance for the deposit to arrive. Once the budget is exhausted the
     /// error is returned so the caller can keep the key for a later attempt.
     ///
-    /// Reconstructing the keypair is deterministic, so it happens once, outside the retry
-    /// loop: a secret that is not a valid scalar will never become one.
+    /// The keypair arrives typed, so there is no secret to reconstruct and no way to be handed
+    /// one belonging to a different scheme.
     async fn withdraw_deposit(
         &self,
-        key: &PixDepositSecret,
+        key: &EthDepositKey,
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        let chain_key = ChainKeypair::from_secret(key.0.as_ref()).map_err(StrategyError::other)?;
-        let (node, cfg, chain_key) = (&self.node, &self.cfg, &chain_key);
+        let (node, cfg, chain_key) = (&self.node, &self.cfg, key.chain_key());
 
         (move || sweep_single(Arc::clone(node), cfg, chain_key, dst))
             .retry(retry_policy(cfg.max_sweep_retries))
@@ -461,5 +539,23 @@ where
             })
             .await
             .map(|_| ())
+    }
+
+    /// Move a deposit to another address inside the pool.
+    ///
+    /// For a non-anonymous pool "inside the pool" is not a meaningful distinction — every address
+    /// is an ordinary Ethereum account and every movement is a plain transfer — so this is the
+    /// same operation as [`withdraw_deposit`](Self::withdraw_deposit) with a different
+    /// destination, and it shares the sweep's retry budget and gas top-up for that reason.
+    ///
+    /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
+    /// anonymity set while a withdrawal leaves it.
+    async fn pool_transfer(
+        &self,
+        key: &EthDepositKey,
+        dst: Address,
+        amount: Option<HoprBalance>,
+    ) -> Result<Self::Receipt, Self::Error> {
+        self.withdraw_deposit(key, dst, amount).await
     }
 }
