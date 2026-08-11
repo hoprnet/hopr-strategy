@@ -107,6 +107,9 @@ pub struct AutoRedeemingStrategyConfig {
 /// Call [`new`](AutoRedeemingStrategy::new) with the strategy configuration,
 /// then [`build`](AutoRedeemingStrategy::build) to wire in a node and obtain a
 /// runnable `Box<dyn Strategy + Send>`.
+///
+/// [`build`](AutoRedeemingStrategy::build) validates the configuration and returns
+/// an error rather than panicking; see [`AutoRedeemingStrategyConfig`].
 pub struct AutoRedeemingStrategy {
     cfg: AutoRedeemingStrategyConfig,
     interval: Duration,
@@ -123,18 +126,25 @@ impl AutoRedeemingStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints.
+    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + HasTicketManagement + ActionableEventSource + Send + Sync + 'static,
         N::ChainApi: ChainReadChannelOperations + ChainWriteTicketOperations + Clone + Send + Sync + 'static,
         N::TicketManager: TicketManagement + Clone + Send + Sync + 'static,
     {
-        Box::new(AutoRedeemingStrategyInner {
+        StrategyError::validate_config(&self.cfg)?;
+
+        Ok(Box::new(AutoRedeemingStrategyInner {
             cfg: self.cfg,
             interval: self.interval,
             node,
             running_redemptions: new_redemption_cache(),
-        })
+        }))
     }
 }
 
@@ -997,7 +1007,7 @@ mod tests {
 
         let strategy: Box<dyn crate::strategy::Strategy + Send> =
             super::AutoRedeemingStrategy::new(AutoRedeemingStrategyConfig::default(), Duration::from_secs(60))
-                .build(node);
+                .build(node)?;
 
         assert_eq!(strategy.to_string(), "auto_redeeming");
         // Verify the box is Send (compile-time check via trait object)

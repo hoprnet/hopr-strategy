@@ -100,6 +100,9 @@ pub struct AutoFundingStrategyConfig {
 /// Call [`new`](AutoFundingStrategy::new) with the strategy configuration,
 /// then [`build`](AutoFundingStrategy::build) to wire in a node and obtain a
 /// runnable `Box<dyn Strategy + Send>`.
+///
+/// [`build`](AutoFundingStrategy::build) validates the configuration and returns
+/// an error rather than panicking; see [`AutoFundingStrategyConfig`].
 pub struct AutoFundingStrategy {
     cfg: AutoFundingStrategyConfig,
     interval: Duration,
@@ -124,7 +127,13 @@ impl AutoFundingStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints — for `AutoFundingStrategyConfig` that means a
+    /// `funding_amount` of zero.
+    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
         N::ChainApi: ChainReadChannelOperations
@@ -136,12 +145,14 @@ impl AutoFundingStrategy {
             + Sync
             + 'static,
     {
-        Box::new(AutoFundingStrategyInner {
+        StrategyError::validate_config(&self.cfg)?;
+
+        Ok(Box::new(AutoFundingStrategyInner {
             cfg: self.cfg,
             interval: self.interval,
             node,
             in_flight: Arc::new(DashSet::new()),
-        })
+        }))
     }
 }
 
@@ -1091,12 +1102,46 @@ mod tests {
 
         let strategy: Box<dyn crate::strategy::Strategy + Send> =
             super::AutoFundingStrategy::new(AutoFundingStrategyConfig::default(), std::time::Duration::from_secs(60))
-                .build(node);
+                .build(node)?;
 
         assert_eq!(strategy.to_string(), "auto_funding");
         // Verify the box is Send (compile-time check via trait object)
         fn assert_send<T: Send>(_: T) {}
         assert_send(strategy);
+
+        Ok(())
+    }
+
+    /// `funding_amount` carries a `#[validate(custom(...))]` that nothing used to
+    /// invoke, so a zero-amount config built a strategy that could never fund.
+    /// `build` now enforces it and returns `InvalidConfiguration`, never panics.
+    #[tokio::test]
+    async fn build_should_reject_zero_funding_amount() -> anyhow::Result<()> {
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let node = Arc::new(ChainNode(Arc::new(chain_connector)));
+
+        let cfg = AutoFundingStrategyConfig {
+            funding_amount: HoprBalance::zero(),
+            ..Default::default()
+        };
+        let Err(err) = super::AutoFundingStrategy::new(cfg, std::time::Duration::from_secs(60)).build(node) else {
+            anyhow::bail!("build must reject a zero funding_amount");
+        };
+        assert!(
+            matches!(err, StrategyError::InvalidConfiguration(_)),
+            "expected InvalidConfiguration, got {err:?}"
+        );
 
         Ok(())
     }

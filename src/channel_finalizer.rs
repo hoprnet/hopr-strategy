@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 use validator::Validate;
 
-use crate::{errors, strategy::Strategy as StrategyTrait};
+use crate::{errors, errors::StrategyError, strategy::Strategy as StrategyTrait};
 
 #[cfg(all(feature = "telemetry", not(test)))]
 lazy_static::lazy_static! {
@@ -63,6 +63,10 @@ pub struct ClosureFinalizerStrategyConfig {
 /// Call [`new`](ClosureFinalizerStrategy::new) with the strategy configuration,
 /// then [`build`](ClosureFinalizerStrategy::build) to wire in a node and obtain a
 /// runnable `Box<dyn Strategy + Send>`.
+///
+/// [`build`](ClosureFinalizerStrategy::build) validates the configuration and
+/// returns an error rather than panicking; see
+/// [`ClosureFinalizerStrategyConfig`].
 pub struct ClosureFinalizerStrategy {
     cfg: ClosureFinalizerStrategyConfig,
     interval: Duration,
@@ -79,16 +83,23 @@ impl ClosureFinalizerStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints.
+    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + Send + Sync + 'static,
         N::ChainApi: ChainReadChannelOperations + ChainWriteChannelOperations + Clone + Send + Sync + 'static,
     {
-        Box::new(ClosureFinalizerStrategyInner {
+        StrategyError::validate_config(&self.cfg)?;
+
+        Ok(Box::new(ClosureFinalizerStrategyInner {
             node,
             cfg: self.cfg,
             interval: self.interval,
-        })
+        }))
     }
 }
 
@@ -304,7 +315,7 @@ mod tests {
             ClosureFinalizerStrategyConfig::default(),
             std::time::Duration::from_secs(60),
         )
-        .build(node);
+        .build(node)?;
 
         assert_eq!(strategy.to_string(), "closure_finalizer");
         // Verify the box is Send (compile-time check via trait object)
