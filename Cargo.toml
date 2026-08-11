@@ -34,6 +34,14 @@ strategy-auto-funding = []
 strategy-auto-redeeming = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
+# The PIX strategy engine, without a deposit pool.
+#
+# `DepositPool` is generic over its keypair, and `K::Public` is the deposit address the pool can
+# settle to. That has to match the address type `HoprPixSpec` produces, which is chosen by a
+# feature on `hopr-crypto-packet` — an entirely separate crate. Enabling this alone gives the
+# generic engine and `PixStrategy::build_with_pool`, for a consumer bringing its own pool.
+#
+# Consumers that want a bundled pool pick one of the two pairings below instead.
 strategy-pix = [
   "dep:backon",
   "dep:chacha20poly1305",
@@ -42,6 +50,20 @@ strategy-pix = [
   "dep:subtle",
   "dep:tokio",
 ]
+# `NonAnonymousDepositPool`, keyed on `EthDepositKey` (Ethereum deposit addresses).
+#
+# Pair with `hopr-crypto-packet/pix-secp256k1` — reached through `hopr-lib/pix-secp256k1` — or
+# the pool cannot spend the addresses the events carry. Cargo cannot express "these two must
+# agree" across crates, so the consumer states both and `hoprd::strategy` asserts the result.
+strategy-pix-secp256k1 = ["strategy-pix"]
+# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses).
+#
+# Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
+# feature and nothing else already agrees.
+#
+# NOTE: the pool itself is a stub whose methods panic. The feature wiring is final; the
+# implementation is not.
+strategy-pix-bjj = ["strategy-pix"]
 
 [dependencies]
 anyhow              = { workspace = true }

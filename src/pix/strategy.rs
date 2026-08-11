@@ -9,9 +9,12 @@
 //! * `D` — The deposit pool implementation.
 //! * `N` — The node type that emits PIX events via [`ActionableEventSource`].
 //!
-//! When the default [`NonAnonymousDepositPool`] is sufficient, use
-//! [`PixStrategy::build`] directly.  For a custom pool, construct it first and
-//! pass it to [`PixStrategy::build_with_pool`].
+//! When the pool bundled with the enabled `strategy-pix-*` feature is sufficient, use
+//! [`PixStrategy::build_default_pool`] — it selects whichever of
+//! [`NonAnonymousDepositPool`](crate::pix::non_anonymous_pool::NonAnonymousDepositPool) or
+//! [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool) the build chose, so a caller
+//! does not name a pool and needs no edit when the choice changes. For a custom pool, construct
+//! it first and pass it to [`PixStrategy::build_with_pool`].
 
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -30,13 +33,15 @@ use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+#[cfg(all(feature = "strategy-pix-bjj", not(feature = "strategy-pix-secp256k1")))]
+use crate::pix::curvy_pool::CurvyDepositPool;
+#[cfg(feature = "strategy-pix-secp256k1")]
+use crate::pix::non_anonymous_pool::NonAnonymousDepositPool;
+#[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
+use crate::pix::{PoolConfig, PoolKeypair};
 use crate::{
     errors::{Result, StrategyError},
-    pix::{
-        PoolKeypair,
-        non_anonymous_pool::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig},
-        recovery_store::PixRecoveryStore,
-    },
+    pix::recovery_store::PixRecoveryStore,
     strategy::Strategy as StrategyTrait,
 };
 
@@ -99,9 +104,13 @@ pub struct PixStrategyConfig {
     #[default(HoprBalance::new_base(100))]
     #[serde(default)]
     pub max_ssa_allocation: HoprBalance,
-    /// Configuration for the default non-anonymous deposit pool.
+    /// Configuration for the deposit pool bundled with the enabled `strategy-pix-*` feature.
+    ///
+    /// Absent when neither pairing is enabled — that build has no bundled pool to configure and
+    /// supplies its own through [`PixStrategy::build_with_pool`].
+    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
     #[serde(default)]
-    pub pool: NonAnonymousDepositPoolConfig,
+    pub pool: PoolConfig,
     /// If set, recovered private keys are persisted to redb at this path.
     ///
     /// Strongly recommended in production. A `PrivateKeyRecovered` event can arrive before
@@ -148,19 +157,44 @@ impl PixStrategy {
         Self { cfg }
     }
 
-    /// Build with the default [`NonAnonymousDepositPool`].
-    pub fn build_non_anonymous<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
+    /// Build with the deposit pool bundled with the enabled `strategy-pix-*` feature.
+    ///
+    /// This is the curve-agnostic entry point: it names neither pool, so a caller needs no edit
+    /// when the build switches between them. Which one it selects is decided entirely by the
+    /// feature graph, and [`PoolKeypair`] is the alias to assert the resulting deposit-address
+    /// type against.
+    ///
+    /// Note that with `strategy-pix-bjj` the selected pool is
+    /// [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool), which is a stub: building
+    /// succeeds and the first deposit panics.
+    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
+    pub fn build_default_pool<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
     {
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
+        #[cfg(feature = "strategy-pix-secp256k1")]
         let pool = Arc::new(NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
+        #[cfg(all(feature = "strategy-pix-bjj", not(feature = "strategy-pix-secp256k1")))]
+        let pool = Arc::new(CurvyDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
+
         let safe_address = node.identity().safe_address;
 
-        // The key is named rather than inferred: it is the choice this builder exists to make,
-        // and [`PoolKeypair`] is the alias a consumer asserts its deposit-address type against.
+        // The key is named rather than inferred: it is the choice this builder exists to make.
         self.build_with_pool::<_, _, PoolKeypair>(pool, node, safe_address)
+    }
+
+    /// Build with the [`NonAnonymousDepositPool`], by name.
+    ///
+    /// Prefer [`build_default_pool`](Self::build_default_pool) unless the caller genuinely
+    /// requires *this* pool rather than the configured one.
+    #[cfg(feature = "strategy-pix-secp256k1")]
+    pub fn build_non_anonymous<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
+    where
+        N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
+    {
+        self.build_default_pool(node)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
@@ -878,7 +912,12 @@ where
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Gated on the secp pairing rather than plain `test`: every case here drives a real
+// `NonAnonymousDepositPool` against a stub chain, so they exercise the pool as much as the
+// strategy. The bjj pairing has no equivalent yet because its pool is a stub — when
+// `CurvyDepositPool` is implemented, the engine-level cases here are the ones worth
+// generalising over `PoolKeypair` rather than duplicating.
+#[cfg(all(test, feature = "strategy-pix-secp256k1"))]
 mod tests {
     use std::{num::NonZeroU32, sync::Arc, time::Duration as StdDuration};
 
