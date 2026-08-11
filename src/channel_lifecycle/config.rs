@@ -310,9 +310,11 @@ pub struct FundingConfig {
 /// from this cannot drift from the strategy's own behaviour, because it *is* the
 /// strategy's own calculation.
 ///
-/// The four fields are ordered `lower_balance_threshold` < `topup_balance` <
-/// `initial_balance` < `min_safe_balance_required` under the default proportions, though
-/// a custom [`FundingConfig`] is free to break that.
+/// Each field resolves its own [`FundingConfig`] capacity independently, so their
+/// relative order is whatever that config sets — no ordering is implied or enforced
+/// here. Under [`FundingConfig::default`] the top-up, initial and min-safe capacities
+/// are all 1 GiB and resolve to the same balance, with only the lower threshold
+/// (256 MiB) below them.
 ///
 /// ```no_run
 /// # use hopr_strategy::channel_lifecycle::FundingConfig;
