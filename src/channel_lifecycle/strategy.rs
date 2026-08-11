@@ -34,12 +34,28 @@ use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 /// Call [`new`](ChannelLifecycleStrategy::new) with the strategy configuration,
 /// then [`build`](ChannelLifecycleStrategy::build) to wire in a node and obtain
 /// a runnable `Box<dyn Strategy + Send>`.
+///
+/// # Configuration is not validated here
+///
+/// Neither `new` nor `build` validates the config. Deserialization fills in
+/// defaults but does not enforce the field constraints declared on
+/// [`ChannelLifecycleConfig`] (e.g. `funding.assumed_hops` ∈ `[1, 3]`,
+/// `funding.sizing_mode` bounds), so the caller is responsible for running
+/// [`Validate::validate`](validator::Validate::validate) on the config —
+/// at the point the top-level configuration is constructed or deserialized,
+/// or immediately before constructing this builder — and for surfacing the
+/// error through its own error type.
 pub struct ChannelLifecycleStrategy {
     cfg: ChannelLifecycleConfig,
 }
 
 impl ChannelLifecycleStrategy {
     /// Create a new builder with the given configuration.
+    ///
+    /// The config is taken as-is; see the [type-level note] on validating it
+    /// beforehand.
+    ///
+    /// [type-level note]: ChannelLifecycleStrategy#configuration-is-not-validated-here
     pub fn new(cfg: ChannelLifecycleConfig) -> Self {
         Self { cfg }
     }
@@ -69,11 +85,6 @@ impl ChannelLifecycleStrategy {
             + Sync
             + 'static,
     {
-        use validator::Validate as _;
-        self.cfg
-            .validate()
-            .expect("invalid ChannelLifecycleConfig: field constraints violated");
-
         let selector: Arc<dyn super::selector::Selector> = match self.cfg.selector.multi_objective_config() {
             Some(mo_cfg) => {
                 mo_cfg

@@ -1361,7 +1361,7 @@ mod config_tests {
 
     #[test]
     fn default_lifecycle_config_passes_validation() -> anyhow::Result<()> {
-        // Guards the `expect` in `ChannelLifecycleStrategy::build`.
+        // A caller that validates a defaulted config must never see an error.
         ChannelLifecycleConfig::default().validate().context("default config")?;
         Ok(())
     }
@@ -1437,6 +1437,32 @@ impl SelectorProfile {
 ///
 /// Unknown keys are rejected rather than ignored, so a misspelled field is a
 /// load-time error instead of a silent fallback to the default.
+///
+/// # Validation is the caller's responsibility
+///
+/// Defaulting and validation are separate concerns: deserialization fills in
+/// every unspecified field but does **not** check the constraints declared on
+/// this type and its nested sections (`funding.assumed_hops` ∈ `[1, 3]`,
+/// `funding.sizing_mode`'s `success_probability` bounds). Nested sections are
+/// marked `#[validate(nested)]`, so a single
+/// [`Validate::validate`](validator::Validate::validate) call on this struct
+/// covers all of them — but nothing in this crate invokes it.
+///
+/// Call it where the surrounding configuration is constructed or deserialized,
+/// or immediately before
+/// [`ChannelLifecycleStrategy::new`](crate::channel_lifecycle::ChannelLifecycleStrategy::new),
+/// and report the failure through the enclosing error type:
+///
+/// ```
+/// # use hopr_strategy::channel_lifecycle::ChannelLifecycleConfig;
+/// use validator::Validate as _;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let cfg: ChannelLifecycleConfig = serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#)?;
+/// cfg.validate()?;
+/// # Ok(())
+/// # }
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
