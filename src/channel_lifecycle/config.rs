@@ -12,6 +12,7 @@ use validator::Validate;
 /// Population thresholds: how many open channels to maintain.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PopulationConfig {
     /// Minimum number of open outgoing channels.  Closures are suppressed
     /// when the open count would drop below this.  Default: 5.
@@ -38,6 +39,7 @@ fn default_peer_reopen_cooldown() -> Duration {
 /// Peer eligibility filters for channel opening and for determining staleness.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct EligibilityConfig {
     /// Only open channels to peers that are currently connected.  Default: true.
     #[default = true]
@@ -136,9 +138,14 @@ pub struct EligibilityConfig {
 /// sizing_mode:
 ///   probabilistic:
 ///     success_probability: 0.999
+///
+/// # `success_probability` is optional (defaults to 0.999), but the empty map is
+/// # required — a struct variant cannot be named on its own.
+/// sizing_mode:
+///   probabilistic: {}
 /// ```
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapacitySizingMode {
     /// `stake = max( ticket_price × hops / win_prob ,  N × hops × ticket_price )`
     ///
@@ -253,6 +260,7 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// The floor only binds for tiny capacities (`N < 1 / win_prob`), where it lifts
 /// the stake up to one winning ticket so the channel can still relay.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FundingConfig {
     /// Data volume a newly opened channel's stake should be able to carry.
     /// Default: 1 GiB.
@@ -446,6 +454,7 @@ impl FundingConfig {
 /// the projected balance after confirmation would fall below the threshold.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProactiveFundingConfig {
     /// Enable proactive funding.  Default: true.
     #[default = true]
@@ -490,6 +499,7 @@ fn default_depletion_lookback() -> Duration {
 /// Thresholds that trigger channel closure.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClosureConfig {
     /// Close a channel after the peer has been absent for this long.  Default: 24 h.
     #[serde(default = "default_close_when_peer_unseen_for", with = "humantime_serde")]
@@ -521,6 +531,7 @@ fn default_close_when_peer_unseen_for() -> Duration {
 /// channels once the notice period has elapsed).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FinalizerConfig {
     /// Enable the finalizer phase.  When `false`, `PendingToClose` channels
     /// are left to be finalized externally.  Default: true.
@@ -548,6 +559,7 @@ fn default_max_closure_overdue() -> Duration {
 /// scratch and peers appear unseen until heartbeats arrive).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RestartGuardConfig {
     /// The close pass is suppressed entirely for this long after startup.
     /// Should exceed network bootstrap time + first heartbeat round.
@@ -565,6 +577,7 @@ fn default_startup_close_grace_period() -> Duration {
 /// Concurrency knobs for the per-channel evaluation loops.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     /// Maximum simultaneous in-flight chain-write operations (open + fund +
     /// close + finalize combined).  Additional operations are deferred to the
@@ -575,6 +588,7 @@ pub struct ConcurrencyConfig {
 
 /// Per-axis weights for the multi-objective channel selector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SelectorWeights {
     /// Weight of the latency axis.
     pub latency: f64,
@@ -590,6 +604,13 @@ pub struct SelectorWeights {
     pub trust_ack: f64,
     /// Inner weight for ticket activity within the trust axis.  Default: 0.15.
     pub trust_ticket: f64,
+}
+
+impl Default for SelectorWeights {
+    /// Same axis weights as [`MultiObjectiveSelectorConfig::balanced`].
+    fn default() -> Self {
+        Self::new(0.35, 0.30, 0.15, 0.20)
+    }
 }
 
 impl SelectorWeights {
@@ -608,6 +629,7 @@ impl SelectorWeights {
 
 /// Configuration for the multi-objective channel selector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MultiObjectiveSelectorConfig {
     pub weights: SelectorWeights,
     /// Maximum number of opens initiated per strategy tick.  Selector returns at most this many
@@ -627,6 +649,13 @@ pub struct MultiObjectiveSelectorConfig {
     /// suppresses churn — once open, a channel stays open until quality is
     /// substantially worse than the open bar.
     pub hysteresis_gap: f64,
+}
+
+impl Default for MultiObjectiveSelectorConfig {
+    /// The [`balanced`](MultiObjectiveSelectorConfig::balanced) profile.
+    fn default() -> Self {
+        Self::balanced()
+    }
 }
 
 impl MultiObjectiveSelectorConfig {
@@ -1225,6 +1254,139 @@ mod config_tests {
         cfg.weights.trust_ticket = 0.9; // sum = 2.7
         assert!(cfg.validate_trust_weights().is_err());
     }
+
+    #[test]
+    fn selector_weights_default_matches_balanced() {
+        assert_eq!(
+            SelectorWeights::default(),
+            MultiObjectiveSelectorConfig::balanced().weights
+        );
+        assert_eq!(
+            MultiObjectiveSelectorConfig::default(),
+            MultiObjectiveSelectorConfig::balanced()
+        );
+        // The inner trust weights documented on the fields.
+        let w = SelectorWeights::default();
+        assert_eq!((w.trust_probe, w.trust_ack, w.trust_ticket), (0.50, 0.35, 0.15));
+    }
+
+    // ── Partial configuration: every field is optional ───────────────────────
+
+    #[test]
+    fn empty_config_deserializes_to_default() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str("{}").context("empty object")?;
+        assert_eq!(cfg, ChannelLifecycleConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_config_defaults_the_rest() -> anyhow::Result<()> {
+        // A single leaf field inside a single section — everything else must default.
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#).context("partial")?;
+
+        assert_eq!(cfg.population.min_open_channels, 3, "the overridden field");
+        assert_eq!(cfg.population.target_open_channels, 8, "sibling in the same section");
+        assert_eq!(
+            cfg.population.peer_reopen_cooldown,
+            Duration::from_secs(30 * 60),
+            "sibling with a per-field serde default"
+        );
+        assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");
+        assert_eq!(cfg.tick_interval, Duration::from_secs(60), "untouched top-level field");
+        Ok(())
+    }
+
+    /// Every nested section must be independently omittable.
+    #[rstest]
+    #[case(r#"{"eligibility":{"min_peer_quality_score":0.9}}"#)]
+    #[case(r#"{"funding":{"initial_capacity":"2 GiB"}}"#)]
+    #[case(r#"{"proactive_funding":{"enabled":false}}"#)]
+    #[case(r#"{"closure":{"close_max_concurrent":7}}"#)]
+    #[case(r#"{"finalizer":{"enabled":false}}"#)]
+    #[case(r#"{"restart":{"startup_close_grace_period":"1m"}}"#)]
+    #[case(r#"{"concurrency":{"max_concurrent_actions":1}}"#)]
+    #[case(r#"{"tick_interval":"30s"}"#)]
+    #[case(r#"{"selector":"low_latency"}"#)]
+    fn each_section_is_independently_partial(#[case] json: &str) -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(json).with_context(|| json.to_string())?;
+        cfg.validate().with_context(|| format!("validate {json}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn partial_nested_selector_custom_defaults_inner_weights() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"selector":{"custom":{"open_per_tick":5}}}"#).context("custom selector")?;
+        let mo = cfg
+            .selector
+            .multi_objective_config()
+            .expect("custom profile must yield a config");
+        assert_eq!(mo.open_per_tick, 5, "the overridden field");
+        assert_eq!(mo.weights, SelectorWeights::default(), "weights default wholesale");
+        assert_eq!(mo.k_floor, MultiObjectiveSelectorConfig::balanced().k_floor);
+        // The inner trust weights must still sum to ~1.0, or `build()` would panic.
+        mo.validate_trust_weights().map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn probabilistic_sizing_mode_defaults_success_probability() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"funding":{"sizing_mode":{"probabilistic":{}}}}"#).context("probabilistic")?;
+        assert_eq!(
+            cfg.funding.sizing_mode,
+            CapacitySizingMode::Probabilistic {
+                success_probability: 0.999
+            }
+        );
+        Ok(())
+    }
+
+    // ── Unknown keys are rejected, not silently defaulted ────────────────────
+
+    #[rstest]
+    #[case(r#"{"populatio":{}}"#)] // misspelled section
+    #[case(r#"{"population":{"min_open_channel":3}}"#)] // misspelled leaf
+    #[case(r#"{"funding":{"sizing_mode":{"probabilistic":{"sucess_probability":0.9}}}}"#)] // in a variant
+    #[case(r#"{"selector":{"custom":{"open_per_tik":5}}}"#)] // in a nested selector
+    fn unknown_field_is_rejected(#[case] json: &str) {
+        assert!(
+            serde_json::from_str::<ChannelLifecycleConfig>(json).is_err(),
+            "unknown key must be an error, not a silent default: {json}"
+        );
+    }
+
+    // ── Nested validation actually runs ──────────────────────────────────────
+
+    #[test]
+    fn default_lifecycle_config_passes_validation() -> anyhow::Result<()> {
+        // Guards the `expect` in `ChannelLifecycleStrategy::build`.
+        ChannelLifecycleConfig::default().validate().context("default config")?;
+        Ok(())
+    }
+
+    #[test]
+    fn nested_validation_rejects_bad_assumed_hops() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(r#"{"funding":{"assumed_hops":0}}"#).context("parse")?;
+        assert!(
+            cfg.validate().is_err(),
+            "funding.assumed_hops = 0 must fail top-level validation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_validation_rejects_bad_success_probability() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"funding":{"sizing_mode":{"probabilistic":{"success_probability":0.2}}}}"#)
+                .context("parse")?;
+        assert!(
+            cfg.validate().is_err(),
+            "success_probability = 0.2 must fail top-level validation"
+        );
+        Ok(())
+    }
 }
 
 /// Selector profile selection for [`ChannelLifecycleConfig`].
@@ -1232,7 +1394,7 @@ mod config_tests {
 /// Defaults to `Default` (existing `DefaultSelector` behavior, zero behavior change).
 /// Operators opt in to multi-objective selection by choosing a named profile or `Custom`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorProfile {
     /// Original weighted-sum selector.  Zero behavior change from pre-redesign deployments.
     #[default]
@@ -1260,10 +1422,24 @@ impl SelectorProfile {
 
 /// Top-level configuration for [`ChannelLifecycleStrategy`].
 ///
-/// All fields have sensible defaults; consumers only need to set the fields
-/// they want to override.
+/// Every field — including every field of every nested section — has a sensible
+/// default, so a partial configuration is always valid: consumers only need to
+/// set the fields they want to override, and an empty configuration is
+/// equivalent to [`ChannelLifecycleConfig::default`].
+///
+/// ```yaml
+/// # Everything not mentioned keeps its default.
+/// population:
+///   target_open_channels: 12      # min_open_channels stays 5
+/// funding:
+///   initial_capacity: 2 GiB       # topup_capacity stays 1 GiB
+/// ```
+///
+/// Unknown keys are rejected rather than ignored, so a misspelled field is a
+/// load-time error instead of a silent fallback to the default.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChannelLifecycleConfig {
     /// Base period between full evaluation passes.  Default: 60 s.
     #[serde(default = "default_tick_interval", with = "humantime_serde")]
@@ -1277,13 +1453,21 @@ pub struct ChannelLifecycleConfig {
     #[default(default_jitter())]
     pub jitter: Duration,
 
+    #[validate(nested)]
     pub population: PopulationConfig,
+    #[validate(nested)]
     pub eligibility: EligibilityConfig,
+    #[validate(nested)]
     pub funding: FundingConfig,
+    #[validate(nested)]
     pub proactive_funding: ProactiveFundingConfig,
+    #[validate(nested)]
     pub closure: ClosureConfig,
+    #[validate(nested)]
     pub finalizer: FinalizerConfig,
+    #[validate(nested)]
     pub restart: RestartGuardConfig,
+    #[validate(nested)]
     pub concurrency: ConcurrencyConfig,
     /// Open/close selection policy.  Defaults to the original weighted-sum selector.
     #[default(SelectorProfile::Default)]

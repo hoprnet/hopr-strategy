@@ -69,6 +69,11 @@ impl ChannelLifecycleStrategy {
             + Sync
             + 'static,
     {
+        use validator::Validate as _;
+        self.cfg
+            .validate()
+            .expect("invalid ChannelLifecycleConfig: field constraints violated");
+
         let selector: Arc<dyn super::selector::Selector> = match self.cfg.selector.multi_objective_config() {
             Some(mo_cfg) => {
                 mo_cfg

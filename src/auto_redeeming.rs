@@ -53,6 +53,7 @@ fn min_redeem_hopr() -> HoprBalance {
 /// Configuration object for the `AutoRedeemingStrategy`
 #[serde_as]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutoRedeemingStrategyConfig {
     /// If set to true, will redeem all tickets in the channel (which are over the
     /// `minimum_redeem_ticket_value` threshold) once it transitions to `PendingToClose`.

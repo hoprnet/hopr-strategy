@@ -54,6 +54,7 @@ fn validate_funding_amount(amount: &HoprBalance) -> std::result::Result<(), Vali
 /// Configuration for `AutoFundingStrategy`.
 #[serde_as]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutoFundingStrategyConfig {
     /// Minimum stake that a channel's balance must not go below.
     ///
@@ -550,6 +551,29 @@ mod tests {
     fn test_default_config_passes_validation() {
         let cfg = AutoFundingStrategyConfig::default();
         assert!(cfg.validate().is_ok(), "default config should pass validation");
+    }
+
+    #[test]
+    fn empty_config_deserializes_to_default() -> anyhow::Result<()> {
+        let cfg: AutoFundingStrategyConfig = serde_json::from_str("{}")?;
+        assert_eq!(cfg, AutoFundingStrategyConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_config_defaults_the_rest() -> anyhow::Result<()> {
+        let cfg: AutoFundingStrategyConfig = serde_json::from_str(r#"{"funding_amount":"20 wxHOPR"}"#)?;
+        assert_eq!(cfg.funding_amount, HoprBalance::new_base(20));
+        assert_eq!(
+            cfg.min_stake_threshold,
+            AutoFundingStrategyConfig::default().min_stake_threshold
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        assert!(serde_json::from_str::<AutoFundingStrategyConfig>(r#"{"funding_amont":"20 wxHOPR"}"#).is_err());
     }
 
     #[test_log::test(tokio::test)]

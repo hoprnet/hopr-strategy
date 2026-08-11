@@ -34,6 +34,7 @@ fn default_max_closure_overdue() -> Duration {
 
 /// Contains configuration of the [`ClosureFinalizerStrategy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClosureFinalizerStrategyConfig {
     /// Do not attempt to finalize closure of channels that have
     /// been overdue for closure for more than this period.
