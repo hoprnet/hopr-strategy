@@ -19,12 +19,16 @@ use hopr_api::{
         PacketTransport,
     },
 };
+use validator::Validate as _;
 
 use super::{
     ChannelLifecycleConfig, ChannelLifecycleStrategyInner,
     selector::{DefaultSelector, MultiObjectiveSelector},
 };
-use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
+use crate::{
+    errors::{Result, StrategyError},
+    strategy::Strategy as StrategyTrait,
+};
 
 /// Builder for [`ChannelLifecycleStrategy`].
 ///
@@ -34,6 +38,10 @@ use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 /// Call [`new`](ChannelLifecycleStrategy::new) with the strategy configuration,
 /// then [`build`](ChannelLifecycleStrategy::build) to wire in a node and obtain
 /// a runnable `Box<dyn Strategy + Send>`.
+///
+/// [`build`](ChannelLifecycleStrategy::build) validates the configuration and
+/// returns an error rather than panicking; see
+/// [`ChannelLifecycleConfig`] for what is and is not checked.
 pub struct ChannelLifecycleStrategy {
     cfg: ChannelLifecycleConfig,
 }
@@ -49,7 +57,35 @@ impl ChannelLifecycleStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints, or if a `Custom` selector profile's inner
+    /// trust weights do not sum to ~1.0.
+    ///
+    /// Propagate it like any other error — `build` never panics on a bad config:
+    ///
+    /// ```text
+    /// let strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
+    /// ```
+    ///
+    /// or handle the configuration case specifically:
+    ///
+    /// ```text
+    /// match ChannelLifecycleStrategy::new(cfg).build(node) {
+    ///     Ok(strategy) => spawn(strategy),
+    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad strategy config: {msg}"),
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// ```
+    ///
+    /// These are `text` rather than compiled examples because `N`'s bounds
+    /// require a live node whose `ChainApi` implements the full chain read/write
+    /// trait set; no such type is constructible outside the `testing` feature.
+    /// See `build_should_reject_invalid_config_without_panicking` in
+    /// `channel_lifecycle::pipeline` for an executable version.
+    pub fn build<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi
             + HasNetworkView
@@ -69,17 +105,21 @@ impl ChannelLifecycleStrategy {
             + Sync
             + 'static,
     {
+        self.cfg
+            .validate()
+            .map_err(|e| StrategyError::InvalidConfiguration(e.to_string()))?;
+
         let selector: Arc<dyn super::selector::Selector> = match self.cfg.selector.multi_objective_config() {
             Some(mo_cfg) => {
                 mo_cfg
                     .validate_trust_weights()
-                    .expect("invalid selector config: trust inner weights must sum to ~1.0");
+                    .map_err(StrategyError::InvalidConfiguration)?;
                 Arc::new(MultiObjectiveSelector::new(mo_cfg))
             }
             None => Arc::new(DefaultSelector),
         };
 
-        Box::new(ChannelLifecycleStrategyInner {
+        Ok(Box::new(ChannelLifecycleStrategyInner {
             cfg: self.cfg,
             node,
             selector,
@@ -93,7 +133,7 @@ impl ChannelLifecycleStrategy {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-        })
+        }))
     }
 }
 
