@@ -586,6 +586,21 @@ impl Default for SelectorWeights {
 impl SelectorWeights {
     /// Axis weights of the [`balanced`](MultiObjectiveSelectorConfig::balanced)
     /// profile, and the [`Default`] for this type.
+    ///
+    /// ```
+    /// # use hopr_strategy::channel_lifecycle::{MultiObjectiveSelectorConfig, SelectorWeights};
+    /// // The default weights are the balanced profile's weights.
+    /// assert_eq!(SelectorWeights::BALANCED, SelectorWeights::default());
+    /// assert_eq!(
+    ///     SelectorWeights::BALANCED,
+    ///     MultiObjectiveSelectorConfig::balanced().weights
+    /// );
+    ///
+    /// // Start from them and tune a single axis.
+    /// let mut weights = SelectorWeights::BALANCED;
+    /// weights.latency = 0.50;
+    /// assert_eq!(weights.anonymity, SelectorWeights::BALANCED.anonymity);
+    /// ```
     pub const BALANCED: Self = Self::new(0.35, 0.30, 0.15, 0.20);
 
     pub const fn new(latency: f64, trust: f64, stake: f64, anonymity: f64) -> Self {
@@ -1442,9 +1457,10 @@ impl SelectorProfile {
 /// Top-level configuration for [`ChannelLifecycleStrategy`].
 ///
 /// Every field — including every field of every nested section — has a sensible
-/// default, so a partial configuration is always valid: consumers only need to
-/// set the fields they want to override, and an empty configuration is
-/// equivalent to [`ChannelLifecycleConfig::default`].
+/// default, so any subset of the fields deserializes: consumers only need to set
+/// the fields they want to override, and an empty configuration is equivalent to
+/// [`ChannelLifecycleConfig::default`]. Omitted fields are defaulted; values that
+/// *are* supplied must still pass validation (see below).
 ///
 /// ```yaml
 /// # Everything not mentioned keeps its default.

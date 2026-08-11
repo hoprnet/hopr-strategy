@@ -63,6 +63,28 @@ impl ChannelLifecycleStrategy {
     /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
     /// of its declared constraints, or if a `Custom` selector profile's inner
     /// trust weights do not sum to ~1.0.
+    ///
+    /// Propagate it like any other error — `build` never panics on a bad config:
+    ///
+    /// ```text
+    /// let strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
+    /// ```
+    ///
+    /// or handle the configuration case specifically:
+    ///
+    /// ```text
+    /// match ChannelLifecycleStrategy::new(cfg).build(node) {
+    ///     Ok(strategy) => spawn(strategy),
+    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad strategy config: {msg}"),
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// ```
+    ///
+    /// These are `text` rather than compiled examples because `N`'s bounds
+    /// require a live node whose `ChainApi` implements the full chain read/write
+    /// trait set; no such type is constructible outside the `testing` feature.
+    /// See `build_should_reject_invalid_config_without_panicking` in
+    /// `channel_lifecycle::pipeline` for an executable version.
     pub fn build<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi

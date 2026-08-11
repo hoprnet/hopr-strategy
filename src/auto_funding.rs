@@ -52,6 +52,29 @@ fn validate_funding_amount(amount: &HoprBalance) -> std::result::Result<(), Vali
 }
 
 /// Configuration for `AutoFundingStrategy`.
+///
+/// Every field is optional; an omitted field takes its default, and an unknown
+/// key is a load-time error rather than a silent fallback.
+///
+/// ```
+/// # use hopr_strategy::auto_funding::AutoFundingStrategyConfig;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // An empty config is the default config.
+/// let cfg: AutoFundingStrategyConfig = serde_json::from_str("{}")?;
+/// assert_eq!(cfg, AutoFundingStrategyConfig::default());
+///
+/// // Override one field; the other keeps its default.
+/// let cfg: AutoFundingStrategyConfig = serde_json::from_str(r#"{"funding_amount":"20 wxHOPR"}"#)?;
+/// assert_eq!(
+///     cfg.min_stake_threshold,
+///     AutoFundingStrategyConfig::default().min_stake_threshold
+/// );
+///
+/// // A misspelled key is rejected.
+/// assert!(serde_json::from_str::<AutoFundingStrategyConfig>(r#"{"funding_amont":"20 wxHOPR"}"#).is_err());
+/// # Ok(())
+/// # }
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

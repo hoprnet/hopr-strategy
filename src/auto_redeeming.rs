@@ -50,6 +50,26 @@ fn min_redeem_hopr() -> HoprBalance {
 }
 
 /// Configuration object for the `AutoRedeemingStrategy`
+///
+/// Every field is optional; an omitted field takes its default, and an unknown
+/// key is a load-time error rather than a silent fallback.
+///
+/// ```
+/// # use hopr_strategy::auto_redeeming::AutoRedeemingStrategyConfig;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // An empty config is the default config.
+/// let cfg: AutoRedeemingStrategyConfig = serde_json::from_str("{}")?;
+/// assert_eq!(cfg, AutoRedeemingStrategyConfig::default());
+/// assert!(cfg.redeem_all_on_close);
+/// assert!(!cfg.redeem_on_winning);
+///
+/// // Override one field; the others keep their defaults.
+/// let cfg: AutoRedeemingStrategyConfig = serde_json::from_str(r#"{"redeem_on_winning":true}"#)?;
+/// assert!(cfg.redeem_on_winning);
+/// assert!(cfg.redeem_all_on_close);
+/// # Ok(())
+/// # }
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

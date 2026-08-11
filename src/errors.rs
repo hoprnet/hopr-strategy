@@ -10,6 +10,19 @@ pub enum StrategyError {
     #[error("strategy could not perform action because action of the same type is on-going")]
     InProgress,
 
+    /// A strategy was given a configuration that violates its declared
+    /// constraints. Returned by strategy builders instead of panicking, so the
+    /// caller can report it through its own error type.
+    ///
+    /// ```
+    /// # use hopr_strategy::errors::StrategyError;
+    /// let err = StrategyError::InvalidConfiguration("assumed_hops: out of range".into());
+    /// assert!(matches!(err, StrategyError::InvalidConfiguration(_)));
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "invalid strategy configuration: assumed_hops: out of range"
+    /// );
+    /// ```
     #[error("invalid strategy configuration: {0}")]
     InvalidConfiguration(String),
 

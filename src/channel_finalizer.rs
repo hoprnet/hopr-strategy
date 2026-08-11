@@ -28,6 +28,24 @@ lazy_static::lazy_static! {
 }
 
 /// Contains configuration of the [`ClosureFinalizerStrategy`].
+///
+/// The single field is optional and accepts a human-readable duration; an
+/// unknown key is a load-time error rather than a silent fallback.
+///
+/// ```
+/// # use std::time::Duration;
+/// # use hopr_strategy::channel_finalizer::ClosureFinalizerStrategyConfig;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Omitted -> the 300 s default.
+/// let cfg: ClosureFinalizerStrategyConfig = serde_json::from_str("{}")?;
+/// assert_eq!(cfg.max_closure_overdue, Duration::from_secs(300));
+///
+/// // Supplied as a humantime string.
+/// let cfg: ClosureFinalizerStrategyConfig = serde_json::from_str(r#"{"max_closure_overdue":"10m"}"#)?;
+/// assert_eq!(cfg.max_closure_overdue, Duration::from_secs(600));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClosureFinalizerStrategyConfig {
