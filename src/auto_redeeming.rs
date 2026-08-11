@@ -32,7 +32,6 @@ use validator::Validate;
 
 use crate::{
     errors::{StrategyError, StrategyError::CriteriaNotSatisfied},
-    just_false, just_true,
     strategy::Strategy as StrategyTrait,
 };
 
@@ -51,14 +50,34 @@ fn min_redeem_hopr() -> HoprBalance {
 }
 
 /// Configuration object for the `AutoRedeemingStrategy`
+///
+/// Every field is optional; an omitted field takes its default, and an unknown
+/// key is a load-time error rather than a silent fallback.
+///
+/// ```
+/// # use hopr_strategy::auto_redeeming::AutoRedeemingStrategyConfig;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // An empty config is the default config.
+/// let cfg: AutoRedeemingStrategyConfig = serde_json::from_str("{}")?;
+/// assert_eq!(cfg, AutoRedeemingStrategyConfig::default());
+/// assert!(cfg.redeem_all_on_close);
+/// assert!(!cfg.redeem_on_winning);
+///
+/// // Override one field; the others keep their defaults.
+/// let cfg: AutoRedeemingStrategyConfig = serde_json::from_str(r#"{"redeem_on_winning":true}"#)?;
+/// assert!(cfg.redeem_on_winning);
+/// assert!(cfg.redeem_all_on_close);
+/// # Ok(())
+/// # }
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AutoRedeemingStrategyConfig {
     /// If set to true, will redeem all tickets in the channel (which are over the
     /// `minimum_redeem_ticket_value` threshold) once it transitions to `PendingToClose`.
     ///
     /// Default is `true`.
-    #[serde(default = "just_true")]
     #[default = true]
     pub redeem_all_on_close: bool,
 
@@ -66,7 +85,6 @@ pub struct AutoRedeemingStrategyConfig {
     /// If 0 is given, the strategy will redeem tickets regardless of their value.
     ///
     /// Default is `1 wxHOPR`.
-    #[serde(default = "min_redeem_hopr")]
     #[serde_as(as = "DisplayFromStr")]
     #[default(min_redeem_hopr())]
     pub minimum_redeem_ticket_value: HoprBalance,
@@ -79,8 +97,7 @@ pub struct AutoRedeemingStrategyConfig {
     /// Set this to `false` when winning tickets are happening very often (e.g., when winning probability
     /// is above 1%).
     ///
-    /// Default is `true`
-    #[serde(default = "just_false")]
+    /// Default is `false`
     #[default = false]
     pub redeem_on_winning: bool,
 }
@@ -90,6 +107,9 @@ pub struct AutoRedeemingStrategyConfig {
 /// Call [`new`](AutoRedeemingStrategy::new) with the strategy configuration,
 /// then [`build`](AutoRedeemingStrategy::build) to wire in a node and obtain a
 /// runnable `Box<dyn Strategy + Send>`.
+///
+/// [`build`](AutoRedeemingStrategy::build) validates the configuration and returns
+/// an error rather than panicking; see [`AutoRedeemingStrategyConfig`].
 pub struct AutoRedeemingStrategy {
     cfg: AutoRedeemingStrategyConfig,
     interval: Duration,
@@ -106,18 +126,41 @@ impl AutoRedeemingStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints.
+    ///
+    /// ```text
+    /// // Propagate, like any other error — `build` never panics on a bad config.
+    /// let strategy = AutoRedeemingStrategy::new(cfg, interval).build(node)?;
+    ///
+    /// // Or single out the configuration case.
+    /// match AutoRedeemingStrategy::new(cfg, interval).build(node) {
+    ///     Ok(strategy) => spawn(strategy),
+    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad auto-redeeming config: {msg}"),
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// ```
+    ///
+    /// Not a compiled doctest: `N`'s bounds require a live node whose `ChainApi`
+    /// and `TicketManager` implement the full chain and ticket trait sets, and no
+    /// such type is constructible outside the `testing` feature.
+    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + HasTicketManagement + ActionableEventSource + Send + Sync + 'static,
         N::ChainApi: ChainReadChannelOperations + ChainWriteTicketOperations + Clone + Send + Sync + 'static,
         N::TicketManager: TicketManagement + Clone + Send + Sync + 'static,
     {
-        Box::new(AutoRedeemingStrategyInner {
+        StrategyError::validate_config(&self.cfg)?;
+
+        Ok(Box::new(AutoRedeemingStrategyInner {
             cfg: self.cfg,
             interval: self.interval,
             node,
             running_redemptions: new_redemption_cache(),
-        })
+        }))
     }
 }
 
@@ -426,6 +469,23 @@ mod tests {
     use crate::testing::{
         BlokliTestClient, BlokliTestStateBuilder, StaticState, TestChainConnector, create_test_blokli_connector,
     };
+
+    /// Pins the documented defaults so a field's doc comment and its
+    /// `#[default(...)]` cannot drift apart unnoticed.
+    #[test]
+    fn documented_defaults_match_actual_defaults() -> anyhow::Result<()> {
+        let cfg = AutoRedeemingStrategyConfig::default();
+        assert!(cfg.redeem_all_on_close, "documented as true");
+        assert!(!cfg.redeem_on_winning, "documented as false");
+        assert_eq!(
+            cfg.minimum_redeem_ticket_value,
+            min_redeem_hopr(),
+            "documented as 1 wxHOPR"
+        );
+        // An empty config must land on exactly the same values.
+        assert_eq!(serde_json::from_str::<AutoRedeemingStrategyConfig>("{}")?, cfg);
+        Ok(())
+    }
 
     mockall::mock! {
         pub TicketMgmt {}
@@ -963,7 +1023,7 @@ mod tests {
 
         let strategy: Box<dyn crate::strategy::Strategy + Send> =
             super::AutoRedeemingStrategy::new(AutoRedeemingStrategyConfig::default(), Duration::from_secs(60))
-                .build(node);
+                .build(node)?;
 
         assert_eq!(strategy.to_string(), "auto_redeeming");
         // Verify the box is Send (compile-time check via trait object)

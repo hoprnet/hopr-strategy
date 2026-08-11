@@ -1080,7 +1080,10 @@ mod tests {
     // Private items (ChannelLifecycleStrategyInner) are accessible from descendant modules.
     use super::super::ChannelLifecycleStrategyInner;
     use super::super::{config::ResolvedFunding, *};
-    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
+    use crate::{
+        errors::StrategyError,
+        testing::{BlokliTestStateBuilder, create_test_blokli_connector},
+    };
 
     /// Build a [`ResolvedFunding`] directly from wxHOPR amounts for use in
     /// `try_open_channel` unit tests that bypass the pipeline.
@@ -1497,7 +1500,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
 
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
@@ -1557,11 +1560,67 @@ mod tests {
         let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
 
         let strategy: Box<dyn crate::strategy::Strategy + Send> =
-            ChannelLifecycleStrategy::new(ChannelLifecycleConfig::default()).build(node);
+            ChannelLifecycleStrategy::new(ChannelLifecycleConfig::default()).build(node)?;
 
         assert_eq!(strategy.to_string(), "channel_lifecycle");
         fn assert_send<T: Send>(_: T) {}
         assert_send(strategy);
+
+        Ok(())
+    }
+
+    /// An invalid config must come back as `InvalidConfiguration` from `build`,
+    /// never as a panic — the caller reports it through its own error type.
+    #[tokio::test]
+    async fn build_should_reject_invalid_config_without_panicking() -> anyhow::Result<()> {
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let chain_connector = Arc::new(chain_connector);
+
+        // `assumed_hops = 0` violates the `range(min = 1, max = 3)` constraint.
+        let bad_hops = ChannelLifecycleConfig {
+            funding: FundingConfig {
+                assumed_hops: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // A `Custom` selector whose inner trust weights do not sum to ~1.0 — this
+        // one is checked outside the `Validate` tree, so it exercises the second
+        // error path in `build`.
+        let mut weights = SelectorWeights::BALANCED;
+        weights.trust_probe = 0.9;
+        weights.trust_ack = 0.9;
+        weights.trust_ticket = 0.9;
+        let bad_weights = ChannelLifecycleConfig {
+            selector: SelectorProfile::Custom(MultiObjectiveSelectorConfig {
+                weights,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        for (what, cfg) in [("assumed_hops = 0", bad_hops), ("unnormalised weights", bad_weights)] {
+            let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
+            let Err(err) = ChannelLifecycleStrategy::new(cfg).build(node) else {
+                anyhow::bail!("build must reject {what}");
+            };
+            assert!(
+                matches!(err, StrategyError::InvalidConfiguration(_)),
+                "{what}: expected InvalidConfiguration, got {err:?}"
+            );
+        }
 
         Ok(())
     }
@@ -2209,7 +2268,7 @@ mod tests {
         };
 
         let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
         });
@@ -2421,7 +2480,7 @@ mod tests {
 
         // Leave the graph empty — no observations for any peer.
         let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
         });
@@ -2503,7 +2562,7 @@ mod tests {
         // Keep a handle to the graph so we can inject an edge mid-run.
         let graph = Arc::new(StubGraph::default());
         let node = Arc::new(ChainNode::with_graph(Arc::clone(&connector), Arc::clone(&graph)));
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
         });
@@ -2616,7 +2675,7 @@ mod tests {
         };
 
         let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
         });
@@ -2706,7 +2765,7 @@ mod tests {
 
         let graph = Arc::new(StubGraph::default());
         let node = Arc::new(ChainNode::with_graph(Arc::clone(&connector), Arc::clone(&graph)));
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
         });
@@ -2833,7 +2892,7 @@ mod tests {
         };
 
         let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
-        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node);
+        let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
         let handle = tokio::spawn(async move {
             let _ = strategy.run().await;
         });
