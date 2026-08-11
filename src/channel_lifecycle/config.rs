@@ -308,16 +308,13 @@ pub struct FundingConfig {
 /// economics.  Computed once per pipeline tick and threaded through the fund,
 /// open, and close-decision paths.
 ///
-/// Returned by [`FundingConfig::resolve`], which callers outside this crate can use
-/// to report what the strategy will actually lock — a funding recommendation derived
-/// from this cannot drift from the strategy's own behaviour, because it *is* the
-/// strategy's own calculation.
+/// Returned by [`FundingConfig::resolve`], which callers outside this crate can use to
+/// report what the strategy will lock — such a figure cannot drift from the strategy,
+/// because it *is* the strategy's own calculation.
 ///
-/// Each field resolves its own [`FundingConfig`] capacity independently, so their
-/// relative order is whatever that config sets — no ordering is implied or enforced
-/// here. Under [`FundingConfig::default`] the top-up, initial and min-safe capacities
-/// are all 1 GiB and resolve to the same balance, with only the lower threshold
-/// (256 MiB) below them.
+/// Each field resolves its own capacity independently; no ordering is implied. Under
+/// [`FundingConfig::default`] the top-up, initial and min-safe capacities are all 1 GiB
+/// and resolve equal, with only the lower threshold (256 MiB) below them.
 ///
 /// ```no_run
 /// # use hopr_strategy::channel_lifecycle::FundingConfig;
@@ -441,16 +438,14 @@ impl FundingConfig {
     ///
     /// # Reporting what the strategy will lock
     ///
-    /// This is the only supported way to learn the wxHOPR the strategy resolves a
-    /// capacity to.  It honours this config's [`CapacitySizingMode`], so the answer
-    /// tracks whichever mode is configured rather than assuming one.
+    /// The only supported way to learn the wxHOPR a capacity resolves to, and it honours
+    /// this config's [`CapacitySizingMode`] rather than assuming one.
     ///
-    /// Callers building a funding recommendation should read it from here rather than
-    /// reimplementing the conversion.  A reimplementation compiles perfectly well after
-    /// the formula changes here and then silently reports a figure the strategy does not
-    /// agree with — and because [`FundingConfig::min_safe_capacity_required`] gates
-    /// opening at all when `stop_when_unfunded` is set, a recommendation below what this
-    /// returns leaves a node unable to open a single channel.
+    /// Build funding recommendations from here, not from a reimplementation: a copy
+    /// compiles fine after the formula changes here, then reports figures the strategy
+    /// disagrees with.  Since [`FundingConfig::min_safe_capacity_required`] gates opening
+    /// when `stop_when_unfunded` is set, reporting below this leaves a node unable to
+    /// open a single channel.
     ///
     /// ```no_run
     /// # use hopr_strategy::channel_lifecycle::FundingConfig;
