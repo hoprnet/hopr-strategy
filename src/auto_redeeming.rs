@@ -77,7 +77,7 @@ pub struct AutoRedeemingStrategyConfig {
     /// Set this to `false` when winning tickets are happening very often (e.g., when winning probability
     /// is above 1%).
     ///
-    /// Default is `true`
+    /// Default is `false`
     #[default = false]
     pub redeem_on_winning: bool,
 }
@@ -423,6 +423,23 @@ mod tests {
     use crate::testing::{
         BlokliTestClient, BlokliTestStateBuilder, StaticState, TestChainConnector, create_test_blokli_connector,
     };
+
+    /// Pins the documented defaults so a field's doc comment and its
+    /// `#[default(...)]` cannot drift apart unnoticed.
+    #[test]
+    fn documented_defaults_match_actual_defaults() -> anyhow::Result<()> {
+        let cfg = AutoRedeemingStrategyConfig::default();
+        assert!(cfg.redeem_all_on_close, "documented as true");
+        assert!(!cfg.redeem_on_winning, "documented as false");
+        assert_eq!(
+            cfg.minimum_redeem_ticket_value,
+            min_redeem_hopr(),
+            "documented as 1 wxHOPR"
+        );
+        // An empty config must land on exactly the same values.
+        assert_eq!(serde_json::from_str::<AutoRedeemingStrategyConfig>("{}")?, cfg);
+        Ok(())
+    }
 
     mockall::mock! {
         pub TicketMgmt {}
