@@ -44,28 +44,34 @@ fn default_max_deposit_tracking_time() -> Duration {
 
 /// Configuration for [`CurvyDepositPool`].
 ///
-/// Deliberately field-compatible with
+/// **Shares nothing with
 /// [`NonAnonymousDepositPoolConfig`](crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig)
-/// on the values a consumer actually sets, so that `PixStrategyConfig` and any YAML that feeds it
-/// do not have to change shape when the pool does. Fields specific to on-chain settlement, such
-/// as the sweep gas top-up, are absent — an anonymous pool does not send a transaction the
-/// depositor pays for.
+/// by design.** The two pools settle by different means, so neither one's knobs are evidence
+/// that the other needs them, in either direction:
+///
+/// * The non-anonymous pool's `gas_xdai_per_sweep` funds a recovered stealth address so it can
+///   pay for its own `withdraw_from_signer` transaction. That is a fact about settling on-chain
+///   from an EOA, not about deposit pools. This pool has no such field and should not acquire
+///   one by analogy.
+/// * Its `max_deposit_retries` / `max_sweep_retries` budget retries of a *transaction* against
+///   a chain that may drop it. What this pool retries, and whether retrying is even meaningful,
+///   is not yet decided.
+///
+/// So this carries only what the [`DepositPool`] contract itself forces — a pool owns the
+/// deadline on the future it returns from [`DepositPool::notify_deposit`], so it needs somewhere
+/// to keep it — and stays otherwise empty until the settlement design says what belongs here.
+/// A consumer that wants both pools configured writes the two separately; nothing lets a value
+/// intended for one silently reach the other.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
 pub struct CurvyDepositPoolConfig {
-    /// How long to keep waiting for the expected deposit before giving up. Default: 60 seconds.
+    /// How long [`DepositPool::notify_deposit`]'s future waits before resolving to an error.
+    /// Default: 60 seconds.
+    ///
+    /// Present because the trait requires the pool to own this deadline, not because the
+    /// non-anonymous pool has a field of the same name.
     #[default(default_max_deposit_tracking_time())]
     #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
     pub max_deposit_tracking_time: Duration,
-
-    /// Attempts *in addition to* the first for a deposit.  Default: 3.
-    #[default(3)]
-    #[serde(default)]
-    pub max_deposit_retries: usize,
-
-    /// Attempts *in addition to* the first for a withdrawal.  Default: 5.
-    #[default(5)]
-    #[serde(default)]
-    pub max_sweep_retries: usize,
 }
 
 /// A [`DepositPool`] for Baby JubJub deposit addresses.
@@ -93,7 +99,7 @@ macro_rules! not_implemented {
     ($what:literal) => {
         unimplemented!(
             "CurvyDepositPool::{} is not implemented — this build selected the Baby JubJub \
-             deposit pool via `strategy-pix-bjj`, which is currently a stub. For a working pool \
+             deposit pool via `strategy-pix-curvy`, which is currently a stub. For a working pool \
              build with `strategy-pix-secp256k1` instead (and `hopr-lib/pix-secp256k1` with it).",
             $what
         )

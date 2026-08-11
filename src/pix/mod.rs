@@ -14,7 +14,7 @@
 //! | feature | pool | `K::Public` | pair with |
 //! |---|---|---|---|
 //! | `strategy-pix-secp256k1` | [`non_anonymous_pool::NonAnonymousDepositPool`] | `Address` | `hopr-lib/pix-secp256k1` |
-//! | `strategy-pix-bjj` | [`curvy_pool::CurvyDepositPool`] (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
+//! | `strategy-pix-curvy` | [`curvy_pool::CurvyDepositPool`] (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
 //!
 //! [`PoolKeypair`] and [`PoolConfig`] name the selected pool's types in one place, so a consumer
 //! can state the invariant `<HoprPixSpec as PixSpec>::DepositAddress == PoolKeypair::Public`
@@ -25,7 +25,7 @@
 //! consumer supplying its own via
 //! [`PixStrategy::build_with_pool`](strategy::PixStrategy::build_with_pool).
 
-#[cfg(feature = "strategy-pix-bjj")]
+#[cfg(feature = "strategy-pix-curvy")]
 pub mod curvy_pool;
 #[cfg(feature = "strategy-pix-secp256k1")]
 pub mod non_anonymous_pool;
@@ -36,9 +36,9 @@ pub mod strategy;
 // merge — it is a contradiction. Cargo features are additive and this crate is a library, so
 // this fires when two consumers in one graph each pick a different pool; that is a real
 // configuration error and the error message is the only place it can be explained.
-#[cfg(all(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
+#[cfg(all(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
 compile_error!(
-    "features `strategy-pix-secp256k1` and `strategy-pix-bjj` are mutually exclusive: they \
+    "features `strategy-pix-secp256k1` and `strategy-pix-curvy` are mutually exclusive: they \
      select deposit pools with incompatible address types. Exactly one crate in the dependency \
      graph may choose, and every consumer of `hopr-strategy` must agree on the same one."
 );
@@ -52,14 +52,17 @@ compile_error!(
 pub type PoolKeypair = non_anonymous_pool::EthDepositKey;
 // `not(secp)` so that enabling both yields only the `compile_error!` above, rather than burying
 // it under a pile of duplicate-definition errors.
-#[cfg(all(feature = "strategy-pix-bjj", not(feature = "strategy-pix-secp256k1")))]
+#[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
 pub type PoolKeypair = hopr_api::types::crypto::prelude::BjjKeypair;
 
 /// The configuration type of the deposit pool selected by the enabled `strategy-pix-*` feature.
 ///
-/// Carried by [`strategy::PixStrategyConfig::pool`]. The two are field-compatible on everything
-/// a consumer sets, so switching pools does not reshape the config a caller writes.
+/// Carried by [`strategy::PixStrategyConfig::pool`]. The two configs deliberately share **no**
+/// fields by contract: the pools settle by different means, so neither one's knobs are evidence
+/// that the other needs them. A caller that sets pool-specific values therefore writes them
+/// under the same `cfg` that selects the pool, which is what stops a value meant for one from
+/// silently reaching the other.
 #[cfg(feature = "strategy-pix-secp256k1")]
 pub type PoolConfig = non_anonymous_pool::NonAnonymousDepositPoolConfig;
-#[cfg(all(feature = "strategy-pix-bjj", not(feature = "strategy-pix-secp256k1")))]
+#[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
 pub type PoolConfig = curvy_pool::CurvyDepositPoolConfig;

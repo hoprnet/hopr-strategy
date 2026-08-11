@@ -33,11 +33,11 @@ use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-#[cfg(all(feature = "strategy-pix-bjj", not(feature = "strategy-pix-secp256k1")))]
+#[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
 use crate::pix::curvy_pool::CurvyDepositPool;
 #[cfg(feature = "strategy-pix-secp256k1")]
 use crate::pix::non_anonymous_pool::NonAnonymousDepositPool;
-#[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
+#[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
 use crate::pix::{PoolConfig, PoolKeypair};
 use crate::{
     errors::{Result, StrategyError},
@@ -108,7 +108,7 @@ pub struct PixStrategyConfig {
     ///
     /// Absent when neither pairing is enabled — that build has no bundled pool to configure and
     /// supplies its own through [`PixStrategy::build_with_pool`].
-    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
+    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
     #[serde(default)]
     pub pool: PoolConfig,
     /// If set, recovered private keys are persisted to redb at this path.
@@ -164,10 +164,10 @@ impl PixStrategy {
     /// feature graph, and [`PoolKeypair`] is the alias to assert the resulting deposit-address
     /// type against.
     ///
-    /// Note that with `strategy-pix-bjj` the selected pool is
+    /// Note that with `strategy-pix-curvy` the selected pool is
     /// [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool), which is a stub: building
     /// succeeds and the first deposit panics.
-    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-bjj"))]
+    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
     pub fn build_default_pool<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
@@ -176,7 +176,7 @@ impl PixStrategy {
         // `DepositPool` is auto-implemented for `Arc<D>`.
         #[cfg(feature = "strategy-pix-secp256k1")]
         let pool = Arc::new(NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
-        #[cfg(all(feature = "strategy-pix-bjj", not(feature = "strategy-pix-secp256k1")))]
+        #[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
         let pool = Arc::new(CurvyDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
 
         let safe_address = node.identity().safe_address;
@@ -1577,6 +1577,168 @@ mod tests {
             hopr_balance(&*cc, ra).await?,
             HoprBalance::zero(),
             "the deposit address must be emptied by the sweep"
+        );
+        Ok(())
+    }
+
+    /// `pool_transfer` must move the deposit to the destination it is *given*.
+    ///
+    /// It delegates to `withdraw_deposit`, whose every other caller passes the Safe — so the
+    /// one thing that can go wrong in the delegation is the destination being dropped and the
+    /// funds landing in the Safe anyway. That would look like success from the return value.
+    /// `CHRIS` is deliberately neither the Safe (`BOB`) nor the deposit address.
+    #[test_log::test(tokio::test)]
+    async fn test_pool_transfer_moves_the_deposit_to_the_given_destination() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let deposit = HoprBalance::new_base(7);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            // A funded deposit address with gas of its own to pay for the transfer.
+            .with_balances([(ra, deposit)])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+
+        let safe_before = hopr_balance(&*cc, *BOB).await?;
+        let dst_before = hopr_balance(&*cc, *CHRIS).await?;
+
+        pool.pool_transfer(
+            &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
+            *CHRIS,
+            None,
+        )
+        .await?;
+
+        assert_eq!(
+            hopr_balance(&*cc, ra).await?,
+            HoprBalance::zero(),
+            "the deposit address must be emptied by the transfer"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, *CHRIS).await?,
+            dst_before + deposit,
+            "the destination passed to pool_transfer must receive the deposit"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, *BOB).await?,
+            safe_before,
+            "the Safe must not receive anything: this is a transfer, not a withdrawal"
+        );
+        Ok(())
+    }
+
+    /// An empty address is refused rather than reported as a no-op transfer.
+    ///
+    /// Same contract as the sweep, and for the same reason: a `pool_transfer` that "succeeded"
+    /// while moving nothing is indistinguishable from one that moved the funds, so a caller
+    /// tracking the deposit would drop it.
+    #[test_log::test(tokio::test)]
+    async fn test_pool_transfer_of_empty_address_is_rejected() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(cc)));
+        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+
+        let result = pool
+            .pool_transfer(
+                &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
+                *CHRIS,
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(StrategyError::CriteriaNotSatisfied)),
+            "an empty address must be refused, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// `pool_transfer` inherits the sweep's retry budget, because it is the same operation.
+    ///
+    /// Worth pinning: the delegation is what makes this true, and someone giving
+    /// `pool_transfer` its own body later would silently lose it — leaving a transfer that
+    /// gives up on the first attempt while the identical withdrawal keeps trying.
+    #[test_log::test(tokio::test)]
+    async fn test_pool_transfer_retries_until_the_deposit_lands() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let deposit = HoprBalance::new_base(5);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(
+            node,
+            pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 3),
+        );
+
+        let funder = Arc::clone(&cc);
+        let landing = tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(300)).await;
+            funder.withdraw(deposit, &ra).await?.await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let result = pool
+            .pool_transfer(
+                &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
+                *CHRIS,
+                None,
+            )
+            .await;
+        landing.await??;
+
+        assert!(
+            result.is_ok(),
+            "the transfer must succeed once the deposit lands: {result:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, ra).await?,
+            HoprBalance::zero(),
+            "the deposit address must be emptied by the transfer"
         );
         Ok(())
     }

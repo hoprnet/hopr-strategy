@@ -63,7 +63,7 @@ strategy-pix-secp256k1 = ["strategy-pix"]
 #
 # NOTE: the pool itself is a stub whose methods panic. The feature wiring is final; the
 # implementation is not.
-strategy-pix-bjj = ["strategy-pix"]
+strategy-pix-curvy = ["strategy-pix"]
 
 [dependencies]
 anyhow              = { workspace = true }
