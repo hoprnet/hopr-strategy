@@ -27,11 +27,6 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
-#[inline]
-fn default_max_closure_overdue() -> Duration {
-    Duration::from_secs(300)
-}
-
 /// Contains configuration of the [`ClosureFinalizerStrategy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -40,8 +35,8 @@ pub struct ClosureFinalizerStrategyConfig {
     /// been overdue for closure for more than this period.
     ///
     /// Default is 300 seconds.
-    #[serde(default = "default_max_closure_overdue", with = "humantime_serde")]
-    #[default(default_max_closure_overdue())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(300))]
     pub max_closure_overdue: Duration,
 }
 

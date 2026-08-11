@@ -26,14 +26,9 @@ pub struct PopulationConfig {
 
     /// How long a peer is ineligible for a new channel after its previous
     /// channel was closed.  Default: 30 minutes.
-    #[serde(default = "default_peer_reopen_cooldown", with = "humantime_serde")]
-    #[default(default_peer_reopen_cooldown())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30 * 60))]
     pub peer_reopen_cooldown: Duration,
-}
-
-#[inline]
-fn default_peer_reopen_cooldown() -> Duration {
-    Duration::from_secs(30 * 60)
 }
 
 /// Peer eligibility filters for channel opening and for determining staleness.
@@ -462,13 +457,13 @@ pub struct ProactiveFundingConfig {
 
     /// Fallback tx-confirmation duration used when
     /// `ChainValues::typical_resolution_time()` fails.  Default: 60 s.
-    #[serde(default = "default_fallback_chain_op_duration", with = "humantime_serde")]
-    #[default(default_fallback_chain_op_duration())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(60))]
     pub fallback_chain_op_duration: Duration,
 
     /// How far back to look when computing the drain rate.  Default: 10 min.
-    #[serde(default = "default_depletion_lookback", with = "humantime_serde")]
-    #[default(default_depletion_lookback())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(10 * 60))]
     pub depletion_lookback: Duration,
 
     /// Multiplicative safety margin applied to the projected drain.
@@ -487,23 +482,14 @@ pub struct ProactiveFundingConfig {
     pub ticket_index_drain_weight: f64,
 }
 
-#[inline]
-fn default_fallback_chain_op_duration() -> Duration {
-    Duration::from_secs(60)
-}
-#[inline]
-fn default_depletion_lookback() -> Duration {
-    Duration::from_secs(10 * 60)
-}
-
 /// Thresholds that trigger channel closure.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClosureConfig {
     /// Close a channel after the peer has been absent for this long.  Default: 24 h.
-    #[serde(default = "default_close_when_peer_unseen_for", with = "humantime_serde")]
-    #[default(default_close_when_peer_unseen_for())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(24 * 60 * 60))]
     pub close_when_peer_unseen_for: Duration,
 
     /// Close channels to peers whose quality score has dropped below this.
@@ -522,11 +508,6 @@ pub struct ClosureConfig {
     pub close_max_concurrent: usize,
 }
 
-#[inline]
-fn default_close_when_peer_unseen_for() -> Duration {
-    Duration::from_secs(24 * 60 * 60)
-}
-
 /// Controls the finalizer phase (second `close_channel` call for `PendingToClose`
 /// channels once the notice period has elapsed).
 #[serde_as]
@@ -540,19 +521,14 @@ pub struct FinalizerConfig {
 
     /// Extra time to wait beyond the on-chain notice period before finalizing.
     /// Provides a buffer for slow-block periods.  Default: 30 min.
-    #[serde(default = "default_max_closure_overdue", with = "humantime_serde")]
-    #[default(default_max_closure_overdue())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30 * 60))]
     pub max_closure_overdue: Duration,
 
     /// Maximum simultaneous finalization transactions initiated per pass.
     /// Default: 4.
     #[default = 4]
     pub finalize_max_concurrent: usize,
-}
-
-#[inline]
-fn default_max_closure_overdue() -> Duration {
-    Duration::from_secs(30 * 60)
 }
 
 /// Guards against mass-closing channels on restart (the graph is rebuilt from
@@ -564,14 +540,9 @@ pub struct RestartGuardConfig {
     /// The close pass is suppressed entirely for this long after startup.
     /// Should exceed network bootstrap time + first heartbeat round.
     /// Default: 10 min.
-    #[serde(default = "default_startup_close_grace_period", with = "humantime_serde")]
-    #[default(default_startup_close_grace_period())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(10 * 60))]
     pub startup_close_grace_period: Duration,
-}
-
-#[inline]
-fn default_startup_close_grace_period() -> Duration {
-    Duration::from_secs(10 * 60)
 }
 
 /// Concurrency knobs for the per-channel evaluation loops.
@@ -607,13 +578,16 @@ pub struct SelectorWeights {
 }
 
 impl Default for SelectorWeights {
-    /// Same axis weights as [`MultiObjectiveSelectorConfig::balanced`].
     fn default() -> Self {
-        Self::new(0.35, 0.30, 0.15, 0.20)
+        Self::BALANCED
     }
 }
 
 impl SelectorWeights {
+    /// Axis weights of the [`balanced`](MultiObjectiveSelectorConfig::balanced)
+    /// profile, and the [`Default`] for this type.
+    pub const BALANCED: Self = Self::new(0.35, 0.30, 0.15, 0.20);
+
     pub const fn new(latency: f64, trust: f64, stake: f64, anonymity: f64) -> Self {
         Self {
             latency,
@@ -671,7 +645,7 @@ impl MultiObjectiveSelectorConfig {
 
     pub fn balanced() -> Self {
         Self {
-            weights: SelectorWeights::new(0.35, 0.30, 0.15, 0.20),
+            weights: SelectorWeights::BALANCED,
             open_per_tick: 2,
             close_per_tick: 2,
             k_floor: 3,
@@ -1290,27 +1264,82 @@ mod config_tests {
         assert_eq!(
             cfg.population.peer_reopen_cooldown,
             Duration::from_secs(30 * 60),
-            "sibling with a per-field serde default"
+            "sibling of a different type"
         );
         assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");
         assert_eq!(cfg.tick_interval, Duration::from_secs(60), "untouched top-level field");
         Ok(())
     }
 
-    /// Every nested section must be independently omittable.
-    #[rstest]
-    #[case(r#"{"eligibility":{"min_peer_quality_score":0.9}}"#)]
-    #[case(r#"{"funding":{"initial_capacity":"2 GiB"}}"#)]
-    #[case(r#"{"proactive_funding":{"enabled":false}}"#)]
-    #[case(r#"{"closure":{"close_max_concurrent":7}}"#)]
-    #[case(r#"{"finalizer":{"enabled":false}}"#)]
-    #[case(r#"{"restart":{"startup_close_grace_period":"1m"}}"#)]
-    #[case(r#"{"concurrency":{"max_concurrent_actions":1}}"#)]
-    #[case(r#"{"tick_interval":"30s"}"#)]
-    #[case(r#"{"selector":"low_latency"}"#)]
-    fn each_section_is_independently_partial(#[case] json: &str) -> anyhow::Result<()> {
-        let cfg: ChannelLifecycleConfig = serde_json::from_str(json).with_context(|| json.to_string())?;
-        cfg.validate().with_context(|| format!("validate {json}"))?;
+    /// Walk every object node reachable from a serialized default config and, at
+    /// each one, assert the two properties the container-level
+    /// `#[serde(default, deny_unknown_fields)]` is there to provide: the node may
+    /// be reduced to `{}` and still yield the default, and an unknown key inside
+    /// it is an error.
+    ///
+    /// Deliberately data-driven rather than a hand-written case list: a section
+    /// added to [`ChannelLifecycleConfig`] later is covered automatically, which
+    /// is exactly the recurrence this test exists to prevent. Non-object nodes
+    /// (`sizing_mode: "deterministic"`, durations, byte sizes) are skipped —
+    /// container-level `default` does not apply to them.
+    #[test]
+    fn every_nested_object_is_partial_and_rejects_unknown_keys() -> anyhow::Result<()> {
+        use serde_json::{Map, Value};
+
+        /// Rebuilds `root` with the object at `path` replaced by `replacement`.
+        fn substitute(root: &Value, path: &[String], replacement: Value) -> Value {
+            match path.split_first() {
+                None => replacement,
+                Some((key, rest)) => {
+                    let mut obj = root.as_object().cloned().unwrap_or_default();
+                    let child = obj.get(key).cloned().unwrap_or(Value::Null);
+                    obj.insert(key.clone(), substitute(&child, rest, replacement));
+                    Value::Object(obj)
+                }
+            }
+        }
+
+        fn object_paths(node: &Value, path: Vec<String>, out: &mut Vec<Vec<String>>) {
+            if let Value::Object(map) = node {
+                out.push(path.clone());
+                for (key, child) in map {
+                    let mut child_path = path.clone();
+                    child_path.push(key.clone());
+                    object_paths(child, child_path, out);
+                }
+            }
+        }
+
+        let default = ChannelLifecycleConfig::default();
+        let root = serde_json::to_value(&default).context("serialize default")?;
+        let mut paths = Vec::new();
+        object_paths(&root, Vec::new(), &mut paths);
+        assert!(
+            paths.len() > 8,
+            "expected the root plus every nested section, found {} object nodes",
+            paths.len()
+        );
+
+        for path in paths {
+            let at = if path.is_empty() {
+                "<root>".into()
+            } else {
+                path.join(".")
+            };
+
+            let emptied = substitute(&root, &path, Value::Object(Map::new()));
+            let parsed: ChannelLifecycleConfig =
+                serde_json::from_value(emptied).with_context(|| format!("`{at}` reduced to {{}}"))?;
+            assert_eq!(parsed, default, "`{at}` reduced to {{}} must yield the default");
+
+            let mut with_unknown = Map::new();
+            with_unknown.insert("__unknown__".into(), Value::Bool(true));
+            let polluted = substitute(&root, &path, Value::Object(with_unknown));
+            assert!(
+                serde_json::from_value::<ChannelLifecycleConfig>(polluted).is_err(),
+                "unknown key in `{at}` must be an error, not a silent default"
+            );
+        }
         Ok(())
     }
 
@@ -1324,8 +1353,7 @@ mod config_tests {
             .expect("custom profile must yield a config");
         assert_eq!(mo.open_per_tick, 5, "the overridden field");
         assert_eq!(mo.weights, SelectorWeights::default(), "weights default wholesale");
-        assert_eq!(mo.k_floor, MultiObjectiveSelectorConfig::balanced().k_floor);
-        // The inner trust weights must still sum to ~1.0, or `build()` would panic.
+        // `selector` is outside the `Validate` tree, so `build()` checks this separately.
         mo.validate_trust_weights().map_err(anyhow::Error::msg)?;
         Ok(())
     }
@@ -1345,11 +1373,12 @@ mod config_tests {
 
     // ── Unknown keys are rejected, not silently defaulted ────────────────────
 
+    /// The generic walk above covers unknown keys in every *struct* node; these
+    /// are the cases it cannot reach — a misspelling of the section key itself,
+    /// and a key inside an enum struct variant.
     #[rstest]
     #[case(r#"{"populatio":{}}"#)] // misspelled section
-    #[case(r#"{"population":{"min_open_channel":3}}"#)] // misspelled leaf
     #[case(r#"{"funding":{"sizing_mode":{"probabilistic":{"sucess_probability":0.9}}}}"#)] // in a variant
-    #[case(r#"{"selector":{"custom":{"open_per_tik":5}}}"#)] // in a nested selector
     fn unknown_field_is_rejected(#[case] json: &str) {
         assert!(
             serde_json::from_str::<ChannelLifecycleConfig>(json).is_err(),
@@ -1366,25 +1395,15 @@ mod config_tests {
         Ok(())
     }
 
-    #[test]
-    fn nested_validation_rejects_bad_assumed_hops() -> anyhow::Result<()> {
-        let cfg: ChannelLifecycleConfig = serde_json::from_str(r#"{"funding":{"assumed_hops":0}}"#).context("parse")?;
-        assert!(
-            cfg.validate().is_err(),
-            "funding.assumed_hops = 0 must fail top-level validation"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn nested_validation_rejects_bad_success_probability() -> anyhow::Result<()> {
-        let cfg: ChannelLifecycleConfig =
-            serde_json::from_str(r#"{"funding":{"sizing_mode":{"probabilistic":{"success_probability":0.2}}}}"#)
-                .context("parse")?;
-        assert!(
-            cfg.validate().is_err(),
-            "success_probability = 0.2 must fail top-level validation"
-        );
+    /// Constraints declared on a nested section must surface from a single
+    /// `validate()` on the top-level config — this is what `#[validate(nested)]`
+    /// buys, and without it these validators are dead code.
+    #[rstest]
+    #[case(r#"{"funding":{"assumed_hops":0}}"#)]
+    #[case(r#"{"funding":{"sizing_mode":{"probabilistic":{"success_probability":0.2}}}}"#)]
+    fn nested_validation_rejects_out_of_range_values(#[case] json: &str) -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(json).with_context(|| json.to_string())?;
+        assert!(cfg.validate().is_err(), "must fail top-level validation: {json}");
         Ok(())
     }
 }
@@ -1394,7 +1413,7 @@ mod config_tests {
 /// Defaults to `Default` (existing `DefaultSelector` behavior, zero behavior change).
 /// Operators opt in to multi-objective selection by choosing a named profile or `Custom`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum SelectorProfile {
     /// Original weighted-sum selector.  Zero behavior change from pre-redesign deployments.
     #[default]
@@ -1451,8 +1470,8 @@ impl SelectorProfile {
 /// A config loader that wants to reject a bad file before constructing anything
 /// can validate up front instead. The nested sections are marked
 /// `#[validate(nested)]`, so one
-/// [`Validate::validate`](validator::Validate::validate) call on this struct
-/// covers the whole tree:
+/// [`Validate::validate`](validator::Validate::validate) call covers all of
+/// them:
 ///
 /// ```
 /// # use hopr_strategy::channel_lifecycle::ChannelLifecycleConfig;
@@ -1465,21 +1484,27 @@ impl SelectorProfile {
 /// # }
 /// ```
 ///
+/// The one exception is [`selector`](Self::selector): [`SelectorProfile`] does not
+/// derive [`Validate`], so a `Custom` profile's trust weights are checked only by
+/// [`MultiObjectiveSelectorConfig::validate_trust_weights`], which
+/// [`ChannelLifecycleStrategy::build`] calls separately. A loader that validates
+/// up front should call it too, or leave that check to `build`.
+///
 /// [`ChannelLifecycleStrategy::build`]: crate::channel_lifecycle::ChannelLifecycleStrategy::build
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChannelLifecycleConfig {
     /// Base period between full evaluation passes.  Default: 60 s.
-    #[serde(default = "default_tick_interval", with = "humantime_serde")]
-    #[default(default_tick_interval())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(60))]
     pub tick_interval: Duration,
 
     /// Maximum random offset added to the tick interval to spread out
     /// concurrent node restarts.  Implemented as a deterministic offset based
     /// on the current system time nanoseconds.  Default: 5 s.
-    #[serde(default = "default_jitter", with = "humantime_serde")]
-    #[default(default_jitter())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5))]
     pub jitter: Duration,
 
     #[validate(nested)]
@@ -1501,13 +1526,4 @@ pub struct ChannelLifecycleConfig {
     /// Open/close selection policy.  Defaults to the original weighted-sum selector.
     #[default(SelectorProfile::Default)]
     pub selector: SelectorProfile,
-}
-
-#[inline]
-fn default_tick_interval() -> Duration {
-    Duration::from_secs(60)
-}
-#[inline]
-fn default_jitter() -> Duration {
-    Duration::from_secs(5)
 }

@@ -19,12 +19,16 @@ use hopr_api::{
         PacketTransport,
     },
 };
+use validator::Validate as _;
 
 use super::{
     ChannelLifecycleConfig, ChannelLifecycleStrategyInner,
     selector::{DefaultSelector, MultiObjectiveSelector},
 };
-use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
+use crate::{
+    errors::{Result, StrategyError},
+    strategy::Strategy as StrategyTrait,
+};
 
 /// Builder for [`ChannelLifecycleStrategy`].
 ///
@@ -35,29 +39,15 @@ use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 /// then [`build`](ChannelLifecycleStrategy::build) to wire in a node and obtain
 /// a runnable `Box<dyn Strategy + Send>`.
 ///
-/// # Where configuration is validated
-///
-/// Deserialization fills in defaults but does not enforce the field constraints
-/// declared on [`ChannelLifecycleConfig`] (e.g. `funding.assumed_hops` ∈
-/// `[1, 3]`, `funding.sizing_mode`'s `success_probability` bounds).
-/// [`build`](ChannelLifecycleStrategy::build) checks them and returns
-/// [`StrategyError::InvalidConfiguration`] — never panics — so a bad operator
-/// config surfaces as an error at wiring time rather than aborting the process.
-///
-/// Callers are free to validate earlier as well: because the nested sections are
-/// marked `#[validate(nested)]`, a single
-/// [`Validate::validate`](validator::Validate::validate) call on the top-level
-/// config covers the whole tree, which lets a config loader reject a bad file
-/// before any strategy is constructed.
+/// [`build`](ChannelLifecycleStrategy::build) validates the configuration and
+/// returns an error rather than panicking; see
+/// [`ChannelLifecycleConfig`] for what is and is not checked.
 pub struct ChannelLifecycleStrategy {
     cfg: ChannelLifecycleConfig,
 }
 
 impl ChannelLifecycleStrategy {
     /// Create a new builder with the given configuration.
-    ///
-    /// The config is taken as-is; it is validated by
-    /// [`build`](ChannelLifecycleStrategy::build).
     pub fn new(cfg: ChannelLifecycleConfig) -> Self {
         Self { cfg }
     }
@@ -73,7 +63,7 @@ impl ChannelLifecycleStrategy {
     /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
     /// of its declared constraints, or if a `Custom` selector profile's inner
     /// trust weights do not sum to ~1.0.
-    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
+    pub fn build<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi
             + HasNetworkView
@@ -93,7 +83,6 @@ impl ChannelLifecycleStrategy {
             + Sync
             + 'static,
     {
-        use validator::Validate as _;
         self.cfg
             .validate()
             .map_err(|e| StrategyError::InvalidConfiguration(e.to_string()))?;

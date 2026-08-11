@@ -32,7 +32,6 @@ use validator::Validate;
 
 use crate::{
     errors::{StrategyError, StrategyError::CriteriaNotSatisfied},
-    just_false, just_true,
     strategy::Strategy as StrategyTrait,
 };
 
@@ -59,7 +58,6 @@ pub struct AutoRedeemingStrategyConfig {
     /// `minimum_redeem_ticket_value` threshold) once it transitions to `PendingToClose`.
     ///
     /// Default is `true`.
-    #[serde(default = "just_true")]
     #[default = true]
     pub redeem_all_on_close: bool,
 
@@ -67,7 +65,6 @@ pub struct AutoRedeemingStrategyConfig {
     /// If 0 is given, the strategy will redeem tickets regardless of their value.
     ///
     /// Default is `1 wxHOPR`.
-    #[serde(default = "min_redeem_hopr")]
     #[serde_as(as = "DisplayFromStr")]
     #[default(min_redeem_hopr())]
     pub minimum_redeem_ticket_value: HoprBalance,
@@ -81,7 +78,6 @@ pub struct AutoRedeemingStrategyConfig {
     /// is above 1%).
     ///
     /// Default is `true`
-    #[serde(default = "just_false")]
     #[default = false]
     pub redeem_on_winning: bool,
 }

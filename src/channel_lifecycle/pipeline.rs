@@ -1080,7 +1080,10 @@ mod tests {
     // Private items (ChannelLifecycleStrategyInner) are accessible from descendant modules.
     use super::super::ChannelLifecycleStrategyInner;
     use super::super::{config::ResolvedFunding, *};
-    use crate::testing::{BlokliTestStateBuilder, create_test_blokli_connector};
+    use crate::{
+        errors::StrategyError,
+        testing::{BlokliTestStateBuilder, create_test_blokli_connector},
+    };
 
     /// Build a [`ResolvedFunding`] directly from wxHOPR amounts for use in
     /// `try_open_channel` unit tests that bypass the pipeline.
@@ -1585,36 +1588,39 @@ mod tests {
         let chain_connector = Arc::new(chain_connector);
 
         // `assumed_hops = 0` violates the `range(min = 1, max = 3)` constraint.
-        let mut cfg = ChannelLifecycleConfig::default();
-        cfg.funding.assumed_hops = 0;
-
-        let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
-        let Err(err) = ChannelLifecycleStrategy::new(cfg).build(node) else {
-            anyhow::bail!("build must reject assumed_hops = 0");
-        };
-        assert!(
-            matches!(err, crate::errors::StrategyError::InvalidConfiguration(_)),
-            "expected InvalidConfiguration, got {err:?}"
-        );
-
-        // A `Custom` selector whose inner trust weights do not sum to ~1.0.
-        let mut mo = crate::channel_lifecycle::MultiObjectiveSelectorConfig::balanced();
-        mo.weights.trust_probe = 0.9;
-        mo.weights.trust_ack = 0.9;
-        mo.weights.trust_ticket = 0.9;
-        let cfg = ChannelLifecycleConfig {
-            selector: crate::channel_lifecycle::SelectorProfile::Custom(mo),
+        let bad_hops = ChannelLifecycleConfig {
+            funding: FundingConfig {
+                assumed_hops: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
-        let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
-        let Err(err) = ChannelLifecycleStrategy::new(cfg).build(node) else {
-            anyhow::bail!("build must reject unnormalised trust weights");
+        // A `Custom` selector whose inner trust weights do not sum to ~1.0 — this
+        // one is checked outside the `Validate` tree, so it exercises the second
+        // error path in `build`.
+        let mut weights = SelectorWeights::BALANCED;
+        weights.trust_probe = 0.9;
+        weights.trust_ack = 0.9;
+        weights.trust_ticket = 0.9;
+        let bad_weights = ChannelLifecycleConfig {
+            selector: SelectorProfile::Custom(MultiObjectiveSelectorConfig {
+                weights,
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-        assert!(
-            matches!(err, crate::errors::StrategyError::InvalidConfiguration(_)),
-            "expected InvalidConfiguration, got {err:?}"
-        );
+
+        for (what, cfg) in [("assumed_hops = 0", bad_hops), ("unnormalised weights", bad_weights)] {
+            let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
+            let Err(err) = ChannelLifecycleStrategy::new(cfg).build(node) else {
+                anyhow::bail!("build must reject {what}");
+            };
+            assert!(
+                matches!(err, StrategyError::InvalidConfiguration(_)),
+                "{what}: expected InvalidConfiguration, got {err:?}"
+            );
+        }
 
         Ok(())
     }
