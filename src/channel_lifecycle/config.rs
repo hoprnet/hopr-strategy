@@ -321,16 +321,7 @@ pub struct FundingConfig {
 /// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
 /// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
 /// let resolved = funding.resolve::<C>(price, win_prob);
-///
-/// // What one new channel locks, and what the Safe must hold before the strategy
-/// // will open it at all when `stop_when_unfunded` is set.
-/// let per_channel = resolved.initial_balance;
-/// let safe_floor = resolved.min_safe_balance_required;
-///
-/// // What a running channel decays to before a top-up fires, and what that adds back.
-/// let triggers_topup_at = resolved.lower_balance_threshold;
-/// let topup_adds = resolved.topup_balance;
-/// # let _ = (per_channel, safe_floor, triggers_topup_at, topup_adds);
+/// # let _ = resolved;
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy)]
