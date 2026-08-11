@@ -88,6 +88,22 @@ impl ClosureFinalizerStrategy {
     ///
     /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
     /// of its declared constraints.
+    ///
+    /// ```text
+    /// // Propagate, like any other error — `build` never panics on a bad config.
+    /// let strategy = ClosureFinalizerStrategy::new(cfg, interval).build(node)?;
+    ///
+    /// // Or single out the configuration case.
+    /// match ClosureFinalizerStrategy::new(cfg, interval).build(node) {
+    ///     Ok(strategy) => spawn(strategy),
+    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad finalizer config: {msg}"),
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// ```
+    ///
+    /// Not a compiled doctest: `N`'s bounds require a live node whose `ChainApi`
+    /// implements the chain read/write channel traits, and no such type is
+    /// constructible outside the `testing` feature.
     pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + Send + Sync + 'static,

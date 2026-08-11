@@ -133,6 +133,24 @@ impl AutoFundingStrategy {
     /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
     /// of its declared constraints — for `AutoFundingStrategyConfig` that means a
     /// `funding_amount` of zero.
+    ///
+    /// ```text
+    /// // Propagate, like any other error — `build` never panics on a bad config.
+    /// let strategy = AutoFundingStrategy::new(cfg, interval).build(node)?;
+    ///
+    /// // Or single out the configuration case.
+    /// match AutoFundingStrategy::new(cfg, interval).build(node) {
+    ///     Ok(strategy) => spawn(strategy),
+    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad auto-funding config: {msg}"),
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// ```
+    ///
+    /// Not a compiled doctest: `N`'s bounds require a live node whose `ChainApi`
+    /// implements the full chain read/write trait set, and no such type is
+    /// constructible outside the `testing` feature. See
+    /// `build_should_reject_zero_funding_amount` in this module's tests for an
+    /// executable version.
     pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
