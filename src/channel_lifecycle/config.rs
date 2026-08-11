@@ -309,6 +309,28 @@ pub struct FundingConfig {
 /// to report what the strategy will actually lock — a funding recommendation derived
 /// from this cannot drift from the strategy's own behaviour, because it *is* the
 /// strategy's own calculation.
+///
+/// The four fields are ordered `lower_balance_threshold` < `topup_balance` <
+/// `initial_balance` < `min_safe_balance_required` under the default proportions, though
+/// a custom [`FundingConfig`] is free to break that.
+///
+/// ```no_run
+/// # use hopr_strategy::channel_lifecycle::FundingConfig;
+/// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
+/// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
+/// let resolved = funding.resolve::<C>(price, win_prob);
+///
+/// // What one new channel locks, and what the Safe must hold before the strategy
+/// // will open it at all when `stop_when_unfunded` is set.
+/// let per_channel = resolved.initial_balance;
+/// let safe_floor = resolved.min_safe_balance_required;
+///
+/// // What a running channel decays to before a top-up fires, and what that adds back.
+/// let triggers_topup_at = resolved.lower_balance_threshold;
+/// let topup_adds = resolved.topup_balance;
+/// # let _ = (per_channel, safe_floor, triggers_topup_at, topup_adds);
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedFunding {
     /// Initial balance when opening a new channel.
