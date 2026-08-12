@@ -29,19 +29,17 @@ lazy_static::lazy_static! {
 
 /// Contains configuration of the [`ClosureFinalizerStrategy`].
 ///
-/// The single field is optional and accepts a human-readable duration; an
-/// unknown key is a load-time error rather than a silent fallback.
+/// The field is optional and humantime-encoded; unknown keys are rejected.
 ///
 /// ```
 /// # use std::time::Duration;
-/// # use hopr_strategy::channel_finalizer::ClosureFinalizerStrategyConfig;
+/// # use hopr_strategy::channel_finalizer::ClosureFinalizerStrategyConfig as C;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// // Omitted -> the 300 s default.
-/// let cfg: ClosureFinalizerStrategyConfig = serde_json::from_str("{}")?;
-/// assert_eq!(cfg.max_closure_overdue, Duration::from_secs(300));
-///
-/// // Supplied as a humantime string.
-/// let cfg: ClosureFinalizerStrategyConfig = serde_json::from_str(r#"{"max_closure_overdue":"10m"}"#)?;
+/// assert_eq!(
+///     serde_json::from_str::<C>("{}")?.max_closure_overdue,
+///     Duration::from_secs(300)
+/// );
+/// let cfg: C = serde_json::from_str(r#"{"max_closure_overdue":"10m"}"#)?;
 /// assert_eq!(cfg.max_closure_overdue, Duration::from_secs(600));
 /// # Ok(())
 /// # }
@@ -63,10 +61,6 @@ pub struct ClosureFinalizerStrategyConfig {
 /// Call [`new`](ClosureFinalizerStrategy::new) with the strategy configuration,
 /// then [`build`](ClosureFinalizerStrategy::build) to wire in a node and obtain a
 /// runnable `Box<dyn Strategy + Send>`.
-///
-/// [`build`](ClosureFinalizerStrategy::build) validates the configuration and
-/// returns an error rather than panicking; see
-/// [`ClosureFinalizerStrategyConfig`].
 pub struct ClosureFinalizerStrategy {
     cfg: ClosureFinalizerStrategyConfig,
     interval: Duration,
@@ -87,23 +81,14 @@ impl ClosureFinalizerStrategy {
     /// # Errors
     ///
     /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
-    /// of its declared constraints.
+    /// of its declared constraints. Never panics.
     ///
     /// ```text
-    /// // Propagate, like any other error — `build` never panics on a bad config.
     /// let strategy = ClosureFinalizerStrategy::new(cfg, interval).build(node)?;
-    ///
-    /// // Or single out the configuration case.
-    /// match ClosureFinalizerStrategy::new(cfg, interval).build(node) {
-    ///     Ok(strategy) => spawn(strategy),
-    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad finalizer config: {msg}"),
-    ///     Err(e) => return Err(e.into()),
-    /// }
     /// ```
     ///
-    /// Not a compiled doctest: `N`'s bounds require a live node whose `ChainApi`
-    /// implements the chain read/write channel traits, and no such type is
-    /// constructible outside the `testing` feature.
+    /// `text` because `N`'s bounds need a live node, constructible only under the
+    /// `testing` feature.
     pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + Send + Sync + 'static,

@@ -134,8 +134,7 @@ pub struct EligibilityConfig {
 ///   probabilistic:
 ///     success_probability: 0.999
 ///
-/// # `success_probability` is optional (defaults to 0.999), but the empty map is
-/// # required — a struct variant cannot be named on its own.
+/// # `success_probability` defaults to 0.999, but the empty map is required.
 /// sizing_mode:
 ///   probabilistic: {}
 /// ```
@@ -627,18 +626,9 @@ impl SelectorWeights {
     /// profile, and the [`Default`] for this type.
     ///
     /// ```
-    /// # use hopr_strategy::channel_lifecycle::{MultiObjectiveSelectorConfig, SelectorWeights};
-    /// // The default weights are the balanced profile's weights.
-    /// assert_eq!(SelectorWeights::BALANCED, SelectorWeights::default());
-    /// assert_eq!(
-    ///     SelectorWeights::BALANCED,
-    ///     MultiObjectiveSelectorConfig::balanced().weights
-    /// );
-    ///
-    /// // Start from them and tune a single axis.
-    /// let mut weights = SelectorWeights::BALANCED;
-    /// weights.latency = 0.50;
-    /// assert_eq!(weights.anonymity, SelectorWeights::BALANCED.anonymity);
+    /// # use hopr_strategy::channel_lifecycle::{MultiObjectiveSelectorConfig as M, SelectorWeights as W};
+    /// assert_eq!(W::BALANCED, W::default());
+    /// assert_eq!(W::BALANCED, M::balanced().weights);
     /// ```
     pub const BALANCED: Self = Self::new(0.35, 0.30, 0.15, 0.20);
 
@@ -1495,55 +1485,33 @@ impl SelectorProfile {
 
 /// Top-level configuration for [`ChannelLifecycleStrategy`].
 ///
-/// Every field — including every field of every nested section — has a sensible
-/// default, so any subset of the fields deserializes: consumers only need to set
-/// the fields they want to override, and an empty configuration is equivalent to
-/// [`ChannelLifecycleConfig::default`]. Omitted fields are defaulted; values that
-/// *are* supplied must still pass validation (see below).
+/// Every field, at every nesting level, has a default, so any subset
+/// deserializes and `{}` equals [`ChannelLifecycleConfig::default`]. Unknown keys
+/// are rejected rather than silently ignored.
 ///
 /// ```yaml
-/// # Everything not mentioned keeps its default.
 /// population:
 ///   target_open_channels: 12      # min_open_channels stays 5
-/// funding:
-///   initial_capacity: 2 GiB       # topup_capacity stays 1 GiB
 /// ```
 ///
-/// Unknown keys are rejected rather than ignored, so a misspelled field is a
-/// load-time error instead of a silent fallback to the default.
-///
-/// # Defaulting is not validation
-///
-/// Deserialization fills in every unspecified field but does **not** check the
-/// constraints declared on this type and its nested sections
-/// (`funding.assumed_hops` ∈ `[1, 3]`, `funding.sizing_mode`'s
-/// `success_probability` bounds). Those are enforced when the strategy is built:
-/// [`ChannelLifecycleStrategy::build`] returns
-/// [`StrategyError::InvalidConfiguration`](crate::errors::StrategyError::InvalidConfiguration)
-/// rather than panicking.
-///
-/// A config loader that wants to reject a bad file before constructing anything
-/// can validate up front instead. The nested sections are marked
-/// `#[validate(nested)]`, so one
-/// [`Validate::validate`](validator::Validate::validate) call covers all of
-/// them:
+/// Defaulting is not validation: supplied values must still satisfy the declared
+/// constraints (`funding.assumed_hops` ∈ `[1, 3]`, `sizing_mode` bounds).
+/// [`ChannelLifecycleStrategy::build`] enforces them, returning
+/// [`StrategyError::InvalidConfiguration`](crate::errors::StrategyError::InvalidConfiguration).
+/// A loader can check earlier with one `validate()`, which `#[validate(nested)]`
+/// extends to all eight sections — but not [`selector`](Self::selector), whose
+/// `Custom` trust weights only
+/// [`MultiObjectiveSelectorConfig::validate_trust_weights`] checks.
 ///
 /// ```
 /// # use hopr_strategy::channel_lifecycle::ChannelLifecycleConfig;
 /// use validator::Validate as _;
-///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let cfg: ChannelLifecycleConfig = serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#)?;
 /// cfg.validate()?;
 /// # Ok(())
 /// # }
 /// ```
-///
-/// The one exception is [`selector`](Self::selector): [`SelectorProfile`] does not
-/// derive [`Validate`], so a `Custom` profile's trust weights are checked only by
-/// [`MultiObjectiveSelectorConfig::validate_trust_weights`], which
-/// [`ChannelLifecycleStrategy::build`] calls separately. A loader that validates
-/// up front should call it too, or leave that check to `build`.
 ///
 /// [`ChannelLifecycleStrategy::build`]: crate::channel_lifecycle::ChannelLifecycleStrategy::build
 #[serde_as]
