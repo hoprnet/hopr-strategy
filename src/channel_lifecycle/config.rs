@@ -307,8 +307,25 @@ pub struct FundingConfig {
 /// wxHOPR amounts resolved from [`FundingConfig`] at the current ticket
 /// economics.  Computed once per pipeline tick and threaded through the fund,
 /// open, and close-decision paths.
+///
+/// Returned by [`FundingConfig::resolve`], which callers outside this crate can use to
+/// report what the strategy will lock — such a figure cannot drift from the strategy,
+/// because it *is* the strategy's own calculation.
+///
+/// Each field resolves its own capacity independently; no ordering is implied. Under
+/// [`FundingConfig::default`] the top-up, initial and min-safe capacities are all 1 GiB
+/// and resolve equal, with only the lower threshold (256 MiB) below them.
+///
+/// ```no_run
+/// # use hopr_strategy::channel_lifecycle::FundingConfig;
+/// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
+/// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
+/// let resolved = funding.resolve::<C>(price, win_prob);
+/// # let _ = resolved;
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ResolvedFunding {
+pub struct ResolvedFunding {
     /// Initial balance when opening a new channel.
     pub initial_balance: HoprBalance,
     /// Amount added when topping up an underfunded channel.
@@ -418,7 +435,29 @@ impl FundingConfig {
     ///
     /// `win_prob` must be in `(0, 1]`.  Every mode uses it to compute the
     /// one-winning-ticket floor, so it is always required.
-    pub(crate) fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: f64) -> ResolvedFunding {
+    ///
+    /// # Reporting what the strategy will lock
+    ///
+    /// The only supported way to learn the wxHOPR a capacity resolves to, and it honours
+    /// this config's [`CapacitySizingMode`] rather than assuming one.
+    ///
+    /// Build funding recommendations from here, not from a reimplementation: a copy
+    /// compiles fine after the formula changes here, then reports figures the strategy
+    /// disagrees with.  Since [`FundingConfig::min_safe_capacity_required`] gates opening
+    /// when `stop_when_unfunded` is set, reporting below this leaves a node unable to
+    /// open a single channel.
+    ///
+    /// ```no_run
+    /// # use hopr_strategy::channel_lifecycle::FundingConfig;
+    /// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
+    /// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
+    /// let resolved = funding.resolve::<C>(price, win_prob);
+    /// // Fund the safe to at least this before expecting any channel to open.
+    /// let required = resolved.min_safe_balance_required;
+    /// # let _ = required;
+    /// # }
+    /// ```
+    pub fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: f64) -> ResolvedFunding {
         let hops = self.assumed_hops;
         let mode = &self.sizing_mode;
         ResolvedFunding {
