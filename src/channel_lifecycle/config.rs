@@ -380,6 +380,29 @@ pub struct ResolvedFunding {
 /// N = 10, p = 1e-4:  F = tp·h/p = 300 wxHOPR  (dominates)
 ///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (1 × F)
 /// ```
+/// Whole winning tickets a target of `tickets` face values has to be rounded up to.
+///
+/// Rounds up, but snaps to the nearest whole ticket when the ratio sits within a few ULPs
+/// of one.  `target / face_value` is exact in principle and can still land an ULP above a
+/// whole number — at `win_prob = 1`, where the ratio is exactly `N`, a bare `ceil` would
+/// then charge a full extra face value on every stake.
+///
+/// The bound is deliberately ULP-scale rather than a fixed relative epsilon: it must absorb
+/// float noise and nothing else, so that a genuinely fractional ticket count — however
+/// small its fraction — still rounds up rather than being quietly under-funded.
+fn whole_tickets(tickets: f64) -> f64 {
+    /// Rounding slack, in ULPs of `tickets`.  `target` and `face_value` each cost a couple
+    /// of roundings before the division, so a few ULPs covers the accumulated error.
+    const SNAP_ULPS: f64 = 4.0;
+
+    let nearest = tickets.round();
+    if (tickets - nearest).abs() <= SNAP_ULPS * f64::EPSILON * tickets.abs() {
+        nearest
+    } else {
+        tickets.ceil()
+    }
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
@@ -440,16 +463,7 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
     // target is zero too.
     let target = target.max(face_value).max(0.0);
     let stake_f64 = if face_value > 0.0 {
-        // `target / face_value` is exact in principle, but can land an ulp above a
-        // whole number — `ceil` alone would then charge a spurious extra ticket, so
-        // snap to the nearest whole ticket when within rounding distance of one.
-        let tickets = target / face_value;
-        let whole = if (tickets - tickets.round()).abs() <= tickets.abs() * 1e-12 {
-            tickets.round()
-        } else {
-            tickets.ceil()
-        };
-        whole * face_value
+        whole_tickets(target / face_value) * face_value
     } else {
         target
     };
@@ -962,6 +976,39 @@ mod config_tests {
         ] {
             assert_close(bal.amount().low_u128(), floor, name);
         }
+    }
+
+    /// Regression: the snap that absorbs float noise must not swallow a real fraction.
+    ///
+    /// A fixed relative epsilon here (this started at `1e-12`) is orders of magnitude
+    /// wider than the rounding error it exists to absorb, so a ticket count genuinely
+    /// above a whole number — by less than that epsilon — was rounded *down*, under-funding
+    /// the target by part of a ticket.  The bound is ULP-scale for exactly this reason.
+    #[rstest]
+    // (ratio, expected) — noise below the bound snaps; anything above it rounds up.
+    #[case(5.0, 5.0)]
+    #[case(5.0 + 1e-13, 6.0)] // 2e-14 relative: far above ULP noise, below a 1e-12 epsilon
+    #[case(1.0 + 1e-15, 2.0)]
+    #[case(1e6 + 1e-7, 1e6 + 1.0)] // 1e-13 relative at a large count
+    #[case(0.25, 1.0)]
+    fn whole_tickets_snaps_only_float_noise(#[case] ratio: f64, #[case] expected: f64) {
+        assert_eq!(whole_tickets(ratio), expected, "ratio={ratio:.17e}");
+    }
+
+    /// The other side of the bound: a ratio one ULP off a whole number is noise from the
+    /// division, not demand, and must not cost an extra face value.
+    #[rstest]
+    #[case(5.0)]
+    #[case(1.0)]
+    #[case(1e6)]
+    fn whole_tickets_absorbs_a_one_ulp_overshoot(#[case] whole: f64) {
+        let overshoot = f64::from_bits(whole.to_bits() + 1);
+        assert!(overshoot > whole, "test setup: {overshoot} must exceed {whole}");
+        assert_eq!(
+            whole_tickets(overshoot),
+            whole,
+            "one ULP above {whole} must not add a ticket"
+        );
     }
 
     /// Regression: a stake is always a whole number of winning tickets.  A channel
