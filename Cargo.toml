@@ -53,10 +53,15 @@ thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = ["derive"] }
 
-hopr-api    = { workspace = true, features = ["node", "serde", "types-chain"] }
-hopr-utils  = { workspace = true, default-features = false }
-moka        = { workspace = true, features = ["sync"] }
-multiaddr   = { workspace = true }
+hopr-api = { workspace = true, features = [
+  "node",
+  "serde",
+  "types-chain",
+  "types-internal",
+] }
+hopr-utils = { workspace = true, default-features = false }
+moka = { workspace = true, features = ["sync"] }
+multiaddr = { workspace = true }
 parking_lot = { workspace = true }
 
 # Optional deps enabled by the `testing` feature

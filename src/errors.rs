@@ -15,10 +15,10 @@ pub enum StrategyError {
     ///
     /// ```
     /// # use hopr_strategy::errors::StrategyError;
-    /// let err = StrategyError::InvalidConfiguration("assumed_hops: out of range".into());
+    /// let err = StrategyError::InvalidConfiguration("sizing_mode: out of range".into());
     /// assert_eq!(
     ///     err.to_string(),
-    ///     "invalid strategy configuration: assumed_hops: out of range"
+    ///     "invalid strategy configuration: sizing_mode: out of range"
     /// );
     /// ```
     #[error("invalid strategy configuration: {0}")]
