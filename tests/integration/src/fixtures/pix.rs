@@ -196,7 +196,7 @@ impl IntegrationFixture {
 
 /// Builds a deterministic [`PixAddressId`] from a seed byte and an SSA index.
 pub fn pix_address_id(seed: u8, ssa_index: u32) -> PixAddressId {
-    (
+    PixAddressId::new(
         HoprPseudonym::from([seed; HoprPseudonym::SIZE]),
         NonZeroU32::new(ssa_index).expect("ssa index must be non-zero"),
     )
@@ -209,5 +209,5 @@ pub fn deposit_secret(account: &TestAccount) -> Result<PixDepositSecret> {
         .secret_bytes()
         .try_into()
         .context("chain keypair secret is not 32 bytes")?;
-    Ok(PixDepositSecret(secret.into()))
+    Ok(PixDepositSecret::Eth(secret.into()))
 }
