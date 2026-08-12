@@ -113,7 +113,7 @@ async fn redeems_queued_ticket(#[future(awt)] fixture: IntegrationFixture) -> Re
         },
         Duration::from_secs(3600),
     )
-    .build(node);
+    .build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     let redeemed = await_channel_where(
@@ -153,7 +153,7 @@ async fn redeems_all_tickets_on_channel_closure(#[future(awt)] fixture: Integrat
         },
         Duration::from_secs(3600),
     )
-    .build(node);
+    .build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // Trigger the incoming-channel closure; the redeemer observes it as a
@@ -198,7 +198,7 @@ async fn skips_ticket_below_minimum_value(#[future(awt)] fixture: IntegrationFix
         },
         Duration::from_secs(3600),
     )
-    .build(node);
+    .build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // The sub-threshold ticket must never be redeemed: ticket index stays put.
@@ -239,7 +239,7 @@ async fn redeems_ticket_on_winning_event(#[future(awt)] fixture: IntegrationFixt
         // Tick far in the future so the periodic scan cannot fire during the test.
         Duration::from_secs(3600),
     )
-    .build(node.clone());
+    .build(node.clone())?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // Emit the winning-ticket event for the queued ticket. The unbounded channel

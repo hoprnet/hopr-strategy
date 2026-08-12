@@ -10,6 +10,22 @@ pub enum StrategyError {
     #[error("strategy could not perform action because action of the same type is on-going")]
     InProgress,
 
+    /// A strategy was given a configuration that violates its declared
+    /// constraints. Returned by strategy builders instead of panicking, so the
+    /// caller can report it through its own error type.
+    ///
+    /// ```
+    /// # use hopr_strategy::errors::StrategyError;
+    /// let err = StrategyError::InvalidConfiguration("assumed_hops: out of range".into());
+    /// assert!(matches!(err, StrategyError::InvalidConfiguration(_)));
+    /// assert_eq!(
+    ///     err.to_string(),
+    ///     "invalid strategy configuration: assumed_hops: out of range"
+    /// );
+    /// ```
+    #[error("invalid strategy configuration: {0}")]
+    InvalidConfiguration(String),
+
     #[error("non-specific strategy error: {0}")]
     Other(anyhow::Error),
 
@@ -23,6 +39,35 @@ pub enum StrategyError {
 impl StrategyError {
     pub fn other<E: Into<anyhow::Error>>(e: E) -> Self {
         StrategyError::Other(e.into())
+    }
+
+    /// Validate a strategy configuration, mapping any constraint violation to
+    /// [`Self::InvalidConfiguration`].
+    ///
+    /// Every strategy builder runs this so a configuration that violates its own
+    /// declared constraints is reported as an error at wiring time rather than
+    /// panicking or being silently ignored. Callers that load configuration
+    /// themselves can use it to fail early with the same error.
+    ///
+    /// ```
+    /// # use hopr_strategy::errors::StrategyError;
+    /// use validator::Validate;
+    ///
+    /// #[derive(Validate)]
+    /// struct Cfg {
+    ///     #[validate(range(min = 1, max = 3))]
+    ///     hops: u32,
+    /// }
+    ///
+    /// assert!(StrategyError::validate_config(&Cfg { hops: 3 }).is_ok());
+    /// assert!(matches!(
+    ///     StrategyError::validate_config(&Cfg { hops: 0 }),
+    ///     Err(StrategyError::InvalidConfiguration(_))
+    /// ));
+    /// ```
+    pub fn validate_config<C: validator::Validate>(cfg: &C) -> Result<()> {
+        cfg.validate()
+            .map_err(|e| StrategyError::InvalidConfiguration(e.to_string()))
     }
 }
 

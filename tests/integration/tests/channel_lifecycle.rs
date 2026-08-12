@@ -53,7 +53,7 @@ async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture)
     cfg.finalizer.enabled = false;
 
     let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
-    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node);
+    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     let funded = await_channel_where(
@@ -115,7 +115,7 @@ async fn skips_funding_when_safe_below_required(#[future(awt)] fixture: Integrat
     cfg.finalizer.enabled = false;
 
     let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
-    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node);
+    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // The underfunded channel must never be topped up while the safe is short.
