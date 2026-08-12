@@ -346,31 +346,63 @@ pub struct ResolvedFunding {
 /// h     = hops
 /// tp    = ticket_price
 ///
-/// floor = tp × h / p                         one full-path winning ticket
+/// F     = tp × h / p                         one full-path winning ticket
 /// E[D]  = N × h × tp                          mean drain (win-prob independent)
 /// σ[D]  = tp × h × √(N × (1 − p) / p)         (tp·h/p) × Binomial(N, p) std-dev
 ///
-/// Deterministic:    stake = max(floor, E[D])
-/// Probabilistic(α): stake = max(floor, E[D] + k·σ[D])   k = Φ⁻¹(α)
+/// Deterministic:    stake = ⌈F⌉ max(F, E[D])
+/// Probabilistic(α): stake = ⌈F⌉ max(F, E[D] + k·σ[D])   k = Φ⁻¹(α)
+///
+/// where ⌈F⌉x = ceil(x / F) × F                whole winning tickets
 /// ```
 ///
-/// The `max(floor, …)` guarantees the stake always covers at least one winning
+/// The `max(F, …)` guarantees the stake always covers at least one winning
 /// ticket, so the channel can always issue the next ticket regardless of how
 /// small the capacity is or how low `win_prob` is.  Returns
 /// [`HoprBalance::zero`] only for zero capacity.
+///
+/// Payouts leave the channel in whole tickets of `F`, so any remainder below one
+/// is unusable and funds nothing.  Both modes therefore round the stake up to a
+/// whole number of tickets — otherwise a target of `10.9 × F` would fund only 10
+/// payable tickets and deliver less than the confidence it was sized for.  The
+/// cost is up to one extra face value per stake, which for small `N × p` (few
+/// winning tickets per channel) can be a sizeable fraction of it.
 ///
 /// # Examples
 ///
 /// ```text
 /// tp = 0.01 wxHOPR,  h = 3
 ///
-/// N = 100 000, p = 0.01:  floor = 3 wxHOPR
-///     Deterministic  = max(3, 3,000)                 = 3,000 wxHOPR
-///     Probabilistic  = max(3, 3,000 + 3.09 × 94.39)  ≈ 3,292 wxHOPR
+/// N = 100 000, p = 0.01:  F = 3 wxHOPR
+///     Deterministic  = max(3, 3,000)                 = 3,000 wxHOPR  (1,000 × F)
+///     Probabilistic  = max(3, 3,000 + 3.09 × 94.39)  ≈ 3,292 → 3,294 (1,098 × F)
 ///
-/// N = 10, p = 1e-4:  floor = tp·h/p = 300 wxHOPR  (dominates)
-///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (floor binds)
+/// N = 10, p = 1e-4:  F = tp·h/p = 300 wxHOPR  (dominates)
+///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (1 × F)
 /// ```
+/// Whole winning tickets a target of `tickets` face values has to be rounded up to.
+///
+/// Rounds up, but snaps to the nearest whole ticket when the ratio sits within a few ULPs
+/// of one.  `target / face_value` is exact in principle and can still land an ULP above a
+/// whole number — at `win_prob = 1`, where the ratio is exactly `N`, a bare `ceil` would
+/// then charge a full extra face value on every stake.
+///
+/// The bound is deliberately ULP-scale rather than a fixed relative epsilon: it must absorb
+/// float noise and nothing else, so that a genuinely fractional ticket count — however
+/// small its fraction — still rounds up rather than being quietly under-funded.
+fn whole_tickets(tickets: f64) -> f64 {
+    /// Rounding slack, in ULPs of `tickets`.  `target` and `face_value` each cost a couple
+    /// of roundings before the division, so a few ULPs covers the accumulated error.
+    const SNAP_ULPS: f64 = 4.0;
+
+    let nearest = tickets.round();
+    if (tickets - nearest).abs() <= SNAP_ULPS * f64::EPSILON * tickets.abs() {
+        nearest
+    } else {
+        tickets.ceil()
+    }
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
@@ -417,14 +449,28 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
         }
     };
 
-    // One-winning-ticket floor: the channel must always be able to issue a
-    // full-path ticket of face value tp × h / p, or it cannot relay at all.
-    let floor = price_f64 * h / p;
+    // A channel pays out in whole tickets of this face value, and it must always
+    // be able to issue at least one or it cannot relay at all — so it is both the
+    // floor and the quantum.
+    let face_value = price_f64 * h / p;
+
+    // Quantise up to a whole number of tickets.  A remainder below one face value
+    // can never leave the channel, so it funds no further ticket and buys none of
+    // the confidence the mode was asked for: at `target = 10.9 × face_value` only
+    // 10 tickets are payable, which is a lower confidence than requested.  Rounding
+    // up makes the stake deliver the mode's stated guarantee instead of just under
+    // it.  `face_value` is zero only when the price or hop count is, and then the
+    // target is zero too.
+    let target = target.max(face_value).max(0.0);
+    let stake_f64 = if face_value > 0.0 {
+        whole_tickets(target / face_value) * face_value
+    } else {
+        target
+    };
 
     // Round up: the one-ticket floor is a strict safety guarantee (the on-chain
     // face value is integer wei), so a downward-truncating cast could yield a
     // stake one wei below face value and still trip `OutOfFunds`.
-    let stake_f64 = target.max(floor).max(0.0);
     HoprBalance::from(U256::from(stake_f64.ceil() as u128))
 }
 
@@ -932,6 +978,71 @@ mod config_tests {
         }
     }
 
+    /// Regression: the snap that absorbs float noise must not swallow a real fraction.
+    ///
+    /// A fixed relative epsilon here (this started at `1e-12`) is orders of magnitude
+    /// wider than the rounding error it exists to absorb, so a ticket count genuinely
+    /// above a whole number — by less than that epsilon — was rounded *down*, under-funding
+    /// the target by part of a ticket.  The bound is ULP-scale for exactly this reason.
+    #[rstest]
+    // (ratio, expected) — noise below the bound snaps; anything above it rounds up.
+    #[case(5.0, 5.0)]
+    #[case(5.0 + 1e-13, 6.0)] // 2e-14 relative: far above ULP noise, below a 1e-12 epsilon
+    #[case(1.0 + 1e-15, 2.0)]
+    #[case(1e6 + 1e-7, 1e6 + 1.0)] // 1e-13 relative at a large count
+    #[case(0.25, 1.0)]
+    fn whole_tickets_snaps_only_float_noise(#[case] ratio: f64, #[case] expected: f64) {
+        assert_eq!(whole_tickets(ratio), expected, "ratio={ratio:.17e}");
+    }
+
+    /// The other side of the bound: a ratio one ULP off a whole number is noise from the
+    /// division, not demand, and must not cost an extra face value.
+    #[rstest]
+    #[case(5.0)]
+    #[case(1.0)]
+    #[case(1e6)]
+    fn whole_tickets_absorbs_a_one_ulp_overshoot(#[case] whole: f64) {
+        let overshoot = f64::from_bits(whole.to_bits() + 1);
+        assert!(overshoot > whole, "test setup: {overshoot} must exceed {whole}");
+        assert_eq!(
+            whole_tickets(overshoot),
+            whole,
+            "one ULP above {whole} must not add a ticket"
+        );
+    }
+
+    /// Regression: a stake is always a whole number of winning tickets.  A channel
+    /// pays out only in whole tickets of `tp·h/p`, so a fractional remainder funds
+    /// nothing — before this was enforced, a `Probabilistic(α)` stake of `k.9`
+    /// tickets could pay for only `k` and so delivered less than `α`.
+    #[test]
+    fn stake_is_a_whole_number_of_winning_tickets() {
+        let ps = [1.0, 0.5, 0.1, 1e-2, 1e-3, ROTSEE_P, JURA_P];
+        let tps = [1u128, 100, PRICE_WEI, JURA_TP];
+        let caps = [
+            ByteSize::b(1),
+            ByteSize::b(PAYLOAD),
+            ByteSize::mib(256),
+            ByteSize::gib(1),
+        ];
+        for &p in &ps {
+            for &tp in &tps {
+                for &cap in &caps {
+                    for mode in [DET, prob(0.99), prob(0.999)] {
+                        let got = stake_wei(cap, tp, p, 3, &mode);
+                        let face = tp as f64 * 3.0 / p;
+                        let tickets = got as f64 / face;
+                        assert_close(
+                            got,
+                            (tickets.round() * face) as u128,
+                            &format!("{mode:?} p={p} tp={tp} cap={cap:?} ({tickets} tickets)"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ── Probabilistic: stake = max(floor, mean + k·σ) ────────────────────────
 
     /// At win_prob = 1.0 the variance vanishes → Probabilistic == Deterministic.
@@ -963,7 +1074,8 @@ mod config_tests {
     }
 
     /// Above the floor, Probabilistic matches mean + k·σ with the corrected σ
-    /// (`σ = tp·h·√(N·(1−p)/p)`), verified against an independent computation.
+    /// (`σ = tp·h·√(N·(1−p)/p)`), verified against an independent computation —
+    /// then rounded up to the next whole winning ticket.
     #[rstest]
     #[case(0.5, 0.999)]
     #[case(0.1, 0.999)]
@@ -974,9 +1086,17 @@ mod config_tests {
         let cap = ByteSize::b(PAYLOAD * n as u64);
         let mean = mean_wei(n, 3, PRICE_WEI) as f64;
         let sigma = PRICE_WEI as f64 * 3.0 * (n as f64 * (1.0 - p) / p).sqrt();
-        let want = (mean + z_score(alpha) * sigma) as u128;
+        let raw = mean + z_score(alpha) * sigma;
+        let face = PRICE_WEI as f64 * 3.0 / p;
+        let want = ((raw / face).ceil() * face) as u128;
         let got = stake_wei(cap, PRICE_WEI, p, 3, &prob(alpha));
         assert_close(got, want, &format!("p={p} alpha={alpha}"));
+        // The unrounded target is what the rounding starts from: the stake must
+        // sit in [raw, raw + F).
+        assert!(
+            got as f64 >= raw && (got as f64) < raw + face,
+            "p={p} alpha={alpha}: {got} not within one ticket above {raw}"
+        );
     }
 
     /// Higher confidence → larger stake (monotone in alpha), above the floor.
@@ -1103,6 +1223,10 @@ mod config_tests {
     /// jura (staging): tp = 1e13 wei, win_prob = 4e-6.  Documents the exact
     /// default-Deterministic stakes and confirms each covers ≥ 1 winning ticket
     /// (face value = 7.5 wxHOPR = 7.5e18 wei).
+    ///
+    /// jura shows the rounding at its most expensive: 1/p = 250 000 packets per
+    /// winning ticket against ~1.04 M packets per GiB is only ~4.15 tickets, so
+    /// rounding to 5 adds 21%.  The unrounded 31.09 wxHOPR would have paid for 4.
     #[test]
     fn jura_default_deterministic_stakes() {
         let cfg = FundingConfig::default();
@@ -1110,24 +1234,26 @@ mod config_tests {
         let floor = floor_wei(JURA_TP, 3, JURA_P); // 7.5e18
         assert_close(floor, 7_500_000_000_000_000_000, "jura 1-ticket floor");
 
-        // initial / topup / min_safe = 1 GiB → mean drain ≈ 31.09 wxHOPR.
+        // initial / topup / min_safe = 1 GiB → mean drain ≈ 31.09 wxHOPR = 4.15
+        // tickets, rounded up to 5 × 7.5 = 37.5 wxHOPR.
         let n_gib = packets(ByteSize::gib(1).as_u64()); // 1_036_431
+        assert_close(mean_wei(n_gib, 3, JURA_TP), 31_092_930_000_000_000_000, "jura mean");
         assert_close(
             r.initial_balance.amount().low_u128(),
-            mean_wei(n_gib, 3, JURA_TP),
-            "jura initial",
+            37_500_000_000_000_000_000,
+            "jura initial = 5 × 7.5 wxHOPR",
         );
-        assert_close(
-            r.initial_balance.amount().low_u128(),
-            31_092_930_000_000_000_000,
-            "jura initial ≈ 31.09 wxHOPR",
-        );
-        // lower threshold = 256 MiB → ≈ 7.77 wxHOPR, still ≥ one ticket (7.5).
+        // lower threshold = 256 MiB → ≈ 7.77 wxHOPR = 1.04 tickets, rounded to 2.
         let n_256 = packets(ByteSize::mib(256).as_u64()); // 259_108
         assert_close(
-            r.lower_balance_threshold.amount().low_u128(),
             mean_wei(n_256, 3, JURA_TP),
-            "jura lower",
+            7_773_240_000_000_000_000,
+            "jura lower mean",
+        );
+        assert_close(
+            r.lower_balance_threshold.amount().low_u128(),
+            15_000_000_000_000_000_000,
+            "jura lower = 2 × 7.5 wxHOPR",
         );
         assert!(
             r.lower_balance_threshold.amount().low_u128() >= floor,
@@ -1144,22 +1270,21 @@ mod config_tests {
         let floor = floor_wei(ROTSEE_TP, 3, ROTSEE_P); // 2_400_000 wei
         assert_close(floor, 2_400_000, "rotsee 1-ticket floor");
 
+        // 1 GiB → mean 310_929_300 wei = 129.55 tickets, rounded up to 130.
         let n_gib = packets(ByteSize::gib(1).as_u64());
+        assert_close(mean_wei(n_gib, 3, ROTSEE_TP), 310_929_300, "rotsee mean");
         assert_close(
             r.initial_balance.amount().low_u128(),
-            mean_wei(n_gib, 3, ROTSEE_TP),
-            "rotsee initial",
+            130 * 2_400_000,
+            "rotsee initial = 130 tickets",
         );
-        assert_close(
-            r.initial_balance.amount().low_u128(),
-            310_929_300,
-            "rotsee initial (wei)",
-        );
+        // 256 MiB → mean 77_732_400 wei = 32.39 tickets, rounded up to 33.
         let n_256 = packets(ByteSize::mib(256).as_u64());
+        assert_close(mean_wei(n_256, 3, ROTSEE_TP), 77_732_400, "rotsee lower mean");
         assert_close(
             r.lower_balance_threshold.amount().low_u128(),
-            mean_wei(n_256, 3, ROTSEE_TP),
-            "rotsee lower",
+            33 * 2_400_000,
+            "rotsee lower = 33 tickets",
         );
         assert!(r.lower_balance_threshold.amount().low_u128() >= floor);
     }
