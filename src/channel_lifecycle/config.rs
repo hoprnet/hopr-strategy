@@ -3,11 +3,24 @@ use std::{collections::HashSet, time::Duration};
 use bytesize::ByteSize;
 use hopr_api::{
     node::PacketTransport,
-    types::primitive::prelude::{Address, HoprBalance, U256},
+    types::{
+        internal::routing::RoutingOptions,
+        primitive::prelude::{Address, HoprBalance, U256},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use validator::Validate;
+
+/// Paid downstream relay hops every channel stake is sized for.
+///
+/// Fixed at the longest path the protocol can encode — not a tuning parameter.  A ticket's
+/// face value is `ticket_price × hops / win_prob`, and the issuing node cannot know how long
+/// a path a given packet will take, so sizing below the maximum under-funds the tickets a
+/// relayer must issue and the channel stalls mid-relay on any path that exceeds the guess.
+/// Sizing at the maximum over-funds shorter paths instead, which only leaves balance idle
+/// until the channel closes.
+const ASSUMED_HOPS: u32 = RoutingOptions::MAX_INTERMEDIATE_HOPS as u32;
 
 /// Population thresholds: how many open channels to maintain.
 #[serde_as]
@@ -237,9 +250,11 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// topup_capacity: 1 GiB
 /// lower_capacity_threshold: 256 MiB
 /// min_safe_capacity_required: 1 GiB
-/// assumed_hops: 3
 /// sizing_mode: deterministic
 /// ```
+///
+/// Hop count is not configurable: every stake is sized for
+/// [`ASSUMED_HOPS`], the protocol's maximum path length.
 ///
 /// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` the default
 /// `Deterministic` mode resolves `initial_capacity` to:
@@ -280,15 +295,6 @@ pub struct FundingConfig {
     /// balance is below `min_safe_capacity_required`.  Default: true.
     #[default = true]
     pub stop_when_unfunded: bool,
-
-    /// Number of paid downstream relay hops assumed when sizing the channel
-    /// stake.  Must be ≥ 1 and ≤ [`RoutingOptions::MAX_INTERMEDIATE_HOPS`][routing] (3).
-    /// Default: 3.
-    ///
-    /// [routing]: hopr_api::types::internal::routing::RoutingOptions
-    #[default = 3]
-    #[validate(range(min = 1, max = 3))]
-    pub assumed_hops: u32,
 
     /// How each capacity field is converted to a wxHOPR stake.
     /// Default: `Deterministic` (mean drain, floored at one winning ticket).
@@ -457,7 +463,7 @@ impl FundingConfig {
     /// # }
     /// ```
     pub fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: f64) -> ResolvedFunding {
-        let hops = self.assumed_hops;
+        let hops = ASSUMED_HOPS;
         let mode = &self.sizing_mode;
         ResolvedFunding {
             initial_balance: capacity_to_balance::<C>(self.initial_capacity, price, win_prob, hops, mode),
@@ -1172,7 +1178,7 @@ mod config_tests {
         let price = balance_from_wei(PRICE_WEI);
         let p = 0.5_f64;
         let r = cfg.resolve::<TestTransport>(price, p);
-        let cap = |c| capacity_to_balance::<TestTransport>(c, price, p, cfg.assumed_hops, &cfg.sizing_mode);
+        let cap = |c| capacity_to_balance::<TestTransport>(c, price, p, ASSUMED_HOPS, &cfg.sizing_mode);
         assert_eq!(r.initial_balance, cap(cfg.initial_capacity));
         assert_eq!(r.topup_balance, cap(cfg.topup_capacity));
         assert_eq!(r.lower_balance_threshold, cap(cfg.lower_capacity_threshold));
@@ -1190,17 +1196,26 @@ mod config_tests {
         assert!(FundingConfig::default().validate().is_ok());
     }
 
+    /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the
+    /// protocol's maximum path length cannot silently rescale every stake in the strategy.
+    /// A ticket's face value is linear in this count, so a move from 3 to 4 would raise
+    /// every resolved balance by a third.
     #[test]
-    fn assumed_hops_zero_is_rejected() {
-        use validator::Validate as _;
-        let mut cfg = FundingConfig::default();
-        cfg.assumed_hops = 0;
-        assert!(cfg.validate().is_err());
+    fn assumed_hops_should_stay_at_the_protocol_maximum_of_three() {
+        assert_eq!(ASSUMED_HOPS, 3);
+        assert_eq!(ASSUMED_HOPS as usize, RoutingOptions::MAX_INTERMEDIATE_HOPS);
     }
 
+    /// The hop count is no longer configurable, so a config naming it must be rejected
+    /// rather than silently ignored — `deny_unknown_fields` is what enforces that.
     #[test]
-    fn default_assumed_hops_is_three() {
-        assert_eq!(FundingConfig::default().assumed_hops, 3);
+    fn assumed_hops_is_no_longer_accepted_in_config() {
+        let err = serde_json::from_str::<FundingConfig>(r#"{"assumed_hops":1}"#)
+            .expect_err("assumed_hops must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("assumed_hops"),
+            "error should name the offending key, got: {err}"
+        );
     }
 
     #[test]
@@ -1211,7 +1226,6 @@ mod config_tests {
             lower_capacity_threshold: ByteSize::mib(128),
             min_safe_capacity_required: ByteSize::gib(2),
             stop_when_unfunded: false,
-            assumed_hops: 2,
             sizing_mode: prob(0.9999),
         };
         let json = serde_json::to_string(&cfg).context("serialize")?;
@@ -1443,7 +1457,6 @@ mod config_tests {
     /// `validate()` on the top-level config — this is what `#[validate(nested)]`
     /// buys, and without it these validators are dead code.
     #[rstest]
-    #[case(r#"{"funding":{"assumed_hops":0}}"#)]
     #[case(r#"{"funding":{"sizing_mode":{"probabilistic":{"success_probability":0.2}}}}"#)]
     fn nested_validation_rejects_out_of_range_values(#[case] json: &str) -> anyhow::Result<()> {
         let cfg: ChannelLifecycleConfig = serde_json::from_str(json).with_context(|| json.to_string())?;
@@ -1495,7 +1508,7 @@ impl SelectorProfile {
 /// ```
 ///
 /// Defaulting is not validation: supplied values must still satisfy the declared
-/// constraints (`funding.assumed_hops` ∈ `[1, 3]`, `sizing_mode` bounds).
+/// constraints (`sizing_mode` bounds, selector weights).
 /// [`ChannelLifecycleStrategy::build`] enforces them, returning
 /// [`StrategyError::InvalidConfiguration`](crate::errors::StrategyError::InvalidConfiguration).
 /// A loader can check earlier with one `validate()`, which `#[validate(nested)]`

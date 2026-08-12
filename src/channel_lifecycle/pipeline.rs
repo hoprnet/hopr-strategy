@@ -1587,10 +1587,12 @@ mod tests {
         let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
         let chain_connector = Arc::new(chain_connector);
 
-        // `assumed_hops = 0` violates the `range(min = 1, max = 3)` constraint.
-        let bad_hops = ChannelLifecycleConfig {
+        // A success probability of 0.2 is below the range `validate_sizing_mode` accepts.
+        let bad_sizing_mode = ChannelLifecycleConfig {
             funding: FundingConfig {
-                assumed_hops: 0,
+                sizing_mode: CapacitySizingMode::Probabilistic {
+                    success_probability: 0.2,
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -1611,7 +1613,10 @@ mod tests {
             ..Default::default()
         };
 
-        for (what, cfg) in [("assumed_hops = 0", bad_hops), ("unnormalised weights", bad_weights)] {
+        for (what, cfg) in [
+            ("success_probability = 0.2", bad_sizing_mode),
+            ("unnormalised weights", bad_weights),
+        ] {
             let node = Arc::new(ChainNode::new(Arc::clone(&chain_connector)));
             let Err(err) = ChannelLifecycleStrategy::new(cfg).build(node) else {
                 anyhow::bail!("build must reject {what}");
@@ -2194,8 +2199,8 @@ mod tests {
     /// correct wxHOPR **topup** amount via the live ticket economics fetched from
     /// the Blokli simulator, and the fund pass applies it to an underfunded channel.
     ///
-    /// The Blokli test sim defaults to `ticket_price = "1 wxHOPR"`.  With
-    /// `assumed_hops = 3` and `topup_capacity = 1 byte` (= 1 packet):
+    /// The Blokli test sim defaults to `ticket_price = "1 wxHOPR"`.  With the
+    /// protocol's 3 hops and `topup_capacity = 1 byte` (= 1 packet):
     ///
     /// ```text
     /// topup_balance = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR
@@ -2208,7 +2213,7 @@ mod tests {
     async fn pipeline_funds_underfunded_channel_with_capacity_derived_wxhopr_amount() -> anyhow::Result<()> {
         use super::super::config::capacity_to_balance;
 
-        // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0, assumed_hops = 3.
+        // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0; hops is the protocol max, 3.
         // Deterministic sizing (win_prob still sets the one-ticket floor):
         //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic)
         //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR.
@@ -2256,7 +2261,6 @@ mod tests {
                 topup_capacity: ByteSize::b(1),
                 min_safe_capacity_required: ByteSize::b(0),
                 stop_when_unfunded: true,
-                assumed_hops: 3,
                 ..Default::default()
             },
             // Disable proactive funding so only the reactive threshold path fires.
