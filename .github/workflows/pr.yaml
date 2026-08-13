@@ -105,6 +105,8 @@ jobs:
       unit_coverage_command: "nix build -L .#coverage -o coverage.lcov"
       enable_integration_tests: true
       integration_test_command: "nix build -L .#integration-tests"
+      enable_integration_coverage: true
+      integration_coverage_command: "nix build -L .#coverage-integration -o coverage.lcov"
       test_timeout: 30
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
