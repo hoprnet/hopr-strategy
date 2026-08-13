@@ -1,20 +1,18 @@
-use std::{sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use hopr_api::{
-    chain::ChainValues,
-    types::{
-        crypto::prelude::{ChainKeypair, HalfKey, Hash, Keypair, Response},
-        internal::prelude::{RedeemableTicket, TicketBuilder, WinningProbability},
-        primitive::prelude::{Address, HoprBalance},
-    },
+use blokli_client::api::BlokliQueryClient;
+use hopr_api::types::{
+    crypto::prelude::{ChainKeypair, HalfKey, Hash, Keypair, Response},
+    internal::prelude::{RedeemableTicket, TicketBuilder, WinningProbability},
+    primitive::prelude::{Address, HoprBalance},
 };
 use hopr_strategy::{
     auto_redeeming::{AutoRedeemingStrategy, AutoRedeemingStrategyConfig},
     testing::{LiveTicketManager, TicketNode},
 };
 use hopr_strategy_integration_tests::{
-    TestAccount,
+    AnvilAccount,
     fixtures::{
         ChannelParty, ChannelScenario, IntegrationFixture, ScenarioOpts, assert_channel_never, await_channel_where,
         integration_fixture as fixture,
@@ -56,8 +54,8 @@ fn build_redeemable_ticket(
 /// Returns the scenario, the redeemer node, and the queued ticket amount.
 async fn ticket_scenario(
     fixture: &IntegrationFixture,
-    issuer: &TestAccount,
-    redeemer: &TestAccount,
+    issuer: &AnvilAccount,
+    redeemer: &AnvilAccount,
 ) -> Result<(ChannelScenario, Arc<TicketNode<Arc<NodeConnector>>>, HoprBalance)> {
     let scenario = fixture
         .open_channel_scenario(
@@ -70,9 +68,15 @@ async fn ticket_scenario(
         )
         .await?;
 
-    let issuer_key = node_chain_keypair(issuer.secret_bytes())?;
-    let redeemer_key = node_chain_keypair(redeemer.secret_bytes())?;
-    let channel_dst = scenario.connector.domain_separators().await?.channel;
+    let issuer_key = node_chain_keypair(&issuer.secret_bytes())?;
+    let redeemer_key = node_chain_keypair(&redeemer.secret_bytes())?;
+    let channel_dst = fixture
+        .client()
+        .query_chain_info()
+        .await?
+        .channel_dst
+        .context("missing channel domain separator")?;
+    let channel_dst = Hash::from_str(&channel_dst)?;
     let ticket_amount: HoprBalance = "2 wxHOPR".parse()?;
     let ticket = build_redeemable_ticket(
         &issuer_key,
@@ -94,10 +98,10 @@ async fn ticket_scenario(
 /// incoming channel (`redeem_on_winning = false`, no value floor).
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn redeems_queued_ticket(fixture: IntegrationFixture) -> Result<()> {
+async fn redeems_queued_ticket(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
-    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, &issuer, &redeemer).await?;
+    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, issuer, redeemer).await?;
     let initial_index = scenario.initial.ticket_index;
     let initial_balance = scenario.initial.balance;
 
@@ -133,10 +137,10 @@ async fn redeems_queued_ticket(fixture: IntegrationFixture) -> Result<()> {
 /// isolating the on-close path.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn redeems_all_tickets_on_channel_closure(fixture: IntegrationFixture) -> Result<()> {
+async fn redeems_all_tickets_on_channel_closure(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
-    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, &issuer, &redeemer).await?;
+    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, issuer, redeemer).await?;
     let initial_index = scenario.initial.ticket_index;
     let initial_balance = scenario.initial.balance;
 
@@ -154,8 +158,8 @@ async fn redeems_all_tickets_on_channel_closure(fixture: IntegrationFixture) -> 
 
     // Trigger the incoming-channel closure; the redeemer observes it as a
     // ChannelClosureInitiated event and should redeem the queued ticket.
-    scenario
-        .initiate_closure()
+    fixture
+        .initiate_outgoing_channel_closure(issuer, redeemer, &scenario.source_safe.module_address)
         .await
         .context("failed to initiate channel closure")?;
 
@@ -179,10 +183,10 @@ async fn redeems_all_tickets_on_channel_closure(fixture: IntegrationFixture) -> 
 /// and no on-chain transaction is issued, so the channel ticket index stays put.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_ticket_below_minimum_value(fixture: IntegrationFixture) -> Result<()> {
+async fn skips_ticket_below_minimum_value(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
-    let (scenario, node, _ticket_amount) = ticket_scenario(&fixture, &issuer, &redeemer).await?;
+    let (scenario, node, _ticket_amount) = ticket_scenario(&fixture, issuer, redeemer).await?;
     let initial_index = scenario.initial.ticket_index;
 
     let mut strategy = AutoRedeemingStrategy::new(
@@ -218,10 +222,10 @@ async fn skips_ticket_below_minimum_value(fixture: IntegrationFixture) -> Result
 /// stream — the path a live node exercises on ticket acknowledgement.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn redeems_ticket_on_winning_event(fixture: IntegrationFixture) -> Result<()> {
+async fn redeems_ticket_on_winning_event(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [issuer, redeemer] = fixture.claim_accounts::<2>();
-    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, &issuer, &redeemer).await?;
+    let (scenario, node, ticket_amount) = ticket_scenario(&fixture, issuer, redeemer).await?;
     let initial_index = scenario.initial.ticket_index;
     let initial_balance = scenario.initial.balance;
 

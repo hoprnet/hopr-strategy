@@ -2,9 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use bytesize::ByteSize;
-use hopr_api::types::primitive::prelude::HoprBalance;
+use hopr_api::{chain::ChainValues, types::primitive::prelude::HoprBalance};
 use hopr_strategy::{
-    channel_lifecycle::{ChannelLifecycleConfig, ChannelLifecycleStrategy},
+    channel_lifecycle::{CapacitySizingMode, ChannelLifecycleConfig, ChannelLifecycleStrategy},
     testing::LifecycleNode,
 };
 use hopr_strategy_integration_tests::{
@@ -20,19 +20,24 @@ use rstest::rstest;
 /// neutralised via target == min == 1, proactive + finalizer disabled).
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> {
+async fn tops_up_underfunded_channel(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
 
     let scenario = fixture
-        .open_channel_scenario(&source, &destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
+        .open_channel_scenario(source, destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
         .await?;
     let initial_balance = scenario.initial.balance;
 
-    // Funding is now expressed as data capacity (hoprnet #8243). With the harness's
-    // default economics (ticket price 1 wxHOPR, win_prob 1.0, assumed_hops 3),
-    // `ByteSize::b(1)` = 1 packet resolves to 3 wxHOPR — see `capacity_to_balance`.
-    let topup: HoprBalance = "3 wxHOPR".parse()?; // = resolve(topup_capacity = ByteSize::b(1))
+    // Size the capacity from the image's live ticket price. The in-memory
+    // connector uses a 1 wxHOPR ticket, while bloklid-anvil may use a smaller
+    // network minimum; a fixed one-packet capacity would then sit below the
+    // existing 1 wxHOPR channel and never trigger the funding pass.
+    let target: HoprBalance = "2 wxHOPR".parse()?;
+    let packet_cost = scenario.connector.minimum_ticket_price().await?.amount().low_u128() * 3;
+    anyhow::ensure!(packet_cost > 0, "bloklid-anvil returned a zero minimum ticket price");
+    let packets = target.amount().low_u128().div_ceil(packet_cost);
+    let capacity = ByteSize::b(u64::try_from(packets * 1036)?);
     let mut cfg = ChannelLifecycleConfig {
         tick_interval: Duration::from_secs(3600),
         jitter: Duration::ZERO,
@@ -40,8 +45,9 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
     };
     cfg.population.min_open_channels = 1;
     cfg.population.target_open_channels = 1;
-    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // ~3 wxHOPR; channel at 1 wxHOPR is below → tops up
-    cfg.funding.topup_capacity = ByteSize::b(1); // adds ~3 wxHOPR
+    cfg.funding.sizing_mode = CapacitySizingMode::Deterministic;
+    cfg.funding.lower_capacity_threshold = capacity;
+    cfg.funding.topup_capacity = capacity;
     cfg.funding.min_safe_capacity_required = ByteSize::b(0); // no safe floor
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
@@ -59,7 +65,10 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
         move |channel| channel.balance > initial_balance,
     )
     .await?;
-    assert_eq!(funded.balance, initial_balance + topup);
+    // The production conversion intentionally passes through f64, so do not
+    // assert the exact last wei derived above; require at least the requested
+    // target increase instead.
+    assert!(funded.balance >= initial_balance + target);
     assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
@@ -70,7 +79,7 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
 /// channel is left untouched.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_funding_when_safe_below_required(fixture: IntegrationFixture) -> Result<()> {
+async fn skips_funding_when_safe_below_required(#[future(awt)] fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
 
@@ -78,8 +87,8 @@ async fn skips_funding_when_safe_below_required(fixture: IntegrationFixture) -> 
     // balance sits below `min_safe_balance_required`.
     let scenario = fixture
         .open_channel_scenario(
-            &source,
-            &destination,
+            source,
+            destination,
             ScenarioOpts {
                 source_funding: "2 wxHOPR".parse()?,
                 destination_funding: "2 wxHOPR".parse()?,

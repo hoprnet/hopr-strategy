@@ -188,9 +188,12 @@ impl<C: PacketTransport> PacketTransport for ChainNode<C> {
     }
 }
 
-impl<C: PacketTransport> PacketTransport for LifecycleNode<C> {
+// Some live chain connectors predate the node-level `PacketTransport` trait.
+// The lifecycle test adapter still uses the protocol's canonical payload size
+// so those connectors can exercise capacity-based funding against a real chain.
+impl<C> PacketTransport for LifecycleNode<C> {
     fn packet_payload_size() -> usize {
-        C::packet_payload_size()
+        1036
     }
 }
 
