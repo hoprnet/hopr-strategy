@@ -223,6 +223,17 @@ fn default_success_probability() -> f64 {
     0.999
 }
 
+/// Rejects a zero duration where zero disables the protection rather than
+/// meaning "no limit": a zero lease expires on the spot, so every pass would
+/// re-submit a transaction already in flight, and a zero read budget makes every
+/// read unavailable.
+fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationError> {
+    match duration.is_zero() {
+        true => Err(validator::ValidationError::new("duration must be greater than zero")),
+        false => Ok(()),
+    }
+}
+
 fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::ValidationError> {
     if let CapacitySizingMode::Probabilistic { success_probability } = mode
         && !(*success_probability >= 0.5001 && *success_probability <= 0.99999)
@@ -635,7 +646,8 @@ pub struct RestartGuardConfig {
     pub startup_close_grace_period: Duration,
 }
 
-/// Concurrency knobs for the per-channel evaluation loops.
+/// Concurrency knobs for the per-channel evaluation loops, and the time bounds
+/// that keep a misbehaving chain from stalling them.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -645,6 +657,33 @@ pub struct ConcurrencyConfig {
     /// next tick.  Default: 4.
     #[default = 4]
     pub max_concurrent_actions: usize,
+
+    /// How long an in-flight chain-write operation holds its per-channel slot
+    /// before the slot is reclaimed.
+    ///
+    /// A slot is normally released by whichever comes first: the operation's
+    /// confirmation resolving, or its chain event (`ChannelOpened`,
+    /// `ChannelBalanceIncreased`, `ChannelClosureInitiated`, `ChannelClosed`).
+    /// Neither is guaranteed — the event stream is lossy under load, and a task
+    /// can be starved or its node stopped mid-flight.  This bounds how long one
+    /// lost signal suppresses further action on a channel, so it must exceed the
+    /// worst-case confirmation plus indexer lag.  Default: 5 min.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5 * 60))]
+    #[validate(custom(function = "validate_non_zero"))]
+    pub action_lease_timeout: Duration,
+
+    /// Time budget shared by every chain read of a tick — safe info and balance,
+    /// ticket economics, the channel and account streams.
+    ///
+    /// The pipeline shares a task with chain-event handling, so an unbounded
+    /// read stalls ticks *and* event processing, indefinitely if it never
+    /// answers.  Reads that overrun the budget count as unavailable for that
+    /// tick and are retried on the next.  Default: 30 s.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30))]
+    #[validate(custom(function = "validate_non_zero"))]
+    pub chain_read_timeout: Duration,
 }
 
 /// Per-axis weights for the multi-objective channel selector.
@@ -1319,6 +1358,45 @@ mod config_tests {
     fn default_config_passes_validation() {
         use validator::Validate as _;
         assert!(FundingConfig::default().validate().is_ok());
+    }
+
+    /// Zero disables the protection rather than lifting a limit: a zero lease expires on the spot, so a channel with a
+    /// transaction already in flight gets another every pass, and a zero read budget makes every read unavailable.
+    ///
+    /// Checked through the top-level config so this also pins that `#[validate(nested)]` still reaches
+    /// `ConcurrencyConfig` — a rule that is never reached is the same as no rule.
+    #[rstest]
+    #[case::zero_lease(Duration::ZERO, Duration::from_secs(30))]
+    #[case::zero_read_budget(Duration::from_secs(300), Duration::ZERO)]
+    fn concurrency_config_should_reject_a_zero_timeout(
+        #[case] action_lease_timeout: Duration,
+        #[case] chain_read_timeout: Duration,
+    ) {
+        use validator::Validate as _;
+
+        let concurrency = ConcurrencyConfig {
+            action_lease_timeout,
+            chain_read_timeout,
+            ..Default::default()
+        };
+
+        assert!(concurrency.validate().is_err(), "a zero duration must be rejected");
+        assert!(
+            ChannelLifecycleConfig {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "and must be rejected through the top-level config too"
+        );
+    }
+
+    #[test]
+    fn concurrency_config_should_accept_its_defaults() {
+        use validator::Validate as _;
+
+        assert!(ConcurrencyConfig::default().validate().is_ok());
     }
 
     /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the

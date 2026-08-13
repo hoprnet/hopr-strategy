@@ -14,7 +14,8 @@ use rstest::fixture;
 mod scenario;
 
 pub use scenario::{
-    ChannelParty, ChannelScenario, ScenarioOpts, assert_channel_never, await_channel, await_channel_where,
+    ChannelParty, ChannelScenario, MultiChannelScenario, ScenarioOpts, assert_channel_never, await_channel,
+    await_channel_where,
 };
 
 /// Simple test account with a deterministic keypair.

@@ -102,5 +102,24 @@ in
     runCoverage = true;
     cargoExtraArgs = "--all-features --lib";
   };
+
+  # The same for the integration suite.  It drives whole strategies against a
+  # stub chain, so it is what covers the failure paths — lost events, stalled
+  # confirmations, exhausted budgets — that no unit test can reach; without this
+  # they count as uncovered.
+  coverage-integration = builders.localCoverage.callPackage nixLib.mkRustPackage {
+    src = sources.test;
+    depsSrc = sources.deps;
+    cargoToml = ./../../Cargo.toml;
+    inherit rev;
+    runCoverage = true;
+    # Selects targets, not packages: the library has to stay in scope to be
+    # reported on, so excluding it — or naming the integration crate with `-p`,
+    # which the builder's own `--workspace` forbids — yields a report covering
+    # only the test crate's source.  `--tests` therefore also re-runs the lib's
+    # unit tests, which costs a few seconds and makes this report a superset of
+    # the unit one.
+    cargoExtraArgs = "--all-features --tests";
+  };
 }
 // hoprStrategyPlatformPackages

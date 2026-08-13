@@ -43,7 +43,7 @@ use hopr_api::{
         },
         internal::prelude::{
             AccountEntry, AccountType, ChannelBuilder, ChannelId, ChannelStatus, RedeemableTicket, VerifiedTicket,
-            WinningProbability,
+            WinningProbability, generate_channel_id,
         },
         primitive::prelude::{Address, HoprBalance, WxHOPR, XDai},
     },
@@ -649,6 +649,265 @@ struct ParsedChainInfo {
     closure_grace_period: std::time::Duration,
 }
 
+// ─── Fault injection ─────────────────────────────────────────────────────────
+
+/// How a chain operation should misbehave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fault {
+    /// Operate normally.
+    #[default]
+    None,
+    /// Return an error.
+    Fail,
+    /// Never resolve.  Models an RPC that neither answers nor times out.
+    Hang,
+}
+
+/// Chain operations that [`ChainFaults`] can perturb, each naming the call it
+/// stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChainOp {
+    /// `ChainReadSafeOperations::safe_info`.
+    SafeInfo,
+    /// `ChainValues::balance`, for the safe and for per-peer stake.
+    Balance,
+    /// `ChainValues::minimum_ticket_price`.
+    TicketPrice,
+    /// `ChainValues::minimum_incoming_ticket_win_prob`.
+    WinProb,
+    /// `ChainValues::typical_resolution_time`.
+    ResolutionTime,
+    /// `ChainReadChannelOperations::stream_channels`.
+    StreamChannels,
+    /// `ChainReadAccountOperations::stream_accounts`.
+    StreamAccounts,
+    /// `ChainWriteChannelOperations::open_channel`.
+    OpenChannel,
+    /// `ChainWriteChannelOperations::fund_channel`.
+    FundChannel,
+    /// `ChainWriteChannelOperations::close_channel`, which both initiates and
+    /// finalizes a closure depending on the channel's status.
+    CloseChannel,
+}
+
+/// Chain event kinds that [`ChainFaults`] can withhold from subscribers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    /// `ChainEvent::ChannelBalanceIncreased`, reporting a funded channel.
+    BalanceIncreased,
+    /// `ChainEvent::ChannelBalanceDecreased`, reporting a drained channel.
+    BalanceDecreased,
+    /// `ChainEvent::ChannelOpened`.
+    ChannelOpened,
+    /// `ChainEvent::ChannelClosureInitiated`, the first of the two closure
+    /// steps: the channel has entered its notice period.
+    ClosureInitiated,
+    /// `ChainEvent::ChannelClosed`, the second closure step.
+    Closed,
+    /// `ChainEvent::TicketRedeemed`.
+    TicketRedeemed,
+}
+
+impl EventKind {
+    fn of(event: &ChainEvent) -> Option<Self> {
+        match event {
+            ChainEvent::ChannelBalanceIncreased(..) => Some(Self::BalanceIncreased),
+            ChainEvent::ChannelBalanceDecreased(..) => Some(Self::BalanceDecreased),
+            ChainEvent::ChannelOpened(_) => Some(Self::ChannelOpened),
+            ChainEvent::ChannelClosureInitiated(_) => Some(Self::ClosureInitiated),
+            ChainEvent::ChannelClosed(_) => Some(Self::Closed),
+            ChainEvent::TicketRedeemed(..) => Some(Self::TicketRedeemed),
+            _ => None,
+        }
+    }
+}
+
+/// Shared, live-mutable fault configuration for a [`TestChainConnector`].
+///
+/// Handed out by [`TestChainConnector::faults`] so a test can perturb the chain
+/// while the strategy is running — which is how these failures actually occur.
+/// Empty by default.
+///
+/// ```text
+/// let faults = connector.faults();
+///
+/// // The funding tx lands, but its outcome never comes back and the event that
+/// // would report it is lost — the strategy learns nothing either way.
+/// faults.set_confirmation(ChainOp::FundChannel, Fault::Hang);
+/// faults.withhold_event(EventKind::BalanceIncreased);
+///
+/// // ... drive the strategy, then let the chain recover:
+/// faults.clear(ChainOp::FundChannel);
+/// faults.deliver_event(EventKind::BalanceIncreased);
+///
+/// // What the strategy did meanwhile:
+/// assert_eq!(faults.calls(ChainOp::FundChannel), 1);
+/// assert_eq!(faults.peak_in_flight(ChainOp::FundChannel), 1);
+/// ```
+///
+/// `text` because the example needs a connected [`TestChainConnector`], which
+/// exists only under the `testing` feature.
+#[derive(Debug, Default)]
+pub struct ChainFaults {
+    ops: dashmap::DashMap<ChainOp, Fault>,
+    /// Faults applied to the confirmation future of a write op, rather than to
+    /// its submission.
+    confirmations: dashmap::DashMap<ChainOp, Fault>,
+    withheld_events: dashmap::DashSet<EventKind>,
+    calls: dashmap::DashMap<ChainOp, usize>,
+    /// Writes between submission and confirmation, and the most ever outstanding
+    /// at once, per kind and in total.  Lets a test observe what the strategy
+    /// does in parallel, not just what it eventually achieves.
+    in_flight: dashmap::DashMap<ChainOp, usize>,
+    peak_in_flight: dashmap::DashMap<ChainOp, usize>,
+    peak_in_flight_total: std::sync::atomic::AtomicUsize,
+}
+
+impl ChainFaults {
+    /// Makes `op` misbehave from now on.  For writes this is *submission*; see
+    /// [`ChainFaults::set_confirmation`].
+    pub fn set(&self, op: ChainOp, fault: Fault) {
+        self.ops.insert(op, fault);
+    }
+
+    /// Makes `op`'s confirmation misbehave while submission still succeeds: a tx
+    /// accepted but whose outcome never arrives (`Hang`) or fails (`Fail`).
+    pub fn set_confirmation(&self, op: ChainOp, fault: Fault) {
+        self.confirmations.insert(op, fault);
+    }
+
+    /// Restores normal behaviour of `op`, both submission and confirmation.
+    pub fn clear(&self, op: ChainOp) {
+        self.ops.remove(&op);
+        self.confirmations.remove(&op);
+    }
+
+    /// Stops delivering `kind` to subscribers, as the lossy broadcast does: the
+    /// on-chain effect still happens, the notification does not.
+    pub fn withhold_event(&self, kind: EventKind) {
+        self.withheld_events.insert(kind);
+    }
+
+    /// Resumes delivery of `kind`.
+    pub fn deliver_event(&self, kind: EventKind) {
+        self.withheld_events.remove(&kind);
+    }
+
+    /// Times `op` was invoked, counted on entry, before any injected fault.
+    pub fn calls(&self, op: ChainOp) -> usize {
+        self.calls.get(&op).map(|c| *c).unwrap_or(0)
+    }
+
+    /// Most `op` transactions that were ever in flight at the same time.
+    pub fn peak_in_flight(&self, op: ChainOp) -> usize {
+        self.peak_in_flight.get(&op).map(|c| *c).unwrap_or(0)
+    }
+
+    /// Most writes of any kind ever in flight at once — what
+    /// `concurrency.max_concurrent_actions` bounds.
+    pub fn peak_in_flight_total(&self) -> usize {
+        self.peak_in_flight_total.load(Ordering::Relaxed)
+    }
+
+    /// Marks a submitted write as outstanding and updates the watermarks.  The
+    /// returned guard releases it when dropped.
+    #[must_use]
+    fn enter_in_flight(self: &std::sync::Arc<Self>, op: ChainOp) -> InFlightGuard {
+        // Scoped so the entry guard is released before the map is iterated below.
+        let outstanding = {
+            let mut entry = self.in_flight.entry(op).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        self.peak_in_flight
+            .entry(op)
+            .and_modify(|peak| *peak = (*peak).max(outstanding))
+            .or_insert(outstanding);
+
+        let total: usize = self.in_flight.iter().map(|entry| *entry.value()).sum();
+        self.peak_in_flight_total.fetch_max(total, Ordering::Relaxed);
+
+        InFlightGuard {
+            faults: std::sync::Arc::clone(self),
+            op,
+        }
+    }
+
+    /// Marks an outstanding write as finished.
+    fn leave_in_flight(&self, op: ChainOp) {
+        if let Some(mut outstanding) = self.in_flight.get_mut(&op) {
+            *outstanding = outstanding.saturating_sub(1);
+        }
+    }
+
+    fn fault(&self, op: ChainOp) -> Fault {
+        self.ops.get(&op).map(|f| *f).unwrap_or_default()
+    }
+
+    fn confirmation_fault(&self, op: ChainOp) -> Fault {
+        self.confirmations.get(&op).map(|f| *f).unwrap_or_default()
+    }
+
+    fn record(&self, op: ChainOp) {
+        *self.calls.entry(op).or_insert(0) += 1;
+    }
+
+    fn is_withheld(&self, event: &ChainEvent) -> bool {
+        EventKind::of(event).is_some_and(|kind| self.withheld_events.contains(&kind))
+    }
+
+    /// Applies a `Fail`/`Hang` fault to an async operation, if one is set.
+    async fn gate(&self, op: ChainOp) -> Result<(), TestConnectorError> {
+        self.record(op);
+        match self.fault(op) {
+            Fault::None => Ok(()),
+            Fault::Fail => Err(injected_fault(op)),
+            Fault::Hang => futures::future::pending().await,
+        }
+    }
+
+    /// Applies a fault to a stream-returning operation: `Fail` errors from the
+    /// call, `Hang` is returned so the caller can yield a pending stream.
+    fn gate_stream(&self, op: ChainOp) -> Result<Fault, TestConnectorError> {
+        self.record(op);
+        match self.fault(op) {
+            Fault::Fail => Err(injected_fault(op)),
+            other => Ok(other),
+        }
+    }
+
+    /// Resolves the confirmation future of write op `op`.
+    async fn confirm(&self, op: ChainOp) -> Result<(), TestConnectorError> {
+        match self.confirmation_fault(op) {
+            Fault::None => Ok(()),
+            Fault::Fail => Err(injected_fault(op)),
+            Fault::Hang => futures::future::pending().await,
+        }
+    }
+}
+
+/// Holds an operation's in-flight count up for as long as it lives.
+///
+/// Tied to the confirmation future's lifetime rather than to a call at its end,
+/// so a caller that drops the future without polling it to completion — an
+/// aborted task, say — cannot leave the count raised and every later watermark
+/// reading too high.
+pub struct InFlightGuard {
+    faults: std::sync::Arc<ChainFaults>,
+    op: ChainOp,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.faults.leave_in_flight(self.op);
+    }
+}
+
+fn injected_fault(op: ChainOp) -> TestConnectorError {
+    TestConnectorError::from(anyhow::anyhow!("injected fault on {op:?}"))
+}
+
 /// A minimal chain connector backed by a [`BlokliTestClient`] for use in unit tests.
 ///
 /// Wraps the test blokli client and implements all [`HoprChainApi`](hopr_api::chain::HoprChainApi)
@@ -684,6 +943,8 @@ pub struct TestChainConnector<M: BlokliTestStateMutator> {
             hopr_api::types::internal::prelude::ChannelEntry,
         >,
     >,
+    /// Injected chain-operation faults; empty unless a test configures them.
+    faults: std::sync::Arc<ChainFaults>,
 }
 
 impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnector<M> {
@@ -708,7 +969,14 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             nonce: Default::default(),
             accounts: Default::default(),
             channels: Default::default(),
+            faults: Default::default(),
         }
+    }
+
+    /// Handle to this connector's fault configuration.  Faults can be set and
+    /// cleared at any time, including while a strategy is running against it.
+    pub fn faults(&self) -> std::sync::Arc<ChainFaults> {
+        self.faults.clone()
     }
 
     /// Loads initial state via finite queries and spawns a background task for live event forwarding.
@@ -908,6 +1176,42 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             .build()?)
     }
 
+    /// Waits until this connector's own channel view satisfies `predicate`.
+    ///
+    /// The emulated RPC wraps the chain, not the other way round: the tx has
+    /// already executed and broadcast by the time submission returns, so a
+    /// confirmation must not resolve before the caller can read the result.
+    /// This connector ingests that broadcast on a background task, so without
+    /// the wait it would report success against a view it has not caught up
+    /// with — which no real chain RPC does.
+    async fn await_own_view(
+        channels: std::sync::Arc<
+            dashmap::DashMap<
+                hopr_api::types::internal::prelude::ChannelId,
+                hopr_api::types::internal::prelude::ChannelEntry,
+            >,
+        >,
+        channel_id: hopr_api::types::internal::prelude::ChannelId,
+        predicate: impl Fn(&hopr_api::types::internal::prelude::ChannelEntry) -> bool,
+    ) {
+        // Generous for an in-process broadcast: only a stuck background task
+        // reaches it, and the caller's own timeout covers that.
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let deadline = std::time::Instant::now() + LIMIT;
+        loop {
+            if channels.get(&channel_id).is_some_and(|entry| predicate(&entry)) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(%channel_id, "test connector: own view never caught up with the confirmed tx");
+                return;
+            }
+            futures_time::task::sleep(POLL.into()).await;
+        }
+    }
+
     async fn send_tx(
         client: &BlokliTestClient<M>,
         tx_req: hopr_api::types::chain::payload::TransactionRequest,
@@ -995,6 +1299,10 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         &'a self,
         selector: hopr_api::chain::AccountSelector,
     ) -> Result<futures::stream::BoxStream<'a, hopr_api::types::internal::prelude::AccountEntry>, Self::Error> {
+        if self.faults.gate_stream(ChainOp::StreamAccounts)? == Fault::Hang {
+            return Ok(futures::stream::pending().boxed());
+        }
+
         let entries: Vec<_> = self
             .accounts
             .iter()
@@ -1142,6 +1450,10 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         &'a self,
         selector: hopr_api::chain::ChannelSelector,
     ) -> Result<futures::stream::BoxStream<'a, hopr_api::types::internal::prelude::ChannelEntry>, Self::Error> {
+        if self.faults.gate_stream(ChainOp::StreamChannels)? == Fault::Hang {
+            return Ok(futures::stream::pending().boxed());
+        }
+
         let entries: Vec<_> = self
             .channels
             .iter()
@@ -1165,11 +1477,22 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         dst: &'a hopr_api::types::primitive::prelude::Address,
         amount: hopr_api::types::primitive::prelude::HoprBalance,
     ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        self.faults.gate(ChainOp::OpenChannel).await?;
+
+        let channel_id = generate_channel_id(&self.my_addr, dst);
         let tx_req = self.payload_gen()?.fund_channel(*dst, amount)?;
         let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
             .await
             .map_err(TestConnectorError::from)?;
-        Ok(Box::pin(async move { Ok(receipt) }))
+        let faults = self.faults.clone();
+        let channels = self.channels.clone();
+        let in_flight = faults.enter_in_flight(ChainOp::OpenChannel);
+        Ok(Box::pin(async move {
+            let _in_flight = in_flight;
+            Self::await_own_view(channels, channel_id, |channel| channel.status == ChannelStatus::Open).await;
+            faults.confirm(ChainOp::OpenChannel).await?;
+            Ok(receipt)
+        }))
     }
 
     async fn fund_channel<'a>(
@@ -1177,6 +1500,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         channel_id: &'a hopr_api::types::internal::prelude::ChannelId,
         amount: hopr_api::types::primitive::prelude::HoprBalance,
     ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        self.faults.gate(ChainOp::FundChannel).await?;
+
         let channel = self
             .channels
             .get(channel_id)
@@ -1184,16 +1509,28 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .ok_or_else(|| anyhow::anyhow!("channel {channel_id} not found"))?;
 
         let tx_req = self.payload_gen()?.fund_channel(channel.destination, amount)?;
+        let funded_to = channel.balance + amount;
         let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
             .await
             .map_err(TestConnectorError::from)?;
-        Ok(Box::pin(async move { Ok(receipt) }))
+        let faults = self.faults.clone();
+        let channels = self.channels.clone();
+        let channel_id = *channel_id;
+        let in_flight = faults.enter_in_flight(ChainOp::FundChannel);
+        Ok(Box::pin(async move {
+            let _in_flight = in_flight;
+            Self::await_own_view(channels, channel_id, |channel| channel.balance >= funded_to).await;
+            faults.confirm(ChainOp::FundChannel).await?;
+            Ok(receipt)
+        }))
     }
 
     async fn close_channel<'a>(
         &'a self,
         channel_id: &'a hopr_api::types::internal::prelude::ChannelId,
     ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        self.faults.gate(ChainOp::CloseChannel).await?;
+
         let channel = self
             .channels
             .get(channel_id)
@@ -1210,10 +1547,23 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             ChannelStatus::Closed => return Err(anyhow::anyhow!("channel {channel_id} is already closed").into()),
         };
 
+        let previous_status = channel.status;
         let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
             .await
             .map_err(TestConnectorError::from)?;
-        Ok(Box::pin(async move { Ok(receipt) }))
+        let faults = self.faults.clone();
+        let channels = self.channels.clone();
+        let channel_id = *channel_id;
+        let in_flight = faults.enter_in_flight(ChainOp::CloseChannel);
+        Ok(Box::pin(async move {
+            let _in_flight = in_flight;
+            // Closure is two steps (Open → PendingToClose → Closed); either way
+            // the status this call moved the channel out of must be gone from
+            // our own view before we report success.
+            Self::await_own_view(channels, channel_id, |channel| channel.status != previous_status).await;
+            faults.confirm(ChainOp::CloseChannel).await?;
+            Ok(receipt)
+        }))
     }
 }
 
@@ -1252,6 +1602,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         &self,
         selector: hopr_api::chain::SafeSelector,
     ) -> Result<Option<hopr_api::chain::DeployedSafe>, Self::Error> {
+        self.faults.gate(ChainOp::SafeInfo).await?;
+
         let blokli_selector = match selector {
             hopr_api::chain::SafeSelector::Address(a) => BlokliSafeSelector::SafeAddress(a.into()),
             hopr_api::chain::SafeSelector::Deployer(a) => BlokliSafeSelector::ChainKey(a.into()),
@@ -1344,7 +1696,16 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
                 }
             })
             .collect();
-        Ok(futures::stream::iter(snapshot).chain(self.events.1.activate_cloned()))
+        // Withheld kinds are filtered per subscriber: the chain state still
+        // changes, only the notification is lost — exactly what an overflowing
+        // event broadcast does to a slow consumer.
+        // Boxed so the returned stream stays `Unpin` for callers that poll it
+        // directly (`next().timeout(..)`), which `Filter` is not.
+        let faults = self.faults.clone();
+        Ok(futures::stream::iter(snapshot)
+            .chain(self.events.1.activate_cloned())
+            .filter(move |event| futures::future::ready(!faults.is_withheld(event)))
+            .boxed())
     }
 }
 
@@ -1393,6 +1754,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         &self,
         address: A,
     ) -> Result<hopr_api::types::primitive::prelude::Balance<C>, Self::Error> {
+        self.faults.gate(ChainOp::Balance).await?;
+
         let address = address.into();
         if C::is::<WxHOPR>() {
             Ok(self
@@ -1423,11 +1786,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
     async fn minimum_incoming_ticket_win_prob(
         &self,
     ) -> Result<hopr_api::types::internal::prelude::WinningProbability, Self::Error> {
+        self.faults.gate(ChainOp::WinProb).await?;
+
         let info = self.client.query_chain_info().await?;
         Ok(Self::parse_chain_info_model(info)?.ticket_win_prob)
     }
 
     async fn minimum_ticket_price(&self) -> Result<hopr_api::types::primitive::prelude::HoprBalance, Self::Error> {
+        self.faults.gate(ChainOp::TicketPrice).await?;
+
         let info = self.client.query_chain_info().await?;
         Ok(Self::parse_chain_info_model(info)?.ticket_price)
     }
@@ -1474,6 +1841,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
     }
 
     async fn typical_resolution_time(&self) -> Result<std::time::Duration, Self::Error> {
+        self.faults.gate(ChainOp::ResolutionTime).await?;
+
         Ok(std::time::Duration::from_secs(5))
     }
 }
