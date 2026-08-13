@@ -3,8 +3,8 @@
 //! Every chain interaction the strategy makes can fail, time out, or complete
 //! without the strategy ever learning about it:
 //!
-//! * the chain-event broadcast is lossy — it overflows rather than blocking, so
-//!   a slow consumer silently loses the notification that an operation landed;
+//! * the chain-event broadcast is lossy — it overflows rather than blocking, so a slow consumer silently loses the
+//!   notification that an operation landed;
 //! * a submitted transaction's confirmation may never resolve;
 //! * a read (safe balance, channel list, ticket economics) may error or hang.
 //!
