@@ -9,12 +9,11 @@
 //! * `D` — The deposit pool implementation.
 //! * `N` — The node type that emits PIX events via [`ActionableEventSource`].
 //!
-//! When the pool bundled with the enabled `strategy-pix-*` feature is sufficient, use
-//! [`PixStrategy::build_default_pool`] — it selects whichever of
-//! [`NonAnonymousDepositPool`](crate::pix::non_anonymous_pool::NonAnonymousDepositPool) or
-//! [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool) the build chose, so a caller
-//! does not name a pool and needs no edit when the choice changes. For a custom pool, construct
-//! it first and pass it to [`PixStrategy::build_with_pool`].
+//! The non-anonymous pairing includes
+//! [`NonAnonymousDepositPool`](crate::pix::non_anonymous_pool::NonAnonymousDepositPool) and can
+//! use [`PixStrategy::build_default_pool`]. Curvy settlement belongs to the chain connector:
+//! construct that pool in the node composition layer and pass it to
+//! [`PixStrategy::build_with_pool`].
 
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -23,22 +22,26 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
+#[cfg(feature = "strategy-pix-secp256k1")]
+use hopr_api::node::HasChainApi;
+#[cfg(feature = "strategy-pix-curvy")]
+use hopr_api::types::crypto::prelude::BjjKeypair;
 use hopr_api::{
     chain::{DepositPool, PixDepositAddress, PixDepositSecret},
-    node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixAddressId, PixEvent},
-    types::primitive::prelude::{Address, HoprBalance},
-    types::{crypto::prelude::Keypair, primitive::prelude::GeneralError},
+    node::{ActionableEventDiscriminant, ActionableEventSource, PixAddressId, PixEvent},
+    types::{
+        crypto::prelude::PixKeypairExt,
+        primitive::prelude::{Address, GeneralError, HoprBalance},
+    },
 };
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-#[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
-use crate::pix::curvy_pool::CurvyDepositPool;
 #[cfg(feature = "strategy-pix-secp256k1")]
-use crate::pix::non_anonymous_pool::NonAnonymousDepositPool;
-#[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
-use crate::pix::{PoolConfig, PoolKeypair};
+use crate::pix::PoolConfig;
+#[cfg(feature = "strategy-pix-secp256k1")]
+use crate::pix::non_anonymous_pool::{EthDepositKey, NonAnonymousDepositPool};
 use crate::{
     errors::{Result, StrategyError},
     pix::recovery_store::PixRecoveryStore,
@@ -101,14 +104,17 @@ pub struct PixStrategyConfig {
     #[serde(default)]
     pub price_per_byte: HoprBalance,
     /// Maximum wxHOPR the strategy will send to a single deposit address.
-    #[default(HoprBalance::new_base(100))]
+    ///
+    /// At the default price of one base unit per byte this covers RFC-0012's
+    /// default `8192 × 64 × 1038` byte quota.
+    #[default(HoprBalance::new_base(544_210_944))]
     #[serde(default)]
     pub max_ssa_allocation: HoprBalance,
-    /// Configuration for the deposit pool bundled with the enabled `strategy-pix-*` feature.
+    /// Configuration for the bundled non-anonymous deposit pool.
     ///
-    /// Absent when neither pairing is enabled — that build has no bundled pool to configure and
-    /// supplies its own through [`PixStrategy::build_with_pool`].
-    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
+    /// Curvy pool configuration belongs to the connector instance supplied through
+    /// [`PixStrategy::build_with_pool`].
+    #[cfg(feature = "strategy-pix-secp256k1")]
     #[serde(default)]
     pub pool: PoolConfig,
     /// If set, recovered private keys are persisted to redb at this path.
@@ -157,32 +163,20 @@ impl PixStrategy {
         Self { cfg }
     }
 
-    /// Build with the deposit pool bundled with the enabled `strategy-pix-*` feature.
-    ///
-    /// This is the curve-agnostic entry point: it names neither pool, so a caller needs no edit
-    /// when the build switches between them. Which one it selects is decided entirely by the
-    /// feature graph, and [`PoolKeypair`] is the alias to assert the resulting deposit-address
-    /// type against.
-    ///
-    /// Note that with `strategy-pix-curvy` the selected pool is
-    /// [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool), which is a stub: building
-    /// succeeds and the first deposit panics.
-    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
+    /// Build with the bundled non-anonymous deposit pool.
+    #[cfg(feature = "strategy-pix-secp256k1")]
     pub fn build_default_pool<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
     {
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
-        #[cfg(feature = "strategy-pix-secp256k1")]
         let pool = Arc::new(NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
-        #[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
-        let pool = Arc::new(CurvyDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
 
         let safe_address = node.identity().safe_address;
 
         // The key is named rather than inferred: it is the choice this builder exists to make.
-        self.build_with_pool::<_, _, PoolKeypair>(pool, node, safe_address)
+        self.build_with_pool::<_, _, EthDepositKey>(pool, node, safe_address)
     }
 
     /// Build with the [`NonAnonymousDepositPool`], by name.
@@ -195,6 +189,25 @@ impl PixStrategy {
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
     {
         self.build_default_pool(node)
+    }
+
+    /// Build the BJJ PIX strategy with a connector-owned Curvy pool.
+    ///
+    /// This keeps Curvy client construction, scan credentials, proving state and
+    /// persistence out of the strategy crate while fixing the pool key type at the
+    /// composition boundary.
+    #[cfg(feature = "strategy-pix-curvy")]
+    pub fn build_curvy_with_pool<D, N>(
+        self,
+        pool: D,
+        node: Arc<N>,
+        safe_address: Address,
+    ) -> Result<Box<dyn StrategyTrait + Send>>
+    where
+        D: DepositPool<BjjKeypair> + Clone + Send + Sync + 'static,
+        N: ActionableEventSource + Send + Sync + 'static,
+    {
+        self.build_with_pool::<D, N, BjjKeypair>(pool, node, safe_address)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
@@ -210,7 +223,7 @@ impl PixStrategy {
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
         D: DepositPool<K> + Clone + Send + Sync + 'static,
-        K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+        K: PixKeypairExt + Send + Sync + 'static,
         K::Public: Into<PixDepositAddress>
             + TryFrom<PixDepositAddress>
             + Eq
@@ -220,7 +233,6 @@ impl PixStrategy {
             + Send
             + Sync
             + 'static,
-        D::Error: Into<StrategyError>,
         N: ActionableEventSource + Send + Sync + 'static,
     {
         let recovery_store = open_recovery_store(
@@ -285,7 +297,7 @@ fn open_recovery_store(
 struct PixStrategyInner<D, N, K>
 where
     D: DepositPool<K>,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -314,7 +326,7 @@ where
 impl<D, N, K> PixStrategyInner<D, N, K>
 where
     D: DepositPool<K>,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -360,7 +372,7 @@ impl<D, N, K> PixStrategyInner<D, N, K>
 where
     D: DepositPool<K> + Sync,
     N: ActionableEventSource + Send + Sync + 'static,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -370,7 +382,6 @@ where
         + Send
         + Sync
         + 'static,
-    D::Error: Into<StrategyError>,
 {
     /// Validate and buffer a PIX event for batched execution.
     ///
@@ -437,7 +448,7 @@ where
                     }
                 };
 
-                let notify_fut = match self.pool.notify_deposit(track_addr, target_deposit) {
+                let notify_fut = match self.pool.notify_deposit(pix_id, track_addr, target_deposit) {
                     Ok(fut) => fut,
                     Err(error) => {
                         tracing::error!(%error, ?pix_id, "cannot track this deposit");
@@ -452,7 +463,7 @@ where
                     let result = notify_fut.await;
 
                     match result {
-                        Ok((_addr, balance)) => {
+                        Ok((_id, _addr, balance)) => {
                             if let Some(mut notifier) = deposit_updated {
                                 let _ = notifier.send((pix_id, balance)).await;
                             }
@@ -519,9 +530,9 @@ where
         if count == 1 {
             let (id, dest_addr, amount) = batch.into_iter().next().unwrap();
             let result = pool
-                .deposit_funds_to(dest_addr.clone(), amount)
+                .deposit_funds_to(id, dest_addr.clone(), amount)
                 .await
-                .map_err(Into::<StrategyError>::into);
+                .map_err(StrategyError::other);
 
             match result {
                 Ok(_) => {
@@ -539,13 +550,15 @@ where
                 }
             }
         } else {
-            let deposits: Vec<(K::Public, HoprBalance)> =
-                batch.iter().map(|(_, addr, amount)| (addr.clone(), *amount)).collect();
+            let deposits: Vec<(PixAddressId, K::Public, HoprBalance)> = batch
+                .iter()
+                .map(|(id, addr, amount)| (*id, addr.clone(), *amount))
+                .collect();
 
             let result = pool
                 .deposit_funds_to_multiple(deposits)
                 .await
-                .map_err(Into::<StrategyError>::into);
+                .map_err(StrategyError::other);
 
             match result {
                 Ok(_receipts) => {
@@ -591,9 +604,9 @@ where
                 return;
             };
             let result = pool
-                .withdraw_deposit(&key, safe_address, None)
+                .withdraw_deposit(id, &key, safe_address, None)
                 .await
-                .map_err(Into::<StrategyError>::into);
+                .map_err(StrategyError::other);
 
             match result {
                 Ok(_) => {
@@ -613,16 +626,25 @@ where
                 }
             }
         } else {
-            let keys: Vec<K> = batch
-                .iter()
-                .filter_map(|(_, secret)| key_from_secret::<K>(secret).ok())
-                .collect();
-            let ids: Vec<PixAddressId> = batch.iter().map(|(id, _)| *id).collect();
+            let mut deposits = Vec::with_capacity(batch.len());
+            for (id, secret) in &batch {
+                match key_from_secret::<K>(secret) {
+                    Ok(key) => deposits.push((*id, key)),
+                    Err(error) => {
+                        self.in_flight_sweeps.invalidate(id);
+                        tracing::error!(%error, ?id, "stored recovery secret is not valid for this pool's scheme");
+                    }
+                }
+            }
+            if deposits.is_empty() {
+                return;
+            }
+            let ids: Vec<PixAddressId> = deposits.iter().map(|(id, _)| *id).collect();
 
             let result = pool
-                .withdraw_multiple_deposits(&keys, safe_address)
+                .withdraw_multiple_deposits(&deposits, safe_address)
                 .await
-                .map_err(Into::<StrategyError>::into);
+                .map_err(StrategyError::other);
 
             match result {
                 Ok(results) => {
@@ -674,9 +696,9 @@ where
 /// is a durable on-disk format, and 32 bytes is what it has always held.
 fn key_from_secret<K>(secret: &PixDepositSecret) -> Result<K>
 where
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32>,
+    K: PixKeypairExt,
 {
-    K::from_secret(secret.0.as_ref()).map_err(StrategyError::other)
+    K::from_pix_secret(secret).map_err(StrategyError::other)
 }
 
 async fn replay_pending_recoveries<D, K>(
@@ -686,7 +708,7 @@ async fn replay_pending_recoveries<D, K>(
     safe_address: Address,
 ) where
     D: DepositPool<K>,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -696,7 +718,6 @@ async fn replay_pending_recoveries<D, K>(
         + Send
         + Sync
         + 'static,
-    D::Error: Into<StrategyError>,
 {
     let entries = match store.iter() {
         Ok(entries) => entries,
@@ -724,9 +745,9 @@ async fn replay_pending_recoveries<D, K>(
             continue;
         };
         let sweep_result = pool
-            .withdraw_deposit(&key, safe_address, None)
+            .withdraw_deposit(id, &key, safe_address, None)
             .await
-            .map_err(Into::<StrategyError>::into);
+            .map_err(StrategyError::other);
 
         match sweep_result {
             Ok(_) => {
@@ -752,7 +773,7 @@ async fn replay_pending_recoveries<D, K>(
 impl<D, N, K> Display for PixStrategyInner<D, N, K>
 where
     D: DepositPool<K>,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -771,7 +792,7 @@ where
 impl<D, N, K> Debug for PixStrategyInner<D, N, K>
 where
     D: DepositPool<K>,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -795,7 +816,7 @@ where
 impl<D, N, K> StrategyTrait for PixStrategyInner<D, N, K>
 where
     D: DepositPool<K> + Clone + Send + Sync + 'static,
-    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K: PixKeypairExt + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
         + TryFrom<PixDepositAddress>
         + Eq
@@ -805,7 +826,6 @@ where
         + Send
         + Sync
         + 'static,
-    D::Error: Into<StrategyError>,
     N: ActionableEventSource + Send + Sync + 'static,
 {
     /// Consume PIX events until the stream ends.
@@ -912,11 +932,9 @@ where
 // Tests
 // ---------------------------------------------------------------------------
 
-// Gated on the secp pairing rather than plain `test`: every case here drives a real
-// `NonAnonymousDepositPool` against a stub chain, so they exercise the pool as much as the
-// strategy. The bjj pairing has no equivalent yet because its pool is a stub — when
-// `CurvyDepositPool` is implemented, the engine-level cases here are the ones worth
-// generalising over `PoolKeypair` rather than duplicating.
+// Gated on the secp pairing rather than plain `test`: every case here drives the bundled
+// `NonAnonymousDepositPool` against a stub chain. Curvy uses the same generic engine through
+// `build_with_pool`; connector integration tests cover its pool implementation separately.
 #[cfg(all(test, feature = "strategy-pix-secp256k1"))]
 mod tests {
     use std::{num::NonZeroU32, sync::Arc, time::Duration as StdDuration};
@@ -931,8 +949,8 @@ mod tests {
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
-            ComponentStatusReporter, EventWaitResult, HasChainApi, NodeOnchainIdentity, PixDepositAddressReceived,
-            PixEvent,
+            ComponentStatusReporter, EventWaitResult, HasChainApi, NodeOnchainIdentity, PixAddressId,
+            PixDepositAddressReceived, PixEvent,
         },
         types::{
             crypto::{keypairs::Keypair, prelude::ChainKeypair},
@@ -966,6 +984,13 @@ mod tests {
     }
 
     const MODULE_ADDRESS: [u8; 20] = [1u8; 20];
+
+    fn pix_id(index: u32) -> PixAddressId {
+        PixAddressId::new(
+            HoprPseudonym::random(),
+            NonZeroU32::new(index).expect("non-zero PIX index"),
+        )
+    }
 
     struct ChainNode<C>(C);
 
@@ -1104,7 +1129,7 @@ mod tests {
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         s.on_pix_event(PixEvent::DepositAddressReceived(PixDepositAddressReceived {
-            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
             address: addr.into(),
             quota: 100,
             deposit_updated: Some(tx),
@@ -1153,7 +1178,7 @@ mod tests {
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
             address: da.into(),
             quota: 20,
         }))
@@ -1195,7 +1220,7 @@ mod tests {
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let r = s
             .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-                id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+                id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
                 address: Address::from([0x42u8; 20]).into(),
                 quota: 10,
             }))
@@ -1232,11 +1257,11 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
-        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into();
         // Buffer a sweep with an invalid secret — on_pix_event succeeds.
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
             id,
-            secret: hopr_api::chain::PixDepositSecret(
+            secret: hopr_api::chain::PixDepositSecret::Eth(
                 hex!("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141").into(),
             ),
         }))
@@ -1285,8 +1310,8 @@ mod tests {
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
-            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
-            secret: hopr_api::chain::PixDepositSecret(rk.into()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
+            secret: hopr_api::chain::PixDepositSecret::Eth(rk.into()),
         }))
         .await?;
         s.flush_withdrawals().await;
@@ -1371,7 +1396,7 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
-        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into();
         let mk = |id| {
             PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
                 id,
@@ -1461,14 +1486,14 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, Some(store));
-        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into();
         s.recovery_store
             .as_ref()
             .unwrap()
-            .insert(&id, &hopr_api::chain::PixDepositSecret(rk.into()))?;
+            .insert(&id, &hopr_api::chain::PixDepositSecret::Eth(rk.into()))?;
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
             id,
-            secret: hopr_api::chain::PixDepositSecret(rk.into()),
+            secret: hopr_api::chain::PixDepositSecret::Eth(rk.into()),
         }))
         .await?;
         s.flush_withdrawals().await;
@@ -1506,6 +1531,7 @@ mod tests {
         let started = std::time::Instant::now();
         let result = pool
             .withdraw_deposit(
+                pix_id(1),
                 &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
                 *BOB,
                 None,
@@ -1562,6 +1588,7 @@ mod tests {
 
         let result = pool
             .withdraw_deposit(
+                pix_id(1),
                 &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
                 *CHRIS,
                 None,
@@ -1616,7 +1643,9 @@ mod tests {
         let dst_before = hopr_balance(&*cc, *CHRIS).await?;
 
         pool.pool_transfer(
+            pix_id(1),
             &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
+            pix_id(2),
             *CHRIS,
             None,
         )
@@ -1669,7 +1698,9 @@ mod tests {
 
         let result = pool
             .pool_transfer(
+                pix_id(1),
                 &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
+                pix_id(2),
                 *CHRIS,
                 None,
             )
@@ -1724,7 +1755,9 @@ mod tests {
 
         let result = pool
             .pool_transfer(
+                pix_id(1),
                 &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
+                pix_id(2),
                 *CHRIS,
                 None,
             )
@@ -1796,7 +1829,13 @@ mod tests {
 
         let keys: Vec<_> = rks
             .iter()
-            .map(|rk| crate::pix::non_anonymous_pool::EthDepositKey::from_secret(rk).expect("valid test secret"))
+            .enumerate()
+            .map(|(index, rk)| {
+                (
+                    pix_id(u32::try_from(index + 1).expect("test allocation index fits u32")),
+                    crate::pix::non_anonymous_pool::EthDepositKey::from_secret(rk).expect("valid test secret"),
+                )
+            })
             .collect();
         let results = pool.withdraw_multiple_deposits(&keys, *CHRIS).await?;
         landing.await??;
@@ -1835,8 +1874,8 @@ mod tests {
 
         let dir = tempfile::tempdir()?;
         let store = PixRecoveryStore::open(dir.path().join("pix.redb"), "test_password")?;
-        let stranded = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
-        store.insert(&stranded, &hopr_api::chain::PixDepositSecret(rk.into()))?;
+        let stranded = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into();
+        store.insert(&stranded, &hopr_api::chain::PixDepositSecret::Eth(rk.into()))?;
 
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
@@ -1881,7 +1920,7 @@ mod tests {
 
         let running = tokio::spawn(async move { s.run().await });
         node.inject_pix(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
             address: da.into(),
             quota,
         }));
@@ -1945,13 +1984,13 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, Some(store));
-        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap());
+        let id = (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into();
 
         // `flush_withdrawals` logs the failure rather than propagating it, so the event
         // itself reports success — what matters is that the key was not discarded.
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
             id,
-            secret: hopr_api::chain::PixDepositSecret(rk.into()),
+            secret: hopr_api::chain::PixDepositSecret::Eth(rk.into()),
         }))
         .await?;
 
@@ -2067,13 +2106,13 @@ mod tests {
         let amount1 = HoprBalance::new_base(20);
         let amount2 = HoprBalance::new_base(30);
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
             address: da1.into(),
             quota: 20,
         }))
         .await?;
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: (HoprPseudonym::random(), NonZeroU32::new(2).unwrap()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(2).unwrap()).into(),
             address: da2.into(),
             quota: 30,
         }))
@@ -2127,13 +2166,13 @@ mod tests {
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
-            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
-            secret: hopr_api::chain::PixDepositSecret(rk1.into()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()).into(),
+            secret: hopr_api::chain::PixDepositSecret::Eth(rk1.into()),
         }))
         .await?;
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
-            id: (HoprPseudonym::random(), NonZeroU32::new(2).unwrap()),
-            secret: hopr_api::chain::PixDepositSecret(rk2.into()),
+            id: (HoprPseudonym::random(), NonZeroU32::new(2).unwrap()).into(),
+            secret: hopr_api::chain::PixDepositSecret::Eth(rk2.into()),
         }))
         .await?;
         // Both withdrawals buffered — flush withdrawals.

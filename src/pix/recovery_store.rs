@@ -72,19 +72,15 @@
 //! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] and
 //! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env`] are both set).
 
-use std::{num::NonZeroU32, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
-use hopr_api::{
-    chain::PixDepositSecret,
-    node::PixAddressId,
-    types::{crypto_random::random_bytes, internal::prelude::HoprPseudonym, primitive::traits::BytesRepresentable},
-};
+use hopr_api::{chain::PixDepositSecret, node::PixAddressId, types::crypto_random::random_bytes};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use scrypt::{Params as ScryptParams, scrypt};
 
 // Key = pseudonym (10 bytes) + ssa_index (4 bytes)
-const KEY_SIZE: usize = HoprPseudonym::SIZE + 4;
+const KEY_SIZE: usize = PixAddressId::SIZE;
 
 // Value = nonce (12 bytes) + ciphertext (32 + 16 tag)
 const NONCE_SIZE: usize = 12;
@@ -92,6 +88,8 @@ const VALUE_SIZE: usize = NONCE_SIZE + 32 + 16;
 
 const PIX_RECOVERED_KEYS: TableDefinition<[u8; KEY_SIZE], [u8; VALUE_SIZE]> =
     TableDefinition::new("pix_recovered_keys");
+const PIX_RECOVERED_KEY_SCHEMES: TableDefinition<[u8; KEY_SIZE], u8> =
+    TableDefinition::new("pix_recovered_key_schemes");
 
 /// Per-database scrypt salt, stored in a separate table.
 const PIX_KDF_SALT_TABLE: TableDefinition<u8, [u8; 16]> = TableDefinition::new("pix_kdf_salt");
@@ -122,6 +120,8 @@ pub enum PixRecoveryStoreError {
     Decryption,
     #[error("corrupt key: {0}")]
     CorruptKey(String),
+    #[error("a different recovered secret is already stored for PIX allocation {0:?}")]
+    ConflictingSecret(PixAddressId),
     #[error("the configured password does not match this recovery store")]
     WrongPassword,
 }
@@ -161,27 +161,18 @@ impl From<redb::CommitError> for PixRecoveryStoreError {
 // Every offset is derived from `HoprPseudonym::SIZE` so the layout follows the type.
 
 fn encode_key(id: &PixAddressId) -> [u8; KEY_SIZE] {
-    let (pseudonym, ssa_index) = id;
-    let pseudonym_bytes: &[u8] = pseudonym.as_ref();
-    let ssa_bytes = ssa_index.get().to_be_bytes();
-    let mut out = [0u8; KEY_SIZE];
-    out[..HoprPseudonym::SIZE].copy_from_slice(pseudonym_bytes);
-    out[HoprPseudonym::SIZE..].copy_from_slice(&ssa_bytes);
-    out
+    id.to_bytes()
 }
 
 fn decode_key(bytes: &[u8; KEY_SIZE]) -> Result<PixAddressId, PixRecoveryStoreError> {
-    let pseudonym = HoprPseudonym::from(
-        <[u8; HoprPseudonym::SIZE]>::try_from(&bytes[..HoprPseudonym::SIZE])
-            .map_err(|_| PixRecoveryStoreError::CorruptKey("pseudonym slice".into()))?,
-    );
+    PixAddressId::try_from(bytes.as_slice()).map_err(|error| PixRecoveryStoreError::CorruptKey(error.to_string()))
+}
 
-    let ssa_index_bytes: [u8; 4] = <[u8; 4]>::try_from(&bytes[HoprPseudonym::SIZE..KEY_SIZE])
-        .map_err(|_| PixRecoveryStoreError::CorruptKey("ssa index slice".into()))?;
-    let ssa_index = NonZeroU32::new(u32::from_be_bytes(ssa_index_bytes))
-        .ok_or_else(|| PixRecoveryStoreError::CorruptKey("zero ssa index".into()))?;
-
-    Ok((pseudonym, ssa_index))
+fn secret_scheme(secret: &PixDepositSecret) -> u8 {
+    match secret {
+        PixDepositSecret::Eth(_) => 0,
+        PixDepositSecret::Bjj(_) => 1,
+    }
 }
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
@@ -260,6 +251,7 @@ impl PixRecoveryStore {
             };
             drop(salt_table);
             write_tx.open_table(PIX_RECOVERED_KEYS)?;
+            write_tx.open_table(PIX_RECOVERED_KEY_SCHEMES)?;
             write_tx.commit()?;
             s
         };
@@ -307,7 +299,9 @@ impl PixRecoveryStore {
     /// Insert an encrypted recovered key.  Returns `true` if the entry was newly
     /// inserted, `false` if the key was already present.
     ///
-    /// An existing entry is never overwritten, so its ciphertext and nonce stay as they were.
+    /// An identical existing entry is never overwritten, so its ciphertext and nonce stay as
+    /// they were. A different curve or scalar for the same allocation is rejected as protocol
+    /// state corruption.
     /// The check happens inside the write transaction: doing it in a separate read transaction
     /// would double the I/O and leave a window in which another writer could insert the same
     /// key in between.
@@ -316,12 +310,24 @@ impl PixRecoveryStore {
         let write_tx = self.db.begin_write()?;
         let was_inserted = {
             let mut table = write_tx.open_table(PIX_RECOVERED_KEYS)?;
-            if table.get(key)?.is_some() {
+            if let Some(existing) = table.get(key)? {
+                let plaintext = decrypt(&self.encryption_key, &existing.value())?;
+                let schemes = write_tx.open_table(PIX_RECOVERED_KEY_SCHEMES)?;
+                let existing_scheme = schemes.get(key)?.map(|value| value.value()).unwrap_or(0);
+                if existing_scheme != secret_scheme(secret) || plaintext.as_slice() != secret.secret().as_ref() {
+                    return Err(PixRecoveryStoreError::ConflictingSecret(*id));
+                }
                 false
             } else {
-                let plaintext: [u8; 32] = secret.0.as_ref().try_into().expect("PixDepositSecret is 32 bytes");
+                let plaintext: [u8; 32] = secret
+                    .secret()
+                    .as_ref()
+                    .try_into()
+                    .expect("PixDepositSecret is 32 bytes");
                 let stored = encrypt(&self.encryption_key, &plaintext)?;
                 table.insert(key, stored)?;
+                let mut schemes = write_tx.open_table(PIX_RECOVERED_KEY_SCHEMES)?;
+                schemes.insert(key, secret_scheme(secret))?;
                 true
             }
         };
@@ -336,7 +342,10 @@ impl PixRecoveryStore {
         let write_tx = self.db.begin_write()?;
         let was_removed = {
             let mut table = write_tx.open_table(PIX_RECOVERED_KEYS)?;
-            table.remove(key)?.is_some()
+            let removed = table.remove(key)?.is_some();
+            let mut schemes = write_tx.open_table(PIX_RECOVERED_KEY_SCHEMES)?;
+            schemes.remove(key)?;
+            removed
         };
         write_tx.commit()?;
         Ok(was_removed)
@@ -354,6 +363,7 @@ impl PixRecoveryStore {
     pub fn iter(&self) -> Result<Vec<(PixAddressId, PixDepositSecret)>, PixRecoveryStoreError> {
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(PIX_RECOVERED_KEYS)?;
+        let schemes = read_tx.open_table(PIX_RECOVERED_KEY_SCHEMES)?;
         let mut results = Vec::new();
         let mut skipped = 0usize;
         for result in table.iter()? {
@@ -383,7 +393,17 @@ impl PixRecoveryStore {
                     continue;
                 }
             };
-            let secret = PixDepositSecret(plaintext.into());
+            // Records created before curve tagging were exclusively secp256k1,
+            // so a missing scheme entry is a safe legacy-Ethereum migration.
+            let secret = match schemes.get(key_bytes.value())?.map(|value| value.value()).unwrap_or(0) {
+                0 => PixDepositSecret::Eth(plaintext.into()),
+                1 => PixDepositSecret::Bjj(plaintext.into()),
+                value => {
+                    tracing::error!(?id, value, "invalid PIX recovery key scheme, skipping");
+                    skipped += 1;
+                    continue;
+                }
+            };
             results.push((id, secret));
         }
         if skipped > 0 {
@@ -399,22 +419,24 @@ impl PixRecoveryStore {
 
 #[cfg(test)]
 mod tests {
-    use hopr_api::types::crypto_random::Randomizable;
+    use std::num::NonZeroU32;
+
+    use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
 
     use super::{
-        HoprPseudonym, NonZeroU32, PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore,
-        PixRecoveryStoreError, ReadableDatabase, VALUE_SIZE, encode_key,
+        PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore, PixRecoveryStoreError, ReadableDatabase,
+        VALUE_SIZE, encode_key,
     };
 
     const TEST_PASSWORD: &str = "test-password-for-unit-tests";
     const ALT_PASSWORD: &str = "password-a";
 
     fn make_id(index: u32) -> PixAddressId {
-        (HoprPseudonym::random(), NonZeroU32::new(index).unwrap())
+        PixAddressId::new(HoprPseudonym::random(), NonZeroU32::new(index).unwrap())
     }
 
     fn make_secret(byte: u8) -> PixDepositSecret {
-        PixDepositSecret([byte; 32].into())
+        PixDepositSecret::Eth([byte; 32].into())
     }
 
     fn open_temp_store() -> (PixRecoveryStore, tempfile::TempDir) {
@@ -456,6 +478,18 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_secret_for_the_same_allocation_is_rejected() {
+        let (store, _dir) = open_temp_store();
+        let id = make_id(1);
+        store.insert(&id, &make_secret(0x11)).unwrap();
+
+        assert!(matches!(
+            store.insert(&id, &make_secret(0x22)),
+            Err(PixRecoveryStoreError::ConflictingSecret(conflicting)) if conflicting == id
+        ));
+    }
+
+    #[test]
     fn test_contains_empty_store() {
         let (store, _dir) = open_temp_store();
         assert!(!store.contains(&make_id(1)).unwrap());
@@ -493,12 +527,12 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|(id, s)| id == &id1 && s.0.as_ref() == sec1.0.as_ref())
+                .any(|(id, s)| id == &id1 && s.secret().as_ref() == sec1.secret().as_ref())
         );
         assert!(
             entries
                 .iter()
-                .any(|(id, s)| id == &id2 && s.0.as_ref() == sec2.0.as_ref())
+                .any(|(id, s)| id == &id2 && s.secret().as_ref() == sec2.secret().as_ref())
         );
     }
 
@@ -522,7 +556,7 @@ mod tests {
         let entries = store.iter().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, id);
-        assert_eq!(entries[0].1.0.as_ref(), secret.0.as_ref());
+        assert_eq!(entries[0].1.secret().as_ref(), secret.secret().as_ref());
     }
 
     /// A wrong password must be rejected at `open`. Letting it through would leave every
@@ -569,8 +603,8 @@ mod tests {
     fn test_key_uniqueness_per_pseudonym_and_index() {
         let (store, _dir) = open_temp_store();
         let pseudo = HoprPseudonym::random();
-        let id_a = (pseudo, NonZeroU32::new(1).unwrap());
-        let id_b = (pseudo, NonZeroU32::new(2).unwrap());
+        let id_a = PixAddressId::new(pseudo, NonZeroU32::new(1).unwrap());
+        let id_b = PixAddressId::new(pseudo, NonZeroU32::new(2).unwrap());
         let sec_a = make_secret(0xaa);
         let sec_b = make_secret(0xbb);
 
@@ -622,7 +656,7 @@ mod tests {
         let stored = raw_stored_value(&store, &id).expect("should be present");
         assert_ne!(
             stored.as_slice(),
-            secret.0.as_ref(),
+            secret.secret().as_ref(),
             "stored value (nonce + ciphertext) must differ from plaintext"
         );
     }

@@ -30,8 +30,8 @@ testing = [
   "hopr-utils/testing-blokli",
 ]
 ## Strategy features — each enables one strategy implementation.
-strategy-auto-funding = []
-strategy-auto-redeeming = []
+strategy-auto-funding      = []
+strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
 # The PIX strategy engine, without a deposit pool.
@@ -41,7 +41,8 @@ strategy-closure-finalizer = []
 # feature on `hopr-crypto-packet` — an entirely separate crate. Enabling this alone gives the
 # generic engine and `PixStrategy::build_with_pool`, for a consumer bringing its own pool.
 #
-# Consumers that want a bundled pool pick one of the two pairings below instead.
+# Consumers that want the bundled non-anonymous pool select its pairing below.
+# Curvy consumers inject the connector-owned implementation with `build_with_pool`.
 strategy-pix = [
   "dep:backon",
   "dep:chacha20poly1305",
@@ -56,13 +57,11 @@ strategy-pix = [
 # the pool cannot spend the addresses the events carry. Cargo cannot express "these two must
 # agree" across crates, so the consumer states both and `hoprd::strategy` asserts the result.
 strategy-pix-secp256k1 = ["strategy-pix"]
-# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses).
+# Selects `BjjKeypair` (Baby JubJub deposit addresses) for a connector-owned Curvy pool.
 #
 # Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
 # feature and nothing else already agrees.
 #
-# NOTE: the pool itself is a stub whose methods panic. The feature wiring is final; the
-# implementation is not.
 strategy-pix-curvy = ["strategy-pix"]
 
 [dependencies]
@@ -147,7 +146,7 @@ futures             = "0.3.33"
 futures-concurrency = "7.7.1"
 futures-time        = "3.1.0"
 hex-literal         = "1.1.0"
-hopr-api            = "1.20.0"
+hopr-api            = "1.20.1"
 hopr-strategy       = { path = "." }
 hopr-utils          = { package = "hopr-utilities", version = "0.5.0", default-features = false }
 humantime-serde     = "1.1.1"

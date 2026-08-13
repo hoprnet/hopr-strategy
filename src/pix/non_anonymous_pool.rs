@@ -19,9 +19,12 @@ use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
     chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool},
-    node::HasChainApi,
+    node::{HasChainApi, PixAddressId},
     types::{
-        crypto::prelude::Keypair,
+        crypto::{
+            errors::CryptoError,
+            prelude::{Keypair, PixDepositSecret, PixKeypairExt},
+        },
         primitive::prelude::{Address, HoprBalance, XDaiBalance},
     },
 };
@@ -88,6 +91,16 @@ impl Keypair for EthDepositKey {
 
     fn public(&self) -> &Self::Public {
         &self.1
+    }
+}
+
+impl PixKeypairExt for EthDepositKey {
+    fn from_pix_secret(secret: &PixDepositSecret) -> Result<Self, CryptoError> {
+        ChainKeypair::from_pix_secret(secret).map(Into::into)
+    }
+
+    fn unzip_into_pix(self) -> (PixDepositSecret, hopr_api::chain::PixDepositAddress) {
+        self.0.unzip_into_pix()
     }
 }
 
@@ -215,17 +228,21 @@ impl Drop for DepositTrackerSlot {
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use hopr_api::{chain::DepositPool, node::HasChainApi, types::primitive::prelude::HoprBalance};
+/// use hopr_api::{
+///     chain::DepositPool,
+///     node::{HasChainApi, PixAddressId},
+///     types::primitive::prelude::{Address, HoprBalance},
+/// };
 /// use hopr_strategy::pix::non_anonymous_pool::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
 ///
-/// async fn deposit<N>(node: Arc<N>, dst: hopr_api::chain::PixDepositAddress) -> anyhow::Result<()>
+/// async fn deposit<N>(node: Arc<N>, id: PixAddressId, dst: Address) -> anyhow::Result<()>
 /// where
 ///     N: HasChainApi + Send + Sync + 'static,
 /// {
 ///     let pool = NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default());
 ///
 ///     // The pool owns the retries; a single call is best effort by itself.
-///     pool.deposit_funds_to(dst, HoprBalance::new_base(20)).await?;
+///     pool.deposit_funds_to(id, dst, HoprBalance::new_base(20)).await?;
 ///     Ok(())
 /// }
 /// ```
@@ -419,8 +436,12 @@ where
     /// transfer whose confirmation was lost is therefore not sent twice. The guarantee is
     /// balance-based rather than transaction-based, so a third party funding the same
     /// address also satisfies the check.
-    ///
-    async fn deposit_funds_to(&self, dst: Address, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
+    async fn deposit_funds_to(
+        &self,
+        _id: PixAddressId,
+        dst: Address,
+        amount: HoprBalance,
+    ) -> Result<Self::Receipt, Self::Error> {
         let dest_addr = dst;
         let node = &self.node;
 
@@ -442,6 +463,7 @@ where
     /// out what the bound should be.
     fn notify_deposit(
         &self,
+        id: PixAddressId,
         dst: Address,
         min_amount: HoprBalance,
     ) -> Result<DepositNotification<'static, Address, Self::Error>, Self::Error> {
@@ -469,7 +491,7 @@ where
             let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
-                return Ok((dst, balance));
+                return Ok((id, dst, balance));
             }
 
             futures_time::task::sleep(phase_jitter.into()).await;
@@ -499,7 +521,7 @@ where
             )
             .await
             {
-                Ok(Some(balance)) => Ok((dst, balance)),
+                Ok(Some(balance)) => Ok((id, dst, balance)),
                 Ok(None) => Err(StrategyError::other(anyhow::anyhow!(
                     "deposit balance stream ended unexpectedly"
                 ))),
@@ -525,6 +547,7 @@ where
     /// one belonging to a different scheme.
     async fn withdraw_deposit(
         &self,
+        _id: PixAddressId,
         key: &EthDepositKey,
         dst: Address,
         _amount: Option<HoprBalance>,
@@ -552,10 +575,12 @@ where
     /// anonymity set while a withdrawal leaves it.
     async fn pool_transfer(
         &self,
+        source_id: PixAddressId,
         key: &EthDepositKey,
+        _destination_id: PixAddressId,
         dst: Address,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        self.withdraw_deposit(key, dst, amount).await
+        self.withdraw_deposit(source_id, key, dst, amount).await
     }
 }
