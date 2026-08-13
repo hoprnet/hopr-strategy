@@ -8,9 +8,9 @@
 //! * a submitted transaction's confirmation may never resolve;
 //! * a read (safe balance, channel list, ticket economics) may error or hang.
 //!
-//! None of these may leave the strategy permanently unable to act.  The tests
-//! below inject each failure through [`ChainFaults`] while the strategy is
-//! running, then assert that the strategy still converges once the fault clears.
+//! None may leave the strategy permanently unable to act.  Each test injects one
+//! failure through [`ChainFaults`] while the strategy runs, then asserts it
+//! still converges once the fault clears.
 
 use std::{sync::Arc, time::Duration};
 
@@ -34,23 +34,21 @@ use rstest::rstest;
 /// win_prob 1.0, assumed_hops 3): 1 packet of capacity = 3 wxHOPR.
 const TOPUP: &str = "3 wxHOPR";
 
-/// Payload bytes per packet for the test transport, as
-/// `PacketTransport::packet_payload_size()` reports it.
+/// Payload bytes per packet, per `PacketTransport::packet_payload_size()`.
 ///
-/// Capacity is rounded *up* to whole packets (`div_ceil`), so every `ByteSize`
-/// from 1 byte to a full packet resolves to the same 3 wxHOPR — the multiple has
-/// to be spelled out in packets for a threshold to be more than one top-up wide.
+/// Capacity rounds *up* to whole packets, so every `ByteSize` from 1 byte to a
+/// full packet is the same 3 wxHOPR — a threshold wider than one top-up has to
+/// be spelled out in packets.
 const PACKET: u64 = 1036;
 
 /// Ticks fast enough that several passes fit inside the action timeout.
 const TICK: Duration = Duration::from_millis(100);
 
-/// Lease long enough to satisfy the knob's contract in this harness: it must
-/// exceed the time an operation legitimately takes to report back, which here is
-/// the simulated confirmation plus the connector's own view catching up (about a
-/// second).  Undersize it and the lease reclaims slots from operations that are
-/// still running, which shows up as duplicate transactions rather than as the
-/// stalls these tests are about.
+/// Long enough to honour the knob's contract here: it must exceed the time an
+/// operation legitimately takes to report back — simulated confirmation plus the
+/// connector's view catching up, about a second.  Undersized, it reclaims slots
+/// from running operations, which shows up as duplicate transactions rather than
+/// the stalls these tests are about.
 const LEASE: Duration = Duration::from_secs(2);
 
 /// Every chain read the pipeline makes, so a test can knock out the strategy's
@@ -70,12 +68,10 @@ const EVERY_READ: [ChainOp; 7] = [
 /// hang on purpose.
 const READ_BUDGET: Duration = Duration::from_millis(200);
 
-/// Config for a single channel that stays below the funding threshold across
-/// several top-ups: the threshold is 4 packets (12 wxHOPR) and each top-up adds
-/// 1 packet (3 wxHOPR), so a channel starting at 1 wxHOPR is still under it at
-/// 4, 7 and 10 wxHOPR.  Any "did it fund again?" assertion is therefore about
-/// the strategy's willingness to act, never about the channel having become
-/// healthy.
+/// A channel that stays below its funding threshold across several top-ups: the
+/// threshold is 4 packets (12 wxHOPR), each top-up 1 packet (3 wxHOPR), so 1
+/// wxHOPR is still under it at 4, 7 and 10.  "Did it fund again?" is therefore
+/// about willingness to act, never about the channel becoming healthy.
 fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
     let mut cfg = ChannelLifecycleConfig {
         tick_interval: TICK,
@@ -94,15 +90,12 @@ fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
     cfg
 }
 
-/// Config that makes the strategy retire its only channel through the full
-/// two-step closure.
+/// Makes the strategy retire its only channel through the full two-step closure.
 ///
-/// The channel's stake sits below `close_when_drained_below`, so the close pass
-/// selects it on the first tick without needing any probing history, and the
-/// finalize pass follows the moment the notice period is up
-/// (`max_closure_overdue = 0`).  Funding is switched off — an unaffordable safe
-/// floor with `stop_when_unfunded` — so the fund pass cannot take the channel's
-/// in-flight slot ahead of the close pass.
+/// The stake sits below `close_when_drained_below`, so the close pass selects it
+/// on the first tick with no probing history, and the finalize pass follows once
+/// the notice period is up (`max_closure_overdue = 0`).  Funding is off — an
+/// unaffordable safe floor — so the fund pass cannot take the slot first.
 fn retire_channel_config(lease: Duration) -> ChannelLifecycleConfig {
     let mut cfg = ChannelLifecycleConfig {
         tick_interval: TICK,

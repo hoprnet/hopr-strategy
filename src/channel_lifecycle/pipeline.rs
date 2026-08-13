@@ -65,10 +65,9 @@ where
     /// Returns the available safe balance, `Some(zero)` if the safe is not
     /// registered, or `None` if the chain could not answer.
     ///
-    /// `None` is distinct from a zero balance: it means *unknown*, and only the
-    /// passes that spend from the safe (fund, open) are skipped for this tick.
-    /// Reporting it as zero instead would make an unreachable chain look like an
-    /// empty safe.
+    /// `None` means *unknown*, not zero: only the passes that spend from the safe
+    /// (fund, open) are skipped.  Reporting zero would make an unreachable chain
+    /// look like an empty safe.
     pub(super) async fn safe_balance_budget(&self, deadline: Instant) -> Option<HoprBalance> {
         let me = *self.node.chain_api().me();
         let chain = self.node.chain_api().clone();
@@ -100,9 +99,8 @@ where
         .unwrap_or(self.cfg.proactive_funding.fallback_chain_op_duration)
     }
 
-    /// Total number of in-flight chain-write operations across all four kinds.
-    /// Slots whose lease has expired do not count: an operation that never
-    /// reported back must not consume the action budget forever.
+    /// In-flight chain writes across all four kinds.  Expired slots do not
+    /// count: an operation that never reported back must not hold the budget.
     fn total_in_flight(&self) -> usize {
         self.open_in_flight.held_count()
             + self.fund_in_flight.held_count()
@@ -110,8 +108,7 @@ where
             + self.finalize_in_flight.held_count()
     }
 
-    /// Drops expired action leases.  Called once per tick, before any pass reads
-    /// them, so slot counts and per-channel checks work from swept state.
+    /// Drops expired action leases, once per tick before any pass reads them.
     fn sweep_action_leases(&self) {
         self.open_in_flight.sweep();
         self.fund_in_flight.sweep();
@@ -119,21 +116,19 @@ where
         self.finalize_in_flight.sweep();
     }
 
-    /// The instant by which every chain read of the work starting now must be
-    /// done, from [`ConcurrencyConfig::chain_read_timeout`].
+    /// When the reads of the work starting now must be done, per
+    /// [`ConcurrencyConfig::chain_read_timeout`].
     pub(super) fn read_deadline(&self) -> Instant {
         Instant::now() + self.cfg.concurrency.chain_read_timeout
     }
 
     /// Runs a chain read against a shared `deadline`, mapping failure, timeout
-    /// and an already-elapsed deadline alike to `None`.
+    /// and a spent deadline alike to `None`.
     ///
-    /// The deadline is shared rather than per-read so that a chain hanging on
-    /// every read costs one budget for the whole tick instead of one per read.
-    /// That matters because the pipeline shares its task with the strategy's
-    /// event loop: for as long as a tick runs, no chain events are drained and
-    /// no slots are released.  Callers decide how to degrade; passes that do not
-    /// need the value keep running.
+    /// Sharing the deadline costs one budget for a whole hung tick instead of
+    /// one per read, which matters because the pipeline shares its task with the
+    /// event loop: while a tick runs, no events are drained and no slots
+    /// released.  Callers decide how to degrade.
     async fn read<T, E: std::fmt::Display>(
         &self,
         what: &'static str,
@@ -244,18 +239,14 @@ where
     // Action dispatchers
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Takes `key`'s slot, charges it against the shared action budget, and runs
-    /// `submit` under it, giving the slot back once the operation reports back.
+    /// Takes `key`'s slot, charges it against the action budget, and runs
+    /// `submit` under it.  Returns `false` if the slot was held or the budget
+    /// spent.
     ///
-    /// Returns `true` if the operation was started, `false` if the slot was
-    /// already held or the budget was exhausted.
-    ///
-    /// Every chain write goes through here so the three things that must happen
-    /// together — take the slot, honour
-    /// [`ConcurrencyConfig::max_concurrent_actions`], and release the slot on
-    /// *either* outcome — cannot drift apart between the four kinds of action.
-    /// A release that skipped a path would strand the slot until its lease
-    /// expired, which is the failure this whole mechanism exists to bound.
+    /// Every chain write goes through here so that taking the slot, honouring
+    /// [`ConcurrencyConfig::max_concurrent_actions`] and releasing on *either*
+    /// outcome cannot drift apart between the four kinds of action.  A missed
+    /// release strands the slot until its lease expires.
     fn spawn_leased<K, Fut>(
         &self,
         leases: &Arc<ActionLeases<K>>,
@@ -277,13 +268,9 @@ where
         let leases = Arc::clone(leases);
         hopr_utils::runtime::prelude::spawn(async move {
             submit().await;
-            // Released however the operation went: it is over either way.  A
-            // confirmation resolves only once the chain state it wrote is
-            // readable, so the next pass reads the new state rather than
-            // repeating the operation.  The matching chain event releases the
-            // slot too, for whichever arrives first; the lease covers the case
-            // where neither does.  `release_owned` is a no-op if this operation
-            // overran its lease and a later attempt now holds the slot.
+            // Released however it went.  A confirmation resolves only once the
+            // state it wrote is readable, so the next pass sees that state
+            // rather than repeating the operation.
             leases.release_owned(&key, holder);
         });
 
@@ -373,11 +360,9 @@ where
     /// config for this tick.  `amount` is `funding.initial_balance` (passed by
     /// the caller so this helper stays generic).
     ///
-    /// Before taking a slot, queries the current on-chain channel state so the
-    /// strategy converges to the desired state in this tick rather than
-    /// deferring to the next one.  The `channel_by_parties` call is serviced by
-    /// the in-process cache (moka + RocksDB), so the overhead is a fast
-    /// in-memory lookup in the common case.
+    /// Re-reads the channel before taking a slot so the strategy converges
+    /// within this tick rather than the next.  `channel_by_parties` is served by
+    /// the in-process cache, so this is a fast lookup in the common case.
     fn try_open_channel(&self, dest: Address, amount: HoprBalance, funding: &ResolvedFunding) -> Option<HoprBalance> {
         // The snapshot `all_channels` in `pipeline_inner` can be stale (race
         // between chain events and the snapshot pass), so re-read before
@@ -881,8 +866,8 @@ where
     /// refreshing it from the on-chain account stream when the cache is empty
     /// or older than [`PEER_ADDR_CACHE_TTL`].  Filtered to accounts with a
     /// published off-chain key, which is the only set we can address as peers.
-    /// Returns `None` when the account stream could not be read and no cached
-    /// map is available; the passes that need it are skipped for this tick.
+    /// `None` when the account stream failed and no cached map is available; the
+    /// passes needing it are skipped for this tick.
     async fn peer_addr_map(
         &self,
         chain: &N::ChainApi,

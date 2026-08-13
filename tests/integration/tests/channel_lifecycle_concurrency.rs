@@ -6,13 +6,12 @@
 //! `closure.close_max_concurrent` and `finalizer.finalize_max_concurrent`, and
 //! per channel to one operation of a kind at a time.
 //!
-//! Both directions matter.  Too little concurrency and a node with many channels
-//! converges a tick at a time; too much and it floods the chain with
-//! transactions, or issues two for the same channel and pays twice.  These tests
-//! assert the *simultaneity* rather than the eventual outcome, reading the
-//! watermarks [`ChainFaults`] records between a transaction's submission and its
-//! confirmation.  Confirmations are parked (`Fault::Hang`) so every operation the
-//! strategy starts stays outstanding and the watermark is observable.
+//! Both directions matter: too little and a node with many channels converges a
+//! tick at a time, too much and it floods the chain or pays twice for one
+//! channel.  These tests assert *simultaneity* rather than the eventual outcome,
+//! reading the watermarks [`ChainFaults`] records between submission and
+//! confirmation.  Confirmations are parked (`Fault::Hang`) so everything the
+//! strategy starts stays outstanding and observable.
 
 use std::{sync::Arc, time::Duration};
 

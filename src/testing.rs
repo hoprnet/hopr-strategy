@@ -725,9 +725,8 @@ impl EventKind {
 /// Shared, live-mutable fault configuration for a [`TestChainConnector`].
 ///
 /// Handed out by [`TestChainConnector::faults`] so a test can perturb the chain
-/// while the strategy under test is already running — which is how the failures
-/// this models actually occur.  Empty by default: a connector with no faults set
-/// behaves exactly as it did before.
+/// while the strategy is running — which is how these failures actually occur.
+/// Empty by default.
 ///
 /// ```text
 /// let faults = connector.faults();
@@ -746,8 +745,8 @@ impl EventKind {
 /// assert_eq!(faults.peak_in_flight(ChainOp::FundChannel), 1);
 /// ```
 ///
-/// `text` rather than a doctest because the example needs a connected
-/// [`TestChainConnector`], which exists only under the `testing` feature.
+/// `text` because the example needs a connected [`TestChainConnector`], which
+/// exists only under the `testing` feature.
 #[derive(Debug, Default)]
 pub struct ChainFaults {
     ops: dashmap::DashMap<ChainOp, Fault>,
@@ -756,25 +755,23 @@ pub struct ChainFaults {
     confirmations: dashmap::DashMap<ChainOp, Fault>,
     withheld_events: dashmap::DashSet<EventKind>,
     calls: dashmap::DashMap<ChainOp, usize>,
-    /// Write operations currently between submission and confirmation, and the
-    /// most that were ever outstanding at the same time — per kind and in total.
-    /// Lets a test observe how much the strategy actually does in parallel,
-    /// rather than only what it eventually achieves.
+    /// Writes between submission and confirmation, and the most ever outstanding
+    /// at once, per kind and in total.  Lets a test observe what the strategy
+    /// does in parallel, not just what it eventually achieves.
     in_flight: dashmap::DashMap<ChainOp, usize>,
     peak_in_flight: dashmap::DashMap<ChainOp, usize>,
     peak_in_flight_total: std::sync::atomic::AtomicUsize,
 }
 
 impl ChainFaults {
-    /// Makes `op` misbehave as `fault` from now on.  For write operations this
-    /// applies to *submission*; see [`ChainFaults::set_confirmation`].
+    /// Makes `op` misbehave from now on.  For writes this is *submission*; see
+    /// [`ChainFaults::set_confirmation`].
     pub fn set(&self, op: ChainOp, fault: Fault) {
         self.ops.insert(op, fault);
     }
 
-    /// Makes the *confirmation future* of write op `op` misbehave as `fault`,
-    /// while submission still succeeds.  Models a tx that is accepted but whose
-    /// outcome never arrives (`Hang`) or arrives as a failure (`Fail`).
+    /// Makes `op`'s confirmation misbehave while submission still succeeds: a tx
+    /// accepted but whose outcome never arrives (`Hang`) or fails (`Fail`).
     pub fn set_confirmation(&self, op: ChainOp, fault: Fault) {
         self.confirmations.insert(op, fault);
     }
@@ -785,8 +782,8 @@ impl ChainFaults {
         self.confirmations.remove(&op);
     }
 
-    /// Stops delivering `kind` to event subscribers.  Models the lossy event
-    /// broadcast: the on-chain effect still happens, the notification does not.
+    /// Stops delivering `kind` to subscribers, as the lossy broadcast does: the
+    /// on-chain effect still happens, the notification does not.
     pub fn withhold_event(&self, kind: EventKind) {
         self.withheld_events.insert(kind);
     }
@@ -796,8 +793,7 @@ impl ChainFaults {
         self.withheld_events.remove(&kind);
     }
 
-    /// Number of times `op` was invoked, counted on entry — before any injected
-    /// fault is applied.
+    /// Times `op` was invoked, counted on entry, before any injected fault.
     pub fn calls(&self, op: ChainOp) -> usize {
         self.calls.get(&op).map(|c| *c).unwrap_or(0)
     }
@@ -807,8 +803,8 @@ impl ChainFaults {
         self.peak_in_flight.get(&op).map(|c| *c).unwrap_or(0)
     }
 
-    /// Most write transactions of any kind that were ever in flight at the same
-    /// time — the figure `concurrency.max_concurrent_actions` bounds.
+    /// Most writes of any kind ever in flight at once — what
+    /// `concurrency.max_concurrent_actions` bounds.
     pub fn peak_in_flight_total(&self) -> usize {
         self.peak_in_flight_total.load(Ordering::Relaxed)
     }
@@ -864,9 +860,8 @@ impl ChainFaults {
         }
     }
 
-    /// Applies a fault to a synchronous, stream-returning operation.  `Fail`
-    /// surfaces as an error from the call itself; `Hang` is reported back to the
-    /// caller so it can return a stream that never yields.
+    /// Applies a fault to a stream-returning operation: `Fail` errors from the
+    /// call, `Hang` is returned so the caller can yield a pending stream.
     fn gate_stream(&self, op: ChainOp) -> Result<Fault, TestConnectorError> {
         self.record(op);
         match self.fault(op) {
@@ -1159,14 +1154,12 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
 
     /// Waits until this connector's own channel view satisfies `predicate`.
     ///
-    /// The emulated RPC wraps the chain, not the other way round: by the time a
-    /// submission returns, the transaction has been executed and its state
-    /// broadcast, so a confirmation handed back to a caller must not resolve
-    /// before that caller can read the result.  This connector ingests the
-    /// broadcast on a background task, so without this wait it would report
-    /// success against a view it has not caught up with — something no real
-    /// chain RPC does, and which would make callers act on state they have
-    /// already changed.
+    /// The emulated RPC wraps the chain, not the other way round: the tx has
+    /// already executed and broadcast by the time submission returns, so a
+    /// confirmation must not resolve before the caller can read the result.
+    /// This connector ingests that broadcast on a background task, so without
+    /// the wait it would report success against a view it has not caught up
+    /// with — which no real chain RPC does.
     async fn await_own_view(
         channels: std::sync::Arc<
             dashmap::DashMap<
@@ -1177,9 +1170,8 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
         channel_id: hopr_api::types::internal::prelude::ChannelId,
         predicate: impl Fn(&hopr_api::types::internal::prelude::ChannelEntry) -> bool,
     ) {
-        // Generous relative to the in-process broadcast this waits on; only a
-        // stuck background task can reach it, and the caller's own timeout
-        // covers that case.
+        // Generous for an in-process broadcast: only a stuck background task
+        // reaches it, and the caller's own timeout covers that.
         const LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
         const POLL: std::time::Duration = std::time::Duration::from_millis(2);
 

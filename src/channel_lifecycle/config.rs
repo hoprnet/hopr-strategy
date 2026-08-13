@@ -223,13 +223,10 @@ fn default_success_probability() -> f64 {
     0.999
 }
 
-/// Rejects a zero duration for knobs where zero disables the protection the knob
-/// exists to provide, rather than meaning "no limit".
-///
-/// A zero action lease expires the instant it is taken, so every pass would
-/// start another transaction for a channel that already has one in flight.  A
-/// zero read budget treats every chain read as unavailable, so no pass can ever
-/// act.
+/// Rejects a zero duration where zero disables the protection rather than
+/// meaning "no limit": a zero lease expires on the spot, so every pass would
+/// re-submit a transaction already in flight, and a zero read budget makes every
+/// read unavailable.
 fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationError> {
     match duration.is_zero() {
         true => Err(validator::ValidationError::new("duration must be greater than zero")),
@@ -664,28 +661,25 @@ pub struct ConcurrencyConfig {
     /// How long an in-flight chain-write operation holds its per-channel slot
     /// before the slot is reclaimed.
     ///
-    /// In-flight slots are normally released when the operation's confirmation
-    /// resolves, or when its chain event arrives (`ChannelOpened`,
-    /// `ChannelBalanceIncreased`, `ChannelClosureInitiated`,
-    /// `ChannelClosed`), whichever comes first.  Neither is
-    /// guaranteed: the event stream is lossy under load, and a task can be
-    /// starved or its node stopped mid-flight.  This timeout bounds how long a
-    /// single lost signal can suppress further action on a channel, and must
-    /// therefore exceed the worst-case tx confirmation plus indexer lag.
-    /// Default: 5 min.
+    /// A slot is normally released by whichever comes first: the operation's
+    /// confirmation resolving, or its chain event (`ChannelOpened`,
+    /// `ChannelBalanceIncreased`, `ChannelClosureInitiated`, `ChannelClosed`).
+    /// Neither is guaranteed — the event stream is lossy under load, and a task
+    /// can be starved or its node stopped mid-flight.  This bounds how long one
+    /// lost signal suppresses further action on a channel, so it must exceed the
+    /// worst-case confirmation plus indexer lag.  Default: 5 min.
     #[serde(with = "humantime_serde")]
     #[default(Duration::from_secs(5 * 60))]
     #[validate(custom(function = "validate_non_zero"))]
     pub action_lease_timeout: Duration,
 
-    /// Time budget for a single chain read (safe info, safe balance, ticket
-    /// economics, the channel and account streams).
+    /// Time budget shared by every chain read of a tick — safe info and balance,
+    /// ticket economics, the channel and account streams.
     ///
-    /// The pipeline shares a task with the strategy's chain-event handling, so
-    /// an unbounded read stalls ticks *and* event processing for as long as it
-    /// takes — indefinitely, if the read never answers.  A read that overruns
-    /// this budget is treated as unavailable for the current tick and retried
-    /// on the next one.  Default: 30 s.
+    /// The pipeline shares a task with chain-event handling, so an unbounded
+    /// read stalls ticks *and* event processing, indefinitely if it never
+    /// answers.  Reads that overrun the budget count as unavailable for that
+    /// tick and are retried on the next.  Default: 30 s.
     #[serde(with = "humantime_serde")]
     #[default(Duration::from_secs(30))]
     #[validate(custom(function = "validate_non_zero"))]

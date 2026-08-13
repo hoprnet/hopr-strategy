@@ -53,13 +53,11 @@
 //! `ChannelId` (fund / close / finalize) or peer `Address` (open).  The on-chain
 //! `ChannelStatus` plus those leases together drive transitions.
 //!
-//! Every in-flight state is left by one of three routes: the operation's
-//! confirmation resolving, either way; the chain event named on its edge above;
-//! or — because neither is guaranteed to arrive — the expiry of the operation's
-//! lease ([`ConcurrencyConfig::action_lease_timeout`]).  The chain, not the
-//! strategy's bookkeeping, is the source of truth: after a lease expires the
-//! next tick re-reads the channel and only acts if it still needs the
-//! operation.
+//! An in-flight state is left by the operation's confirmation resolving, by the
+//! chain event on its edge above, or — since neither is guaranteed — by its
+//! lease expiring ([`ConcurrencyConfig::action_lease_timeout`]).  After an
+//! expiry the next tick re-reads the channel and acts only if the operation is
+//! still needed: the chain is the source of truth, not this bookkeeping.
 //!
 //! The cooldown is keyed by peer `Address` with an `Instant`-stamped map entry.
 //!
@@ -160,14 +158,12 @@ lazy_static::lazy_static! {
         ).unwrap();
 }
 
-/// Identifies one holder of a slot, so a release can tell whether the slot it is
-/// giving back is still its own.
+/// Identifies one holder of a slot, so a release can tell its own slot from a
+/// successor's.
 ///
-/// Slot ownership turns over when a lease expires and a later attempt takes the
-/// key again.  The stale attempt may still report back afterwards — a slow
-/// confirmation eventually resolves — and without this it would release the
-/// *successor's* live slot, letting a third attempt start while the second is
-/// still pending.
+/// Ownership turns over when a lease expires and a later attempt takes the key.
+/// The stale attempt may still report back — a slow confirmation eventually
+/// resolves — and must not free the successor's live slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LeaseId(u64);
 
@@ -180,17 +176,15 @@ struct Lease {
 
 /// Time-bounded exclusive slots for in-flight chain-write operations.
 ///
-/// A slot is taken before a transaction is submitted and released when the
-/// operation is over: its confirmation resolved, either way, or the
-/// corresponding chain event arrived.  Neither signal is guaranteed — the event
-/// broadcast drops events under load, and a confirmation may never resolve — so
-/// each slot also carries a deadline.  Once that passes the slot is reclaimed
-/// and the operation may be attempted again.
+/// A slot is taken before a transaction is submitted and released when its
+/// confirmation resolves or its chain event arrives.  Neither is guaranteed —
+/// the event broadcast drops events under load, and a confirmation may never
+/// resolve — so each slot also carries a deadline.
 ///
-/// Without the deadline a single lost signal suppresses that channel's
-/// operation forever, and — because slots share a global budget
-/// ([`ConcurrencyConfig::max_concurrent_actions`]) — enough lost signals
-/// suppress every operation on every channel.
+/// Without it one lost signal suppresses that channel's operation forever, and
+/// since slots share a global budget
+/// ([`ConcurrencyConfig::max_concurrent_actions`]), enough lost signals suppress
+/// every operation on every channel.
 struct ActionLeases<K> {
     leases: DashMap<K, Lease>,
     /// Source of [`LeaseId`]s, unique across every key of this set.
@@ -243,19 +237,17 @@ impl<K: Eq + Hash + Clone> ActionLeases<K> {
 
     /// Releases the slot for `key` if `holder` still holds it.
     ///
-    /// Used by an operation reporting its own outcome: if its lease has since
-    /// expired and been taken by a later attempt, this is a no-op and the
-    /// successor keeps its slot.
+    /// Used by an operation reporting its own outcome; a no-op once the slot has
+    /// turned over, so the successor keeps it.
     fn release_owned(&self, key: &K, holder: LeaseId) {
         self.leases.remove_if(key, |_, lease| lease.holder == holder);
     }
 
     /// Releases the slot for `key` whoever holds it.
     ///
-    /// Used by chain events, which report on the channel rather than on a
-    /// particular attempt and so carry no [`LeaseId`].  Idempotent: releasing a
-    /// slot that is not held is a no-op, which is what an event arriving after a
-    /// restart or after the deadline does.
+    /// Used by chain events, which report on the channel rather than on one
+    /// attempt and so carry no [`LeaseId`].  Releasing an unheld slot is a
+    /// no-op, as an event arriving after a restart or a deadline does.
     fn release(&self, key: &K) {
         self.leases.remove(key);
     }
@@ -272,7 +264,7 @@ impl<K: Eq + Hash + Clone> ActionLeases<K> {
         self.leases.iter().filter(|entry| entry.value().until > now).count()
     }
 
-    /// Drops expired entries.  Only reclaims memory: expired slots already read
+    /// Drops expired entries.  Reclaims memory only — expired slots already read
     /// as free.
     fn sweep(&self) {
         let now = Instant::now();
@@ -290,8 +282,7 @@ mod action_leases {
     use super::*;
 
     const HELD: Duration = Duration::from_secs(3600);
-    /// Expires the instant it is taken, standing in for a lease whose operation
-    /// overran its deadline.
+    /// Expires the instant it is taken: a lease whose operation overran it.
     const EXPIRED: Duration = Duration::ZERO;
 
     #[test]
@@ -318,10 +309,9 @@ mod action_leases {
         assert!(leases.is_held(&"channel"));
     }
 
-    /// The operation whose lease expired may still report back afterwards — a
-    /// slow confirmation eventually resolves.  Releasing by key alone would then
-    /// free the successor's live slot and let a third attempt start while the
-    /// second is still in flight.
+    /// An operation that overran its lease may still report back.  Releasing by
+    /// key alone would free the successor's live slot, letting a third attempt
+    /// start while the second is still in flight.
     #[test]
     fn action_leases_should_keep_the_slot_when_a_stale_holder_releases_it() {
         let leases = ActionLeases::default();
@@ -336,8 +326,8 @@ mod action_leases {
         assert!(!leases.is_held(&"channel"), "its own holder may release it");
     }
 
-    /// Chain events report on the channel rather than on one attempt, so they
-    /// release whoever holds the slot.
+    /// Events report on the channel, not on one attempt, so they release
+    /// whoever holds the slot.
     #[test]
     fn action_leases_should_release_any_holder_when_a_chain_event_reports() {
         let leases = ActionLeases::default();
