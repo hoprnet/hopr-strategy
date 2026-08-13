@@ -254,12 +254,14 @@ where
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, %e, "channel-lifecycle: funding tx failed");
-                        in_flight.release(&channel_id);
                     }
-                    // On success the ChannelBalanceIncreased event releases the
-                    // slot, which also tells us the indexer has caught up so the
-                    // next fund pass sees the new balance.  If that event is
-                    // lost, or this task never gets here, the lease expires.
+                    // Released either way: the operation is over.  A confirmation
+                    // resolves only once the chain state it wrote is readable, so
+                    // the next fund pass sizes against the new balance rather
+                    // than re-funding.  ChannelBalanceIncreased releases the slot
+                    // too, for whichever arrives first; the lease covers the case
+                    // where neither does.
+                    in_flight.release(&channel_id);
                 }
                 Err(e) => {
                     warn!(%channel_id, %e, "channel-lifecycle: failed to submit funding tx");
@@ -298,10 +300,12 @@ where
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, %e, "channel-lifecycle: close tx failed");
-                        in_flight.release(&channel_id);
                     }
-                    // On success the ChannelClosureInitiated event releases the
-                    // slot; if it is lost, the lease expires.
+                    // Released either way — see `try_fund_channel`.  The channel
+                    // reads as PendingToClose from here on, so the close pass
+                    // passes over it and the finalize pass takes it up once the
+                    // notice period elapses.
+                    in_flight.release(&channel_id);
                 }
                 Err(e) => {
                     warn!(%channel_id, %e, "channel-lifecycle: failed to submit close tx");
@@ -341,10 +345,9 @@ where
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed");
-                        in_flight.release(&channel_id);
                     }
-                    // On success the ChannelClosed event releases the slot; if it
-                    // is lost, the lease expires.
+                    // Released either way — see `try_fund_channel`.
+                    in_flight.release(&channel_id);
                 }
                 Err(e) => {
                     warn!(%channel_id, %e, "channel-lifecycle: failed to submit finalize tx");
@@ -426,9 +429,8 @@ where
                     if let Err(e) = confirmation.await {
                         warn!(%dest, %e, "channel-lifecycle: open tx failed");
                     }
-                    // Clear in_flight once the confirmation future resolves,
-                    // success or failure — the tx is no longer pending either way.
-                    // ChannelOpened event handler also clears it as a no-op fallback.
+                    // Released either way — see `try_fund_channel`.  ChannelOpened
+                    // releases it too, as a no-op fallback.
                     in_flight.release(&dest);
                 }
                 Err(e) => {

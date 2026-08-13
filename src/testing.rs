@@ -43,7 +43,7 @@ use hopr_api::{
         },
         internal::prelude::{
             AccountEntry, AccountType, ChannelBuilder, ChannelId, ChannelStatus, RedeemableTicket, VerifiedTicket,
-            WinningProbability,
+            WinningProbability, generate_channel_id,
         },
         primitive::prelude::{Address, HoprBalance, WxHOPR, XDai},
     },
@@ -717,6 +717,13 @@ pub struct ChainFaults {
     confirmations: dashmap::DashMap<ChainOp, Fault>,
     withheld_events: dashmap::DashSet<EventKind>,
     calls: dashmap::DashMap<ChainOp, usize>,
+    /// Write operations currently between submission and confirmation, and the
+    /// most that were ever outstanding at the same time — per kind and in total.
+    /// Lets a test observe how much the strategy actually does in parallel,
+    /// rather than only what it eventually achieves.
+    in_flight: dashmap::DashMap<ChainOp, usize>,
+    peak_in_flight: dashmap::DashMap<ChainOp, usize>,
+    peak_in_flight_total: std::sync::atomic::AtomicUsize,
 }
 
 impl ChainFaults {
@@ -754,6 +761,43 @@ impl ChainFaults {
     /// fault is applied.
     pub fn calls(&self, op: ChainOp) -> usize {
         self.calls.get(&op).map(|c| *c).unwrap_or(0)
+    }
+
+    /// Most `op` transactions that were ever in flight at the same time.
+    pub fn peak_in_flight(&self, op: ChainOp) -> usize {
+        self.peak_in_flight.get(&op).map(|c| *c).unwrap_or(0)
+    }
+
+    /// Most write transactions of any kind that were ever in flight at the same
+    /// time — the figure `concurrency.max_concurrent_actions` bounds.
+    pub fn peak_in_flight_total(&self) -> usize {
+        self.peak_in_flight_total.load(Ordering::Relaxed)
+    }
+
+    /// Marks a submitted write as outstanding and updates the watermarks.
+    fn enter_in_flight(&self, op: ChainOp) {
+        let mut total = 0;
+        {
+            let mut outstanding = self.in_flight.entry(op).or_insert(0);
+            *outstanding += 1;
+            let per_op = *outstanding;
+            drop(outstanding);
+            let mut peak = self.peak_in_flight.entry(op).or_insert(0);
+            if per_op > *peak {
+                *peak = per_op;
+            }
+        }
+        for entry in self.in_flight.iter() {
+            total += *entry.value();
+        }
+        self.peak_in_flight_total.fetch_max(total, Ordering::Relaxed);
+    }
+
+    /// Marks an outstanding write as finished.
+    fn leave_in_flight(&self, op: ChainOp) {
+        if let Some(mut outstanding) = self.in_flight.get_mut(&op) {
+            *outstanding = outstanding.saturating_sub(1);
+        }
     }
 
     fn fault(&self, op: ChainOp) -> Fault {
@@ -1075,6 +1119,45 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             .build()?)
     }
 
+    /// Waits until this connector's own channel view satisfies `predicate`.
+    ///
+    /// The emulated RPC wraps the chain, not the other way round: by the time a
+    /// submission returns, the transaction has been executed and its state
+    /// broadcast, so a confirmation handed back to a caller must not resolve
+    /// before that caller can read the result.  This connector ingests the
+    /// broadcast on a background task, so without this wait it would report
+    /// success against a view it has not caught up with — something no real
+    /// chain RPC does, and which would make callers act on state they have
+    /// already changed.
+    async fn await_own_view(
+        channels: std::sync::Arc<
+            dashmap::DashMap<
+                hopr_api::types::internal::prelude::ChannelId,
+                hopr_api::types::internal::prelude::ChannelEntry,
+            >,
+        >,
+        channel_id: hopr_api::types::internal::prelude::ChannelId,
+        predicate: impl Fn(&hopr_api::types::internal::prelude::ChannelEntry) -> bool,
+    ) {
+        // Generous relative to the in-process broadcast this waits on; only a
+        // stuck background task can reach it, and the caller's own timeout
+        // covers that case.
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let deadline = std::time::Instant::now() + LIMIT;
+        loop {
+            if channels.get(&channel_id).is_some_and(|entry| predicate(&entry)) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(%channel_id, "test connector: own view never caught up with the confirmed tx");
+                return;
+            }
+            futures_time::task::sleep(POLL.into()).await;
+        }
+    }
+
     async fn send_tx(
         client: &BlokliTestClient<M>,
         tx_req: hopr_api::types::chain::payload::TransactionRequest,
@@ -1342,13 +1425,19 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
     ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
         self.faults.gate(ChainOp::OpenChannel).await?;
 
+        let channel_id = generate_channel_id(&self.my_addr, dst);
         let tx_req = self.payload_gen()?.fund_channel(*dst, amount)?;
         let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
             .await
             .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
+        let channels = self.channels.clone();
+        faults.enter_in_flight(ChainOp::OpenChannel);
         Ok(Box::pin(async move {
-            faults.confirm(ChainOp::OpenChannel).await?;
+            Self::await_own_view(channels, channel_id, |channel| channel.status == ChannelStatus::Open).await;
+            let outcome = faults.confirm(ChainOp::OpenChannel).await;
+            faults.leave_in_flight(ChainOp::OpenChannel);
+            outcome?;
             Ok(receipt)
         }))
     }
@@ -1367,12 +1456,19 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .ok_or_else(|| anyhow::anyhow!("channel {channel_id} not found"))?;
 
         let tx_req = self.payload_gen()?.fund_channel(channel.destination, amount)?;
+        let funded_to = channel.balance + amount;
         let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
             .await
             .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
+        let channels = self.channels.clone();
+        let channel_id = *channel_id;
+        faults.enter_in_flight(ChainOp::FundChannel);
         Ok(Box::pin(async move {
-            faults.confirm(ChainOp::FundChannel).await?;
+            Self::await_own_view(channels, channel_id, |channel| channel.balance >= funded_to).await;
+            let outcome = faults.confirm(ChainOp::FundChannel).await;
+            faults.leave_in_flight(ChainOp::FundChannel);
+            outcome?;
             Ok(receipt)
         }))
     }
@@ -1399,12 +1495,22 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             ChannelStatus::Closed => return Err(anyhow::anyhow!("channel {channel_id} is already closed").into()),
         };
 
+        let previous_status = channel.status;
         let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
             .await
             .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
+        let channels = self.channels.clone();
+        let channel_id = *channel_id;
+        faults.enter_in_flight(ChainOp::CloseChannel);
         Ok(Box::pin(async move {
-            faults.confirm(ChainOp::CloseChannel).await?;
+            // Closure is two steps (Open → PendingToClose → Closed); either way
+            // the status this call moved the channel out of must be gone from
+            // our own view before we report success.
+            Self::await_own_view(channels, channel_id, |channel| channel.status != previous_status).await;
+            let outcome = faults.confirm(ChainOp::CloseChannel).await;
+            faults.leave_in_flight(ChainOp::CloseChannel);
+            outcome?;
             Ok(receipt)
         }))
     }
