@@ -53,25 +53,15 @@ fn validate_funding_amount(amount: &HoprBalance) -> std::result::Result<(), Vali
 
 /// Configuration for `AutoFundingStrategy`.
 ///
-/// Every field is optional; an omitted field takes its default, and an unknown
-/// key is a load-time error rather than a silent fallback.
+/// Every field is optional; unknown keys are rejected.
 ///
 /// ```
-/// # use hopr_strategy::auto_funding::AutoFundingStrategyConfig;
+/// # use hopr_strategy::auto_funding::AutoFundingStrategyConfig as C;
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// // An empty config is the default config.
-/// let cfg: AutoFundingStrategyConfig = serde_json::from_str("{}")?;
-/// assert_eq!(cfg, AutoFundingStrategyConfig::default());
-///
-/// // Override one field; the other keeps its default.
-/// let cfg: AutoFundingStrategyConfig = serde_json::from_str(r#"{"funding_amount":"20 wxHOPR"}"#)?;
-/// assert_eq!(
-///     cfg.min_stake_threshold,
-///     AutoFundingStrategyConfig::default().min_stake_threshold
-/// );
-///
-/// // A misspelled key is rejected.
-/// assert!(serde_json::from_str::<AutoFundingStrategyConfig>(r#"{"funding_amont":"20 wxHOPR"}"#).is_err());
+/// assert_eq!(serde_json::from_str::<C>("{}")?, C::default());
+/// let cfg: C = serde_json::from_str(r#"{"funding_amount":"20 wxHOPR"}"#)?;
+/// assert_eq!(cfg.min_stake_threshold, C::default().min_stake_threshold);
+/// assert!(serde_json::from_str::<C>(r#"{"funding_amont":"20 wxHOPR"}"#).is_err());
 /// # Ok(())
 /// # }
 /// ```
@@ -100,9 +90,6 @@ pub struct AutoFundingStrategyConfig {
 /// Call [`new`](AutoFundingStrategy::new) with the strategy configuration,
 /// then [`build`](AutoFundingStrategy::build) to wire in a node and obtain a
 /// runnable `Box<dyn Strategy + Send>`.
-///
-/// [`build`](AutoFundingStrategy::build) validates the configuration and returns
-/// an error rather than panicking; see [`AutoFundingStrategyConfig`].
 pub struct AutoFundingStrategy {
     cfg: AutoFundingStrategyConfig,
     interval: Duration,
@@ -130,27 +117,15 @@ impl AutoFundingStrategy {
     ///
     /// # Errors
     ///
-    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
-    /// of its declared constraints — for `AutoFundingStrategyConfig` that means a
-    /// `funding_amount` of zero.
+    /// [`StrategyError::InvalidConfiguration`] if `funding_amount` is zero — the
+    /// only constraint this config declares. Never panics.
     ///
     /// ```text
-    /// // Propagate, like any other error — `build` never panics on a bad config.
     /// let strategy = AutoFundingStrategy::new(cfg, interval).build(node)?;
-    ///
-    /// // Or single out the configuration case.
-    /// match AutoFundingStrategy::new(cfg, interval).build(node) {
-    ///     Ok(strategy) => spawn(strategy),
-    ///     Err(StrategyError::InvalidConfiguration(msg)) => bail!("bad auto-funding config: {msg}"),
-    ///     Err(e) => return Err(e.into()),
-    /// }
     /// ```
     ///
-    /// Not a compiled doctest: `N`'s bounds require a live node whose `ChainApi`
-    /// implements the full chain read/write trait set, and no such type is
-    /// constructible outside the `testing` feature. See
-    /// `build_should_reject_zero_funding_amount` in this module's tests for an
-    /// executable version.
+    /// `text` because `N`'s bounds need a live node, constructible only under the
+    /// `testing` feature; see `tests::build_should_reject_zero_funding_amount`.
     pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,

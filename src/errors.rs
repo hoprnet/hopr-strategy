@@ -10,17 +10,15 @@ pub enum StrategyError {
     #[error("strategy could not perform action because action of the same type is on-going")]
     InProgress,
 
-    /// A strategy was given a configuration that violates its declared
-    /// constraints. Returned by strategy builders instead of panicking, so the
-    /// caller can report it through its own error type.
+    /// Returned by every strategy builder — instead of panicking — when the
+    /// configuration violates its declared constraints.
     ///
     /// ```
     /// # use hopr_strategy::errors::StrategyError;
-    /// let err = StrategyError::InvalidConfiguration("assumed_hops: out of range".into());
-    /// assert!(matches!(err, StrategyError::InvalidConfiguration(_)));
+    /// let err = StrategyError::InvalidConfiguration("sizing_mode: out of range".into());
     /// assert_eq!(
     ///     err.to_string(),
-    ///     "invalid strategy configuration: assumed_hops: out of range"
+    ///     "invalid strategy configuration: sizing_mode: out of range"
     /// );
     /// ```
     #[error("invalid strategy configuration: {0}")]
@@ -41,13 +39,9 @@ impl StrategyError {
         StrategyError::Other(e.into())
     }
 
-    /// Validate a strategy configuration, mapping any constraint violation to
-    /// [`Self::InvalidConfiguration`].
-    ///
-    /// Every strategy builder runs this so a configuration that violates its own
-    /// declared constraints is reported as an error at wiring time rather than
-    /// panicking or being silently ignored. Callers that load configuration
-    /// themselves can use it to fail early with the same error.
+    /// Validate a strategy configuration, mapping a constraint violation to
+    /// [`Self::InvalidConfiguration`]. Every builder runs this; config loaders can
+    /// call it to fail early with the same error.
     ///
     /// ```
     /// # use hopr_strategy::errors::StrategyError;
@@ -60,10 +54,7 @@ impl StrategyError {
     /// }
     ///
     /// assert!(StrategyError::validate_config(&Cfg { hops: 3 }).is_ok());
-    /// assert!(matches!(
-    ///     StrategyError::validate_config(&Cfg { hops: 0 }),
-    ///     Err(StrategyError::InvalidConfiguration(_))
-    /// ));
+    /// assert!(StrategyError::validate_config(&Cfg { hops: 0 }).is_err());
     /// ```
     pub fn validate_config<C: validator::Validate>(cfg: &C) -> Result<()> {
         cfg.validate()
