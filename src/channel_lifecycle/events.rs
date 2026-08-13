@@ -68,7 +68,7 @@ where
             // Bounded by `concurrency.chain_read_timeout`: this runs on the same
             // task as the event loop, so an unbounded read here would stop the
             // strategy from draining events at all.
-            match self.safe_balance_budget().await {
+            match self.safe_balance_budget(self.read_deadline()).await {
                 Some(budget) if !funding.topup_balance.is_zero() && budget >= funding.topup_balance => {
                     self.try_fund_channel(&ch, funding.topup_balance);
                 }

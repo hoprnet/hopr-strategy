@@ -663,29 +663,48 @@ pub enum Fault {
     Hang,
 }
 
-/// Chain operations that [`ChainFaults`] can perturb.
+/// Chain operations that [`ChainFaults`] can perturb, each naming the call it
+/// stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChainOp {
+    /// `ChainReadSafeOperations::safe_info`.
     SafeInfo,
+    /// `ChainValues::balance`, for the safe and for per-peer stake.
     Balance,
+    /// `ChainValues::minimum_ticket_price`.
     TicketPrice,
+    /// `ChainValues::minimum_incoming_ticket_win_prob`.
     WinProb,
+    /// `ChainValues::typical_resolution_time`.
     ResolutionTime,
+    /// `ChainReadChannelOperations::stream_channels`.
     StreamChannels,
+    /// `ChainReadAccountOperations::stream_accounts`.
     StreamAccounts,
+    /// `ChainWriteChannelOperations::open_channel`.
     OpenChannel,
+    /// `ChainWriteChannelOperations::fund_channel`.
     FundChannel,
+    /// `ChainWriteChannelOperations::close_channel`, which both initiates and
+    /// finalizes a closure depending on the channel's status.
     CloseChannel,
 }
 
 /// Chain event kinds that [`ChainFaults`] can withhold from subscribers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
+    /// `ChainEvent::ChannelBalanceIncreased`, reporting a funded channel.
     BalanceIncreased,
+    /// `ChainEvent::ChannelBalanceDecreased`, reporting a drained channel.
     BalanceDecreased,
+    /// `ChainEvent::ChannelOpened`.
     ChannelOpened,
+    /// `ChainEvent::ChannelClosureInitiated`, the first of the two closure
+    /// steps: the channel has entered its notice period.
     ClosureInitiated,
+    /// `ChainEvent::ChannelClosed`, the second closure step.
     Closed,
+    /// `ChainEvent::TicketRedeemed`.
     TicketRedeemed,
 }
 
@@ -709,6 +728,26 @@ impl EventKind {
 /// while the strategy under test is already running — which is how the failures
 /// this models actually occur.  Empty by default: a connector with no faults set
 /// behaves exactly as it did before.
+///
+/// ```text
+/// let faults = connector.faults();
+///
+/// // The funding tx lands, but its outcome never comes back and the event that
+/// // would report it is lost — the strategy learns nothing either way.
+/// faults.set_confirmation(ChainOp::FundChannel, Fault::Hang);
+/// faults.withhold_event(EventKind::BalanceIncreased);
+///
+/// // ... drive the strategy, then let the chain recover:
+/// faults.clear(ChainOp::FundChannel);
+/// faults.deliver_event(EventKind::BalanceIncreased);
+///
+/// // What the strategy did meanwhile:
+/// assert_eq!(faults.calls(ChainOp::FundChannel), 1);
+/// assert_eq!(faults.peak_in_flight(ChainOp::FundChannel), 1);
+/// ```
+///
+/// `text` rather than a doctest because the example needs a connected
+/// [`TestChainConnector`], which exists only under the `testing` feature.
 #[derive(Debug, Default)]
 pub struct ChainFaults {
     ops: dashmap::DashMap<ChainOp, Fault>,

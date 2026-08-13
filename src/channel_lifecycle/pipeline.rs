@@ -69,12 +69,12 @@ where
     /// passes that spend from the safe (fund, open) are skipped for this tick.
     /// Reporting it as zero instead would make an unreachable chain look like an
     /// empty safe.
-    pub(super) async fn safe_balance_budget(&self) -> Option<HoprBalance> {
+    pub(super) async fn safe_balance_budget(&self, deadline: Instant) -> Option<HoprBalance> {
         let me = *self.node.chain_api().me();
         let chain = self.node.chain_api().clone();
 
         let safe = self
-            .read("safe_info", chain.safe_info(SafeSelector::NodeAddress(me)))
+            .read("safe_info", deadline, chain.safe_info(SafeSelector::NodeAddress(me)))
             .await?;
 
         let Some(safe) = safe else {
@@ -85,14 +85,15 @@ where
             return Some(HoprBalance::zero());
         };
 
-        self.read("safe_balance", chain.balance(safe.address)).await
+        self.read("safe_balance", deadline, chain.balance(safe.address)).await
     }
 
     /// Returns the chain's estimated transaction confirmation time, falling
     /// back to the configured default if the chain cannot be asked.
-    pub(super) async fn est_tx_time(&self) -> Duration {
+    pub(super) async fn est_tx_time(&self, deadline: Instant) -> Duration {
         self.read(
             "typical_resolution_time",
+            deadline,
             self.node.chain_api().typical_resolution_time(),
         )
         .await
@@ -118,20 +119,38 @@ where
         self.finalize_in_flight.sweep();
     }
 
-    /// Runs a chain read under the configured time budget, mapping both failure
-    /// and timeout to `None`.
+    /// The instant by which every chain read of the work starting now must be
+    /// done, from [`ConcurrencyConfig::chain_read_timeout`].
+    pub(super) fn read_deadline(&self) -> Instant {
+        Instant::now() + self.cfg.concurrency.chain_read_timeout
+    }
+
+    /// Runs a chain read against a shared `deadline`, mapping failure, timeout
+    /// and an already-elapsed deadline alike to `None`.
     ///
-    /// The pipeline shares its task with the strategy's event loop, so an
-    /// unbounded read stalls both.  Callers decide how to degrade; passes that
-    /// do not need the value keep running.
+    /// The deadline is shared rather than per-read so that a chain hanging on
+    /// every read costs one budget for the whole tick instead of one per read.
+    /// That matters because the pipeline shares its task with the strategy's
+    /// event loop: for as long as a tick runs, no chain events are drained and
+    /// no slots are released.  Callers decide how to degrade; passes that do not
+    /// need the value keep running.
     async fn read<T, E: std::fmt::Display>(
         &self,
         what: &'static str,
+        deadline: Instant,
         op: impl Future<Output = Result<T, E>>,
     ) -> Option<T> {
         use futures_time::future::FutureExt as _;
 
-        let budget = self.cfg.concurrency.chain_read_timeout;
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            warn!(
+                what,
+                "channel-lifecycle: chain read skipped: budget for this tick is spent"
+            );
+            return None;
+        }
+
         match op.timeout(futures_time::time::Duration::from(budget)).await {
             Ok(Ok(value)) => Some(value),
             Ok(Err(e)) => {
@@ -424,14 +443,18 @@ where
         // budget and per-channel checks see only genuinely pending work.
         self.sweep_action_leases();
 
+        // One budget for every read this tick makes, not one each: see `read`.
+        let deadline = self.read_deadline();
+
         // `safe_balance` is `None` when the chain could not answer: the fund and
         // open passes are skipped for this tick, close and finalize still run.
-        let (est_tx_time_val, safe_balance) = futures::join!(self.est_tx_time(), self.safe_balance_budget());
+        let (est_tx_time_val, safe_balance) =
+            futures::join!(self.est_tx_time(deadline), self.safe_balance_budget(deadline));
         let est_tx_secs = est_tx_time_val.as_secs_f64();
 
         // The channel list is the one input no pass can do without.
         let Some(all_channels) = self
-            .read("stream_channels", async {
+            .read("stream_channels", deadline, async {
                 let mut all_channels: Vec<ChannelEntry> = Vec::new();
                 let mut s = chain.stream_channels(ChannelSelector::default().with_source(me))?;
                 while let Some(ch) = s.next().await {
@@ -483,9 +506,10 @@ where
         // close and finalize still run.
         let (ticket_price, win_prob): (Option<_>, Option<f64>) = {
             let (price, wp) = futures::join!(
-                self.read("minimum_ticket_price", chain.minimum_ticket_price()),
+                self.read("minimum_ticket_price", deadline, chain.minimum_ticket_price()),
                 self.read(
                     "minimum_incoming_ticket_win_prob",
+                    deadline,
                     chain.minimum_incoming_ticket_win_prob()
                 )
             );
@@ -511,7 +535,7 @@ where
 
         // Without the peer map the selector cannot score anyone, so the close
         // and open passes are skipped; fund and finalize do not need it.
-        let peer_addr_map = self.peer_addr_map(chain).await;
+        let peer_addr_map = self.peer_addr_map(chain, deadline).await;
 
         let addr_to_key: HashMap<Address, OffchainPublicKey> = peer_addr_map
             .iter()
@@ -730,7 +754,8 @@ where
 
         // On-chain stake scores — only fetched when the active selector requests STAKE.
         let stake_view = if self.selector.required_signals().contains(SignalSet::STAKE) {
-            self.fetch_stake_view(chain, &close_candidates, &open_candidates).await
+            self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
+                .await
         } else {
             StakeView::empty()
         };
@@ -858,7 +883,11 @@ where
     /// published off-chain key, which is the only set we can address as peers.
     /// Returns `None` when the account stream could not be read and no cached
     /// map is available; the passes that need it are skipped for this tick.
-    async fn peer_addr_map(&self, chain: &N::ChainApi) -> Option<HashMap<PeerId, (OffchainPublicKey, Address)>> {
+    async fn peer_addr_map(
+        &self,
+        chain: &N::ChainApi,
+        deadline: Instant,
+    ) -> Option<HashMap<PeerId, (OffchainPublicKey, Address)>> {
         let cached = {
             let guard = self.peer_addr_cache.lock();
             guard.as_ref().and_then(|c| {
@@ -875,7 +904,7 @@ where
         }
 
         let map = self
-            .read("stream_accounts", async {
+            .read("stream_accounts", deadline, async {
                 let mut map: HashMap<PeerId, (OffchainPublicKey, Address)> = HashMap::new();
                 let mut accounts = chain.stream_accounts(AccountSelector::default().with_public_only(true))?;
                 while let Some(account) = accounts.next().await {
@@ -903,6 +932,7 @@ where
     async fn fetch_stake_view(
         &self,
         chain: &N::ChainApi,
+        deadline: Instant,
         close_candidates: &[CloseCandidate],
         open_candidates: &[OpenCandidate],
     ) -> StakeView {
@@ -920,7 +950,7 @@ where
         // Stream all accounts to build chain_addr → safe_address mapping.
         let safe_map: HashMap<Address, Address> = {
             let accounts = self
-                .read("stream_accounts (stake view)", async {
+                .read("stream_accounts (stake view)", deadline, async {
                     let mut m = HashMap::new();
                     let mut stream = chain.stream_accounts(AccountSelector::default())?;
                     while let Some(account) = stream.next().await {

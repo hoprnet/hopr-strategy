@@ -223,6 +223,20 @@ fn default_success_probability() -> f64 {
     0.999
 }
 
+/// Rejects a zero duration for knobs where zero disables the protection the knob
+/// exists to provide, rather than meaning "no limit".
+///
+/// A zero action lease expires the instant it is taken, so every pass would
+/// start another transaction for a channel that already has one in flight.  A
+/// zero read budget treats every chain read as unavailable, so no pass can ever
+/// act.
+fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationError> {
+    match duration.is_zero() {
+        true => Err(validator::ValidationError::new("duration must be greater than zero")),
+        false => Ok(()),
+    }
+}
+
 fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::ValidationError> {
     if let CapacitySizingMode::Probabilistic { success_probability } = mode
         && !(*success_probability >= 0.5001 && *success_probability <= 0.99999)
@@ -661,6 +675,7 @@ pub struct ConcurrencyConfig {
     /// Default: 5 min.
     #[serde(with = "humantime_serde")]
     #[default(Duration::from_secs(5 * 60))]
+    #[validate(custom(function = "validate_non_zero"))]
     pub action_lease_timeout: Duration,
 
     /// Time budget for a single chain read (safe info, safe balance, ticket
@@ -673,6 +688,7 @@ pub struct ConcurrencyConfig {
     /// on the next one.  Default: 30 s.
     #[serde(with = "humantime_serde")]
     #[default(Duration::from_secs(30))]
+    #[validate(custom(function = "validate_non_zero"))]
     pub chain_read_timeout: Duration,
 }
 
