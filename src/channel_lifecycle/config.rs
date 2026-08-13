@@ -645,6 +645,21 @@ pub struct ConcurrencyConfig {
     /// next tick.  Default: 4.
     #[default = 4]
     pub max_concurrent_actions: usize,
+
+    /// How long an in-flight chain-write operation holds its per-channel slot
+    /// before the slot is reclaimed.
+    ///
+    /// In-flight slots are normally released when the operation's chain event
+    /// arrives (`ChannelBalanceIncreased`, `ChannelClosureInitiated`,
+    /// `ChannelClosed`) or when its confirmation resolves.  Neither is
+    /// guaranteed: the event stream is lossy under load, and a task can be
+    /// starved or its node stopped mid-flight.  This timeout bounds how long a
+    /// single lost signal can suppress further action on a channel, and must
+    /// therefore exceed the worst-case tx confirmation plus indexer lag.
+    /// Default: 5 min.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5 * 60))]
+    pub action_lease_timeout: Duration,
 }
 
 /// Per-axis weights for the multi-objective channel selector.
