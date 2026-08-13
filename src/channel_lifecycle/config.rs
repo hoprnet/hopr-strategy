@@ -1360,6 +1360,29 @@ mod config_tests {
         assert!(FundingConfig::default().validate().is_ok());
     }
 
+    /// Zero disables the protection rather than lifting a limit: a zero lease
+    /// expires on the spot, so a channel with a transaction already in flight
+    /// gets another every pass, and a zero read budget makes every read
+    /// unavailable.
+    #[rstest]
+    #[case::zero_lease(Duration::ZERO, Duration::from_secs(30))]
+    #[case::zero_read_budget(Duration::from_secs(300), Duration::ZERO)]
+    fn concurrency_config_should_reject_a_zero_timeout(
+        #[case] action_lease_timeout: Duration,
+        #[case] chain_read_timeout: Duration,
+    ) {
+        use validator::Validate as _;
+
+        let cfg = ConcurrencyConfig {
+            action_lease_timeout,
+            chain_read_timeout,
+            ..Default::default()
+        };
+
+        assert!(cfg.validate().is_err(), "a zero duration must be rejected");
+        assert!(ConcurrencyConfig::default().validate().is_ok());
+    }
+
     /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the
     /// protocol's maximum path length cannot silently rescale every stake in the strategy.
     /// A ticket's face value is linear in this count, so a move from 3 to 4 would raise
