@@ -1360,10 +1360,11 @@ mod config_tests {
         assert!(FundingConfig::default().validate().is_ok());
     }
 
-    /// Zero disables the protection rather than lifting a limit: a zero lease
-    /// expires on the spot, so a channel with a transaction already in flight
-    /// gets another every pass, and a zero read budget makes every read
-    /// unavailable.
+    /// Zero disables the protection rather than lifting a limit: a zero lease expires on the spot, so a channel with a
+    /// transaction already in flight gets another every pass, and a zero read budget makes every read unavailable.
+    ///
+    /// Checked through the top-level config so this also pins that `#[validate(nested)]` still reaches
+    /// `ConcurrencyConfig` — a rule that is never reached is the same as no rule.
     #[rstest]
     #[case::zero_lease(Duration::ZERO, Duration::from_secs(30))]
     #[case::zero_read_budget(Duration::from_secs(300), Duration::ZERO)]
@@ -1373,13 +1374,28 @@ mod config_tests {
     ) {
         use validator::Validate as _;
 
-        let cfg = ConcurrencyConfig {
+        let concurrency = ConcurrencyConfig {
             action_lease_timeout,
             chain_read_timeout,
             ..Default::default()
         };
 
-        assert!(cfg.validate().is_err(), "a zero duration must be rejected");
+        assert!(concurrency.validate().is_err(), "a zero duration must be rejected");
+        assert!(
+            ChannelLifecycleConfig {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "and must be rejected through the top-level config too"
+        );
+    }
+
+    #[test]
+    fn concurrency_config_should_accept_its_defaults() {
+        use validator::Validate as _;
+
         assert!(ConcurrencyConfig::default().validate().is_ok());
     }
 

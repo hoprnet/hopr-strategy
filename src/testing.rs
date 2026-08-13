@@ -809,8 +809,10 @@ impl ChainFaults {
         self.peak_in_flight_total.load(Ordering::Relaxed)
     }
 
-    /// Marks a submitted write as outstanding and updates the watermarks.
-    fn enter_in_flight(&self, op: ChainOp) {
+    /// Marks a submitted write as outstanding and updates the watermarks.  The
+    /// returned guard releases it when dropped.
+    #[must_use]
+    fn enter_in_flight(self: &std::sync::Arc<Self>, op: ChainOp) -> InFlightGuard {
         // Scoped so the entry guard is released before the map is iterated below.
         let outstanding = {
             let mut entry = self.in_flight.entry(op).or_insert(0);
@@ -825,6 +827,11 @@ impl ChainFaults {
 
         let total: usize = self.in_flight.iter().map(|entry| *entry.value()).sum();
         self.peak_in_flight_total.fetch_max(total, Ordering::Relaxed);
+
+        InFlightGuard {
+            faults: std::sync::Arc::clone(self),
+            op,
+        }
     }
 
     /// Marks an outstanding write as finished.
@@ -877,6 +884,23 @@ impl ChainFaults {
             Fault::Fail => Err(injected_fault(op)),
             Fault::Hang => futures::future::pending().await,
         }
+    }
+}
+
+/// Holds an operation's in-flight count up for as long as it lives.
+///
+/// Tied to the confirmation future's lifetime rather than to a call at its end,
+/// so a caller that drops the future without polling it to completion — an
+/// aborted task, say — cannot leave the count raised and every later watermark
+/// reading too high.
+pub struct InFlightGuard {
+    faults: std::sync::Arc<ChainFaults>,
+    op: ChainOp,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.faults.leave_in_flight(self.op);
     }
 }
 
@@ -1462,12 +1486,11 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
         let channels = self.channels.clone();
-        faults.enter_in_flight(ChainOp::OpenChannel);
+        let in_flight = faults.enter_in_flight(ChainOp::OpenChannel);
         Ok(Box::pin(async move {
+            let _in_flight = in_flight;
             Self::await_own_view(channels, channel_id, |channel| channel.status == ChannelStatus::Open).await;
-            let outcome = faults.confirm(ChainOp::OpenChannel).await;
-            faults.leave_in_flight(ChainOp::OpenChannel);
-            outcome?;
+            faults.confirm(ChainOp::OpenChannel).await?;
             Ok(receipt)
         }))
     }
@@ -1493,12 +1516,11 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         let faults = self.faults.clone();
         let channels = self.channels.clone();
         let channel_id = *channel_id;
-        faults.enter_in_flight(ChainOp::FundChannel);
+        let in_flight = faults.enter_in_flight(ChainOp::FundChannel);
         Ok(Box::pin(async move {
+            let _in_flight = in_flight;
             Self::await_own_view(channels, channel_id, |channel| channel.balance >= funded_to).await;
-            let outcome = faults.confirm(ChainOp::FundChannel).await;
-            faults.leave_in_flight(ChainOp::FundChannel);
-            outcome?;
+            faults.confirm(ChainOp::FundChannel).await?;
             Ok(receipt)
         }))
     }
@@ -1532,15 +1554,14 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         let faults = self.faults.clone();
         let channels = self.channels.clone();
         let channel_id = *channel_id;
-        faults.enter_in_flight(ChainOp::CloseChannel);
+        let in_flight = faults.enter_in_flight(ChainOp::CloseChannel);
         Ok(Box::pin(async move {
+            let _in_flight = in_flight;
             // Closure is two steps (Open → PendingToClose → Closed); either way
             // the status this call moved the channel out of must be gone from
             // our own view before we report success.
             Self::await_own_view(channels, channel_id, |channel| channel.status != previous_status).await;
-            let outcome = faults.confirm(ChainOp::CloseChannel).await;
-            faults.leave_in_flight(ChainOp::CloseChannel);
-            outcome?;
+            faults.confirm(ChainOp::CloseChannel).await?;
             Ok(receipt)
         }))
     }
