@@ -53,6 +53,18 @@ const TICK: Duration = Duration::from_millis(100);
 /// stalls these tests are about.
 const LEASE: Duration = Duration::from_secs(2);
 
+/// Every chain read the pipeline makes, so a test can knock out the strategy's
+/// whole view of the chain at once.
+const EVERY_READ: [ChainOp; 7] = [
+    ChainOp::SafeInfo,
+    ChainOp::Balance,
+    ChainOp::TicketPrice,
+    ChainOp::WinProb,
+    ChainOp::ResolutionTime,
+    ChainOp::StreamChannels,
+    ChainOp::StreamAccounts,
+];
+
 /// Chain reads against the in-memory harness resolve in microseconds, so any
 /// read that has not answered within a couple of ticks is one this test made
 /// hang on purpose.
@@ -121,7 +133,7 @@ fn retire_channel_config(lease: Duration) -> ChannelLifecycleConfig {
 /// lost event disables funding for that channel for the lifetime of the process.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn funding_resumes_after_balance_increased_event_is_lost(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_resume_funding_when_the_balance_event_is_lost(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -147,7 +159,7 @@ async fn funding_resumes_after_balance_increased_event_is_lost(fixture: Integrat
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -157,7 +169,7 @@ async fn funding_resumes_after_balance_increased_event_is_lost(fixture: Integrat
 /// back, the channel must be topped up exactly once.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn funding_is_not_repeated_while_the_lease_is_live(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_not_repeat_funding_when_the_slot_is_still_held(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -199,7 +211,7 @@ async fn funding_is_not_repeated_while_the_lease_is_live(fixture: IntegrationFix
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -215,7 +227,9 @@ async fn funding_is_not_repeated_while_the_lease_is_live(fixture: IntegrationFix
 /// alone from then on.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn funding_stops_once_the_channel_is_funded_without_any_event(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_stop_funding_when_the_channel_is_funded_without_events(
+    fixture: IntegrationFixture,
+) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -256,7 +270,7 @@ async fn funding_stops_once_the_channel_is_funded_without_any_event(fixture: Int
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -267,7 +281,7 @@ async fn funding_stops_once_the_channel_is_funded_without_any_event(fixture: Int
 /// deadline can release the slot.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn funding_resumes_after_funding_confirmation_never_resolves(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_resume_funding_when_a_confirmation_never_resolves(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -309,7 +323,7 @@ async fn funding_resumes_after_funding_confirmation_never_resolves(fixture: Inte
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -328,7 +342,7 @@ async fn funding_resumes_after_funding_confirmation_never_resolves(fixture: Inte
 /// own confirmations.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn channel_closure_completes_both_steps_when_events_are_lost(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_complete_both_closure_steps_when_events_are_lost(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -365,7 +379,7 @@ async fn channel_closure_completes_both_steps_when_events_are_lost(fixture: Inte
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -376,7 +390,7 @@ async fn channel_closure_completes_both_steps_when_events_are_lost(fixture: Inte
 /// on-chain until the slot is reclaimed and the step retried.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn finalization_resumes_after_the_second_close_stalls(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_retry_finalization_when_the_second_close_stalls(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -424,7 +438,7 @@ async fn finalization_resumes_after_the_second_close_stalls(fixture: Integration
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -443,7 +457,9 @@ async fn finalization_resumes_after_the_second_close_stalls(fixture: Integration
 /// budget ahead of the third, which is fund-pass fairness — a separate concern.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn stalled_leases_do_not_block_unrelated_channels(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_keep_acting_on_other_channels_when_slots_are_stranded(
+    fixture: IntegrationFixture,
+) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, d1, d2, d3] = fixture.claim_accounts::<4>();
     let destinations = [d1, d2, d3];
@@ -484,7 +500,7 @@ async fn stalled_leases_do_not_block_unrelated_channels(fixture: IntegrationFixt
         .await?;
     }
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -493,9 +509,17 @@ async fn stalled_leases_do_not_block_unrelated_channels(fixture: IntegrationFixt
 /// the same task as the event loop, so an unbounded read stalls ticks *and*
 /// event handling: without a deadline the strategy never recovers, even after
 /// the chain does.
+///
+/// Both cases are reads the fund pass depends on — the safe balance it spends
+/// from, and the channel list every pass starts from.
 #[rstest]
+#[case::safe_balance(ChainOp::SafeInfo)]
+#[case::channel_list(ChainOp::StreamChannels)]
 #[test_log::test(tokio::test)]
-async fn pipeline_recovers_from_hanging_safe_balance_read(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_recover_when_a_chain_read_hangs(
+    fixture: IntegrationFixture,
+    #[case] hanging: ChainOp,
+) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -505,7 +529,7 @@ async fn pipeline_recovers_from_hanging_safe_balance_read(fixture: IntegrationFi
     let topup: HoprBalance = TOPUP.parse()?;
 
     let faults = scenario.connector.faults();
-    faults.set(ChainOp::SafeInfo, Fault::Hang);
+    faults.set(hanging, Fault::Hang);
 
     let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
     let mut strategy = ChannelLifecycleStrategy::new(perpetually_underfunded_config(LEASE)).build(node)?;
@@ -513,56 +537,19 @@ async fn pipeline_recovers_from_hanging_safe_balance_read(fixture: IntegrationFi
 
     // Give the strategy time to enter the hanging read, then let it recover.
     tokio::time::sleep(TICK * 3).await;
-    faults.clear(ChainOp::SafeInfo);
+    faults.clear(hanging);
 
     await_channel_where(
         &scenario.connector,
         scenario.source_addr,
         scenario.destination_addr,
         timeouts.action,
-        "funding resumed after the hanging safe read cleared",
+        "funding resumed after the hanging read cleared",
         move |channel| channel.balance >= initial + topup,
     )
     .await?;
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
-    handle.stop().await;
-    Ok(())
-}
-
-/// As above, for the channel list — the one read every pass depends on.
-#[rstest]
-#[test_log::test(tokio::test)]
-async fn pipeline_recovers_from_hanging_channel_stream(fixture: IntegrationFixture) -> Result<()> {
-    let timeouts = fixture.timeouts();
-    let [source, destination] = fixture.claim_accounts::<2>();
-    let scenario = fixture
-        .open_channel_scenario(&source, &destination, ScenarioOpts::new("1 wxHOPR".parse()?)?)
-        .await?;
-    let initial = scenario.initial.balance;
-    let topup: HoprBalance = TOPUP.parse()?;
-
-    let faults = scenario.connector.faults();
-    faults.set(ChainOp::StreamChannels, Fault::Hang);
-
-    let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
-    let mut strategy = ChannelLifecycleStrategy::new(perpetually_underfunded_config(LEASE)).build(node)?;
-    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
-
-    tokio::time::sleep(TICK * 3).await;
-    faults.clear(ChainOp::StreamChannels);
-
-    await_channel_where(
-        &scenario.connector,
-        scenario.source_addr,
-        scenario.destination_addr,
-        timeouts.action,
-        "funding resumed after the hanging channel stream cleared",
-        move |channel| channel.balance >= initial + topup,
-    )
-    .await?;
-
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -571,7 +558,7 @@ async fn pipeline_recovers_from_hanging_channel_stream(fixture: IntegrationFixtu
 /// strategy keeps ticking and resumes as soon as the chain answers again.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn pipeline_recovers_from_failing_reads(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_recover_when_chain_reads_fail(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -581,39 +568,19 @@ async fn pipeline_recovers_from_failing_reads(fixture: IntegrationFixture) -> Re
     let topup: HoprBalance = TOPUP.parse()?;
 
     let faults = scenario.connector.faults();
-    for op in [
-        ChainOp::SafeInfo,
-        ChainOp::Balance,
-        ChainOp::TicketPrice,
-        ChainOp::WinProb,
-        ChainOp::ResolutionTime,
-        ChainOp::StreamChannels,
-        ChainOp::StreamAccounts,
-    ] {
-        faults.set(op, Fault::Fail);
-    }
+    EVERY_READ.iter().for_each(|op| faults.set(*op, Fault::Fail));
 
     let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
     let mut strategy = ChannelLifecycleStrategy::new(perpetually_underfunded_config(LEASE)).build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     tokio::time::sleep(TICK * 3).await;
-    assert!(
+    anyhow::ensure!(
         !handle.is_finished(),
         "strategy must survive a chain that fails every read"
     );
 
-    for op in [
-        ChainOp::SafeInfo,
-        ChainOp::Balance,
-        ChainOp::TicketPrice,
-        ChainOp::WinProb,
-        ChainOp::ResolutionTime,
-        ChainOp::StreamChannels,
-        ChainOp::StreamAccounts,
-    ] {
-        faults.clear(op);
-    }
+    EVERY_READ.iter().for_each(|op| faults.clear(*op));
 
     await_channel_where(
         &scenario.connector,

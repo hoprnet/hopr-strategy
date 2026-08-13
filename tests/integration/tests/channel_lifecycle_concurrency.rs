@@ -63,7 +63,7 @@ fn all_channels_underfunded(action_budget: usize) -> ChannelLifecycleConfig {
 /// underfunded channels than the budget allows, the budget must be filled.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn funding_fills_the_action_budget_and_never_exceeds_it(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_fill_the_action_budget_and_never_exceed_it(fixture: IntegrationFixture) -> Result<()> {
     const BUDGET: usize = 3;
 
     let timeouts = fixture.timeouts();
@@ -114,7 +114,7 @@ async fn funding_fills_the_action_budget_and_never_exceeds_it(fixture: Integrati
         "no further funding transactions may be submitted while the budget is saturated"
     );
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -127,7 +127,9 @@ async fn funding_fills_the_action_budget_and_never_exceeds_it(fixture: Integrati
 /// slot stops it from paying twice for the same shortfall.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn a_channel_never_has_two_funding_transactions_in_flight(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_not_fund_a_channel_twice_while_a_funding_is_in_flight(
+    fixture: IntegrationFixture,
+) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
     let scenario = fixture
@@ -172,7 +174,7 @@ async fn a_channel_never_has_two_funding_transactions_in_flight(fixture: Integra
         "the shortfall must be funded once, not once per tick"
     );
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }
@@ -181,7 +183,9 @@ async fn a_channel_never_has_two_funding_transactions_in_flight(fixture: Integra
 /// decides to retire many channels at once still initiates closures gradually.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn closures_respect_the_close_pass_cap(fixture: IntegrationFixture) -> Result<()> {
+async fn strategy_should_respect_the_close_pass_cap_when_many_channels_are_closable(
+    fixture: IntegrationFixture,
+) -> Result<()> {
     const CLOSE_CAP: usize = 2;
 
     let timeouts = fixture.timeouts();
@@ -241,7 +245,7 @@ async fn closures_respect_the_close_pass_cap(fixture: IntegrationFixture) -> Res
         "exactly the channels that took a close slot may have entered their notice period"
     );
 
-    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    anyhow::ensure!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
     handle.stop().await;
     Ok(())
 }

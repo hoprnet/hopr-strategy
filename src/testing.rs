@@ -776,20 +776,19 @@ impl ChainFaults {
 
     /// Marks a submitted write as outstanding and updates the watermarks.
     fn enter_in_flight(&self, op: ChainOp) {
-        let mut total = 0;
-        {
-            let mut outstanding = self.in_flight.entry(op).or_insert(0);
-            *outstanding += 1;
-            let per_op = *outstanding;
-            drop(outstanding);
-            let mut peak = self.peak_in_flight.entry(op).or_insert(0);
-            if per_op > *peak {
-                *peak = per_op;
-            }
-        }
-        for entry in self.in_flight.iter() {
-            total += *entry.value();
-        }
+        // Scoped so the entry guard is released before the map is iterated below.
+        let outstanding = {
+            let mut entry = self.in_flight.entry(op).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        self.peak_in_flight
+            .entry(op)
+            .and_modify(|peak| *peak = (*peak).max(outstanding))
+            .or_insert(outstanding);
+
+        let total: usize = self.in_flight.iter().map(|entry| *entry.value()).sum();
         self.peak_in_flight_total.fetch_max(total, Ordering::Relaxed);
     }
 

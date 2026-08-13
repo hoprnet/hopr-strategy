@@ -31,7 +31,7 @@ use hopr_api::{
 use tracing::{debug, warn};
 
 use super::{
-    ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
+    ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
     config::ResolvedFunding,
     selector::{
         BucketCell, BucketView, CloseCandidate, LatencyBucket, OpenCandidate, PeerEdgeInfo, SelectorContext, SignalSet,
@@ -225,138 +225,125 @@ where
     // Action dispatchers
     // ─────────────────────────────────────────────────────────────────────
 
+    /// Takes `key`'s slot, charges it against the shared action budget, and runs
+    /// `submit` under it, giving the slot back once the operation reports back.
+    ///
+    /// Returns `true` if the operation was started, `false` if the slot was
+    /// already held or the budget was exhausted.
+    ///
+    /// Every chain write goes through here so the three things that must happen
+    /// together — take the slot, honour
+    /// [`ConcurrencyConfig::max_concurrent_actions`], and release the slot on
+    /// *either* outcome — cannot drift apart between the four kinds of action.
+    /// A release that skipped a path would strand the slot until its lease
+    /// expired, which is the failure this whole mechanism exists to bound.
+    fn spawn_leased<K, Fut>(
+        &self,
+        leases: &Arc<ActionLeases<K>>,
+        key: K,
+        submit: impl FnOnce() -> Fut + Send + 'static,
+    ) -> bool
+    where
+        K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let Some(holder) = leases.acquire(key.clone(), self.cfg.concurrency.action_lease_timeout) else {
+            return false;
+        };
+        if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
+            leases.release_owned(&key, holder);
+            return false;
+        }
+
+        let leases = Arc::clone(leases);
+        hopr_utils::runtime::prelude::spawn(async move {
+            submit().await;
+            // Released however the operation went: it is over either way.  A
+            // confirmation resolves only once the chain state it wrote is
+            // readable, so the next pass reads the new state rather than
+            // repeating the operation.  The matching chain event releases the
+            // slot too, for whichever arrives first; the lease covers the case
+            // where neither does.  `release_owned` is a no-op if this operation
+            // overran its lease and a later attempt now holds the slot.
+            leases.release_owned(&key, holder);
+        });
+
+        true
+    }
+
     /// Spawn a funding transaction for `channel`.  Returns `true` if the task
     /// was submitted; `false` if it was already in-flight or the concurrency
     /// cap was reached.
     pub(super) fn try_fund_channel(&self, channel: &ChannelEntry, topup: HoprBalance) -> bool {
         let channel_id = *channel.get_id();
-
-        if !self
-            .fund_in_flight
-            .acquire(channel_id, self.cfg.concurrency.action_lease_timeout)
-        {
-            return false;
-        }
-        if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
-            self.fund_in_flight.release(&channel_id);
-            return false;
-        }
-
-        debug!(%channel, %topup, "channel-lifecycle: funding channel");
-        #[cfg(all(feature = "telemetry", not(test)))]
-        super::METRIC_CHANNEL_FUNDS.increment();
-
+        let channel = *channel;
         let chain = self.node.chain_api().clone();
-        let in_flight = Arc::clone(&self.fund_in_flight);
 
-        hopr_utils::runtime::prelude::spawn(async move {
+        self.spawn_leased(&self.fund_in_flight, channel_id, move || async move {
+            debug!(%channel, %topup, "channel-lifecycle: funding channel");
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_CHANNEL_FUNDS.increment();
+
             match chain.fund_channel(&channel_id, topup).await {
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, %e, "channel-lifecycle: funding tx failed");
                     }
-                    // Released either way: the operation is over.  A confirmation
-                    // resolves only once the chain state it wrote is readable, so
-                    // the next fund pass sizes against the new balance rather
-                    // than re-funding.  ChannelBalanceIncreased releases the slot
-                    // too, for whichever arrives first; the lease covers the case
-                    // where neither does.
-                    in_flight.release(&channel_id);
                 }
-                Err(e) => {
-                    warn!(%channel_id, %e, "channel-lifecycle: failed to submit funding tx");
-                    in_flight.release(&channel_id);
-                }
+                Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit funding tx"),
             }
-        });
-
-        true
+        })
     }
 
     /// Spawn a closure transaction for `channel`.  Returns `true` if submitted.
+    ///
+    /// This is the first of the two steps that retire a channel: it moves an
+    /// `Open` channel to `PendingToClose` and starts its notice period.
     fn try_close_channel(&self, channel: &ChannelEntry) -> bool {
         let channel_id = *channel.get_id();
-
-        if !self
-            .close_in_flight
-            .acquire(channel_id, self.cfg.concurrency.action_lease_timeout)
-        {
-            return false;
-        }
-        if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
-            self.close_in_flight.release(&channel_id);
-            return false;
-        }
-
-        debug!(%channel, "channel-lifecycle: closing channel");
-        #[cfg(all(feature = "telemetry", not(test)))]
-        super::METRIC_CHANNEL_CLOSES.increment();
-
+        let channel = *channel;
         let chain = self.node.chain_api().clone();
-        let in_flight = Arc::clone(&self.close_in_flight);
 
-        hopr_utils::runtime::prelude::spawn(async move {
+        self.spawn_leased(&self.close_in_flight, channel_id, move || async move {
+            debug!(%channel, "channel-lifecycle: closing channel");
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_CHANNEL_CLOSES.increment();
+
             match chain.close_channel(&channel_id).await {
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, %e, "channel-lifecycle: close tx failed");
                     }
-                    // Released either way — see `try_fund_channel`.  The channel
-                    // reads as PendingToClose from here on, so the close pass
-                    // passes over it and the finalize pass takes it up once the
-                    // notice period elapses.
-                    in_flight.release(&channel_id);
                 }
-                Err(e) => {
-                    warn!(%channel_id, %e, "channel-lifecycle: failed to submit close tx");
-                    in_flight.release(&channel_id);
-                }
+                Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit close tx"),
             }
-        });
-
-        true
+        })
     }
 
     /// Spawn a finalization transaction for a `PendingToClose` channel.
     /// Returns `true` if submitted.
+    ///
+    /// The second closure step: once the notice period has elapsed, this moves
+    /// the channel to `Closed` and releases its stake.
     fn try_finalize_channel(&self, channel: &ChannelEntry) -> bool {
         let channel_id = *channel.get_id();
-
-        if !self
-            .finalize_in_flight
-            .acquire(channel_id, self.cfg.concurrency.action_lease_timeout)
-        {
-            return false;
-        }
-        if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
-            self.finalize_in_flight.release(&channel_id);
-            return false;
-        }
-
-        debug!(%channel, "channel-lifecycle: finalizing closure");
-        #[cfg(all(feature = "telemetry", not(test)))]
-        super::METRIC_CHANNEL_FINALIZES.increment();
-
+        let channel = *channel;
         let chain = self.node.chain_api().clone();
-        let in_flight = Arc::clone(&self.finalize_in_flight);
 
-        hopr_utils::runtime::prelude::spawn(async move {
+        self.spawn_leased(&self.finalize_in_flight, channel_id, move || async move {
+            debug!(%channel, "channel-lifecycle: finalizing closure");
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_CHANNEL_FINALIZES.increment();
+
             match chain.close_channel(&channel_id).await {
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed");
                     }
-                    // Released either way — see `try_fund_channel`.
-                    in_flight.release(&channel_id);
                 }
-                Err(e) => {
-                    warn!(%channel_id, %e, "channel-lifecycle: failed to submit finalize tx");
-                    in_flight.release(&channel_id);
-                }
+                Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit finalize tx"),
             }
-        });
-
-        true
+        })
     }
 
     /// Spawn an open transaction for a new channel to `dest`.  Returns the
@@ -367,80 +354,55 @@ where
     /// config for this tick.  `amount` is `funding.initial_balance` (passed by
     /// the caller so this helper stays generic).
     ///
-    /// Before submitting, queries the current on-chain channel state from the
-    /// pipeline task so the strategy converges to the desired state in this
-    /// tick rather than deferring to the next one.  The `channel_by_parties`
-    /// call is serviced by the in-process cache (moka + RocksDB), so the
-    /// overhead is a fast in-memory lookup in the common case.
+    /// Before taking a slot, queries the current on-chain channel state so the
+    /// strategy converges to the desired state in this tick rather than
+    /// deferring to the next one.  The `channel_by_parties` call is serviced by
+    /// the in-process cache (moka + RocksDB), so the overhead is a fast
+    /// in-memory lookup in the common case.
     fn try_open_channel(&self, dest: Address, amount: HoprBalance, funding: &ResolvedFunding) -> Option<HoprBalance> {
-        if !self
-            .open_in_flight
-            .acquire(dest, self.cfg.concurrency.action_lease_timeout)
-        {
-            return None;
-        }
-        if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
-            self.open_in_flight.release(&dest);
-            return None;
-        }
-
-        // Pre-check current on-chain state.  The snapshot `all_channels` in
-        // `pipeline_inner` can be stale (race between chain events and the
-        // snapshot pass), so we re-read here before spending a tx slot.
-        {
-            let chain = self.node.chain_api();
-            let me = *chain.me();
-            match chain.channel_by_parties(&me, &dest) {
-                Ok(Some(existing)) => match existing.status {
-                    ChannelStatus::Open => {
-                        self.open_in_flight.release(&dest);
-                        if existing.balance >= funding.lower_balance_threshold {
-                            debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open at desired stake, skipping");
-                            return None;
-                        }
-                        debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open below threshold, funding immediately");
-                        let topup = funding.topup_balance;
-                        return self.try_fund_channel(&existing, topup).then_some(topup);
-                    }
-                    ChannelStatus::PendingToClose(_) => {
-                        self.open_in_flight.release(&dest);
-                        debug!(%dest, "channel-lifecycle: channel pending closure, deferring open");
+        // The snapshot `all_channels` in `pipeline_inner` can be stale (race
+        // between chain events and the snapshot pass), so re-read before
+        // spending a tx slot.
+        let chain = self.node.chain_api();
+        match chain.channel_by_parties(chain.me(), &dest) {
+            Ok(Some(existing)) => match existing.status {
+                ChannelStatus::Open => {
+                    if existing.balance >= funding.lower_balance_threshold {
+                        debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open at desired stake, skipping");
                         return None;
                     }
-                    _ => {} // Closed — fall through to open
-                },
-                Ok(None) => {} // No channel yet — fall through to open
-                Err(e) => {
-                    warn!(%dest, %e, "channel-lifecycle: channel_by_parties check failed, proceeding with open");
+                    debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open below threshold, funding immediately");
+                    let topup = funding.topup_balance;
+                    return self.try_fund_channel(&existing, topup).then_some(topup);
                 }
+                ChannelStatus::PendingToClose(_) => {
+                    debug!(%dest, "channel-lifecycle: channel pending closure, deferring open");
+                    return None;
+                }
+                _ => {} // Closed — fall through to open
+            },
+            Ok(None) => {} // No channel yet — fall through to open
+            Err(e) => {
+                warn!(%dest, %e, "channel-lifecycle: channel_by_parties check failed, proceeding with open");
             }
         }
 
-        debug!(%dest, %amount, "channel-lifecycle: opening channel");
-        #[cfg(all(feature = "telemetry", not(test)))]
-        super::METRIC_CHANNEL_OPENS.increment();
+        let chain = chain.clone();
+        self.spawn_leased(&self.open_in_flight, dest, move || async move {
+            debug!(%dest, %amount, "channel-lifecycle: opening channel");
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_CHANNEL_OPENS.increment();
 
-        let chain = self.node.chain_api().clone();
-        let in_flight = Arc::clone(&self.open_in_flight);
-
-        hopr_utils::runtime::prelude::spawn(async move {
             match chain.open_channel(&dest, amount).await {
                 Ok(confirmation) => {
                     if let Err(e) = confirmation.await {
                         warn!(%dest, %e, "channel-lifecycle: open tx failed");
                     }
-                    // Released either way — see `try_fund_channel`.  ChannelOpened
-                    // releases it too, as a no-op fallback.
-                    in_flight.release(&dest);
                 }
-                Err(e) => {
-                    warn!(%dest, %e, "channel-lifecycle: failed to submit open tx");
-                    in_flight.release(&dest);
-                }
+                Err(e) => warn!(%dest, %e, "channel-lifecycle: failed to submit open tx"),
             }
-        });
-
-        Some(amount)
+        })
+        .then_some(amount)
     }
 
     // ─────────────────────────────────────────────────────────────────────
