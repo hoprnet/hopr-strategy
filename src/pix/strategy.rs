@@ -104,7 +104,10 @@ pub struct PixStrategyConfig {
     #[serde(default)]
     pub price_per_byte: HoprBalance,
     /// Maximum wxHOPR the strategy will send to a single deposit address.
-    #[default(HoprBalance::new_base(100))]
+    ///
+    /// At the default price of one base unit per byte this covers RFC-0012's
+    /// default `8192 × 64 × 1038` byte quota.
+    #[default(HoprBalance::new_base(544_210_944))]
     #[serde(default)]
     pub max_ssa_allocation: HoprBalance,
     /// Configuration for the bundled non-anonymous deposit pool.
@@ -623,10 +626,19 @@ where
                 }
             }
         } else {
-            let deposits: Vec<(PixAddressId, K)> = batch
-                .iter()
-                .filter_map(|(id, secret)| key_from_secret::<K>(secret).ok().map(|key| (*id, key)))
-                .collect();
+            let mut deposits = Vec::with_capacity(batch.len());
+            for (id, secret) in &batch {
+                match key_from_secret::<K>(secret) {
+                    Ok(key) => deposits.push((*id, key)),
+                    Err(error) => {
+                        self.in_flight_sweeps.invalidate(id);
+                        tracing::error!(%error, ?id, "stored recovery secret is not valid for this pool's scheme");
+                    }
+                }
+            }
+            if deposits.is_empty() {
+                return;
+            }
             let ids: Vec<PixAddressId> = deposits.iter().map(|(id, _)| *id).collect();
 
             let result = pool

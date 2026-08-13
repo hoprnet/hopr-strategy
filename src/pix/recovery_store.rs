@@ -120,6 +120,8 @@ pub enum PixRecoveryStoreError {
     Decryption,
     #[error("corrupt key: {0}")]
     CorruptKey(String),
+    #[error("a different recovered secret is already stored for PIX allocation {0:?}")]
+    ConflictingSecret(PixAddressId),
     #[error("the configured password does not match this recovery store")]
     WrongPassword,
 }
@@ -297,7 +299,9 @@ impl PixRecoveryStore {
     /// Insert an encrypted recovered key.  Returns `true` if the entry was newly
     /// inserted, `false` if the key was already present.
     ///
-    /// An existing entry is never overwritten, so its ciphertext and nonce stay as they were.
+    /// An identical existing entry is never overwritten, so its ciphertext and nonce stay as
+    /// they were. A different curve or scalar for the same allocation is rejected as protocol
+    /// state corruption.
     /// The check happens inside the write transaction: doing it in a separate read transaction
     /// would double the I/O and leave a window in which another writer could insert the same
     /// key in between.
@@ -306,7 +310,13 @@ impl PixRecoveryStore {
         let write_tx = self.db.begin_write()?;
         let was_inserted = {
             let mut table = write_tx.open_table(PIX_RECOVERED_KEYS)?;
-            if table.get(key)?.is_some() {
+            if let Some(existing) = table.get(key)? {
+                let plaintext = decrypt(&self.encryption_key, &existing.value())?;
+                let schemes = write_tx.open_table(PIX_RECOVERED_KEY_SCHEMES)?;
+                let existing_scheme = schemes.get(key)?.map(|value| value.value()).unwrap_or(0);
+                if existing_scheme != secret_scheme(secret) || plaintext.as_slice() != secret.secret().as_ref() {
+                    return Err(PixRecoveryStoreError::ConflictingSecret(*id));
+                }
                 false
             } else {
                 let plaintext: [u8; 32] = secret
@@ -465,6 +475,18 @@ mod tests {
         let secret = make_secret(0xaa);
         assert!(store.insert(&id, &secret).unwrap());
         assert!(!store.insert(&id, &secret).unwrap());
+    }
+
+    #[test]
+    fn conflicting_secret_for_the_same_allocation_is_rejected() {
+        let (store, _dir) = open_temp_store();
+        let id = make_id(1);
+        store.insert(&id, &make_secret(0x11)).unwrap();
+
+        assert!(matches!(
+            store.insert(&id, &make_secret(0x22)),
+            Err(PixRecoveryStoreError::ConflictingSecret(conflicting)) if conflicting == id
+        ));
     }
 
     #[test]
