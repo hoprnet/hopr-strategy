@@ -38,7 +38,7 @@ where
         if ch.status != ChannelStatus::Open {
             return;
         }
-        if self.fund_in_flight.contains(ch.get_id()) {
+        if self.fund_in_flight.is_held(ch.get_id()) {
             return;
         }
 
@@ -65,22 +65,25 @@ where
         };
 
         if ch.balance < funding.lower_balance_threshold {
+            // Bounded by `concurrency.chain_read_timeout`: this runs on the same
+            // task as the event loop, so an unbounded read here would stop the
+            // strategy from draining events at all.
             match self.safe_balance_budget().await {
-                Ok(budget) if !funding.topup_balance.is_zero() && budget >= funding.topup_balance => {
+                Some(budget) if !funding.topup_balance.is_zero() && budget >= funding.topup_balance => {
                     self.try_fund_channel(&ch, funding.topup_balance);
                 }
-                Ok(budget) => {
+                Some(budget) => {
                     tracing::debug!(%ch, %budget, "channel-lifecycle: event-driven funding skipped: safe too low");
                 }
-                Err(e) => {
-                    tracing::warn!(%ch, %e, "channel-lifecycle: event-driven funding: could not fetch safe balance");
+                None => {
+                    tracing::debug!(%ch, "channel-lifecycle: event-driven funding skipped: safe balance unknown");
                 }
             }
         }
     }
 
     pub(super) fn on_balance_increased(&self, ch: ChannelEntry) {
-        self.fund_in_flight.remove(ch.get_id());
+        self.fund_in_flight.release(ch.get_id());
         self.last_observed.entry(*ch.get_id()).and_modify(|obs| {
             obs.balance = ch.balance;
         });
@@ -88,18 +91,18 @@ where
     }
 
     pub(super) fn on_channel_opened(&self, ch: ChannelEntry) {
-        self.open_in_flight.remove(&ch.destination);
+        self.open_in_flight.release(&ch.destination);
         tracing::info!(%ch, "channel-lifecycle: channel opened");
     }
 
     pub(super) fn on_channel_closure_initiated(&self, ch: ChannelEntry) {
-        self.close_in_flight.remove(ch.get_id());
+        self.close_in_flight.release(ch.get_id());
         tracing::info!(%ch, "channel-lifecycle: channel closure initiated");
     }
 
     /// Starts the peer cooldown so the channel is not immediately re-opened.
     pub(super) fn on_channel_closed(&self, ch: ChannelEntry) {
-        self.finalize_in_flight.remove(ch.get_id());
+        self.finalize_in_flight.release(ch.get_id());
         self.last_observed.remove(ch.get_id());
         self.peer_ticket_activity.remove(&ch.destination);
         let until = Instant::now() + self.cfg.population.peer_reopen_cooldown;

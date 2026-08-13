@@ -635,7 +635,8 @@ pub struct RestartGuardConfig {
     pub startup_close_grace_period: Duration,
 }
 
-/// Concurrency knobs for the per-channel evaluation loops.
+/// Concurrency knobs for the per-channel evaluation loops, and the time bounds
+/// that keep a misbehaving chain from stalling them.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -660,6 +661,18 @@ pub struct ConcurrencyConfig {
     #[serde(with = "humantime_serde")]
     #[default(Duration::from_secs(5 * 60))]
     pub action_lease_timeout: Duration,
+
+    /// Time budget for a single chain read (safe info, safe balance, ticket
+    /// economics, the channel and account streams).
+    ///
+    /// The pipeline shares a task with the strategy's chain-event handling, so
+    /// an unbounded read stalls ticks *and* event processing for as long as it
+    /// takes — indefinitely, if the read never answers.  A read that overruns
+    /// this budget is treated as unavailable for the current tick and retried
+    /// on the next one.  Default: 30 s.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30))]
+    pub chain_read_timeout: Duration,
 }
 
 /// Per-axis weights for the multi-objective channel selector.

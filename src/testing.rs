@@ -1542,13 +1542,13 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         // Withheld kinds are filtered per subscriber: the chain state still
         // changes, only the notification is lost — exactly what an overflowing
         // event broadcast does to a slow consumer.
+        // Boxed so the returned stream stays `Unpin` for callers that poll it
+        // directly (`next().timeout(..)`), which `Filter` is not.
         let faults = self.faults.clone();
         Ok(futures::stream::iter(snapshot)
             .chain(self.events.1.activate_cloned())
-            .filter(move |event| {
-                let withheld = faults.is_withheld(event);
-                async move { !withheld }
-            }))
+            .filter(move |event| futures::future::ready(!faults.is_withheld(event)))
+            .boxed())
     }
 }
 

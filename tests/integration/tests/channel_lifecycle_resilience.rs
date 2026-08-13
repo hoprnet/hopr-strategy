@@ -40,6 +40,11 @@ const TICK: Duration = Duration::from_millis(100);
 /// accident, short enough to keep the tests fast.
 const LEASE: Duration = Duration::from_millis(600);
 
+/// Chain reads against the in-memory harness resolve in microseconds, so any
+/// read that has not answered within a couple of ticks is one this test made
+/// hang on purpose.
+const READ_BUDGET: Duration = Duration::from_millis(200);
+
 /// Config for a single channel that stays below the funding threshold no matter
 /// how often it is topped up: the threshold is four top-ups wide, so a channel
 /// starting at 1 wxHOPR is still under it after two or three top-ups.  Any
@@ -59,6 +64,7 @@ fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
     cfg.concurrency.action_lease_timeout = lease;
+    cfg.concurrency.chain_read_timeout = READ_BUDGET;
     cfg
 }
 

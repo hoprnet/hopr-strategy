@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use futures::StreamExt as _;
 use hopr_api::{
     chain::{
@@ -105,10 +105,10 @@ impl ChannelLifecycleStrategy {
             cfg: self.cfg,
             node,
             selector,
-            open_in_flight: Arc::new(DashSet::new()),
-            fund_in_flight: Arc::new(DashSet::new()),
-            close_in_flight: Arc::new(DashSet::new()),
-            finalize_in_flight: Arc::new(DashSet::new()),
+            open_in_flight: Default::default(),
+            fund_in_flight: Default::default(),
+            close_in_flight: Default::default(),
+            finalize_in_flight: Default::default(),
             cooldown: Arc::new(DashMap::new()),
             start_epoch: std::time::Instant::now(),
             last_observed: Arc::new(DashMap::new()),
@@ -153,9 +153,24 @@ where
             initial_capacity = %self.cfg.funding.initial_capacity,
             "channel-lifecycle: strategy started"
         );
-        self.run_pipeline().await;
-
         let me = *self.node.chain_api().me();
+
+        // Subscribe *before* the first tick.  Transactions that tick submits can
+        // confirm while it is still running, and the broadcast only reaches
+        // subscribers that already exist — a slot released by an event nobody
+        // was listening for would stay held until its lease expires.
+        let event_stream = self
+            .node
+            .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Chain]))
+            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
+            .filter_map(|ev| {
+                futures::future::ready(match ev {
+                    ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
+                    _ => None,
+                })
+            });
+
+        self.run_pipeline().await;
 
         // Derive a fixed per-run jitter offset from system-time nanoseconds so
         // nodes restarted simultaneously spread out their ticks.  Use the full
@@ -174,17 +189,6 @@ where
         let effective_interval = self.cfg.tick_interval + jitter_offset;
 
         let tick_stream = futures_time::stream::interval(effective_interval.into()).map(|_| LoopEvent::Tick);
-
-        let event_stream = self
-            .node
-            .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Chain]))
-            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
-            .filter_map(|ev| {
-                futures::future::ready(match ev {
-                    ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
-                    _ => None,
-                })
-            });
 
         let mut driver = futures_concurrency::stream::Merge::merge((tick_stream, event_stream));
 

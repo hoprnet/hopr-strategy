@@ -49,8 +49,17 @@
 //!                                                (eligible to reopen)
 //! ```
 //!
-//! In-flight states are tracked off-chain in `DashSet<ChannelId>` / `DashSet<Address>`.
-//! The on-chain `ChannelStatus` plus the in-flight sets together drive transitions.
+//! In-flight states are tracked off-chain as [`ActionLeases`], keyed by
+//! `ChannelId` (fund / close / finalize) or peer `Address` (open).  The on-chain
+//! `ChannelStatus` plus those leases together drive transitions.
+//!
+//! Every in-flight state is left by one of three routes: the chain event named
+//! on its edge above, a confirmation reporting failure, or — because neither is
+//! guaranteed to arrive — the expiry of the operation's lease
+//! ([`ConcurrencyConfig::action_lease_timeout`]).  The chain, not the strategy's
+//! bookkeeping, is the source of truth: after a lease expires the next tick
+//! re-reads the channel and only acts if it still needs the operation.
+//!
 //! The cooldown is keyed by peer `Address` with an `Instant`-stamped map entry.
 //!
 //! ### Feature flag
@@ -64,9 +73,14 @@ mod events;
 mod pipeline;
 pub mod selector;
 mod strategy;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use hopr_api::{
     PeerId,
     types::{
@@ -142,6 +156,84 @@ lazy_static::lazy_static! {
         ).unwrap();
 }
 
+/// Time-bounded exclusive slots for in-flight chain-write operations.
+///
+/// A slot is taken before a transaction is submitted and released when the
+/// operation is known to be over: its confirmation reported a failure, or the
+/// corresponding chain event arrived.  Neither signal is guaranteed — the event
+/// broadcast drops events under load, and a confirmation may never resolve — so
+/// each slot also carries a deadline.  Once that passes the slot is reclaimed
+/// and the operation may be attempted again.
+///
+/// Without the deadline a single lost signal suppresses that channel's
+/// operation forever, and — because slots share a global budget
+/// ([`ConcurrencyConfig::max_concurrent_actions`]) — enough lost signals
+/// suppress every operation on every channel.
+#[derive(Debug)]
+struct ActionLeases<K: Eq + Hash> {
+    /// Key → the instant its slot stops being held.
+    leases: DashMap<K, Instant>,
+}
+
+impl<K: Eq + Hash> Default for ActionLeases<K> {
+    fn default() -> Self {
+        Self { leases: DashMap::new() }
+    }
+}
+
+impl<K: Eq + Hash + Clone> ActionLeases<K> {
+    /// Takes the slot for `key` for at most `timeout`, unless it is already
+    /// held.  Returns `true` if the caller now holds it.
+    fn acquire(&self, key: K, timeout: Duration) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        let now = Instant::now();
+        match self.leases.entry(key) {
+            // Still held by an operation that has not reported back yet.
+            Entry::Occupied(held) if *held.get() > now => false,
+            Entry::Occupied(mut expired) => {
+                expired.insert(now + timeout);
+                true
+            }
+            Entry::Vacant(free) => {
+                free.insert(now + timeout);
+                true
+            }
+        }
+    }
+
+    /// Releases the slot for `key`.  Idempotent: releasing a slot that is not
+    /// held is a no-op, which is what a chain event arriving after a restart or
+    /// after the deadline does.
+    fn release(&self, key: &K) {
+        self.leases.remove(key);
+    }
+
+    /// Whether `key`'s slot is currently held.  Expired slots read as free even
+    /// before [`ActionLeases::sweep`] removes them.
+    fn is_held(&self, key: &K) -> bool {
+        self.leases.get(key).is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Number of slots currently held, excluding expired ones.
+    fn held_count(&self) -> usize {
+        let now = Instant::now();
+        self.leases.iter().filter(|entry| *entry.value() > now).count()
+    }
+
+    /// Drops expired entries.  Only reclaims memory: expired slots already read
+    /// as free.
+    fn sweep(&self) {
+        let now = Instant::now();
+        self.leases.retain(|_, until| *until > now);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+}
+
 /// Per-channel observation snapshot used by the proactive funding estimate.
 #[derive(Clone)]
 struct ChannelObservation {
@@ -172,13 +264,13 @@ struct ChannelLifecycleStrategyInner<N> {
     /// pipeline regardless of the selector's choices.
     selector: Arc<dyn Selector>,
     /// Destination addresses for channels currently being opened.
-    open_in_flight: Arc<DashSet<Address>>,
+    open_in_flight: Arc<ActionLeases<Address>>,
     /// Channel IDs with an in-flight funding transaction.
-    fund_in_flight: Arc<DashSet<ChannelId>>,
+    fund_in_flight: Arc<ActionLeases<ChannelId>>,
     /// Channel IDs with an in-flight closure transaction.
-    close_in_flight: Arc<DashSet<ChannelId>>,
+    close_in_flight: Arc<ActionLeases<ChannelId>>,
     /// Channel IDs with an in-flight finalization transaction.
-    finalize_in_flight: Arc<DashSet<ChannelId>>,
+    finalize_in_flight: Arc<ActionLeases<ChannelId>>,
     /// Peer addresses mapped to the `Instant` when their cooldown expires.
     cooldown: Arc<DashMap<Address, Instant>>,
     /// When this strategy instance started; used by the restart guard.
