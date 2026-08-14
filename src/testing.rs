@@ -1672,6 +1672,79 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
     }
 }
 
+// ── Service registry operations ──────────────────────────────────────────────
+
+// Strategy tests do not exercise service discovery or registry writes. These
+// implementations keep the general-purpose test connector a complete
+// `HoprChainApi`: reads expose an empty registry, while operations that require
+// concrete registry configuration or a transaction fail explicitly.
+#[async_trait::async_trait]
+impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain::ChainReadServiceOperations
+    for TestChainConnector<M>
+{
+    type Error = TestConnectorError;
+
+    fn stream_services<'a>(
+        &'a self,
+        _selector: hopr_api::chain::ServiceSelector,
+    ) -> Result<futures::stream::BoxStream<'a, hopr_api::chain::ServiceEntry>, Self::Error> {
+        Ok(futures::stream::empty().boxed())
+    }
+
+    async fn count_services(&self, _selector: hopr_api::chain::ServiceSelector) -> Result<usize, Self::Error> {
+        Ok(0)
+    }
+
+    async fn get_service_type_config(
+        &self,
+        _service_type: hopr_api::chain::ServiceType,
+    ) -> Result<Option<hopr_api::chain::ServiceTypeConfig>, Self::Error> {
+        Ok(None)
+    }
+
+    async fn get_service_registry_config(&self) -> Result<hopr_api::chain::ServiceRegistryConfig, Self::Error> {
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "service registry configuration is not available in TestChainConnector"
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain::ChainWriteServiceOperations
+    for TestChainConnector<M>
+{
+    type Error = TestConnectorError;
+
+    async fn register_service<'a>(
+        &'a self,
+        _service_type: hopr_api::chain::ServiceType,
+        _metadata: hopr_api::chain::ServiceMetadata,
+    ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "service registry writes are not supported by TestChainConnector"
+        )))
+    }
+
+    async fn update_service<'a>(
+        &'a self,
+        _service_type: hopr_api::chain::ServiceType,
+        _metadata: hopr_api::chain::ServiceMetadata,
+    ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "service registry writes are not supported by TestChainConnector"
+        )))
+    }
+
+    async fn deregister_service<'a>(
+        &'a self,
+        _service_type: hopr_api::chain::ServiceType,
+    ) -> Result<futures::future::BoxFuture<'a, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        Err(TestConnectorError::from(anyhow::anyhow!(
+            "service registry writes are not supported by TestChainConnector"
+        )))
+    }
+}
+
 // ── ChainEvents ───────────────────────────────────────────────────────────────
 
 impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain::ChainEvents for TestChainConnector<M> {

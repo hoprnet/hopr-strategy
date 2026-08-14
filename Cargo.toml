@@ -101,7 +101,7 @@ resolver = "3"
 anyhow              = "1.0.104"
 async-broadcast     = "0.7.2"
 async-trait         = "0.1.91"
-blokli-client       = "0.30.2"
+blokli-client       = { git = "https://github.com/hoprnet/blokli-client", rev = "e304d847ba3bc81d87f79e422e5204a3f766da80" }
 bytesize            = { version = "2.4.2", features = ["serde"] }
 chrono              = { version = "0.4.45", default-features = false }
 dashmap             = "6.2.1"
@@ -109,9 +109,9 @@ futures             = "0.3.33"
 futures-concurrency = "7.7.1"
 futures-time        = "3.1.0"
 hex-literal         = "1.1.0"
-hopr-api            = "1.16.0"
+hopr-api            = { git = "https://github.com/hoprnet/hopr-api", rev = "7469050a8259c497b89728a2923e57887f64194b" }
 hopr-strategy       = { path = "." }
-hopr-utils          = { package = "hopr-utilities", version = "0.5.0", default-features = false }
+hopr-utils          = { package = "hopr-utilities", git = "https://github.com/hoprnet/hopr-utilities", rev = "16a89a7dfbe08748aa9b44b90a04d5910505ddd3", default-features = false }
 humantime-serde     = "1.1.1"
 insta               = "1.48.0"
 lazy_static         = "1.5.0"
