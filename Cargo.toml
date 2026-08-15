@@ -10,8 +10,8 @@ license      = "GPL-3.0-only"
 name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
-rust-version = "1.94"
-version      = "0.26.0"
+rust-version = "1.97"
+version      = "0.27.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -101,7 +101,7 @@ resolver = "3"
 anyhow              = "1.0.104"
 async-broadcast     = "0.7.2"
 async-trait         = "0.1.91"
-blokli-client       = "0.30.2"
+blokli-client       = "0.31.0"
 bytesize            = { version = "2.4.2", features = ["serde"] }
 chrono              = { version = "0.4.45", default-features = false }
 dashmap             = "6.2.1"
@@ -109,9 +109,9 @@ futures             = "0.3.33"
 futures-concurrency = "7.7.1"
 futures-time        = "3.1.0"
 hex-literal         = "1.1.0"
-hopr-api            = "1.16.0"
+hopr-api            = { version = "2.0.0", git = "https://github.com/hoprnet/hopr-api", rev = "ee65b340cf09fd6031735477cc1171d7610694a3" }
 hopr-strategy       = { path = "." }
-hopr-utils          = { package = "hopr-utilities", version = "0.5.0", default-features = false }
+hopr-utils          = { package = "hopr-utilities", version = "0.9.0", git = "https://github.com/hoprnet/hopr-utilities", rev = "68e648be4aa9f1442c75df4006a53db414932f7e", default-features = false }
 humantime-serde     = "1.1.1"
 insta               = "1.48.0"
 lazy_static         = "1.5.0"
