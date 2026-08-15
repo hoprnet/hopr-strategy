@@ -19,7 +19,7 @@ impl DefaultSelector {
     ///
     /// Mirrors the original `ChannelLifecycleStrategyInner::peer_score_for`.
     fn peer_score(candidate: &OpenCandidate, cfg: &super::super::ChannelLifecycleConfig) -> f64 {
-        let edge_score = candidate.edge_info.edge_score.unwrap_or(0.0);
+        let edge_score = candidate.edge_info.quality_score();
         cfg.eligibility.peer_quality_weight * edge_score
             + cfg.eligibility.ticket_activity_weight * candidate.ticket_score
     }
@@ -61,7 +61,7 @@ impl DefaultSelector {
             return false;
         }
 
-        let edge_score = candidate.edge_info.edge_score.unwrap_or(0.0);
+        let edge_score = candidate.edge_info.quality_score();
         let composite_score = cfg.eligibility.peer_quality_weight * edge_score
             + cfg.eligibility.ticket_activity_weight * candidate.ticket_score;
 
@@ -178,7 +178,7 @@ mod tests {
                 edge_score: Some(0.0), // terrible quality — would normally close
                 last_update: Duration::from_secs(9999),
                 average_latency: Some(Duration::from_millis(300)),
-                probe_success_rate: 0.0,
+                probe_success_rate: Some(0.0),
                 ack_rate: Some(0.0),
             },
             ticket_score: 0.0,
@@ -201,7 +201,7 @@ mod tests {
                 edge_score: None,
                 last_update: Duration::ZERO, // no observations at all
                 average_latency: None,
-                probe_success_rate: 0.0,
+                probe_success_rate: Some(0.0),
                 ack_rate: None,
             },
             ticket_score: 0.0,
@@ -232,7 +232,7 @@ mod tests {
                 edge_score: Some(1.0), // excellent quality — would normally keep open
                 last_update: Duration::from_secs(10),
                 average_latency: Some(Duration::from_millis(50)),
-                probe_success_rate: 1.0,
+                probe_success_rate: Some(1.0),
                 ack_rate: Some(1.0),
             },
             ticket_score: 1.0,

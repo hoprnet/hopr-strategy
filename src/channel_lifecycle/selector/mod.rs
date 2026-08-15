@@ -73,14 +73,41 @@ pub struct PeerEdgeInfo {
     /// `None` when no edge record exists or latency has not been measured.
     pub average_latency: Option<Duration>,
     /// EMA probe success rate from the graph edge (messages received / sent).
-    /// `0.0` when no edge record exists.
-    pub probe_success_rate: f64,
+    /// `None` when the edge has never been probed.
+    pub probe_success_rate: Option<f64>,
     /// ACK rate from the immediate QoS measurement (`acks_received / messages_sent`).
     /// `None` when the graph edge has no immediate QoS sample.
     pub ack_rate: Option<f64>,
 }
 
 impl PeerEdgeInfo {
+    /// Score given to a signal that has never been measured.
+    ///
+    /// Absence is not evidence of failure. Scoring an unmeasured signal `0.0` would rank a peer we
+    /// have never probed identically to one probed and found dead, so it would never be selected,
+    /// never carry traffic, and never be probed — the exclusion becomes permanent and
+    /// self-confirming.
+    ///
+    /// `0.5` mirrors the channel graph's own `edge_penalty`, which exists for exactly this case:
+    /// enough of a handicap that measured-good peers win, not so much that an unmeasured peer is
+    /// unreachable.
+    pub const UNMEASURED: f64 = 0.5;
+
+    /// Probe success rate, or [`UNMEASURED`](Self::UNMEASURED) if never probed.
+    pub fn probe_score(&self) -> f64 {
+        self.probe_success_rate.unwrap_or(Self::UNMEASURED)
+    }
+
+    /// Acknowledgement rate, or [`UNMEASURED`](Self::UNMEASURED) if no sample exists.
+    pub fn ack_score(&self) -> f64 {
+        self.ack_rate.unwrap_or(Self::UNMEASURED)
+    }
+
+    /// Combined edge score, or [`UNMEASURED`](Self::UNMEASURED) if the edge carries no measurement.
+    pub fn quality_score(&self) -> f64 {
+        self.edge_score.unwrap_or(Self::UNMEASURED)
+    }
+
     /// `true` when at least one observation has been recorded for this edge.
     /// Used to gate close decisions that depend on graph data.
     pub fn has_probing_data(&self) -> bool {

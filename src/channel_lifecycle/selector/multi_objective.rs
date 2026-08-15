@@ -20,7 +20,7 @@ use hopr_api::types::{crypto::prelude::OffchainPublicKey, internal::prelude::Cha
 use tracing::debug;
 
 use super::{
-    CloseCandidate, OpenCandidate, Selector, SelectorContext, SignalSet,
+    CloseCandidate, OpenCandidate, PeerEdgeInfo, Selector, SelectorContext, SignalSet,
     bucket::{BucketCell, LatencyBucket},
     default::DefaultSelector,
     subnet::SubnetBucket,
@@ -37,6 +37,12 @@ impl MultiObjectiveSelector {
     }
 
     fn latency_score(average_latency: Option<std::time::Duration>) -> f64 {
+        // An unmeasured latency is not a slow one. `from_latency` folds `None` into `VerySlow`,
+        // which would score a peer we have never timed as the worst possible one.
+        if average_latency.is_none() {
+            return PeerEdgeInfo::UNMEASURED;
+        }
+
         match LatencyBucket::from_latency(average_latency) {
             LatencyBucket::VeryFast => 1.0,
             LatencyBucket::Fast => 0.75,
@@ -48,15 +54,15 @@ impl MultiObjectiveSelector {
 
     fn trust_score_open(candidate: &OpenCandidate, cfg: &MultiObjectiveSelectorConfig) -> f64 {
         let w = &cfg.weights;
-        w.trust_probe * candidate.edge_info.probe_success_rate
-            + w.trust_ack * candidate.edge_info.ack_rate.unwrap_or(0.0)
+        w.trust_probe * candidate.edge_info.probe_score()
+            + w.trust_ack * candidate.edge_info.ack_score()
             + w.trust_ticket * candidate.ticket_score
     }
 
     fn trust_score_close(candidate: &CloseCandidate, cfg: &MultiObjectiveSelectorConfig) -> f64 {
         let w = &cfg.weights;
-        w.trust_probe * candidate.edge_info.probe_success_rate
-            + w.trust_ack * candidate.edge_info.ack_rate.unwrap_or(0.0)
+        w.trust_probe * candidate.edge_info.probe_score()
+            + w.trust_ack * candidate.edge_info.ack_score()
             + w.trust_ticket * candidate.ticket_score
     }
 
@@ -319,7 +325,7 @@ mod tests {
             offchain_key: ok,
             edge_info: PeerEdgeInfo {
                 average_latency: latency_ms.map(Duration::from_millis),
-                probe_success_rate: probe_rate,
+                probe_success_rate: Some(probe_rate),
                 ack_rate: Some(probe_rate),
                 edge_score: Some(probe_rate),
                 last_update: Duration::from_secs(1),
@@ -327,6 +333,73 @@ mod tests {
             ticket_score,
             subnet: SubnetBucket::V4Prefix([subnet_id, 0, 0]),
         }
+    }
+
+    /// A candidate with no measurements at all: never probed, never acked, never timed.
+    fn mk_unmeasured_candidate(a: Address, ok: OffchainPublicKey, subnet_id: u8) -> OpenCandidate {
+        OpenCandidate {
+            addr: a,
+            offchain_key: ok,
+            edge_info: PeerEdgeInfo {
+                average_latency: None,
+                probe_success_rate: None,
+                ack_rate: None,
+                edge_score: None,
+                last_update: Duration::from_secs(1),
+            },
+            ticket_score: 0.5,
+            subnet: SubnetBucket::V4Prefix([subnet_id, 0, 0]),
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_peer_should_outrank_one_measured_dead() {
+        // The self-sealing case. Every absent signal used to collapse to `0.0`, scoring a peer we
+        // have never contacted identically to one probed and found dead. It would then never be
+        // selected, never carry traffic, and never be probed, so the exclusion could never be
+        // revisited by the evidence that caused it.
+        let cfg = MultiObjectiveSelectorConfig::default();
+
+        let unmeasured = mk_unmeasured_candidate(addr(1), offchain_key(1), 1);
+        // Measured on every stream, and dead on every one of them.
+        let dead = mk_candidate(addr(2), offchain_key(2), Some(5_000), 0.0, 0.5, 2);
+
+        let trust_unmeasured = MultiObjectiveSelector::trust_score_open(&unmeasured, &cfg);
+        let trust_dead = MultiObjectiveSelector::trust_score_open(&dead, &cfg);
+
+        assert!(
+            trust_unmeasured > trust_dead,
+            "an unprobed peer must not be scored as if it had been probed and failed: unmeasured={trust_unmeasured} \
+             dead={trust_dead}"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_peer_should_still_rank_below_a_measured_good_one() {
+        // The other half of the contract: absence must not become an advantage, or a node would
+        // prefer strangers over peers it has verified.
+        let cfg = MultiObjectiveSelectorConfig::default();
+
+        let unmeasured = mk_unmeasured_candidate(addr(1), offchain_key(1), 1);
+        let healthy = mk_candidate(addr(2), offchain_key(2), Some(20), 1.0, 0.5, 2);
+
+        assert!(
+            MultiObjectiveSelector::trust_score_open(&healthy, &cfg)
+                > MultiObjectiveSelector::trust_score_open(&unmeasured, &cfg),
+            "a verified peer must outrank an unknown one"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_latency_should_not_score_as_the_slowest() {
+        // `LatencyBucket::from_latency` folds `None` into `VerySlow`, so reading the bucket back as
+        // a score would rank a peer we have never timed below one measured at 5 s.
+        let unmeasured = MultiObjectiveSelector::latency_score(None);
+        let slowest = MultiObjectiveSelector::latency_score(Some(Duration::from_secs(5)));
+        let fastest = MultiObjectiveSelector::latency_score(Some(Duration::from_millis(10)));
+
+        assert!(unmeasured > slowest, "unmeasured={unmeasured} slowest={slowest}");
+        assert!(fastest > unmeasured, "fastest={fastest} unmeasured={unmeasured}");
     }
 
     #[test]
@@ -559,7 +632,7 @@ mod tests {
                 edge_score: Some(0.0),
                 last_update: Duration::from_secs(9999),
                 average_latency: Some(Duration::from_millis(50)),
-                probe_success_rate: 0.0,
+                probe_success_rate: Some(0.0),
                 ack_rate: Some(0.0),
             },
             ticket_score: 0.0,
@@ -623,7 +696,7 @@ mod tests {
                 edge_score: Some(0.5),
                 last_update: Duration::from_secs(10),
                 average_latency: Some(Duration::from_millis(50)),
-                probe_success_rate: 0.9,
+                probe_success_rate: Some(0.9),
                 ack_rate: Some(0.9),
             },
             ticket_score: 0.5,
@@ -731,7 +804,7 @@ mod tests {
                 edge_score: Some(0.35), // above default close threshold 0.3 and above hysteresis threshold 0.1
                 last_update: Duration::from_secs(60),
                 average_latency: Some(Duration::from_millis(50)),
-                probe_success_rate: 0.35,
+                probe_success_rate: Some(0.35),
                 ack_rate: Some(0.35),
             },
             ticket_score: 0.35,
@@ -787,7 +860,7 @@ mod tests {
                 edge_score: Some(0.1),
                 last_update: Duration::from_secs(60),
                 average_latency: Some(Duration::from_millis(50)),
-                probe_success_rate: 0.1,
+                probe_success_rate: Some(0.1),
                 ack_rate: Some(0.1),
             },
             ticket_score: 0.1,
@@ -847,7 +920,7 @@ mod tests {
                 edge_score: None,
                 last_update: Duration::ZERO, // no observations recorded
                 average_latency: None,
-                probe_success_rate: 0.0,
+                probe_success_rate: Some(0.0),
                 ack_rate: None,
             },
             ticket_score: 0.0,
