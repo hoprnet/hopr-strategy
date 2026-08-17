@@ -242,6 +242,14 @@ impl hopr_api::graph::NetworkGraphView for EmptyGraph {
     type NodeId = OffchainPublicKey;
     type Observed = EmptyEdge;
 
+    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::Balance> {
+        None
+    }
+
+    fn path_slot(&self, _key: &Self::NodeId) -> Option<u64> {
+        None
+    }
+
     fn node_count(&self) -> usize {
         0
     }
@@ -327,8 +335,8 @@ impl hopr_api::graph::EdgeObservableRead for EmptyEdge {
         None
     }
 
-    fn score(&self) -> f64 {
-        0.0
+    fn score(&self) -> Option<f64> {
+        None
     }
 }
 
@@ -343,18 +351,18 @@ impl hopr_api::graph::EdgeLinkObservable for EmptyMeasurement {
         None
     }
 
-    fn average_probe_rate(&self) -> f64 {
-        0.0
+    fn average_probe_rate(&self) -> Option<f64> {
+        None
     }
 
-    fn score(&self) -> f64 {
-        0.0
+    fn score(&self) -> Option<f64> {
+        None
     }
 }
 
 impl hopr_api::graph::traits::EdgeNetworkObservableRead for EmptyMeasurement {
-    fn is_connected(&self) -> bool {
-        false
+    fn is_connected(&self) -> Option<bool> {
+        None
     }
 }
 
@@ -365,7 +373,7 @@ impl hopr_api::graph::EdgeImmediateProtocolObservable for EmptyMeasurement {
 }
 
 impl hopr_api::graph::traits::EdgeProtocolObservable for EmptyMeasurement {
-    fn capacity(&self) -> Option<u128> {
+    fn balance(&self) -> Option<hopr_api::graph::traits::Balance> {
         None
     }
 }

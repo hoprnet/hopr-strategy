@@ -166,12 +166,18 @@ where
         match self.node.graph().edge(my_key, peer_offchain) {
             Some(e) => {
                 let (average_latency, probe_success_rate, ack_rate) = if let Some(qos) = e.immediate_qos() {
-                    (qos.average_latency(), qos.average_probe_rate(), qos.ack_rate())
+                    // An unmeasured rate collapses to `0.0`, which is what the previous
+                    // `average_probe_rate() -> f64` returned for the same case.
+                    (
+                        qos.average_latency(),
+                        qos.average_probe_rate().unwrap_or(0.0),
+                        qos.ack_rate(),
+                    )
                 } else {
                     (None, 0.0, None)
                 };
                 PeerEdgeInfo {
-                    edge_score: Some(e.score()),
+                    edge_score: e.score(),
                     last_update: e.last_update(),
                     average_latency,
                     probe_success_rate,
@@ -1329,6 +1335,14 @@ mod tests {
         type NodeId = OffchainPublicKey;
         type Observed = StubEdge;
 
+        fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::Balance> {
+            None
+        }
+
+        fn path_slot(&self, _key: &OffchainPublicKey) -> Option<u64> {
+            None
+        }
+
         fn node_count(&self) -> usize {
             0
         }
@@ -1434,8 +1448,8 @@ mod tests {
             None
         }
 
-        fn score(&self) -> f64 {
-            self.score
+        fn score(&self) -> Option<f64> {
+            Some(self.score)
         }
     }
 
@@ -1452,18 +1466,18 @@ mod tests {
             None
         }
 
-        fn average_probe_rate(&self) -> f64 {
-            0.0
+        fn average_probe_rate(&self) -> Option<f64> {
+            None
         }
 
-        fn score(&self) -> f64 {
-            0.0
+        fn score(&self) -> Option<f64> {
+            None
         }
     }
 
     impl hopr_api::graph::traits::EdgeNetworkObservableRead for StubMeasurement {
-        fn is_connected(&self) -> bool {
-            false
+        fn is_connected(&self) -> Option<bool> {
+            None
         }
     }
 
@@ -1474,7 +1488,7 @@ mod tests {
     }
 
     impl hopr_api::graph::traits::EdgeProtocolObservable for StubMeasurement {
-        fn capacity(&self) -> Option<u128> {
+        fn balance(&self) -> Option<hopr_api::graph::traits::Balance> {
             None
         }
     }
