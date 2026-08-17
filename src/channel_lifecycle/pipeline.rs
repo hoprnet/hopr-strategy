@@ -168,13 +168,9 @@ where
                 let (average_latency, probe_success_rate, ack_rate) = if let Some(qos) = e.immediate_qos() {
                     // An unmeasured rate collapses to `0.0`, which is what the previous
                     // `average_probe_rate() -> f64` returned for the same case.
-                    (
-                        qos.average_latency(),
-                        qos.average_probe_rate().unwrap_or(0.0),
-                        qos.ack_rate(),
-                    )
+                    (qos.average_latency(), qos.average_probe_rate(), qos.ack_rate())
                 } else {
-                    (None, 0.0, None)
+                    (None, None, None)
                 };
                 PeerEdgeInfo {
                     edge_score: e.score(),
@@ -697,7 +693,7 @@ where
                 // Composite-score eligibility gate — same formula as today's
                 // `DefaultSelector`, kept here so the threshold acts as a hard
                 // filter that all selectors inherit.
-                let composite = self.cfg.eligibility.peer_quality_weight * edge_info.edge_score.unwrap_or(0.0)
+                let composite = self.cfg.eligibility.peer_quality_weight * edge_info.quality_score()
                     + self.cfg.eligibility.ticket_activity_weight * ticket_score;
                 if composite < self.cfg.eligibility.min_peer_quality_score {
                     return None;
@@ -1095,8 +1091,8 @@ where
                     LatencyBucket::VerySlow => 0.0,
                 };
                 let w = &mo_cfg.weights;
-                let trust = w.trust_probe * c.edge_info.probe_success_rate
-                    + w.trust_ack * c.edge_info.ack_rate.unwrap_or(0.0)
+                let trust = w.trust_probe * c.edge_info.probe_score()
+                    + w.trust_ack * c.edge_info.ack_score()
                     + w.trust_ticket * c.ticket_score;
                 let stake = ctx.stake_view.score(&c.addr);
                 let cell = BucketCell {
