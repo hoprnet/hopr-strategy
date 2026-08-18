@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "0.28.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
