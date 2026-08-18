@@ -9,6 +9,8 @@
 //!                                              │                  │
 //!                 Per-entry random nonce (12) ─┤         ChaCha20Poly1305
 //!                                              │                  │
+//!                     AAD = entry key (14) ────┤                  │
+//!                                              │                  │
 //!                                  Plaintext   │                  │
 //!                                  (32 bytes)  ──→  encrypt      │
 //!                                                                 │
@@ -40,6 +42,14 @@
 //! truncation, etc.) is detected on decryption; the corrupt entry is skipped
 //! during iteration and the skip is logged.
 //!
+//! **Entry binding.**  The encoded database key is passed as ChaCha20Poly1305
+//! associated data, so each ciphertext authenticates the `PixAddressId` it is
+//! filed under.  A value copied or swapped to a different key fails to decrypt
+//! rather than yielding another entry's secret — otherwise a sweep would be
+//! attempted with a private key that does not belong to the deposit address.
+//! The password verifier is bound to an all-zero associated-data value, which
+//! `encode_key` cannot produce, so it cannot be exchanged with a real entry.
+//!
 //! **Key layout.**  The database key is the `PixAddressId` encoded as
 //! `HoprPseudonym::SIZE` bytes of pseudonym followed by a 4-byte big-endian SSA
 //! index.  The key is deterministic (no randomness), so `contains()` and
@@ -51,6 +61,11 @@
 //! database file (e.g. via a filesystem backup, exfiltration, or stolen disk).
 //! Without the config password they cannot derive the encryption key, and
 //! without the key they cannot decrypt any entry.
+//!
+//! An attacker who can *write* to the file cannot forge an entry or move one
+//! between `PixAddressId`s undetected, because every ciphertext is bound to its
+//! key (see **Entry binding**).  They can still delete entries or the whole
+//! file, which loses the pending sweep for those deposits.
 //!
 //! It does **not** protect against:
 //! - An attacker who also has the config (the password comes from the same config file).
@@ -74,7 +89,10 @@
 
 use std::{num::NonZeroU32, path::Path, sync::Arc};
 
-use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
 use hopr_api::{
     chain::PixDepositSecret,
     node::PixAddressId,
@@ -101,6 +119,13 @@ const PIX_KDF_VERIFIER_TABLE: TableDefinition<u8, [u8; VALUE_SIZE]> = TableDefin
 
 /// Known plaintext encrypted under the derived key so the key can be checked on open.
 const VERIFIER_PLAINTEXT: [u8; 32] = *b"hopr-pix-recovery-store-verifier";
+
+/// Associated data binding the verifier record to its own slot.
+///
+/// All-zero, which [`encode_key`] can never produce: its trailing SSA index comes from a
+/// `NonZeroU32`. So the verifier ciphertext can never be relocated into an entry slot, nor an
+/// entry ciphertext into the verifier slot.
+const VERIFIER_AAD: [u8; KEY_SIZE] = [0u8; KEY_SIZE];
 
 /// Persistent encrypted recovery key store backed by `redb`.
 #[derive(Clone)]
@@ -194,13 +219,26 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
 
 // ── Encryption helpers ───────────────────────────────────────────────────────
 
-fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], PixRecoveryStoreError> {
+/// Encrypt `plaintext`, binding the result to `aad` — the database key the value is filed
+/// under. A value moved to a different key no longer authenticates, so relocating a stored
+/// ciphertext turns it into a decryption failure instead of another entry's secret.
+fn encrypt(
+    key: &[u8; 32],
+    aad: &[u8; KEY_SIZE],
+    plaintext: &[u8; 32],
+) -> Result<[u8; VALUE_SIZE], PixRecoveryStoreError> {
     let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let nonce_bytes = random_bytes::<NONCE_SIZE>();
     let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_ref())
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext.as_ref(),
+                aad,
+            },
+        )
         .map_err(|_| PixRecoveryStoreError::Encryption)?;
 
     // ChaCha20Poly1305 output = plaintext_len + 16-byte tag = 48 bytes
@@ -210,16 +248,24 @@ fn encrypt(key: &[u8; 32], plaintext: &[u8; 32]) -> Result<[u8; VALUE_SIZE], Pix
     Ok(out)
 }
 
-fn decrypt(key: &[u8; 32], stored: &[u8; VALUE_SIZE]) -> Result<[u8; 32], PixRecoveryStoreError> {
+/// Decrypt `stored`, which must have been encrypted under the same `aad`. `aad` is the
+/// database key the value was read from, so a value that has been moved between keys fails
+/// here rather than decrypting into the wrong entry's secret.
+fn decrypt(key: &[u8; 32], aad: &[u8; KEY_SIZE], stored: &[u8; VALUE_SIZE]) -> Result<[u8; 32], PixRecoveryStoreError> {
     let cipher = ChaCha20Poly1305::new(&Key::from(*key));
     let nonce_arr: [u8; NONCE_SIZE] = stored[..NONCE_SIZE]
         .try_into()
         .map_err(|_| PixRecoveryStoreError::Decryption)?;
     let nonce = Nonce::from(nonce_arr);
 
-    let ciphertext = &stored[NONCE_SIZE..];
     let plaintext = cipher
-        .decrypt(&nonce, ciphertext)
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &stored[NONCE_SIZE..],
+                aad,
+            },
+        )
         .map_err(|_| PixRecoveryStoreError::Decryption)?;
 
     Ok(plaintext
@@ -274,14 +320,14 @@ impl PixRecoveryStore {
                 let existing: Option<[u8; VALUE_SIZE]> = verifier_table.get(&0u8)?.map(|g| g.value());
                 match existing {
                     Some(stored) => {
-                        let plaintext =
-                            decrypt(&encryption_key, &stored).map_err(|_| PixRecoveryStoreError::WrongPassword)?;
+                        let plaintext = decrypt(&encryption_key, &VERIFIER_AAD, &stored)
+                            .map_err(|_| PixRecoveryStoreError::WrongPassword)?;
                         if plaintext != VERIFIER_PLAINTEXT {
                             return Err(PixRecoveryStoreError::WrongPassword);
                         }
                     }
                     None => {
-                        let verifier = encrypt(&encryption_key, &VERIFIER_PLAINTEXT)?;
+                        let verifier = encrypt(&encryption_key, &VERIFIER_AAD, &VERIFIER_PLAINTEXT)?;
                         verifier_table.insert(&0u8, verifier)?;
                     }
                 }
@@ -320,7 +366,7 @@ impl PixRecoveryStore {
                 false
             } else {
                 let plaintext: [u8; 32] = secret.0.as_ref().try_into().expect("PixDepositSecret is 32 bytes");
-                let stored = encrypt(&self.encryption_key, &plaintext)?;
+                let stored = encrypt(&self.encryption_key, &key, &plaintext)?;
                 table.insert(key, stored)?;
                 true
             }
@@ -365,7 +411,10 @@ impl PixRecoveryStore {
                     continue;
                 }
             };
-            let id = match decode_key(&key_bytes.value()) {
+            // Kept as raw bytes: they are the AAD the entry was encrypted under, so the value
+            // must be authenticated against what is actually stored, not against a re-encoding.
+            let key: [u8; KEY_SIZE] = key_bytes.value();
+            let id = match decode_key(&key) {
                 Ok(id) => id,
                 Err(error) => {
                     tracing::error!(%error, "corrupt recovery store key, skipping entry");
@@ -375,7 +424,7 @@ impl PixRecoveryStore {
             };
             // The table is typed `[u8; VALUE_SIZE]`, so the length is already guaranteed.
             let stored: [u8; VALUE_SIZE] = value_bytes.value();
-            let plaintext = match decrypt(&self.encryption_key, &stored) {
+            let plaintext = match decrypt(&self.encryption_key, &key, &stored) {
                 Ok(p) => p,
                 Err(_) => {
                     tracing::error!(?id, "failed to decrypt recovery store entry, skipping");
@@ -668,6 +717,36 @@ mod tests {
         // iter() must skip the tampered entry.
         let entries = store.iter().unwrap();
         assert!(entries.is_empty(), "tampered entry must be skipped");
+    }
+
+    /// Each ciphertext is bound to its own database key, so swapping two stored values makes
+    /// both unreadable. Without that binding the tags would still verify and `iter` would hand
+    /// the caller each ID paired with the *other* entry's secret — a sweep signed with a private
+    /// key that does not control the deposit address.
+    #[test]
+    fn test_ciphertext_moved_to_another_key_is_skipped() {
+        let (store, _dir) = open_temp_store();
+        let id1 = make_id(1);
+        let id2 = make_id(2);
+        assert!(store.insert(&id1, &make_secret(0x11)).unwrap());
+        assert!(store.insert(&id2, &make_secret(0x22)).unwrap());
+
+        let val1 = raw_stored_value(&store, &id1).expect("entry 1");
+        let val2 = raw_stored_value(&store, &id2).expect("entry 2");
+
+        // Swap the two stored values, leaving the keys in place.
+        let write_tx = store.db.begin_write().unwrap();
+        {
+            let mut table = write_tx.open_table(PIX_RECOVERED_KEYS).unwrap();
+            table.insert(encode_key(&id1), val2).unwrap();
+            table.insert(encode_key(&id2), val1).unwrap();
+        }
+        write_tx.commit().unwrap();
+
+        assert!(
+            store.iter().unwrap().is_empty(),
+            "a ciphertext filed under another ID must not decrypt"
+        );
     }
 
     #[test]
