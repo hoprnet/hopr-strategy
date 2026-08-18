@@ -121,9 +121,6 @@ impl Strategy for MultiStrategy {
             }
         }
 
-        #[cfg(not(feature = "runtime-tokio"))]
-        let _ = strategies;
-
         Ok(())
     }
 }
