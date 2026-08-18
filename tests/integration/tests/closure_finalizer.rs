@@ -46,7 +46,7 @@ async fn closes_elapsed_channel(fixture: IntegrationFixture) -> Result<()> {
         },
         Duration::from_secs(3600),
     )
-    .build(node);
+    .build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     await_channel_where(
@@ -97,7 +97,7 @@ async fn skips_channel_overdue_beyond_max(fixture: IntegrationFixture) -> Result
         ClosureFinalizerStrategyConfig { max_closure_overdue },
         Duration::from_secs(3600),
     )
-    .build(node);
+    .build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // The overdue channel must never be finalized.
@@ -166,7 +166,7 @@ async fn skips_channel_with_pending_deadline(fixture: IntegrationFixture) -> Res
         },
         Duration::from_secs(1),
     )
-    .build(node);
+    .build(node)?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     // Before the deadline elapses, the channel must stay PendingToClose.

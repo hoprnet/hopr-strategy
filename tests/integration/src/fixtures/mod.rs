@@ -16,7 +16,8 @@ mod scenario;
 
 pub use pix::{PixScenario, PixScenarioOpts, deposit_secret, pix_address_id};
 pub use scenario::{
-    ChannelParty, ChannelScenario, ScenarioOpts, assert_channel_never, await_channel, await_channel_where,
+    ChannelParty, ChannelScenario, MultiChannelScenario, ScenarioOpts, assert_channel_never, await_channel,
+    await_channel_where,
 };
 
 /// Address of the Safe module every scenario deploys its node against.

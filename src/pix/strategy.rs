@@ -26,8 +26,10 @@ use futures::{SinkExt, StreamExt};
 use hopr_api::{
     chain::{DepositPool, PixDepositAddress, PixDepositSecret},
     node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixAddressId, PixEvent},
-    types::primitive::prelude::{Address, HoprBalance},
-    types::{crypto::prelude::Keypair, primitive::prelude::GeneralError},
+    types::{
+        crypto::prelude::Keypair,
+        primitive::prelude::{Address, GeneralError, HoprBalance},
+    },
 };
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
@@ -1108,6 +1110,7 @@ mod tests {
             address: addr.into(),
             quota: 100,
             deposit_updated: Some(tx),
+            additional_data: None,
         }))
         .await?;
         let n = timeout(StdDuration::from_secs(10), rx.next())
@@ -1156,6 +1159,7 @@ mod tests {
             id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
             address: da.into(),
             quota: 20,
+            additional_data: None,
         }))
         .await?;
         s.flush_deposits().await;
@@ -1198,6 +1202,7 @@ mod tests {
                 id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
                 address: Address::from([0x42u8; 20]).into(),
                 quota: 10,
+                additional_data: None,
             }))
             .await;
         assert!(matches!(r, Err(StrategyError::CriteriaNotSatisfied)));
@@ -1377,6 +1382,7 @@ mod tests {
                 id,
                 address: da.into(),
                 quota: 20,
+                additional_data: None,
             })
         };
         let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
@@ -1884,6 +1890,7 @@ mod tests {
             id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
             address: da.into(),
             quota,
+            additional_data: None,
         }));
 
         let landed = timeout(StdDuration::from_secs(10), async {
@@ -2070,12 +2077,14 @@ mod tests {
             id: (HoprPseudonym::random(), NonZeroU32::new(1).unwrap()),
             address: da1.into(),
             quota: 20,
+            additional_data: None,
         }))
         .await?;
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
             id: (HoprPseudonym::random(), NonZeroU32::new(2).unwrap()),
             address: da2.into(),
             quota: 30,
+            additional_data: None,
         }))
         .await?;
         // Both events buffered — flush deposits.

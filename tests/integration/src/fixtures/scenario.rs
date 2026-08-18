@@ -78,6 +78,19 @@ impl ChannelScenario {
     }
 }
 
+/// A scenario with several open channels from one source to distinct
+/// destinations, all visible to a single connector attached to the source.
+///
+/// Used by tests that need more concurrent channels than the strategy's
+/// `concurrency.max_concurrent_actions` budget allows.
+pub struct MultiChannelScenario {
+    pub connector: Arc<NodeConnector>,
+    pub source_addr: Address,
+    pub destination_addrs: Vec<Address>,
+    /// Channels as first seen by the connector, in `destination_addrs` order.
+    pub initial: Vec<ChannelEntry>,
+}
+
 impl IntegrationFixture {
     /// Builds initial stub state with both accounts and an open channel, connects a
     /// node to the requested party, and waits until the channel is visible to it.
@@ -158,6 +171,84 @@ impl IntegrationFixture {
             source_connector,
             source_addr: source.address,
             destination_addr: destination.address,
+            initial,
+        })
+    }
+}
+
+impl IntegrationFixture {
+    /// Builds initial stub state with one source, `destinations.len()` peers, and
+    /// an open channel from the source to each of them.  The returned connector is
+    /// attached to the source and has seen every channel.
+    pub async fn open_channels_scenario(
+        &self,
+        source: &TestAccount,
+        destinations: &[TestAccount],
+        stake: HoprBalance,
+    ) -> Result<MultiChannelScenario> {
+        use hopr_api::types::internal::prelude::{ChannelBuilder, ChannelStatus};
+
+        let channels = destinations
+            .iter()
+            .map(|destination| {
+                ChannelBuilder::default()
+                    .between(source.address, destination.address)
+                    .balance(stake)
+                    .ticket_index(0u64)
+                    .status(ChannelStatus::Open)
+                    .epoch(0u32)
+                    .build()
+                    .context("failed to build initial channel")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // `with_generated_accounts` assigns key IDs sequentially from 0 and must
+        // therefore see every account in one call.
+        let addresses: Vec<Address> = std::iter::once(source.address)
+            .chain(destinations.iter().map(|d| d.address))
+            .collect();
+        let address_refs: Vec<&Address> = addresses.iter().collect();
+        let allowance: HoprBalance = SAFE_ALLOWANCE.parse()?;
+
+        let client = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &address_refs,
+                true,
+                XDaiBalance::new_base(1u32),
+                SAFE_FUNDING.parse::<HoprBalance>()?,
+            )
+            .with_safe_allowances(addresses.iter().map(|address| (*address, allowance)))
+            .with_channels(channels)
+            .with_closure_grace_period(Duration::from_secs(2))
+            .build_dynamic_client(module_address());
+
+        let connector = create_test_blokli_connector(&source.keypair, client, module_address())
+            .await
+            .context("failed to connect source node")?;
+        register_test_safe(&connector, source.address)
+            .await
+            .context("failed to register source node safe")?;
+        let connector = Arc::new(connector);
+
+        let mut initial = Vec::with_capacity(destinations.len());
+        for destination in destinations {
+            initial.push(
+                await_channel(
+                    &connector,
+                    source.address,
+                    destination.address,
+                    self.timeouts().visibility,
+                    "scenario channel visible",
+                )
+                .await
+                .context("scenario channel never became visible")?,
+            );
+        }
+
+        Ok(MultiChannelScenario {
+            connector,
+            source_addr: source.address,
+            destination_addrs: destinations.iter().map(|d| d.address).collect(),
             initial,
         })
     }

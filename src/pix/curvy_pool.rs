@@ -49,13 +49,11 @@ fn default_max_deposit_tracking_time() -> Duration {
 /// by design.** The two pools settle by different means, so neither one's knobs are evidence
 /// that the other needs them, in either direction:
 ///
-/// * The non-anonymous pool's `gas_xdai_per_sweep` funds a recovered stealth address so it can
-///   pay for its own `withdraw_from_signer` transaction. That is a fact about settling on-chain
-///   from an EOA, not about deposit pools. This pool has no such field and should not acquire
-///   one by analogy.
-/// * Its `max_deposit_retries` / `max_sweep_retries` budget retries of a *transaction* against
-///   a chain that may drop it. What this pool retries, and whether retrying is even meaningful,
-///   is not yet decided.
+/// * The non-anonymous pool's `gas_xdai_per_sweep` funds a recovered stealth address so it can pay for its own
+///   `withdraw_from_signer` transaction. That is a fact about settling on-chain from an EOA, not about deposit pools.
+///   This pool has no such field and should not acquire one by analogy.
+/// * Its `max_deposit_retries` / `max_sweep_retries` budget retries of a *transaction* against a chain that may drop
+///   it. What this pool retries, and whether retrying is even meaningful, is not yet decided.
 ///
 /// So this carries only what the [`DepositPool`] contract itself forces — a pool owns the
 /// deadline on the future it returns from [`DepositPool::notify_deposit`], so it needs somewhere
@@ -98,9 +96,9 @@ impl<N> CurvyDepositPool<N> {
 macro_rules! not_implemented {
     ($what:literal) => {
         unimplemented!(
-            "CurvyDepositPool::{} is not implemented — this build selected the Baby JubJub \
-             deposit pool via `strategy-pix-curvy`, which is currently a stub. For a working pool \
-             build with `strategy-pix-secp256k1` instead (and `hopr-lib/pix-secp256k1` with it).",
+            "CurvyDepositPool::{} is not implemented — this build selected the Baby JubJub deposit pool via \
+             `strategy-pix-curvy`, which is currently a stub. For a working pool build with `strategy-pix-secp256k1` \
+             instead (and `hopr-lib/pix-secp256k1` with it).",
             $what
         )
     };

@@ -419,7 +419,6 @@ where
     /// transfer whose confirmation was lost is therefore not sent twice. The guarantee is
     /// balance-based rather than transaction-based, so a third party funding the same
     /// address also satisfies the check.
-    ///
     async fn deposit_funds_to(&self, dst: Address, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
         let dest_addr = dst;
         let node = &self.node;

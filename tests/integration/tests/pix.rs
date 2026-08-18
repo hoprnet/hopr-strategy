@@ -80,6 +80,7 @@ async fn deposits_to_new_deposit_address(fixture: IntegrationFixture) -> Result<
         id: pix_address_id(0x11, 1),
         address: deposit.address.into(),
         quota,
+        additional_data: None,
     }));
 
     let deposited = scenario
@@ -129,6 +130,7 @@ async fn skips_deposit_exceeding_max_ssa_allocation(fixture: IntegrationFixture)
         id: pix_address_id(0x22, 1),
         address: deposit.address.into(),
         quota: 10,
+        additional_data: None,
     }));
 
     scenario
@@ -183,6 +185,7 @@ async fn notifies_when_deposit_arrives(fixture: IntegrationFixture) -> Result<()
         address: deposit.address.into(),
         quota,
         deposit_updated: Some(notifier),
+        additional_data: None,
     }));
 
     let (notified_id, notified_balance) = tokio::time::timeout(timeouts.action, notifications.next())
@@ -299,6 +302,7 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         address: deposit.address.into(),
         quota,
         deposit_updated: Some(notifier),
+        additional_data: None,
     }));
 
     // 2. Entry side funds the very same address.
@@ -306,6 +310,7 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         id,
         address: deposit.address.into(),
         quota,
+        additional_data: None,
     }));
 
     let deposited = scenario

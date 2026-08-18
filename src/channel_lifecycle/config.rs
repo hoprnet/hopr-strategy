@@ -3,15 +3,29 @@ use std::{collections::HashSet, time::Duration};
 use bytesize::ByteSize;
 use hopr_api::{
     node::PacketTransport,
-    types::primitive::prelude::{Address, HoprBalance, U256},
+    types::{
+        internal::routing::RoutingOptions,
+        primitive::prelude::{Address, HoprBalance, U256},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use validator::Validate;
 
+/// Paid downstream relay hops every channel stake is sized for.
+///
+/// Fixed at the longest path the protocol can encode — not a tuning parameter.  A ticket's
+/// face value is `ticket_price × hops / win_prob`, and the issuing node cannot know how long
+/// a path a given packet will take, so sizing below the maximum under-funds the tickets a
+/// relayer must issue and the channel stalls mid-relay on any path that exceeds the guess.
+/// Sizing at the maximum over-funds shorter paths instead, which only leaves balance idle
+/// until the channel closes.
+const ASSUMED_HOPS: u32 = RoutingOptions::MAX_INTERMEDIATE_HOPS as u32;
+
 /// Population thresholds: how many open channels to maintain.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PopulationConfig {
     /// Minimum number of open outgoing channels.  Closures are suppressed
     /// when the open count would drop below this.  Default: 5.
@@ -25,19 +39,15 @@ pub struct PopulationConfig {
 
     /// How long a peer is ineligible for a new channel after its previous
     /// channel was closed.  Default: 30 minutes.
-    #[serde(default = "default_peer_reopen_cooldown", with = "humantime_serde")]
-    #[default(default_peer_reopen_cooldown())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30 * 60))]
     pub peer_reopen_cooldown: Duration,
-}
-
-#[inline]
-fn default_peer_reopen_cooldown() -> Duration {
-    Duration::from_secs(30 * 60)
 }
 
 /// Peer eligibility filters for channel opening and for determining staleness.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct EligibilityConfig {
     /// Only open channels to peers that are currently connected.  Default: true.
     #[default = true]
@@ -78,118 +88,120 @@ pub struct EligibilityConfig {
 /// How the strategy converts a data-capacity [`ByteSize`] to a wxHOPR channel
 /// stake at runtime.
 ///
-/// Each packet sent through an h-hop path causes one Bernoulli(win_prob) trial
-/// per hop: a ticket of face value `ticket_price` is redeemed with probability
-/// `win_prob`, draining that amount from the channel balance (§3.2).  The total
-/// drain for N packets therefore follows a scaled Binomial distribution:
+/// # Ticket economics
+///
+/// A packet relayed over an `h`-hop path is paid for with probabilistic
+/// tickets.  On-chain (`HoprTicketFactory`), a single winning ticket's face
+/// value is
 ///
 /// ```text
-/// D ~ Binomial(N, win_prob) × hops × ticket_price
-/// E[D] = N × win_prob × hops × ticket_price
-/// σ[D] = hops × ticket_price × √(N × win_prob × (1 − win_prob))
+/// face_value = ticket_price × hops / win_prob
 /// ```
 ///
-/// The three modes differ only in how much safety buffer is added above the
-/// expected drain.
-///
-/// # Mode comparison for a typical FundingConfig
-///
-/// Common parameters: hops = 3, win_prob = 0.001 (ultralow), ticket_price = 0.001 wxHOPR (ultralow)
+/// i.e. per packet the sender issues **one** aggregated multi-hop ticket of face
+/// value `ticket_price × hops / win_prob` against this channel (not `h`
+/// independent tickets) — a large, indivisible amount redeemed with probability
+/// `win_prob`.  The winning tickets over `N` packets are therefore a single
+/// `Binomial(N, win_prob)`, and the total channel drain `D` is that count scaled
+/// by one face value:
 ///
 /// ```text
-/// Config field            capacity    N (pkts)   Deterministic   Expected   Probabilistic(0.999)
-/// ─────────────────────────────────────────────────────────────────────────────────────────────
-/// lower_capacity_threshold  250 MB     253 035     759 wxHOPR    0.76 wxHOPR    0.91 wxHOPR
-/// initial_capacity            1 GB   1 036 431   3 109 wxHOPR    3.11 wxHOPR    3.41 wxHOPR
-/// topup_capacity              5 GB   5 182 152  15 547 wxHOPR   15.55 wxHOPR   16.21 wxHOPR
+/// D    = (ticket_price × hops / win_prob) × Binomial(N, win_prob)
+/// E[D] = N × hops × ticket_price                              (win-prob independent)
+/// σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)
 /// ```
 ///
-/// `Deterministic` over-funds by ~900× relative to `Probabilistic(0.999)` at these ultralow
-/// parameters.  The k·σ overhead shrinks as N grows (+19 % at 250 MB, +4 % at 5 GB), making
-/// `Probabilistic` indistinguishable from `Expected` at large capacities.
+/// Note `E[D]` does **not** depend on `win_prob`: lower win-prob means rarer but
+/// proportionally larger payouts, so the mean drain is unchanged while the
+/// variance grows as `1 / win_prob`.
 ///
-/// At `win_prob = 1.0` all three modes are equal: σ = 0 and `E[D] = N × hops × tp`.
+/// # The one-winning-ticket floor (applies to every mode)
 ///
-/// # Choosing a mode
+/// A channel cannot even *issue* a ticket whose face value exceeds its balance
+/// — the factory returns `OutOfFunds`.  Every resolved stake is therefore
+/// floored at a single full-path winning ticket:
 ///
-/// * **`Deterministic`** — no chain queries for win_prob; always safe but massively over-funds at low win_prob (~900×
-///   in the example above).
-/// * **`Expected`** — most capital-efficient; ~50 % of cycles see the channel drain slightly faster than planned
-///   (triggering a top-up sooner, not loss).
-/// * **`Probabilistic`** (**default**) — adds a k·σ buffer; the channel carries its full configured capacity with
-///   probability `success_probability`. Overhead over `Expected` is 19 % at 250 MB, 10 % at 1 GB, 4 % at 5 GB.
+/// ```text
+/// stake = max( ticket_price × hops / win_prob ,  <mode term> )
+/// ```
+///
+/// Without this floor, at HOPR's production win-probs (1e-4 … 1e-6) a stake
+/// sized to the *mean* drain can be smaller than one ticket, leaving the
+/// channel unable to relay a single packet.  The floor guarantees every field —
+/// initial, top-up, and lower threshold — always covers ≥ 1 winning ticket.
+///
+/// # Modes
+///
+/// Both modes are floored as above; they differ only in the buffer added above
+/// the mean drain.  At `win_prob = 1.0` the variance vanishes (`σ = 0`) and both
+/// collapse to `N × hops × ticket_price`.
 ///
 /// # Configuration (YAML)
 ///
 /// ```yaml
-/// # Worst-case stake; skips the win_prob chain query each tick.
+/// # Mean-drain stake (default); floored at one winning ticket.
 /// sizing_mode: deterministic
 ///
-/// # Mean-drain stake; most capital-efficient.
-/// sizing_mode: expected
-///
-/// # Statistical guarantee (default); adds k·σ above expected drain.
+/// # Statistical guarantee; adds k·σ above the mean drain.
 /// sizing_mode:
 ///   probabilistic:
 ///     success_probability: 0.999
+///
+/// # `success_probability` defaults to 0.999, but the empty map is required.
+/// sizing_mode:
+///   probabilistic: {}
 /// ```
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapacitySizingMode {
-    /// `stake = N × hops × ticket_price`
+    /// `stake = max( ticket_price × hops / win_prob ,  N × hops × ticket_price )`
     ///
-    /// Hard worst-case guarantee: the channel never empties prematurely
-    /// regardless of win_prob (equivalent to assuming every ticket wins).
-    /// Does **not** require the win_prob chain query each tick.
+    /// Sizes the stake to the **expected** drain `N × hops × ticket_price`,
+    /// floored at one winning ticket.  The main term is independent of
+    /// `win_prob`, so the stake is insensitive to win-prob fluctuations; the
+    /// floor is the only win-prob-dependent part.
     ///
-    /// Over-funds proportionally to `1 / win_prob` relative to the expected
-    /// drain.  Use when capital efficiency is not a concern and you want zero
-    /// sensitivity to win_prob fluctuations.
+    /// This is the **default**.  Because payouts are lumpy, roughly half of all
+    /// fund cycles see the channel drain slightly faster than the mean — this
+    /// triggers a top-up sooner (handled by proactive funding), never message
+    /// loss, as long as the balance stays above the one-ticket floor.
     ///
     /// ```yaml
     /// sizing_mode: deterministic
     /// ```
+    #[default]
     Deterministic,
 
-    /// `stake = N × win_prob × hops × ticket_price`
+    /// `stake = max( ticket_price × hops / win_prob ,  E[D] + k·σ[D] )`
+    /// where `k = Φ⁻¹(success_probability)`,
+    /// `E[D] = N × hops × ticket_price` and
+    /// `σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)`.
     ///
-    /// Sizes the stake exactly to the expected drain.  Capital-efficient at low
-    /// win_prob; approximately half of all fund cycles see the channel drain
-    /// slightly faster than planned (triggers a top-up sooner, not message loss).
-    /// Requires the win_prob chain query each tick.
+    /// Adds `k` standard deviations on top of the mean drain so the channel
+    /// carries its full configured capacity between top-ups with probability
+    /// `success_probability`.  Costs more capital than `Deterministic` and, at
+    /// low win-prob, the `1 / win_prob` variance makes the buffer large — use
+    /// when premature top-ups must be minimised on high-value paths.
     ///
-    /// ```yaml
-    /// sizing_mode: expected
-    /// ```
-    Expected,
-
-    /// `stake = E[D] + k·σ[D]`  where k = Φ⁻¹(success_probability)
-    ///
-    /// Adds `k` Binomial standard deviations on top of the expected drain,
-    /// guaranteeing the channel carries its full configured capacity with
-    /// probability `success_probability`.  Requires the win_prob chain query
-    /// each tick.
-    ///
-    /// # Worked example — default settings (k ≈ 3.09)
+    /// # Worked example — default confidence (k ≈ 3.09)
     ///
     /// Parameters: N = 100 000 packets, win_prob = 0.01, hops = 3,
     /// ticket_price = 0.01 wxHOPR.
     ///
     /// ```text
-    /// E[D]  = 30.000 wxHOPR
-    /// σ[D]  ≈  0.944 wxHOPR
-    /// stake ≈ 30 + 3.09 × 0.944 ≈ 32.9 wxHOPR   (Deterministic would be 3 000)
+    /// E[D]  = N × h × tp                       = 3,000 wxHOPR
+    /// σ[D]  = h × tp × √(N × (1−p)/p)           ≈ 94.39 wxHOPR
+    /// stake ≈ 3,000 + 3.09 × 94.39             ≈ 3,292 wxHOPR
     /// ```
     ///
-    /// At `win_prob = 1.0` the variance term vanishes (σ = 0) and the formula
-    /// collapses to `N × hops × ticket_price` — identical to `Deterministic`.
+    /// At `win_prob = 1.0` the variance term vanishes and the formula collapses
+    /// to `N × hops × ticket_price` — identical to `Deterministic`.
     ///
     /// ```yaml
     /// sizing_mode:
     ///   probabilistic:
     ///     success_probability: 0.999
     /// ```
-    #[default]
     Probabilistic {
         /// Probability that the channel does **not** drain prematurely in any
         /// given fund cycle.  Must be in the range `(0.5, 1.0)`.
@@ -198,7 +210,7 @@ pub enum CapacitySizingMode {
         /// |--------|-------------|-------|
         /// | 0.841  | 1.0  | one-sigma; adequate for large N |
         /// | 0.977  | 2.0  | two-sigma |
-        /// | 0.999  | 3.09 | **default**; recommended for most deployments |
+        /// | 0.999  | 3.09 | recommended for most deployments |
         /// | 0.9999 | 3.72 | four-nines; use for very small N or mission-critical paths |
         #[serde(default = "default_success_probability")]
         #[default = 0.999]
@@ -211,6 +223,17 @@ fn default_success_probability() -> f64 {
     0.999
 }
 
+/// Rejects a zero duration where zero disables the protection rather than
+/// meaning "no limit": a zero lease expires on the spot, so every pass would
+/// re-submit a transaction already in flight, and a zero read budget makes every
+/// read unavailable.
+fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationError> {
+    match duration.is_zero() {
+        true => Err(validator::ValidationError::new("duration must be greater than zero")),
+        false => Ok(()),
+    }
+}
+
 fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::ValidationError> {
     if let CapacitySizingMode::Probabilistic { success_probability } = mode
         && !(*success_probability >= 0.5001 && *success_probability <= 0.99999)
@@ -220,14 +243,6 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
         ));
     }
     Ok(())
-}
-
-impl CapacitySizingMode {
-    /// Returns `true` for modes that use the network's winning probability at
-    /// runtime.  `Deterministic` returns `false` and skips the win_prob query.
-    pub(crate) fn requires_win_prob(&self) -> bool {
-        !matches!(self, Self::Deterministic)
-    }
 }
 
 /// Initial and top-up capacities for channel funding expressed as human-readable
@@ -246,23 +261,26 @@ impl CapacitySizingMode {
 /// topup_capacity: 1 GiB
 /// lower_capacity_threshold: 256 MiB
 /// min_safe_capacity_required: 1 GiB
-/// assumed_hops: 3
-/// sizing_mode:
-///   probabilistic:
-///     success_probability: 0.999
+/// sizing_mode: deterministic
 /// ```
 ///
-/// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` this resolves to:
+/// Hop count is not configurable: every stake is sized for
+/// [`ASSUMED_HOPS`], the protocol's maximum path length.
+///
+/// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` the default
+/// `Deterministic` mode resolves `initial_capacity` to:
 ///
 /// ```text
-/// N_initial = ceil(1 GiB / 1036 B) = 1 036 431 packets
-/// E[D]      = 1 036 431 × 0.001 × 3 × 0.001 ≈ 3.11 wxHOPR
-/// σ[D]      = 3 × 0.001 × √(1 036 431 × 0.001 × 0.999) ≈ 0.097 wxHOPR
-/// stake     ≈ 3.11 + 3.09 × 0.097 ≈ 3.41 wxHOPR
-///
-/// (Deterministic would lock 3 109 wxHOPR — ~912× more)
+/// N_initial = ceil(1 GiB / 1036 B)          = 1 036 431 packets
+/// E[D]      = N × hops × tp = 1 036 431 × 3 × 0.001 ≈ 3 109 wxHOPR
+/// floor     = tp × hops / p = 0.001 × 3 / 0.001     = 3 wxHOPR
+/// stake     = max(floor, E[D])              ≈ 3 109 wxHOPR   (mean drain; floor inert)
 /// ```
+///
+/// The floor only binds for tiny capacities (`N < 1 / win_prob`), where it lifts
+/// the stake up to one winning ticket so the channel can still relay.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FundingConfig {
     /// Data volume a newly opened channel's stake should be able to carry.
     /// Default: 1 GiB.
@@ -289,17 +307,8 @@ pub struct FundingConfig {
     #[default = true]
     pub stop_when_unfunded: bool,
 
-    /// Number of paid downstream relay hops assumed when sizing the channel
-    /// stake.  Must be ≥ 1 and ≤ [`RoutingOptions::MAX_INTERMEDIATE_HOPS`][routing] (3).
-    /// Default: 3.
-    ///
-    /// [routing]: hopr_api::types::internal::routing::RoutingOptions
-    #[default = 3]
-    #[validate(range(min = 1, max = 3))]
-    pub assumed_hops: u32,
-
     /// How each capacity field is converted to a wxHOPR stake.
-    /// Default: `Probabilistic { success_probability: 0.999 }`.
+    /// Default: `Deterministic` (mean drain, floored at one winning ticket).
     ///
     /// See [`CapacitySizingMode`] for the full tradeoff analysis.
     #[default(CapacitySizingMode::default())]
@@ -314,8 +323,25 @@ pub struct FundingConfig {
 /// wxHOPR amounts resolved from [`FundingConfig`] at the current ticket
 /// economics.  Computed once per pipeline tick and threaded through the fund,
 /// open, and close-decision paths.
+///
+/// Returned by [`FundingConfig::resolve`], which callers outside this crate can use to
+/// report what the strategy will lock — such a figure cannot drift from the strategy,
+/// because it *is* the strategy's own calculation.
+///
+/// Each field resolves its own capacity independently; no ordering is implied. Under
+/// [`FundingConfig::default`] the top-up, initial and min-safe capacities are all 1 GiB
+/// and resolve equal, with only the lower threshold (256 MiB) below them.
+///
+/// ```no_run
+/// # use hopr_strategy::channel_lifecycle::FundingConfig;
+/// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
+/// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
+/// let resolved = funding.resolve::<C>(price, win_prob);
+/// # let _ = resolved;
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ResolvedFunding {
+pub struct ResolvedFunding {
     /// Initial balance when opening a new channel.
     pub initial_balance: HoprBalance,
     /// Amount added when topping up an underfunded channel.
@@ -333,29 +359,67 @@ pub(crate) struct ResolvedFunding {
 ///
 /// ```text
 /// N     = ceil(capacity_bytes / packet_payload_size())
-/// p     = win_prob  (clamped to (0, 1])
+/// p     = win_prob  (clamped to [ε, 1])
 /// h     = hops
 /// tp    = ticket_price
 ///
-/// Deterministic:        stake = N × h × tp
-/// Expected:             stake = N × p × h × tp
-/// Probabilistic(α):     stake = N × p × h × tp + k × h × tp × √(N × p × (1−p))
-///                               where k = Φ⁻¹(α)  (standard-normal quantile)
+/// F     = tp × h / p                         one full-path winning ticket
+/// E[D]  = N × h × tp                          mean drain (win-prob independent)
+/// σ[D]  = tp × h × √(N × (1 − p) / p)         (tp·h/p) × Binomial(N, p) std-dev
+///
+/// Deterministic:    stake = ⌈F⌉ max(F, E[D])
+/// Probabilistic(α): stake = ⌈F⌉ max(F, E[D] + k·σ[D])   k = Φ⁻¹(α)
+///
+/// where ⌈F⌉x = ceil(x / F) × F                whole winning tickets
 /// ```
 ///
-/// `win_prob` is ignored for `Deterministic` (pass any value; `1.0` is
-/// conventional).  Returns [`HoprBalance::zero`] for zero capacity.
+/// The `max(F, …)` guarantees the stake always covers at least one winning
+/// ticket, so the channel can always issue the next ticket regardless of how
+/// small the capacity is or how low `win_prob` is.  Returns
+/// [`HoprBalance::zero`] only for zero capacity.
+///
+/// Payouts leave the channel in whole tickets of `F`, so any remainder below one
+/// is unusable and funds nothing.  Both modes therefore round the stake up to a
+/// whole number of tickets — otherwise a target of `10.9 × F` would fund only 10
+/// payable tickets and deliver less than the confidence it was sized for.  The
+/// cost is up to one extra face value per stake, which for small `N × p` (few
+/// winning tickets per channel) can be a sizeable fraction of it.
 ///
 /// # Examples
 ///
 /// ```text
-/// tp = 0.01 wxHOPR,  h = 3,  N = 10 packets (= 10 × 1036 B capacity)
+/// tp = 0.01 wxHOPR,  h = 3
 ///
-/// p = 1.00 → Deterministic = Expected = Probabilistic = 0.30 wxHOPR
-/// p = 0.50 → Expected ≈ 0.150 wxHOPR,  Probabilistic(0.999) ≈ 0.191 wxHOPR
-/// p = 0.01 → Expected ≈ 0.003 wxHOPR,  Probabilistic(0.999) ≈ 0.012 wxHOPR
-///             Deterministic stays 0.30 wxHOPR (100× expected drain)
+/// N = 100 000, p = 0.01:  F = 3 wxHOPR
+///     Deterministic  = max(3, 3,000)                 = 3,000 wxHOPR  (1,000 × F)
+///     Probabilistic  = max(3, 3,000 + 3.09 × 94.39)  ≈ 3,292 → 3,294 (1,098 × F)
+///
+/// N = 10, p = 1e-4:  F = tp·h/p = 300 wxHOPR  (dominates)
+///     Deterministic  = max(300, 0.3)                 = 300 wxHOPR   (1 × F)
 /// ```
+/// Whole winning tickets a target of `tickets` face values has to be rounded up to.
+///
+/// Rounds up, but snaps to the nearest whole ticket when the ratio sits within a few ULPs
+/// of one.  `target / face_value` is exact in principle and can still land an ULP above a
+/// whole number — at `win_prob = 1`, where the ratio is exactly `N`, a bare `ceil` would
+/// then charge a full extra face value on every stake.
+///
+/// The bound is deliberately ULP-scale rather than a fixed relative epsilon: it must absorb
+/// float noise and nothing else, so that a genuinely fractional ticket count — however
+/// small its fraction — still rounds up rather than being quietly under-funded.
+fn whole_tickets(tickets: f64) -> f64 {
+    /// Rounding slack, in ULPs of `tickets`.  `target` and `face_value` each cost a couple
+    /// of roundings before the division, so a few ULPs covers the accumulated error.
+    const SNAP_ULPS: f64 = 4.0;
+
+    let nearest = tickets.round();
+    if (tickets - nearest).abs() <= SNAP_ULPS * f64::EPSILON * tickets.abs() {
+        nearest
+    } else {
+        tickets.ceil()
+    }
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
@@ -370,37 +434,93 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
 
     let payload = C::packet_payload_size() as u64;
     let n = bytes.div_ceil(payload) as f64;
-    let p = win_prob.clamp(f64::MIN_POSITIVE, 1.0_f64);
+    // Clamp win_prob into [f64::EPSILON, 1.0].  Zero, negative, or NaN inputs
+    // would otherwise make the one-ticket floor `tp × h / p` diverge to
+    // `f64::INFINITY` and saturate the stake to `u128::MAX`.  `f64::MIN_POSITIVE`
+    // is too small a lower bound — `tp × h / p` overflows f64 — so `f64::EPSILON`
+    // is used as the effective floor on the win probability.
+    let p = if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    };
     let h = hops as f64;
+    let price_f64 = price.amount().low_u128() as f64;
 
-    // Effective number of winning tickets the stake must cover.
-    let effective_wins: f64 = match mode {
-        CapacitySizingMode::Deterministic => n,
-        CapacitySizingMode::Expected => n * p,
+    // Mean drain E[D] = N × h × tp — the same for every mode, independent of p.
+    let mean_drain = n * h * price_f64;
+
+    // Mode-specific term above the mean.
+    let target: f64 = match mode {
+        CapacitySizingMode::Deterministic => mean_drain,
         CapacitySizingMode::Probabilistic { success_probability } => {
             use statrs::distribution::{ContinuousCDF, Normal};
             let alpha = success_probability.clamp(0.5001, 0.99999);
             let k = Normal::standard().inverse_cdf(alpha);
-            // mean + k · std-dev  (Binomial approximated by Normal via CLT)
-            n * p + k * (n * p * (1.0 - p)).sqrt()
+            // σ[D] = tp·h × √(N·(1−p)/p).  Each packet issues ONE aggregated
+            // multi-hop ticket of face value tp·h/p (not h independent tickets),
+            // so the number of winning tickets is Binomial(N, p) and the drain is
+            // (tp·h/p)·Binomial(N, p).  Var = (tp·h/p)²·N·p(1−p) ⇒ σ = tp·h·√(N(1−p)/p).
+            let sigma = price_f64 * h * (n * (1.0 - p) / p).sqrt();
+            mean_drain + k * sigma
         }
     };
 
-    // stake = effective_wins × hops × ticket_price  (saturating; overflow → U256::MAX)
-    let price_f64 = price.amount().low_u128() as f64;
-    let stake_f64 = (effective_wins * h * price_f64).max(0.0);
-    HoprBalance::from(U256::from(stake_f64 as u128))
+    // A channel pays out in whole tickets of this face value, and it must always
+    // be able to issue at least one or it cannot relay at all — so it is both the
+    // floor and the quantum.
+    let face_value = price_f64 * h / p;
+
+    // Quantise up to a whole number of tickets.  A remainder below one face value
+    // can never leave the channel, so it funds no further ticket and buys none of
+    // the confidence the mode was asked for: at `target = 10.9 × face_value` only
+    // 10 tickets are payable, which is a lower confidence than requested.  Rounding
+    // up makes the stake deliver the mode's stated guarantee instead of just under
+    // it.  `face_value` is zero only when the price or hop count is, and then the
+    // target is zero too.
+    let target = target.max(face_value).max(0.0);
+    let stake_f64 = if face_value > 0.0 {
+        whole_tickets(target / face_value) * face_value
+    } else {
+        target
+    };
+
+    // Round up: the one-ticket floor is a strict safety guarantee (the on-chain
+    // face value is integer wei), so a downward-truncating cast could yield a
+    // stake one wei below face value and still trip `OutOfFunds`.
+    HoprBalance::from(U256::from(stake_f64.ceil() as u128))
 }
 
 impl FundingConfig {
     /// Resolve all data-capacity fields to wxHOPR amounts at the given ticket
     /// economics.  Called once per pipeline tick.
     ///
-    /// `win_prob` must be in `(0, 1]`; it is ignored for
-    /// [`CapacitySizingMode::Deterministic`] (pass `1.0` as the conventional
-    /// placeholder).
-    pub(crate) fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: f64) -> ResolvedFunding {
-        let hops = self.assumed_hops;
+    /// `win_prob` must be in `(0, 1]`.  Every mode uses it to compute the
+    /// one-winning-ticket floor, so it is always required.
+    ///
+    /// # Reporting what the strategy will lock
+    ///
+    /// The only supported way to learn the wxHOPR a capacity resolves to, and it honours
+    /// this config's [`CapacitySizingMode`] rather than assuming one.
+    ///
+    /// Build funding recommendations from here, not from a reimplementation: a copy
+    /// compiles fine after the formula changes here, then reports figures the strategy
+    /// disagrees with.  Since [`FundingConfig::min_safe_capacity_required`] gates opening
+    /// when `stop_when_unfunded` is set, reporting below this leaves a node unable to
+    /// open a single channel.
+    ///
+    /// ```no_run
+    /// # use hopr_strategy::channel_lifecycle::FundingConfig;
+    /// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
+    /// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
+    /// let resolved = funding.resolve::<C>(price, win_prob);
+    /// // Fund the safe to at least this before expecting any channel to open.
+    /// let required = resolved.min_safe_balance_required;
+    /// # let _ = required;
+    /// # }
+    /// ```
+    pub fn resolve<C: PacketTransport>(&self, price: HoprBalance, win_prob: f64) -> ResolvedFunding {
+        let hops = ASSUMED_HOPS;
         let mode = &self.sizing_mode;
         ResolvedFunding {
             initial_balance: capacity_to_balance::<C>(self.initial_capacity, price, win_prob, hops, mode),
@@ -430,6 +550,7 @@ impl FundingConfig {
 /// the projected balance after confirmation would fall below the threshold.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProactiveFundingConfig {
     /// Enable proactive funding.  Default: true.
     #[default = true]
@@ -437,13 +558,13 @@ pub struct ProactiveFundingConfig {
 
     /// Fallback tx-confirmation duration used when
     /// `ChainValues::typical_resolution_time()` fails.  Default: 60 s.
-    #[serde(default = "default_fallback_chain_op_duration", with = "humantime_serde")]
-    #[default(default_fallback_chain_op_duration())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(60))]
     pub fallback_chain_op_duration: Duration,
 
     /// How far back to look when computing the drain rate.  Default: 10 min.
-    #[serde(default = "default_depletion_lookback", with = "humantime_serde")]
-    #[default(default_depletion_lookback())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(10 * 60))]
     pub depletion_lookback: Duration,
 
     /// Multiplicative safety margin applied to the projected drain.
@@ -462,22 +583,14 @@ pub struct ProactiveFundingConfig {
     pub ticket_index_drain_weight: f64,
 }
 
-#[inline]
-fn default_fallback_chain_op_duration() -> Duration {
-    Duration::from_secs(60)
-}
-#[inline]
-fn default_depletion_lookback() -> Duration {
-    Duration::from_secs(10 * 60)
-}
-
 /// Thresholds that trigger channel closure.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClosureConfig {
     /// Close a channel after the peer has been absent for this long.  Default: 24 h.
-    #[serde(default = "default_close_when_peer_unseen_for", with = "humantime_serde")]
-    #[default(default_close_when_peer_unseen_for())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(24 * 60 * 60))]
     pub close_when_peer_unseen_for: Duration,
 
     /// Close channels to peers whose quality score has dropped below this.
@@ -496,15 +609,11 @@ pub struct ClosureConfig {
     pub close_max_concurrent: usize,
 }
 
-#[inline]
-fn default_close_when_peer_unseen_for() -> Duration {
-    Duration::from_secs(24 * 60 * 60)
-}
-
 /// Controls the finalizer phase (second `close_channel` call for `PendingToClose`
 /// channels once the notice period has elapsed).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FinalizerConfig {
     /// Enable the finalizer phase.  When `false`, `PendingToClose` channels
     /// are left to be finalized externally.  Default: true.
@@ -513,8 +622,8 @@ pub struct FinalizerConfig {
 
     /// Extra time to wait beyond the on-chain notice period before finalizing.
     /// Provides a buffer for slow-block periods.  Default: 30 min.
-    #[serde(default = "default_max_closure_overdue", with = "humantime_serde")]
-    #[default(default_max_closure_overdue())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30 * 60))]
     pub max_closure_overdue: Duration,
 
     /// Maximum simultaneous finalization transactions initiated per pass.
@@ -523,42 +632,63 @@ pub struct FinalizerConfig {
     pub finalize_max_concurrent: usize,
 }
 
-#[inline]
-fn default_max_closure_overdue() -> Duration {
-    Duration::from_secs(30 * 60)
-}
-
 /// Guards against mass-closing channels on restart (the graph is rebuilt from
 /// scratch and peers appear unseen until heartbeats arrive).
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RestartGuardConfig {
     /// The close pass is suppressed entirely for this long after startup.
     /// Should exceed network bootstrap time + first heartbeat round.
     /// Default: 10 min.
-    #[serde(default = "default_startup_close_grace_period", with = "humantime_serde")]
-    #[default(default_startup_close_grace_period())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(10 * 60))]
     pub startup_close_grace_period: Duration,
 }
 
-#[inline]
-fn default_startup_close_grace_period() -> Duration {
-    Duration::from_secs(10 * 60)
-}
-
-/// Concurrency knobs for the per-channel evaluation loops.
+/// Concurrency knobs for the per-channel evaluation loops, and the time bounds
+/// that keep a misbehaving chain from stalling them.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     /// Maximum simultaneous in-flight chain-write operations (open + fund +
     /// close + finalize combined).  Additional operations are deferred to the
     /// next tick.  Default: 4.
     #[default = 4]
     pub max_concurrent_actions: usize,
+
+    /// How long an in-flight chain-write operation holds its per-channel slot
+    /// before the slot is reclaimed.
+    ///
+    /// A slot is normally released by whichever comes first: the operation's
+    /// confirmation resolving, or its chain event (`ChannelOpened`,
+    /// `ChannelBalanceIncreased`, `ChannelClosureInitiated`, `ChannelClosed`).
+    /// Neither is guaranteed — the event stream is lossy under load, and a task
+    /// can be starved or its node stopped mid-flight.  This bounds how long one
+    /// lost signal suppresses further action on a channel, so it must exceed the
+    /// worst-case confirmation plus indexer lag.  Default: 5 min.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5 * 60))]
+    #[validate(custom(function = "validate_non_zero"))]
+    pub action_lease_timeout: Duration,
+
+    /// Time budget shared by every chain read of a tick — safe info and balance,
+    /// ticket economics, the channel and account streams.
+    ///
+    /// The pipeline shares a task with chain-event handling, so an unbounded
+    /// read stalls ticks *and* event processing, indefinitely if it never
+    /// answers.  Reads that overrun the budget count as unavailable for that
+    /// tick and are retried on the next.  Default: 30 s.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(30))]
+    #[validate(custom(function = "validate_non_zero"))]
+    pub chain_read_timeout: Duration,
 }
 
 /// Per-axis weights for the multi-objective channel selector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SelectorWeights {
     /// Weight of the latency axis.
     pub latency: f64,
@@ -576,7 +706,23 @@ pub struct SelectorWeights {
     pub trust_ticket: f64,
 }
 
+impl Default for SelectorWeights {
+    fn default() -> Self {
+        Self::BALANCED
+    }
+}
+
 impl SelectorWeights {
+    /// Axis weights of the [`balanced`](MultiObjectiveSelectorConfig::balanced)
+    /// profile, and the [`Default`] for this type.
+    ///
+    /// ```
+    /// # use hopr_strategy::channel_lifecycle::{MultiObjectiveSelectorConfig as M, SelectorWeights as W};
+    /// assert_eq!(W::BALANCED, W::default());
+    /// assert_eq!(W::BALANCED, M::balanced().weights);
+    /// ```
+    pub const BALANCED: Self = Self::new(0.35, 0.30, 0.15, 0.20);
+
     pub const fn new(latency: f64, trust: f64, stake: f64, anonymity: f64) -> Self {
         Self {
             latency,
@@ -592,6 +738,7 @@ impl SelectorWeights {
 
 /// Configuration for the multi-objective channel selector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MultiObjectiveSelectorConfig {
     pub weights: SelectorWeights,
     /// Maximum number of opens initiated per strategy tick.  Selector returns at most this many
@@ -613,6 +760,13 @@ pub struct MultiObjectiveSelectorConfig {
     pub hysteresis_gap: f64,
 }
 
+impl Default for MultiObjectiveSelectorConfig {
+    /// The [`balanced`](MultiObjectiveSelectorConfig::balanced) profile.
+    fn default() -> Self {
+        Self::balanced()
+    }
+}
+
 impl MultiObjectiveSelectorConfig {
     pub fn low_latency() -> Self {
         Self {
@@ -626,7 +780,7 @@ impl MultiObjectiveSelectorConfig {
 
     pub fn balanced() -> Self {
         Self {
-            weights: SelectorWeights::new(0.35, 0.30, 0.15, 0.20),
+            weights: SelectorWeights::BALANCED,
             open_per_tick: 2,
             close_per_tick: 2,
             k_floor: 3,
@@ -683,339 +837,521 @@ mod config_tests {
         }
     }
 
-    // ── capacity_to_balance: parameterised unit tests ────────────────────────
+    // ── capacity_to_balance: helpers ─────────────────────────────────────────
+
+    const PAYLOAD: u64 = 1036;
+    /// 0.01 wxHOPR in wei (10^16).
+    const PRICE_WEI: u128 = 10_000_000_000_000_000;
 
     fn balance_from_wei(wei: u128) -> HoprBalance {
         HoprBalance::from(U256::from(wei))
     }
 
-    /// 0.01 wxHOPR in wei  (10^16)
-    const PRICE_WEI: u128 = 10_000_000_000_000_000;
-
-    /// Expected stake in wei for `Deterministic` mode: N × hops × price_wei.
-    fn det_stake(n_packets: u128, hops: u128) -> u128 {
-        n_packets * hops * PRICE_WEI
+    fn packets(bytes: u64) -> u128 {
+        bytes.div_ceil(PAYLOAD) as u128
     }
 
-    // ── Deterministic: stake = N × hops × price, win_prob irrelevant ─────────
-
-    /// Vary packet count — Deterministic stake grows linearly with N.
-    #[rstest]
-    #[case(1,  1, 1 * 1 * PRICE_WEI)]
-    #[case(10, 1, 10 * 1 * PRICE_WEI)]
-    #[case(100, 1, 100 * 1 * PRICE_WEI)]
-    #[case(1000, 1, 1000 * 1 * PRICE_WEI)]
-    fn deterministic_scales_with_packet_count(#[case] n_pkts: u64, #[case] hops: u32, #[case] expected_wei: u128) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n_pkts);
-        let result = capacity_to_balance::<TestTransport>(cap, price, 0.5, hops, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), expected_wei, "n={n_pkts}");
+    /// One full-path winning ticket face value in wei: `tp × hops / p`.
+    fn floor_wei(tp_wei: u128, hops: u32, p: f64) -> u128 {
+        (tp_wei as f64 * hops as f64 / p) as u128
     }
 
-    /// Vary hop count — Deterministic stake grows linearly with hops.
-    #[rstest]
-    #[case(1, 10 * 1 * PRICE_WEI)]
-    #[case(2, 10 * 2 * PRICE_WEI)]
-    #[case(3, 10 * 3 * PRICE_WEI)]
-    fn deterministic_scales_with_hops(#[case] hops: u32, #[case] expected_wei: u128) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10); // 10 packets
-        let result = capacity_to_balance::<TestTransport>(cap, price, 0.01, hops, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), expected_wei, "hops={hops}");
+    /// Mean drain in wei: `N × hops × tp`.
+    fn mean_wei(n: u128, hops: u32, tp_wei: u128) -> u128 {
+        n * hops as u128 * tp_wei
     }
 
-    /// Vary win_prob — Deterministic must be invariant.
+    /// Φ⁻¹(alpha) — the z-score used by `Probabilistic`.
+    fn z_score(alpha: f64) -> f64 {
+        use statrs::distribution::{ContinuousCDF, Normal};
+        Normal::standard().inverse_cdf(alpha)
+    }
+
+    fn stake_wei(cap: ByteSize, tp_wei: u128, p: f64, hops: u32, mode: &CapacitySizingMode) -> u128 {
+        capacity_to_balance::<TestTransport>(cap, balance_from_wei(tp_wei), p, hops, mode)
+            .amount()
+            .low_u128()
+    }
+
+    /// Assert `got ≈ want` with a 1e-9 relative + 4 wei absolute tolerance
+    /// (accounts for the f64 round-trip inside `capacity_to_balance`).
+    fn assert_close(got: u128, want: u128, ctx: &str) {
+        let hi = got.max(want);
+        let lo = got.min(want);
+        let tol = (hi / 1_000_000_000).max(4);
+        assert!(
+            hi - lo <= tol,
+            "{ctx}: got {got} want {want} (diff {}, tol {tol})",
+            hi - lo
+        );
+    }
+
+    const DET: CapacitySizingMode = CapacitySizingMode::Deterministic;
+    fn prob(alpha: f64) -> CapacitySizingMode {
+        CapacitySizingMode::Probabilistic {
+            success_probability: alpha,
+        }
+    }
+
+    // Live-network parameters used across regression tests.
+    const JURA_TP: u128 = 10_000_000_000_000; // 1e13 wei = 1e-5 wxHOPR
+    const JURA_P: f64 = 4.0e-6; // 288230376143 / (2^56 - 1)
+    const ROTSEE_TP: u128 = 100; // 1e-16 wxHOPR
+    const ROTSEE_P: f64 = 1.25e-4; // 9007199254735 / (2^56 - 1)
+
+    // ── Deterministic: stake = max(floor, N × hops × tp) ─────────────────────
+
+    /// Above the floor, Deterministic equals the mean drain and grows linearly
+    /// with packet count.  (p = 0.5 keeps the floor small.)
     #[rstest]
-    #[case(0.001)]
+    #[case(10)]
+    #[case(100)]
+    #[case(1_000)]
+    #[case(100_000)]
+    fn deterministic_equals_mean_drain_above_floor(#[case] n_pkts: u64) {
+        let cap = ByteSize::b(PAYLOAD * n_pkts);
+        let got = stake_wei(cap, PRICE_WEI, 0.5, 3, &DET);
+        assert_close(got, mean_wei(n_pkts as u128, 3, PRICE_WEI), &format!("n={n_pkts}"));
+    }
+
+    /// Above the floor, Deterministic scales linearly with hops.
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn deterministic_scales_with_hops(#[case] hops: u32) {
+        let cap = ByteSize::b(PAYLOAD * 100_000);
+        let got = stake_wei(cap, PRICE_WEI, 0.5, hops, &DET);
+        assert_close(got, mean_wei(100_000, hops, PRICE_WEI), &format!("hops={hops}"));
+    }
+
+    /// The mean-drain term is win-prob independent: as long as it stays above the
+    /// floor (N > 1/p), varying win_prob leaves the stake unchanged.
+    #[rstest]
     #[case(0.01)]
     #[case(0.1)]
     #[case(0.5)]
     #[case(1.0)]
-    fn deterministic_invariant_to_win_prob(#[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10);
-        let result = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), det_stake(10, 3), "win_prob={win_prob}");
+    fn deterministic_mean_invariant_to_win_prob_above_floor(#[case] p: f64) {
+        // N = 1e6 ≫ 1/p for every p above, so the floor never binds.
+        let cap = ByteSize::b(PAYLOAD * 1_000_000);
+        let got = stake_wei(cap, PRICE_WEI, p, 3, &DET);
+        assert_close(got, mean_wei(1_000_000, 3, PRICE_WEI), &format!("p={p}"));
     }
 
-    /// Sub-packet capacity is always rounded up to 1 packet.
+    /// Sub-packet capacity rounds up to exactly one packet.
     #[rstest]
     #[case(1)]
     #[case(500)]
     #[case(1035)]
-    fn deterministic_sub_packet_rounds_up(#[case] bytes: u64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let result =
-            capacity_to_balance::<TestTransport>(ByteSize::b(bytes), price, 1.0, 1, &CapacitySizingMode::Deterministic);
-        assert_eq!(result.amount().low_u128(), PRICE_WEI, "bytes={bytes}");
+    fn sub_packet_rounds_up_to_one_packet(#[case] bytes: u64) {
+        // p = 1.0 → floor = tp·h = mean for N=1, so stake = tp·h.
+        let got = stake_wei(ByteSize::b(bytes), PRICE_WEI, 1.0, 1, &DET);
+        assert_eq!(got, PRICE_WEI, "bytes={bytes}");
     }
 
-    // ── Expected: stake = N × p × hops × price ───────────────────────────────
+    // ── The one-winning-ticket floor (the core fix) ──────────────────────────
 
-    /// Vary win_prob — Expected stake scales linearly with p.
+    /// When the capacity is worth less than one winning ticket (`N < 1/p`), the
+    /// floor binds and the stake equals exactly one full-path ticket face value.
     #[rstest]
-    // (win_prob, n_packets, hops) → expected wei (integer truncation)
-    #[case(1.0,  10, 3, (10.0 * 1.0 * 3.0 * PRICE_WEI as f64) as u128)]
-    #[case(0.5,  10, 3, (10.0 * 0.5 * 3.0 * PRICE_WEI as f64) as u128)]
-    #[case(0.1,  10, 3, (10.0 * 0.1 * 3.0 * PRICE_WEI as f64) as u128)]
-    #[case(0.01, 10, 3, (10.0 * 0.01 * 3.0 * PRICE_WEI as f64) as u128)]
-    fn expected_scales_with_win_prob(
-        #[case] win_prob: f64,
-        #[case] n: u64,
-        #[case] hops: u32,
-        #[case] expected_wei: u128,
-    ) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n);
-        let result = capacity_to_balance::<TestTransport>(cap, price, win_prob, hops, &CapacitySizingMode::Expected);
-        // Allow 1 wei truncation error from f64 arithmetic
-        let diff = result.amount().low_u128().abs_diff(expected_wei);
+    // (n_pkts, p) chosen so N·h·tp < tp·h/p  ⟺  N < 1/p
+    #[case(1, 1.0e-4)]
+    #[case(10, 1.0e-4)]
+    #[case(1_000, 4.0e-6)] // jura-like: 1/p = 250 000 ≫ 1 000
+    #[case(1, 1.0e-9)]
+    fn floor_binds_below_one_ticket(#[case] n_pkts: u64, #[case] p: f64) {
+        let cap = ByteSize::b(PAYLOAD * n_pkts);
+        let want_floor = floor_wei(PRICE_WEI, 3, p);
+        let got = stake_wei(cap, PRICE_WEI, p, 3, &DET);
+        assert_close(got, want_floor, &format!("n={n_pkts} p={p}"));
+        // And it must be ≥ one ticket by construction.
         assert!(
-            diff <= 1,
-            "win_prob={win_prob}: got {} expected {} (diff={diff})",
-            result.amount().low_u128(),
-            expected_wei
+            got >= want_floor - 4,
+            "n={n_pkts} p={p}: {got} below one ticket {want_floor}"
         );
     }
 
-    /// Expected at win_prob=1.0 must equal Deterministic.
+    /// Both modes always fund at least one winning ticket, for any capacity,
+    /// win_prob and ticket price — the invariant the floor guarantees.
+    #[test]
+    fn never_below_one_winning_ticket() {
+        let ps = [1.0, 0.5, 0.1, 1e-2, 1e-3, ROTSEE_P, JURA_P, 1e-8];
+        let tps = [1u128, 100, PRICE_WEI, JURA_TP, 1_000_000_000_000_000_000];
+        let caps = [
+            ByteSize::b(1),
+            ByteSize::b(PAYLOAD),
+            ByteSize::mib(256),
+            ByteSize::gib(1),
+        ];
+        for &p in &ps {
+            for &tp in &tps {
+                for &cap in &caps {
+                    let floor = floor_wei(tp, 3, p);
+                    for mode in [DET, prob(0.999)] {
+                        let got = stake_wei(cap, tp, p, 3, &mode);
+                        assert!(
+                            got + 4 >= floor,
+                            "{mode:?} p={p} tp={tp} cap={cap:?}: stake {got} < one ticket {floor}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The floor is applied independently to every FundingConfig field, so even
+    /// with 1-byte capacities every resolved balance covers one winning ticket.
+    #[test]
+    fn floor_applies_to_all_four_fields() {
+        let cfg = FundingConfig {
+            initial_capacity: ByteSize::b(1),
+            topup_capacity: ByteSize::b(1),
+            lower_capacity_threshold: ByteSize::b(1),
+            min_safe_capacity_required: ByteSize::b(1),
+            ..FundingConfig::default()
+        };
+        let floor = floor_wei(JURA_TP, 3, JURA_P);
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(JURA_TP), JURA_P);
+        for (name, bal) in [
+            ("initial", r.initial_balance),
+            ("topup", r.topup_balance),
+            ("lower_threshold", r.lower_balance_threshold),
+            ("min_safe", r.min_safe_balance_required),
+        ] {
+            assert_close(bal.amount().low_u128(), floor, name);
+        }
+    }
+
+    /// Regression: the snap that absorbs float noise must not swallow a real fraction.
+    ///
+    /// A fixed relative epsilon here (this started at `1e-12`) is orders of magnitude
+    /// wider than the rounding error it exists to absorb, so a ticket count genuinely
+    /// above a whole number — by less than that epsilon — was rounded *down*, under-funding
+    /// the target by part of a ticket.  The bound is ULP-scale for exactly this reason.
     #[rstest]
-    #[case(1, 1)]
-    #[case(10, 1)]
-    #[case(100, 3)]
-    #[case(1000, 2)]
-    fn expected_at_full_prob_equals_deterministic(#[case] n_pkts: u64, #[case] hops: u32) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n_pkts);
-        let det = capacity_to_balance::<TestTransport>(cap, price, 1.0, hops, &CapacitySizingMode::Deterministic);
-        let exp = capacity_to_balance::<TestTransport>(cap, price, 1.0, hops, &CapacitySizingMode::Expected);
-        // 1 wei tolerance for f64 rounding at large N
-        let diff = det.amount().low_u128().abs_diff(exp.amount().low_u128());
-        assert!(
-            diff <= 1,
-            "n={n_pkts} hops={hops}: Deterministic={det} Expected={exp} diff={diff}"
+    // (ratio, expected) — noise below the bound snaps; anything above it rounds up.
+    #[case(5.0, 5.0)]
+    #[case(5.0 + 1e-13, 6.0)] // 2e-14 relative: far above ULP noise, below a 1e-12 epsilon
+    #[case(1.0 + 1e-15, 2.0)]
+    #[case(1e6 + 1e-7, 1e6 + 1.0)] // 1e-13 relative at a large count
+    #[case(0.25, 1.0)]
+    fn whole_tickets_snaps_only_float_noise(#[case] ratio: f64, #[case] expected: f64) {
+        assert_eq!(whole_tickets(ratio), expected, "ratio={ratio:.17e}");
+    }
+
+    /// The other side of the bound: a ratio one ULP off a whole number is noise from the
+    /// division, not demand, and must not cost an extra face value.
+    #[rstest]
+    #[case(5.0)]
+    #[case(1.0)]
+    #[case(1e6)]
+    fn whole_tickets_absorbs_a_one_ulp_overshoot(#[case] whole: f64) {
+        let overshoot = f64::from_bits(whole.to_bits() + 1);
+        assert!(overshoot > whole, "test setup: {overshoot} must exceed {whole}");
+        assert_eq!(
+            whole_tickets(overshoot),
+            whole,
+            "one ULP above {whole} must not add a ticket"
         );
     }
 
-    // ── Probabilistic: stake = μ + k·σ ───────────────────────────────────────
+    /// Regression: a stake is always a whole number of winning tickets.  A channel
+    /// pays out only in whole tickets of `tp·h/p`, so a fractional remainder funds
+    /// nothing — before this was enforced, a `Probabilistic(α)` stake of `k.9`
+    /// tickets could pay for only `k` and so delivered less than `α`.
+    #[test]
+    fn stake_is_a_whole_number_of_winning_tickets() {
+        let ps = [1.0, 0.5, 0.1, 1e-2, 1e-3, ROTSEE_P, JURA_P];
+        let tps = [1u128, 100, PRICE_WEI, JURA_TP];
+        let caps = [
+            ByteSize::b(1),
+            ByteSize::b(PAYLOAD),
+            ByteSize::mib(256),
+            ByteSize::gib(1),
+        ];
+        for &p in &ps {
+            for &tp in &tps {
+                for &cap in &caps {
+                    for mode in [DET, prob(0.99), prob(0.999)] {
+                        let got = stake_wei(cap, tp, p, 3, &mode);
+                        let face = tp as f64 * 3.0 / p;
+                        let tickets = got as f64 / face;
+                        assert_close(
+                            got,
+                            (tickets.round() * face) as u128,
+                            &format!("{mode:?} p={p} tp={tp} cap={cap:?} ({tickets} tickets)"),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
-    /// At win_prob=1.0 variance is 0 → Probabilistic == Deterministic (±1 wei).
+    // ── Probabilistic: stake = max(floor, mean + k·σ) ────────────────────────
+
+    /// At win_prob = 1.0 the variance vanishes → Probabilistic == Deterministic.
     #[rstest]
     #[case(0.841)]
     #[case(0.977)]
     #[case(0.999)]
     #[case(0.9999)]
-    fn probabilistic_at_full_prob_equals_deterministic(#[case] alpha: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 100);
-        let mode = CapacitySizingMode::Probabilistic {
-            success_probability: alpha,
-        };
-        let prob = capacity_to_balance::<TestTransport>(cap, price, 1.0, 3, &mode);
-        let det = capacity_to_balance::<TestTransport>(cap, price, 1.0, 3, &CapacitySizingMode::Deterministic);
-        let diff = prob.amount().low_u128().abs_diff(det.amount().low_u128());
-        assert!(
-            diff <= 1,
-            "alpha={alpha}: Probabilistic={prob} Deterministic={det} diff={diff}"
-        );
+    fn probabilistic_equals_deterministic_at_full_prob(#[case] alpha: f64) {
+        let cap = ByteSize::b(PAYLOAD * 100_000);
+        let p = stake_wei(cap, PRICE_WEI, 1.0, 3, &prob(alpha));
+        let d = stake_wei(cap, PRICE_WEI, 1.0, 3, &DET);
+        assert_close(p, d, &format!("alpha={alpha}"));
     }
 
-    /// Probabilistic > Expected for any win_prob < 1 (k > 0 adds a buffer).
+    /// Probabilistic ≥ Deterministic for every win_prob (same floor, non-negative
+    /// buffer).  This is the corrected ordering: the buffer sits *above* the mean.
     #[rstest]
-    #[case(0.001)]
-    #[case(0.01)]
+    #[case(1e-3)]
+    #[case(1e-2)]
     #[case(0.1)]
     #[case(0.5)]
-    fn probabilistic_exceeds_expected(#[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10_000); // large N so σ is significant
-        let mode = CapacitySizingMode::Probabilistic {
-            success_probability: 0.999,
-        };
-        let prob = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &mode);
-        let exp = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Expected);
+    #[case(1.0)]
+    fn probabilistic_at_least_deterministic(#[case] p: f64) {
+        let cap = ByteSize::b(PAYLOAD * 1_000_000);
+        let pr = stake_wei(cap, PRICE_WEI, p, 3, &prob(0.999));
+        let d = stake_wei(cap, PRICE_WEI, p, 3, &DET);
+        assert!(pr + 4 >= d, "p={p}: Probabilistic {pr} must be ≥ Deterministic {d}");
+    }
+
+    /// Above the floor, Probabilistic matches mean + k·σ with the corrected σ
+    /// (`σ = tp·h·√(N·(1−p)/p)`), verified against an independent computation —
+    /// then rounded up to the next whole winning ticket.
+    #[rstest]
+    #[case(0.5, 0.999)]
+    #[case(0.1, 0.999)]
+    #[case(0.01, 0.999)]
+    #[case(0.01, 0.9999)]
+    fn probabilistic_matches_mean_plus_k_sigma(#[case] p: f64, #[case] alpha: f64) {
+        let n = 10_000_000u128; // large N so the buffer keeps us above the floor
+        let cap = ByteSize::b(PAYLOAD * n as u64);
+        let mean = mean_wei(n, 3, PRICE_WEI) as f64;
+        let sigma = PRICE_WEI as f64 * 3.0 * (n as f64 * (1.0 - p) / p).sqrt();
+        let raw = mean + z_score(alpha) * sigma;
+        let face = PRICE_WEI as f64 * 3.0 / p;
+        let want = ((raw / face).ceil() * face) as u128;
+        let got = stake_wei(cap, PRICE_WEI, p, 3, &prob(alpha));
+        assert_close(got, want, &format!("p={p} alpha={alpha}"));
+        // The unrounded target is what the rounding starts from: the stake must
+        // sit in [raw, raw + F).
         assert!(
-            prob > exp,
-            "win_prob={win_prob}: Probabilistic={prob} must exceed Expected={exp}"
+            got as f64 >= raw && (got as f64) < raw + face,
+            "p={p} alpha={alpha}: {got} not within one ticket above {raw}"
         );
     }
 
-    /// Probabilistic < Deterministic at low win_prob (the key property).
+    /// Higher confidence → larger stake (monotone in alpha), above the floor.
     #[rstest]
-    #[case(0.001)]
-    #[case(0.01)]
-    #[case(0.05)]
-    #[case(0.1)]
-    fn probabilistic_below_deterministic_at_low_prob(#[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10_000);
-        let mode = CapacitySizingMode::Probabilistic {
-            success_probability: 0.999,
-        };
-        let prob = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &mode);
-        let det = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Deterministic);
-        assert!(
-            prob < det,
-            "win_prob={win_prob}: Probabilistic={prob} must be < Deterministic={det}"
-        );
-    }
-
-    /// Higher confidence → larger stake (monotone in alpha).
-    #[rstest]
-    #[case(0.5, 0.9)]
+    #[case(0.6, 0.9)]
     #[case(0.9, 0.99)]
     #[case(0.99, 0.999)]
     #[case(0.999, 0.9999)]
-    fn probabilistic_monotone_in_confidence(#[case] alpha_lo: f64, #[case] alpha_hi: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 10_000);
-        let lo = capacity_to_balance::<TestTransport>(
-            cap,
-            price,
-            0.1,
-            3,
-            &CapacitySizingMode::Probabilistic {
-                success_probability: alpha_lo,
-            },
-        );
-        let hi = capacity_to_balance::<TestTransport>(
-            cap,
-            price,
-            0.1,
-            3,
-            &CapacitySizingMode::Probabilistic {
-                success_probability: alpha_hi,
-            },
-        );
+    fn probabilistic_monotone_in_confidence(#[case] lo: f64, #[case] hi: f64) {
+        let cap = ByteSize::b(PAYLOAD * 10_000_000);
+        let s_lo = stake_wei(cap, PRICE_WEI, 0.1, 3, &prob(lo));
+        let s_hi = stake_wei(cap, PRICE_WEI, 0.1, 3, &prob(hi));
+        assert!(s_hi > s_lo, "alpha {hi} must exceed {lo}: {s_hi} vs {s_lo}");
+    }
+
+    /// Regression: the variance buffer scales **linearly** with hops.  Each
+    /// packet issues one aggregated ticket of face value `tp·h/p`, so both the
+    /// mean drain and `σ = tp·h·√(N·(1−p)/p)` scale with `h` — the buffer at
+    /// `h = 3` must be ≈ 3× the buffer at `h = 1`.  The prior `σ = tp·√(N·h·…)`
+    /// scaled the buffer by only `√3 ≈ 1.73` and would fail this assertion.
+    #[test]
+    fn probabilistic_buffer_scales_linearly_with_hops() {
+        let n = 10_000_000u128;
+        let cap = ByteSize::b(PAYLOAD * n as u64);
+        let p = 0.01;
+        let buffer = |h: u32| {
+            let mean = mean_wei(n, h, PRICE_WEI);
+            stake_wei(cap, PRICE_WEI, p, h, &prob(0.999)).saturating_sub(mean) as f64
+        };
+        let ratio = buffer(3) / buffer(1);
         assert!(
-            hi > lo,
-            "alpha_hi={alpha_hi} must give larger stake than alpha_lo={alpha_lo}"
+            (ratio - 3.0).abs() < 0.02,
+            "buffer(3)/buffer(1) = {ratio:.4}, expected ≈ 3.0 (√h would give ≈ 1.73)"
         );
     }
 
-    /// Vary hops — all three modes scale linearly with hops.
-    #[rstest]
-    #[case(CapacitySizingMode::Deterministic, 0.5)]
-    #[case(CapacitySizingMode::Expected, 0.5)]
-    #[case(CapacitySizingMode::Probabilistic { success_probability: 0.999 }, 0.5)]
-    fn all_modes_scale_linearly_with_hops(#[case] mode: CapacitySizingMode, #[case] win_prob: f64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * 1000);
-        let h1 = capacity_to_balance::<TestTransport>(cap, price, win_prob, 1, &mode);
-        let h2 = capacity_to_balance::<TestTransport>(cap, price, win_prob, 2, &mode);
-        let h3 = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &mode);
-        // Linear: h2 ≈ 2×h1, h3 ≈ 3×h1 (within 2 wei for f64 rounding in prob mode)
-        let diff2 = h2.amount().low_u128().abs_diff(h1.amount().low_u128() * 2);
-        let diff3 = h3.amount().low_u128().abs_diff(h1.amount().low_u128() * 3);
-        assert!(diff2 <= 2, "{mode:?}: 2-hop={h2} should be 2×1-hop={h1} (diff={diff2})");
-        assert!(diff3 <= 2, "{mode:?}: 3-hop={h3} should be 3×1-hop={h1} (diff={diff3})");
+    /// The variance buffer grows as win_prob falls (rarer, larger payouts).
+    #[test]
+    fn probabilistic_buffer_grows_as_win_prob_falls() {
+        let cap = ByteSize::b(PAYLOAD * 10_000_000);
+        let mean = mean_wei(10_000_000, 3, PRICE_WEI);
+        let buffer = |p: f64| stake_wei(cap, PRICE_WEI, p, 3, &prob(0.999)).saturating_sub(mean);
+        assert!(buffer(0.001) > buffer(0.01), "buffer must grow as p falls");
+        assert!(buffer(0.01) > buffer(0.1));
     }
 
-    // ── Ordering invariant: Expected ≤ Probabilistic ≤ Deterministic ─────────
+    // ── Sanity sweep across all probabilities and ticket prices ──────────────
 
-    /// For all win_prob ∈ (0,1): Expected ≤ Probabilistic(0.999) ≤ Deterministic.
-    #[rstest]
-    #[case(0.001, 1_000)]
-    #[case(0.01, 10_000)]
-    #[case(0.1, 100_000)]
-    #[case(0.5, 1_000_000)]
-    fn ordering_expected_le_probabilistic_le_deterministic(#[case] win_prob: f64, #[case] n_pkts: u64) {
-        let price = balance_from_wei(PRICE_WEI);
-        let cap = ByteSize::b(1036 * n_pkts);
-        let exp = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Expected);
-        let prob = capacity_to_balance::<TestTransport>(
-            cap,
-            price,
-            win_prob,
-            3,
-            &CapacitySizingMode::Probabilistic {
-                success_probability: 0.999,
-            },
+    /// Cross-product sanity check: for every (win_prob, ticket_price, mode) the
+    /// resolved default config is well-formed — finite, ≥ one winning ticket on
+    /// every field, initial ≥ lower threshold, and Probabilistic ≥ Deterministic.
+    #[test]
+    fn sanity_grid_all_probs_and_prices() {
+        let ps = [1.0, 0.5, 0.1, 1e-2, 1e-3, ROTSEE_P, JURA_P, 1e-7];
+        let tps = [1u128, 100, PRICE_WEI, JURA_TP, 1_000_000_000_000_000_000];
+        for &p in &ps {
+            for &tp in &tps {
+                let floor = floor_wei(tp, 3, p);
+                let cfg = FundingConfig::default();
+                let det = cfg.resolve::<TestTransport>(balance_from_wei(tp), p);
+                let pr_cfg = FundingConfig {
+                    sizing_mode: prob(0.999),
+                    ..FundingConfig::default()
+                };
+                let pr = pr_cfg.resolve::<TestTransport>(balance_from_wei(tp), p);
+
+                for (name, d, q) in [
+                    ("initial", det.initial_balance, pr.initial_balance),
+                    ("topup", det.topup_balance, pr.topup_balance),
+                    ("lower", det.lower_balance_threshold, pr.lower_balance_threshold),
+                    ("min_safe", det.min_safe_balance_required, pr.min_safe_balance_required),
+                ] {
+                    let dw = d.amount().low_u128();
+                    let qw = q.amount().low_u128();
+                    assert!(dw + 4 >= floor, "det {name} p={p} tp={tp}: {dw} < ticket {floor}");
+                    assert!(qw + 4 >= floor, "prob {name} p={p} tp={tp}: {qw} < ticket {floor}");
+                    assert!(qw + 4 >= dw, "prob<det {name} p={p} tp={tp}: {qw} < {dw}");
+                }
+                // initial (1 GiB) must dominate the lower threshold (256 MiB).
+                assert!(
+                    det.initial_balance >= det.lower_balance_threshold,
+                    "initial < lower p={p} tp={tp}"
+                );
+            }
+        }
+    }
+
+    /// Win_prob = 1.0 edge: floor = tp·hops, mean = N·hops·tp, and for N ≥ 1 the
+    /// mean dominates, so every field equals its mean drain.
+    #[test]
+    fn edge_win_prob_one() {
+        let n = packets(ByteSize::gib(1).as_u64());
+        let got = stake_wei(ByteSize::gib(1), PRICE_WEI, 1.0, 3, &DET);
+        assert_close(got, mean_wei(n, 3, PRICE_WEI), "p=1.0");
+    }
+
+    /// Extreme-low win_prob edge: floor = tp·hops/p is enormous but computed
+    /// without overflowing to zero, and the stake equals it.
+    #[test]
+    fn edge_extreme_low_win_prob_uses_floor() {
+        let p = 1e-9;
+        let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
+        let floor = floor_wei(PRICE_WEI, 3, p);
+        assert!(got > 0, "must not underflow to zero");
+        assert_close(got, floor, "p=1e-9");
+    }
+
+    /// Regression: a degenerate win_prob (zero, negative, NaN, -∞) must not blow
+    /// the one-ticket floor `tp·hops/p` up to `f64::INFINITY` and saturate the
+    /// stake to `u128::MAX`.  win_prob is clamped into `[f64::EPSILON, 1.0]`, so
+    /// such inputs resolve to the large-but-finite floor at `p = f64::EPSILON`.
+    #[test]
+    fn degenerate_win_prob_is_clamped_not_saturated() {
+        let floor_at_eps = floor_wei(PRICE_WEI, 3, f64::EPSILON);
+        for p in [0.0_f64, -1.0, f64::NAN, f64::NEG_INFINITY] {
+            let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
+            assert!(got < u128::MAX, "p={p}: must not saturate to u128::MAX");
+            assert_close(got, floor_at_eps, &format!("p={p} clamped to ε"));
+        }
+    }
+
+    // ── Live-network regression: jura & rotsee (default Deterministic) ───────
+
+    /// jura (staging): tp = 1e13 wei, win_prob = 4e-6.  Documents the exact
+    /// default-Deterministic stakes and confirms each covers ≥ 1 winning ticket
+    /// (face value = 7.5 wxHOPR = 7.5e18 wei).
+    ///
+    /// jura shows the rounding at its most expensive: 1/p = 250 000 packets per
+    /// winning ticket against ~1.04 M packets per GiB is only ~4.15 tickets, so
+    /// rounding to 5 adds 21%.  The unrounded 31.09 wxHOPR would have paid for 4.
+    #[test]
+    fn jura_default_deterministic_stakes() {
+        let cfg = FundingConfig::default();
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(JURA_TP), JURA_P);
+        let floor = floor_wei(JURA_TP, 3, JURA_P); // 7.5e18
+        assert_close(floor, 7_500_000_000_000_000_000, "jura 1-ticket floor");
+
+        // initial / topup / min_safe = 1 GiB → mean drain ≈ 31.09 wxHOPR = 4.15
+        // tickets, rounded up to 5 × 7.5 = 37.5 wxHOPR.
+        let n_gib = packets(ByteSize::gib(1).as_u64()); // 1_036_431
+        assert_close(mean_wei(n_gib, 3, JURA_TP), 31_092_930_000_000_000_000, "jura mean");
+        assert_close(
+            r.initial_balance.amount().low_u128(),
+            37_500_000_000_000_000_000,
+            "jura initial = 5 × 7.5 wxHOPR",
         );
-        let det = capacity_to_balance::<TestTransport>(cap, price, win_prob, 3, &CapacitySizingMode::Deterministic);
-        assert!(
-            exp <= prob,
-            "win_prob={win_prob}: Expected={exp} must be ≤ Probabilistic={prob}"
+        // lower threshold = 256 MiB → ≈ 7.77 wxHOPR = 1.04 tickets, rounded to 2.
+        let n_256 = packets(ByteSize::mib(256).as_u64()); // 259_108
+        assert_close(
+            mean_wei(n_256, 3, JURA_TP),
+            7_773_240_000_000_000_000,
+            "jura lower mean",
+        );
+        assert_close(
+            r.lower_balance_threshold.amount().low_u128(),
+            15_000_000_000_000_000_000,
+            "jura lower = 2 × 7.5 wxHOPR",
         );
         assert!(
-            prob <= det,
-            "win_prob={win_prob}: Probabilistic={prob} must be ≤ Deterministic={det}"
+            r.lower_balance_threshold.amount().low_u128() >= floor,
+            "jura lower must cover ≥ 1 winning ticket"
         );
     }
 
-    // ── FundingConfig::resolve ───────────────────────────────────────────────
+    /// rotsee (development): tp = 100 wei, win_prob = 1.25e-4.  Face value =
+    /// 2.4e6 wei; every default field sits far above it.
+    #[test]
+    fn rotsee_default_deterministic_stakes() {
+        let cfg = FundingConfig::default();
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(ROTSEE_TP), ROTSEE_P);
+        let floor = floor_wei(ROTSEE_TP, 3, ROTSEE_P); // 2_400_000 wei
+        assert_close(floor, 2_400_000, "rotsee 1-ticket floor");
+
+        // 1 GiB → mean 310_929_300 wei = 129.55 tickets, rounded up to 130.
+        let n_gib = packets(ByteSize::gib(1).as_u64());
+        assert_close(mean_wei(n_gib, 3, ROTSEE_TP), 310_929_300, "rotsee mean");
+        assert_close(
+            r.initial_balance.amount().low_u128(),
+            130 * 2_400_000,
+            "rotsee initial = 130 tickets",
+        );
+        // 256 MiB → mean 77_732_400 wei = 32.39 tickets, rounded up to 33.
+        let n_256 = packets(ByteSize::mib(256).as_u64());
+        assert_close(mean_wei(n_256, 3, ROTSEE_TP), 77_732_400, "rotsee lower mean");
+        assert_close(
+            r.lower_balance_threshold.amount().low_u128(),
+            33 * 2_400_000,
+            "rotsee lower = 33 tickets",
+        );
+        assert!(r.lower_balance_threshold.amount().low_u128() >= floor);
+    }
+
+    // ── FundingConfig::resolve, defaults, validation, serde ──────────────────
 
     #[test]
     fn resolve_maps_all_four_fields() {
         let cfg = FundingConfig::default();
         let price = balance_from_wei(PRICE_WEI);
-        let win_prob = 0.5_f64;
-        let resolved = cfg.resolve::<TestTransport>(price, win_prob);
-
-        assert_eq!(
-            resolved.initial_balance,
-            capacity_to_balance::<TestTransport>(
-                cfg.initial_capacity,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-        assert_eq!(
-            resolved.topup_balance,
-            capacity_to_balance::<TestTransport>(
-                cfg.topup_capacity,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-        assert_eq!(
-            resolved.lower_balance_threshold,
-            capacity_to_balance::<TestTransport>(
-                cfg.lower_capacity_threshold,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-        assert_eq!(
-            resolved.min_safe_balance_required,
-            capacity_to_balance::<TestTransport>(
-                cfg.min_safe_capacity_required,
-                price,
-                win_prob,
-                cfg.assumed_hops,
-                &cfg.sizing_mode
-            )
-        );
-    }
-
-    // ── defaults & validation ────────────────────────────────────────────────
-
-    #[test]
-    fn default_sizing_mode_is_probabilistic_999() {
-        match FundingConfig::default().sizing_mode {
-            CapacitySizingMode::Probabilistic { success_probability } => {
-                assert!((success_probability - 0.999).abs() < 1e-9);
-            }
-            other => panic!("expected Probabilistic, got {other:?}"),
-        }
+        let p = 0.5_f64;
+        let r = cfg.resolve::<TestTransport>(price, p);
+        let cap = |c| capacity_to_balance::<TestTransport>(c, price, p, ASSUMED_HOPS, &cfg.sizing_mode);
+        assert_eq!(r.initial_balance, cap(cfg.initial_capacity));
+        assert_eq!(r.topup_balance, cap(cfg.topup_capacity));
+        assert_eq!(r.lower_balance_threshold, cap(cfg.lower_capacity_threshold));
+        assert_eq!(r.min_safe_balance_required, cap(cfg.min_safe_capacity_required));
     }
 
     #[test]
-    fn requires_win_prob_returns_false_only_for_deterministic() {
-        assert!(!CapacitySizingMode::Deterministic.requires_win_prob());
-        assert!(CapacitySizingMode::Expected.requires_win_prob());
-        assert!(
-            CapacitySizingMode::Probabilistic {
-                success_probability: 0.999
-            }
-            .requires_win_prob()
-        );
+    fn default_sizing_mode_is_deterministic() {
+        assert_eq!(FundingConfig::default().sizing_mode, CapacitySizingMode::Deterministic);
     }
 
     #[test]
@@ -1024,20 +1360,66 @@ mod config_tests {
         assert!(FundingConfig::default().validate().is_ok());
     }
 
-    #[test]
-    fn assumed_hops_zero_is_rejected() {
+    /// Zero disables the protection rather than lifting a limit: a zero lease expires on the spot, so a channel with a
+    /// transaction already in flight gets another every pass, and a zero read budget makes every read unavailable.
+    ///
+    /// Checked through the top-level config so this also pins that `#[validate(nested)]` still reaches
+    /// `ConcurrencyConfig` — a rule that is never reached is the same as no rule.
+    #[rstest]
+    #[case::zero_lease(Duration::ZERO, Duration::from_secs(30))]
+    #[case::zero_read_budget(Duration::from_secs(300), Duration::ZERO)]
+    fn concurrency_config_should_reject_a_zero_timeout(
+        #[case] action_lease_timeout: Duration,
+        #[case] chain_read_timeout: Duration,
+    ) {
         use validator::Validate as _;
-        let mut cfg = FundingConfig::default();
-        cfg.assumed_hops = 0;
-        assert!(cfg.validate().is_err());
+
+        let concurrency = ConcurrencyConfig {
+            action_lease_timeout,
+            chain_read_timeout,
+            ..Default::default()
+        };
+
+        assert!(concurrency.validate().is_err(), "a zero duration must be rejected");
+        assert!(
+            ChannelLifecycleConfig {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "and must be rejected through the top-level config too"
+        );
     }
 
     #[test]
-    fn default_assumed_hops_is_three() {
-        assert_eq!(FundingConfig::default().assumed_hops, 3);
+    fn concurrency_config_should_accept_its_defaults() {
+        use validator::Validate as _;
+
+        assert!(ConcurrencyConfig::default().validate().is_ok());
     }
 
-    // ── Serde round-trips ─────────────────────────────────────────────────────
+    /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the
+    /// protocol's maximum path length cannot silently rescale every stake in the strategy.
+    /// A ticket's face value is linear in this count, so a move from 3 to 4 would raise
+    /// every resolved balance by a third.
+    #[test]
+    fn assumed_hops_should_stay_at_the_protocol_maximum_of_three() {
+        assert_eq!(ASSUMED_HOPS, 3);
+        assert_eq!(ASSUMED_HOPS as usize, RoutingOptions::MAX_INTERMEDIATE_HOPS);
+    }
+
+    /// The hop count is no longer configurable, so a config naming it must be rejected
+    /// rather than silently ignored — `deny_unknown_fields` is what enforces that.
+    #[test]
+    fn assumed_hops_is_no_longer_accepted_in_config() {
+        let err = serde_json::from_str::<FundingConfig>(r#"{"assumed_hops":1}"#)
+            .expect_err("assumed_hops must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("assumed_hops"),
+            "error should name the offending key, got: {err}"
+        );
+    }
 
     #[test]
     fn funding_config_serde_roundtrip_probabilistic() -> anyhow::Result<()> {
@@ -1047,10 +1429,7 @@ mod config_tests {
             lower_capacity_threshold: ByteSize::mib(128),
             min_safe_capacity_required: ByteSize::gib(2),
             stop_when_unfunded: false,
-            assumed_hops: 2,
-            sizing_mode: CapacitySizingMode::Probabilistic {
-                success_probability: 0.9999,
-            },
+            sizing_mode: prob(0.9999),
         };
         let json = serde_json::to_string(&cfg).context("serialize")?;
         let back: FundingConfig = serde_json::from_str(&json).context("deserialize")?;
@@ -1072,13 +1451,8 @@ mod config_tests {
 
     #[test]
     fn sizing_mode_serde_external_tag() -> anyhow::Result<()> {
-        // Unit variants round-trip as plain strings.
         let det: CapacitySizingMode = serde_json::from_str(r#""deterministic""#)?;
         assert_eq!(det, CapacitySizingMode::Deterministic);
-        let exp: CapacitySizingMode = serde_json::from_str(r#""expected""#)?;
-        assert_eq!(exp, CapacitySizingMode::Expected);
-        // Struct variant uses {"probabilistic": {fields}} in JSON /
-        // `probabilistic:\n  success_probability: 0.999` in YAML.
         let prob: CapacitySizingMode = serde_json::from_str(r#"{"probabilistic":{"success_probability":0.99}}"#)?;
         assert_eq!(
             prob,
@@ -1115,6 +1489,183 @@ mod config_tests {
         cfg.weights.trust_ticket = 0.9; // sum = 2.7
         assert!(cfg.validate_trust_weights().is_err());
     }
+
+    #[test]
+    fn selector_weights_default_matches_balanced() {
+        assert_eq!(
+            SelectorWeights::default(),
+            MultiObjectiveSelectorConfig::balanced().weights
+        );
+        assert_eq!(
+            MultiObjectiveSelectorConfig::default(),
+            MultiObjectiveSelectorConfig::balanced()
+        );
+        // The inner trust weights documented on the fields.
+        let w = SelectorWeights::default();
+        assert_eq!((w.trust_probe, w.trust_ack, w.trust_ticket), (0.50, 0.35, 0.15));
+    }
+
+    // ── Partial configuration: every field is optional ───────────────────────
+
+    #[test]
+    fn empty_config_deserializes_to_default() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str("{}").context("empty object")?;
+        assert_eq!(cfg, ChannelLifecycleConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_config_defaults_the_rest() -> anyhow::Result<()> {
+        // A single leaf field inside a single section — everything else must default.
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#).context("partial")?;
+
+        assert_eq!(cfg.population.min_open_channels, 3, "the overridden field");
+        assert_eq!(cfg.population.target_open_channels, 8, "sibling in the same section");
+        assert_eq!(
+            cfg.population.peer_reopen_cooldown,
+            Duration::from_secs(30 * 60),
+            "sibling of a different type"
+        );
+        assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");
+        assert_eq!(cfg.tick_interval, Duration::from_secs(60), "untouched top-level field");
+        Ok(())
+    }
+
+    /// Walk every object node reachable from a serialized default config and, at
+    /// each one, assert the two properties the container-level
+    /// `#[serde(default, deny_unknown_fields)]` is there to provide: the node may
+    /// be reduced to `{}` and still yield the default, and an unknown key inside
+    /// it is an error.
+    ///
+    /// Deliberately data-driven rather than a hand-written case list: a section
+    /// added to [`ChannelLifecycleConfig`] later is covered automatically, which
+    /// is exactly the recurrence this test exists to prevent. Non-object nodes
+    /// (`sizing_mode: "deterministic"`, durations, byte sizes) are skipped —
+    /// container-level `default` does not apply to them.
+    #[test]
+    fn every_nested_object_is_partial_and_rejects_unknown_keys() -> anyhow::Result<()> {
+        use serde_json::{Map, Value};
+
+        /// Rebuilds `root` with the object at `path` replaced by `replacement`.
+        fn substitute(root: &Value, path: &[String], replacement: Value) -> Value {
+            match path.split_first() {
+                None => replacement,
+                Some((key, rest)) => {
+                    let mut obj = root.as_object().cloned().unwrap_or_default();
+                    let child = obj.get(key).cloned().unwrap_or(Value::Null);
+                    obj.insert(key.clone(), substitute(&child, rest, replacement));
+                    Value::Object(obj)
+                }
+            }
+        }
+
+        fn object_paths(node: &Value, path: Vec<String>, out: &mut Vec<Vec<String>>) {
+            if let Value::Object(map) = node {
+                out.push(path.clone());
+                for (key, child) in map {
+                    let mut child_path = path.clone();
+                    child_path.push(key.clone());
+                    object_paths(child, child_path, out);
+                }
+            }
+        }
+
+        let default = ChannelLifecycleConfig::default();
+        let root = serde_json::to_value(&default).context("serialize default")?;
+        let mut paths = Vec::new();
+        object_paths(&root, Vec::new(), &mut paths);
+        assert!(
+            paths.len() > 8,
+            "expected the root plus every nested section, found {} object nodes",
+            paths.len()
+        );
+
+        for path in paths {
+            let at = if path.is_empty() {
+                "<root>".into()
+            } else {
+                path.join(".")
+            };
+
+            let emptied = substitute(&root, &path, Value::Object(Map::new()));
+            let parsed: ChannelLifecycleConfig =
+                serde_json::from_value(emptied).with_context(|| format!("`{at}` reduced to {{}}"))?;
+            assert_eq!(parsed, default, "`{at}` reduced to {{}} must yield the default");
+
+            let mut with_unknown = Map::new();
+            with_unknown.insert("__unknown__".into(), Value::Bool(true));
+            let polluted = substitute(&root, &path, Value::Object(with_unknown));
+            assert!(
+                serde_json::from_value::<ChannelLifecycleConfig>(polluted).is_err(),
+                "unknown key in `{at}` must be an error, not a silent default"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_nested_selector_custom_defaults_inner_weights() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"selector":{"custom":{"open_per_tick":5}}}"#).context("custom selector")?;
+        let mo = cfg
+            .selector
+            .multi_objective_config()
+            .expect("custom profile must yield a config");
+        assert_eq!(mo.open_per_tick, 5, "the overridden field");
+        assert_eq!(mo.weights, SelectorWeights::default(), "weights default wholesale");
+        // `selector` is outside the `Validate` tree, so `build()` checks this separately.
+        mo.validate_trust_weights().map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn probabilistic_sizing_mode_defaults_success_probability() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"funding":{"sizing_mode":{"probabilistic":{}}}}"#).context("probabilistic")?;
+        assert_eq!(
+            cfg.funding.sizing_mode,
+            CapacitySizingMode::Probabilistic {
+                success_probability: 0.999
+            }
+        );
+        Ok(())
+    }
+
+    // ── Unknown keys are rejected, not silently defaulted ────────────────────
+
+    /// The generic walk above covers unknown keys in every *struct* node; these
+    /// are the cases it cannot reach — a misspelling of the section key itself,
+    /// and a key inside an enum struct variant.
+    #[rstest]
+    #[case(r#"{"populatio":{}}"#)] // misspelled section
+    #[case(r#"{"funding":{"sizing_mode":{"probabilistic":{"sucess_probability":0.9}}}}"#)] // in a variant
+    fn unknown_field_is_rejected(#[case] json: &str) {
+        assert!(
+            serde_json::from_str::<ChannelLifecycleConfig>(json).is_err(),
+            "unknown key must be an error, not a silent default: {json}"
+        );
+    }
+
+    // ── Nested validation actually runs ──────────────────────────────────────
+
+    #[test]
+    fn default_lifecycle_config_passes_validation() -> anyhow::Result<()> {
+        // A caller that validates a defaulted config must never see an error.
+        ChannelLifecycleConfig::default().validate().context("default config")?;
+        Ok(())
+    }
+
+    /// Constraints declared on a nested section must surface from a single
+    /// `validate()` on the top-level config — this is what `#[validate(nested)]`
+    /// buys, and without it these validators are dead code.
+    #[rstest]
+    #[case(r#"{"funding":{"sizing_mode":{"probabilistic":{"success_probability":0.2}}}}"#)]
+    fn nested_validation_rejects_out_of_range_values(#[case] json: &str) -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(json).with_context(|| json.to_string())?;
+        assert!(cfg.validate().is_err(), "must fail top-level validation: {json}");
+        Ok(())
+    }
 }
 
 /// Selector profile selection for [`ChannelLifecycleConfig`].
@@ -1150,41 +1701,68 @@ impl SelectorProfile {
 
 /// Top-level configuration for [`ChannelLifecycleStrategy`].
 ///
-/// All fields have sensible defaults; consumers only need to set the fields
-/// they want to override.
+/// Every field, at every nesting level, has a default, so any subset
+/// deserializes and `{}` equals [`ChannelLifecycleConfig::default`]. Unknown keys
+/// are rejected rather than silently ignored.
+///
+/// ```yaml
+/// population:
+///   target_open_channels: 12      # min_open_channels stays 5
+/// ```
+///
+/// Defaulting is not validation: supplied values must still satisfy the declared
+/// constraints (`sizing_mode` bounds, selector weights).
+/// [`ChannelLifecycleStrategy::build`] enforces them, returning
+/// [`StrategyError::InvalidConfiguration`](crate::errors::StrategyError::InvalidConfiguration).
+/// A loader can check earlier with one `validate()`, which `#[validate(nested)]`
+/// extends to all eight sections — but not [`selector`](Self::selector), whose
+/// `Custom` trust weights only
+/// [`MultiObjectiveSelectorConfig::validate_trust_weights`] checks.
+///
+/// ```
+/// # use hopr_strategy::channel_lifecycle::ChannelLifecycleConfig;
+/// use validator::Validate as _;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let cfg: ChannelLifecycleConfig = serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#)?;
+/// cfg.validate()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`ChannelLifecycleStrategy::build`]: crate::channel_lifecycle::ChannelLifecycleStrategy::build
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChannelLifecycleConfig {
     /// Base period between full evaluation passes.  Default: 60 s.
-    #[serde(default = "default_tick_interval", with = "humantime_serde")]
-    #[default(default_tick_interval())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(60))]
     pub tick_interval: Duration,
 
     /// Maximum random offset added to the tick interval to spread out
     /// concurrent node restarts.  Implemented as a deterministic offset based
     /// on the current system time nanoseconds.  Default: 5 s.
-    #[serde(default = "default_jitter", with = "humantime_serde")]
-    #[default(default_jitter())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5))]
     pub jitter: Duration,
 
+    #[validate(nested)]
     pub population: PopulationConfig,
+    #[validate(nested)]
     pub eligibility: EligibilityConfig,
+    #[validate(nested)]
     pub funding: FundingConfig,
+    #[validate(nested)]
     pub proactive_funding: ProactiveFundingConfig,
+    #[validate(nested)]
     pub closure: ClosureConfig,
+    #[validate(nested)]
     pub finalizer: FinalizerConfig,
+    #[validate(nested)]
     pub restart: RestartGuardConfig,
+    #[validate(nested)]
     pub concurrency: ConcurrencyConfig,
     /// Open/close selection policy.  Defaults to the original weighted-sum selector.
     #[default(SelectorProfile::Default)]
     pub selector: SelectorProfile,
-}
-
-#[inline]
-fn default_tick_interval() -> Duration {
-    Duration::from_secs(60)
-}
-#[inline]
-fn default_jitter() -> Duration {
-    Duration::from_secs(5)
 }

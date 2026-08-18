@@ -38,9 +38,9 @@ pub mod strategy;
 // configuration error and the error message is the only place it can be explained.
 #[cfg(all(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
 compile_error!(
-    "features `strategy-pix-secp256k1` and `strategy-pix-curvy` are mutually exclusive: they \
-     select deposit pools with incompatible address types. Exactly one crate in the dependency \
-     graph may choose, and every consumer of `hopr-strategy` must agree on the same one."
+    "features `strategy-pix-secp256k1` and `strategy-pix-curvy` are mutually exclusive: they select deposit pools \
+     with incompatible address types. Exactly one crate in the dependency graph may choose, and every consumer of \
+     `hopr-strategy` must agree on the same one."
 );
 
 /// The keypair of the deposit pool selected by the enabled `strategy-pix-*` feature.

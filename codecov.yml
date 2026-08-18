@@ -22,6 +22,11 @@ comment:
 ignore:
   - "**/benches/**"
   - "**/build.rs"
+  # Test-support code behind the `testing` feature: fixtures and fault
+  # injection for other suites, not shipped behaviour of its own.
+  - "src/testing.rs"
 flags:
   unit:
+    carryforward: true
+  integration:
     carryforward: true

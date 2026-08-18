@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use futures::StreamExt as _;
 use hopr_api::{
     chain::{
@@ -19,12 +19,16 @@ use hopr_api::{
         PacketTransport,
     },
 };
+use validator::Validate as _;
 
 use super::{
     ChannelLifecycleConfig, ChannelLifecycleStrategyInner,
     selector::{DefaultSelector, MultiObjectiveSelector},
 };
-use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
+use crate::{
+    errors::{Result, StrategyError},
+    strategy::Strategy as StrategyTrait,
+};
 
 /// Builder for [`ChannelLifecycleStrategy`].
 ///
@@ -49,7 +53,21 @@ impl ChannelLifecycleStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints, or if a `Custom` selector profile's inner
+    /// trust weights do not sum to ~1.0. Never panics.
+    ///
+    /// ```text
+    /// let strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
+    /// ```
+    ///
+    /// `text` because `N`'s bounds need a live node, constructible only under the
+    /// `testing` feature; see
+    /// `pipeline::tests::build_should_reject_invalid_config_without_panicking`.
+    pub fn build<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi
             + HasNetworkView
@@ -69,31 +87,35 @@ impl ChannelLifecycleStrategy {
             + Sync
             + 'static,
     {
+        self.cfg
+            .validate()
+            .map_err(|e| StrategyError::InvalidConfiguration(e.to_string()))?;
+
         let selector: Arc<dyn super::selector::Selector> = match self.cfg.selector.multi_objective_config() {
             Some(mo_cfg) => {
                 mo_cfg
                     .validate_trust_weights()
-                    .expect("invalid selector config: trust inner weights must sum to ~1.0");
+                    .map_err(StrategyError::InvalidConfiguration)?;
                 Arc::new(MultiObjectiveSelector::new(mo_cfg))
             }
             None => Arc::new(DefaultSelector),
         };
 
-        Box::new(ChannelLifecycleStrategyInner {
+        Ok(Box::new(ChannelLifecycleStrategyInner {
             cfg: self.cfg,
             node,
             selector,
-            open_in_flight: Arc::new(DashSet::new()),
-            fund_in_flight: Arc::new(DashSet::new()),
-            close_in_flight: Arc::new(DashSet::new()),
-            finalize_in_flight: Arc::new(DashSet::new()),
+            open_in_flight: Default::default(),
+            fund_in_flight: Default::default(),
+            close_in_flight: Default::default(),
+            finalize_in_flight: Default::default(),
             cooldown: Arc::new(DashMap::new()),
             start_epoch: std::time::Instant::now(),
             last_observed: Arc::new(DashMap::new()),
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-        })
+        }))
     }
 }
 
@@ -131,9 +153,24 @@ where
             initial_capacity = %self.cfg.funding.initial_capacity,
             "channel-lifecycle: strategy started"
         );
-        self.run_pipeline().await;
-
         let me = *self.node.chain_api().me();
+
+        // Subscribe *before* the first tick.  Transactions that tick submits can
+        // confirm while it is still running, and the broadcast only reaches
+        // subscribers that already exist — a slot released by an event nobody
+        // was listening for would stay held until its lease expires.
+        let event_stream = self
+            .node
+            .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Chain]))
+            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
+            .filter_map(|ev| {
+                futures::future::ready(match ev {
+                    ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
+                    _ => None,
+                })
+            });
+
+        self.run_pipeline().await;
 
         // Derive a fixed per-run jitter offset from system-time nanoseconds so
         // nodes restarted simultaneously spread out their ticks.  Use the full
@@ -152,17 +189,6 @@ where
         let effective_interval = self.cfg.tick_interval + jitter_offset;
 
         let tick_stream = futures_time::stream::interval(effective_interval.into()).map(|_| LoopEvent::Tick);
-
-        let event_stream = self
-            .node
-            .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Chain]))
-            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
-            .filter_map(|ev| {
-                futures::future::ready(match ev {
-                    ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
-                    _ => None,
-                })
-            });
 
         let mut driver = futures_concurrency::stream::Merge::merge((tick_stream, event_stream));
 

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 use validator::Validate;
 
-use crate::{errors, strategy::Strategy as StrategyTrait};
+use crate::{errors, errors::StrategyError, strategy::Strategy as StrategyTrait};
 
 #[cfg(all(feature = "telemetry", not(test)))]
 lazy_static::lazy_static! {
@@ -26,20 +26,32 @@ lazy_static::lazy_static! {
     .unwrap();
 }
 
-#[inline]
-fn default_max_closure_overdue() -> Duration {
-    Duration::from_secs(300)
-}
-
 /// Contains configuration of the [`ClosureFinalizerStrategy`].
+///
+/// The field is optional and humantime-encoded; unknown keys are rejected.
+///
+/// ```
+/// # use std::time::Duration;
+/// # use hopr_strategy::channel_finalizer::ClosureFinalizerStrategyConfig as C;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// assert_eq!(
+///     serde_json::from_str::<C>("{}")?.max_closure_overdue,
+///     Duration::from_secs(300)
+/// );
+/// let cfg: C = serde_json::from_str(r#"{"max_closure_overdue":"10m"}"#)?;
+/// assert_eq!(cfg.max_closure_overdue, Duration::from_secs(600));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClosureFinalizerStrategyConfig {
     /// Do not attempt to finalize closure of channels that have
     /// been overdue for closure for more than this period.
     ///
     /// Default is 300 seconds.
-    #[serde(default = "default_max_closure_overdue", with = "humantime_serde")]
-    #[default(default_max_closure_overdue())]
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(300))]
     pub max_closure_overdue: Duration,
 }
 
@@ -64,16 +76,30 @@ impl ClosureFinalizerStrategy {
     /// The generic `N` is erased at construction time; the returned
     /// `Box<dyn Strategy + Send>` can be held and spawned without knowledge
     /// of the concrete node type.
-    pub fn build<N>(self, node: Arc<N>) -> Box<dyn StrategyTrait + Send>
+    ///
+    /// # Errors
+    ///
+    /// [`StrategyError::InvalidConfiguration`] if the configuration violates any
+    /// of its declared constraints. Never panics.
+    ///
+    /// ```text
+    /// let strategy = ClosureFinalizerStrategy::new(cfg, interval).build(node)?;
+    /// ```
+    ///
+    /// `text` because `N`'s bounds need a live node, constructible only under the
+    /// `testing` feature.
+    pub fn build<N>(self, node: Arc<N>) -> crate::errors::Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + Send + Sync + 'static,
         N::ChainApi: ChainReadChannelOperations + ChainWriteChannelOperations + Clone + Send + Sync + 'static,
     {
-        Box::new(ClosureFinalizerStrategyInner {
+        StrategyError::validate_config(&self.cfg)?;
+
+        Ok(Box::new(ClosureFinalizerStrategyInner {
             node,
             cfg: self.cfg,
             interval: self.interval,
-        })
+        }))
     }
 }
 
@@ -289,7 +315,7 @@ mod tests {
             ClosureFinalizerStrategyConfig::default(),
             std::time::Duration::from_secs(60),
         )
-        .build(node);
+        .build(node)?;
 
         assert_eq!(strategy.to_string(), "closure_finalizer");
         // Verify the box is Send (compile-time check via trait object)
