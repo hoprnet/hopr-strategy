@@ -1,5 +1,34 @@
 //! # PIX strategy
 //!
+//! ## What the strategy does
+//!
+//! The strategy — built by [`PixStrategy`](strategy::PixStrategy) — consumes `PixEvent`s from the
+//! node and turns them into [`DepositPool`](hopr_api::chain::DepositPool) calls. It owns the
+//! policy around those calls; the pool owns the settlement.
+//!
+//! | event | the strategy | the pool |
+//! |---|---|---|
+//! | `NewDepositAddress` | prices the quota at `price_per_byte`, refuses anything above `max_ssa_allocation`, narrows the address to `K::Public`, drops duplicates, buffers | `deposit_funds_to`, or `deposit_funds_to_multiple` for a batch |
+//! | `DepositAddressReceived` | spawns the returned future and reports the confirmed balance back through the event's notifier | `notify_deposit` |
+//! | `PrivateKeyRecovered` | persists the key to the [`recovery_store`], drops duplicate sweeps, buffers | `withdraw_deposit` / `withdraw_multiple_deposits`, always to the node's Safe |
+//!
+//! Deposits and withdrawals are debounced (`deposit_buffer_period`, `withdrawal_buffer_period`)
+//! and flushed together, which is why two rows name both a single- and a multi-address call: the
+//! batch form is used whenever more than one event arrived inside the window.
+//!
+//! ## Where the boundary sits
+//!
+//! The strategy never retries a pool call. `DepositPool` makes reliability the implementation's
+//! job, so an error arriving here means the pool has already spent its budget: the deposit is
+//! abandoned for that flush, and a withdrawal keeps its persisted key so a later start can try
+//! again. The deposit-tracking deadline is the pool's for the same reason — it is reported
+//! through the failure channel of `notify_deposit`'s future.
+//!
+//! What the strategy keeps is what the pool cannot see: pricing and the allocation cap, the
+//! in-flight guards that stop one SSA being funded or swept twice, the debounce windows, and the
+//! recovery store — a recovered key is persisted before its sweep is attempted and removed only
+//! once funds have moved, so an unfinished sweep is replayed on the next start.
+//!
 //! ## Choosing a deposit pool
 //!
 //! [`DepositPool`](hopr_api::chain::DepositPool) is generic over its keypair, and `K::Public` is
