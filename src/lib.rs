@@ -6,7 +6,9 @@
 //! - auto funding strategy (`auto_funding` module, feature `strategy-auto-funding`)
 //! - auto redeeming strategy (`auto_redeeming` module, feature `strategy-auto-redeeming`)
 //! - closure finalizer (`channel_finalizer` module, feature `strategy-closure-finalizer`)
-//! - channel lifecycle strategy (feature `strategy-channel-lifecycle`)
+//! - channel lifecycle strategy (`channel_lifecycle` module, feature `strategy-channel-lifecycle`)
+//! - PIX strategy (`pix` module, feature `strategy-pix`; a bundled deposit pool needs `strategy-pix-secp256k1` or
+//!   `strategy-pix-curvy` in addition)
 //! - [multiple strategy chains](crate::strategy)
 //!
 //! Individual strategies are gated behind Cargo features.
