@@ -6,10 +6,10 @@ use hopr_api::{
     node::{
         DepositUpdated, PixAddressId, PixDepositAddressReceived, PixEvent, PixNewDepositAddress, PixPrivateKeyRecovered,
     },
-    types::primitive::prelude::{HoprBalance, XDaiBalance},
+    types::primitive::prelude::{Address, HoprBalance, XDaiBalance},
 };
 use hopr_strategy::pix::{
-    non_anonymous_pool::NonAnonymousDepositPoolConfig,
+    secp256k1::NonAnonymousDepositPoolConfig,
     strategy::{PixStrategy, PixStrategyConfig},
 };
 use hopr_strategy_integration_tests::{
@@ -18,26 +18,24 @@ use hopr_strategy_integration_tests::{
 };
 use rstest::rstest;
 
-/// PIX config with the deposit pool's gas top-up disabled: `fund_sweep_gas` then
-/// short-circuits, so a sweep is a single transaction and the scenario does not
-/// have to keep the Safe stocked with xDai.
-fn pix_config(
-    price_per_byte: HoprBalance,
-    max_ssa_allocation: HoprBalance,
-    max_deposit_tracking_time: Duration,
-) -> PixStrategyConfig {
+fn pix_config(price_per_byte: HoprBalance, max_ssa_allocation: HoprBalance) -> PixStrategyConfig {
     PixStrategyConfig {
         price_per_byte,
         max_ssa_allocation,
-        pool: NonAnonymousDepositPoolConfig {
-            max_deposit_tracking_time,
-            gas_xdai_per_sweep: XDaiBalance::zero(),
-            ..Default::default()
-        },
         pix_recovery_db_path: None,
         pix_recovery_password_env: None,
         deposit_buffer_period: Duration::ZERO,
         withdrawal_buffer_period: Duration::ZERO,
+    }
+}
+
+/// Pool config with the gas top-up disabled: `fund_sweep_gas` then short-circuits, so a sweep is a
+/// single transaction and the scenario does not have to keep the Safe stocked with xDai.
+fn pool_config(max_deposit_tracking_time: Duration) -> NonAnonymousDepositPoolConfig {
+    NonAnonymousDepositPoolConfig {
+        max_deposit_tracking_time,
+        gas_xdai_per_sweep: XDaiBalance::zero(),
+        ..Default::default()
     }
 }
 
@@ -68,12 +66,8 @@ async fn deposits_to_new_deposit_address(fixture: IntegrationFixture) -> Result<
 
     let node_before = scenario.hopr_balance(scenario.node_addr).await?;
 
-    let mut strategy = PixStrategy::new(pix_config(
-        price_per_byte,
-        HoprBalance::new_base(100u32),
-        Duration::from_secs(60),
-    ))
-    .build_non_anonymous(scenario.node.clone())?;
+    let mut strategy = PixStrategy::new(pix_config(price_per_byte, HoprBalance::new_base(100u32)))
+        .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     scenario.inject(PixEvent::NewDepositAddress(PixNewDepositAddress {
@@ -118,12 +112,9 @@ async fn skips_deposit_exceeding_max_ssa_allocation(fixture: IntegrationFixture)
         .await?;
 
     // 10 wxHOPR/byte * 10 bytes = 100 wxHOPR, well over the 50 wxHOPR cap.
-    let mut strategy = PixStrategy::new(pix_config(
-        HoprBalance::new_base(10u32),
-        HoprBalance::new_base(50u32),
-        Duration::from_secs(60),
-    ))
-    .build_non_anonymous(scenario.node.clone())?;
+    let mut strategy =
+        PixStrategy::new(pix_config(HoprBalance::new_base(10u32), HoprBalance::new_base(50u32)))
+            .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     scenario.inject(PixEvent::NewDepositAddress(PixNewDepositAddress {
@@ -170,12 +161,8 @@ async fn notifies_when_deposit_arrives(fixture: IntegrationFixture) -> Result<()
         )
         .await?;
 
-    let mut strategy = PixStrategy::new(pix_config(
-        price_per_byte,
-        HoprBalance::new_base(100u32),
-        Duration::from_secs(60),
-    ))
-    .build_non_anonymous(scenario.node.clone())?;
+    let mut strategy = PixStrategy::new(pix_config(price_per_byte, HoprBalance::new_base(100u32)))
+        .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     let id = pix_address_id(0x33, 1);
@@ -223,12 +210,9 @@ async fn sweeps_recovered_deposit_to_safe(fixture: IntegrationFixture) -> Result
 
     let safe_before = scenario.hopr_balance(scenario.safe_addr).await?;
 
-    let mut strategy = PixStrategy::new(pix_config(
-        HoprBalance::new_base(1u32),
-        HoprBalance::new_base(100u32),
-        Duration::from_secs(60),
-    ))
-    .build_non_anonymous(scenario.node.clone())?;
+    let mut strategy =
+        PixStrategy::new(pix_config(HoprBalance::new_base(1u32), HoprBalance::new_base(100u32)))
+            .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     scenario.inject(PixEvent::PrivateKeyRecovered(PixPrivateKeyRecovered {
@@ -285,12 +269,8 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
     let node_before = scenario.hopr_balance(scenario.node_addr).await?;
     let safe_before = scenario.hopr_balance(scenario.safe_addr).await?;
 
-    let mut strategy = PixStrategy::new(pix_config(
-        price_per_byte,
-        HoprBalance::new_base(100u32),
-        max_deposit_tracking_time,
-    ))
-    .build_non_anonymous(scenario.node.clone())?;
+    let mut strategy = PixStrategy::new(pix_config(price_per_byte, HoprBalance::new_base(100u32)))
+        .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(max_deposit_tracking_time))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
     let id = pix_address_id(0x55, 1);

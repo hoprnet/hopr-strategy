@@ -1,7 +1,7 @@
 //! ## Baby JubJub [`DepositPool`] implementation — **stub**
 //!
 //! [`CurvyDepositPool`] is the counterpart to
-//! [`NonAnonymousDepositPool`](crate::pix::non_anonymous_pool::NonAnonymousDepositPool) for the
+//! `secp256k1::NonAnonymousDepositPool` for the
 //! Baby JubJub instantiation of `HoprPixSpec`, where a deposit address is a curve point rather
 //! than an Ethereum account.
 //!
@@ -19,7 +19,7 @@
 //! # Why no newtype
 //!
 //! The secp arm needs
-//! [`EthDepositKey`](crate::pix::non_anonymous_pool::EthDepositKey) because
+//! `secp256k1::EthDepositKey` because
 //! `ChainKeypair::Public` is a `PublicKey` while a deposit address is an `Address` — a *hash* of
 //! it, with no way back. Baby JubJub has no such gap: `BjjKeypair::Public` **is** `BjjPublicKey`,
 //! which is exactly what `PixDepositAddress::Bjj` carries, and hopr-types supplies the
@@ -38,15 +38,46 @@ use hopr_api::{
 
 use crate::errors::StrategyError;
 
+// ---------------------------------------------------------------------------
+// Module-level aliases
+// ---------------------------------------------------------------------------
+
+/// This pool's keypair — the `K` in [`DepositPool`], whose `K::Public` is the deposit address it
+/// settles to.
+///
+/// The upstream [`BjjKeypair`] directly, for the reason given under *Why no newtype* above. The
+/// `pix::secp256k1` module exports the same two names for its own pool, so the
+/// two coexist and the choice is made by which one is imported.
+pub type PoolKeypair = BjjKeypair;
+
+/// This pool's configuration type.
+///
+/// Passed to [`PixStrategy::build_curvy`](crate::pix::strategy::PixStrategy::build_curvy) rather
+/// than carried in `PixStrategyConfig`, so that a value meant for one pool cannot silently reach
+/// the other.
+pub type PoolConfig = CurvyDepositPoolConfig;
+
+/// The deposit address this pool settles to — [`BjjPublicKey`], via [`PoolKeypair`].
+///
+/// A projection rather than `BjjPublicKey` directly, for the reason given on
+/// `secp256k1::DepositAddress`: it derives the
+/// [`DepositAddressOf`](crate::pix::DepositAddressOf) impl below from the keypair instead of
+/// restating it, so the impl cannot claim an address type this pool does not settle to.
+pub type DepositAddress = <PoolKeypair as hopr_api::types::crypto::prelude::Keypair>::Public;
+
+/// Naming [`DepositAddress`] (i.e. `BjjPublicKey`) in
+/// [`PixStrategy::build_curvy`](crate::pix::strategy::PixStrategy::build_curvy) is therefore
+/// accepted, and naming any other address type is a compile error at that call site.
+impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
+
 fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
 
 /// Configuration for [`CurvyDepositPool`].
 ///
-/// **Shares nothing with
-/// [`NonAnonymousDepositPoolConfig`](crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig)
-/// by design.** The two pools settle by different means, so neither one's knobs are evidence
+/// **Shares nothing with `secp256k1::NonAnonymousDepositPoolConfig` by design.** The two pools
+/// settle by different means, so neither one's knobs are evidence
 /// that the other needs them, in either direction:
 ///
 /// * The non-anonymous pool's `gas_xdai_per_sweep` funds a recovered stealth address so it can pay for its own

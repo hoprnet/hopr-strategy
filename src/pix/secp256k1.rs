@@ -1,9 +1,13 @@
-//! ## Non-anonymous [`DepositPool`] implementation
+//! ## Non-anonymous [`DepositPool`] implementation — secp256k1 deposit addresses
 //!
 //! A [`DepositPool`] that uses plain Ethereum transactions from the node's Safe
 //! to fund deposit addresses.  All operations are fully visible on-chain.
 //!
 //! **DO NOT USE IN PRODUCTION.**
+//!
+//! Enabled by `strategy-pix-secp256k1`, and to be paired with `hopr-lib/pix-secp256k1` so that
+//! `HoprPixSpec` produces the `Address` deposit addresses this pool can settle to. Built through
+//! [`PixStrategy::build_non_anonymous`](crate::pix::strategy::PixStrategy::build_non_anonymous).
 
 use std::{
     convert::identity,
@@ -28,6 +32,42 @@ use hopr_api::{
 use subtle::{Choice, ConstantTimeEq};
 
 use crate::errors::StrategyError;
+
+// ---------------------------------------------------------------------------
+// Module-level aliases
+// ---------------------------------------------------------------------------
+
+/// This pool's keypair — the `K` in [`DepositPool`], whose `K::Public` is the deposit address it
+/// settles to.
+///
+/// Named separately from [`EthDepositKey`] so a consumer can assert the pool/curve invariant
+/// `<HoprPixSpec as PixSpec>::DepositAddress == PoolKeypair::Public` against a stable path. The
+/// `pix::curvy` module exports the same two names for its own pool, so the two
+/// coexist and the choice is made by which one is imported.
+pub type PoolKeypair = EthDepositKey;
+
+/// This pool's configuration type.
+///
+/// Passed to
+/// [`PixStrategy::build_non_anonymous`](crate::pix::strategy::PixStrategy::build_non_anonymous)
+/// rather than carried in `PixStrategyConfig`: the two pools settle by different means and share
+/// **no** fields by contract, so neither one's knobs are evidence that the other needs them.
+/// Keeping it out of the strategy config is what stops a value meant for one pool from silently
+/// reaching the other.
+pub type PoolConfig = NonAnonymousDepositPoolConfig;
+
+/// The deposit address this pool settles to — [`Address`], via [`PoolKeypair`].
+///
+/// Spelled as a projection rather than as `Address` directly so that the
+/// [`DepositAddressOf`](crate::pix::DepositAddressOf) impl below is *derived* from the keypair
+/// instead of restating it. A hand-written impl could name an address type this pool does not
+/// actually settle to, which would leave the caller's witness asserting nothing; this cannot.
+pub type DepositAddress = <PoolKeypair as Keypair>::Public;
+
+/// Naming [`DepositAddress`] (i.e. `Address`) in
+/// [`PixStrategy::build_non_anonymous`](crate::pix::strategy::PixStrategy::build_non_anonymous) is
+/// therefore accepted, and naming any other address type is a compile error at that call site.
+impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
 
 // ---------------------------------------------------------------------------
 // Pool key
@@ -123,7 +163,7 @@ fn default_max_sweep_retries() -> usize {
 /// ```
 /// use std::time::Duration;
 ///
-/// use hopr_strategy::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig;
+/// use hopr_strategy::pix::secp256k1::NonAnonymousDepositPoolConfig;
 ///
 /// // Override one budget and inherit the documented defaults for the rest.
 /// let cfg = NonAnonymousDepositPoolConfig {
@@ -215,10 +255,16 @@ impl Drop for DepositTrackerSlot {
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use hopr_api::{chain::DepositPool, node::HasChainApi, types::primitive::prelude::HoprBalance};
-/// use hopr_strategy::pix::non_anonymous_pool::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+/// use hopr_api::{
+///     chain::DepositPool,
+///     node::HasChainApi,
+///     types::primitive::prelude::{Address, HoprBalance},
+/// };
+/// use hopr_strategy::pix::secp256k1::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
 ///
-/// async fn deposit<N>(node: Arc<N>, dst: hopr_api::chain::PixDepositAddress) -> anyhow::Result<()>
+/// // `dst` is an `Address` — the pool settles to `EthDepositKey::Public`, not to the
+/// // curve-agnostic `PixDepositAddress` the events carry.
+/// async fn deposit<N>(node: Arc<N>, dst: Address) -> anyhow::Result<()>
 /// where
 ///     N: HasChainApi + Send + Sync + 'static,
 /// {
@@ -244,7 +290,7 @@ impl<N: HasChainApi> NonAnonymousDepositPool<N> {
     /// use std::sync::Arc;
     ///
     /// use hopr_api::node::HasChainApi;
-    /// use hopr_strategy::pix::non_anonymous_pool::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    /// use hopr_strategy::pix::secp256k1::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
     ///
     /// fn build<N: HasChainApi>(node: Arc<N>) -> NonAnonymousDepositPool<N> {
     ///     NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default())

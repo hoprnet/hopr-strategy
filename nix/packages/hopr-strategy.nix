@@ -13,35 +13,13 @@
 }:
 
 let
-  # Every feature except a second deposit pool.
-  #
-  # `--all-features` cannot be used here any more: `strategy-pix-secp256k1` and
-  # `strategy-pix-curvy` select pools with incompatible address types and `src/pix/mod.rs`
-  # rejects both with a `compile_error!`, so the flag that means "everything" names a
-  # configuration that cannot exist. A mutually exclusive pair has no "all" — it has to be
-  # picked, exactly as `hoprd` found when neither pairing could go in its `default`.
-  #
-  # secp256k1 is the pick because it is the only implemented pool; `strategy-pix-curvy`
-  # selects `CurvyDepositPool`, whose methods panic. Swap it here when that lands, and note
-  # that the two cannot both be covered in one derivation — a second one would be needed.
-  allFeaturesOnePool = builtins.concatStringsSep "," [
-    "runtime-tokio"
-    "telemetry"
-    "testing"
-    "strategy-auto-funding"
-    "strategy-auto-redeeming"
-    "strategy-channel-lifecycle"
-    "strategy-closure-finalizer"
-    "strategy-pix-secp256k1"
-  ];
-
   # Common build arguments for hopr-strategy variants
   mkHoprStrategyBuildArgs =
     { src, depsSrc }:
     {
       inherit src depsSrc rev;
       cargoToml = ./../../Cargo.toml;
-      cargoExtraArgs = "--features ${allFeaturesOnePool}";
+      cargoExtraArgs = "--all-features";
     };
 
   localArgs = mkHoprStrategyBuildArgs {
@@ -62,7 +40,7 @@ let
     pname = "hopr-strategy-check";
     buildPhase = ''
       runHook preBuild
-      cargo check --features ${allFeaturesOnePool}
+      cargo check --all-features
       runHook postBuild
     '';
     installPhase = ''
@@ -122,7 +100,7 @@ in
     cargoToml = ./../../Cargo.toml;
     inherit rev;
     runCoverage = true;
-    cargoExtraArgs = "--features ${allFeaturesOnePool} --lib";
+    cargoExtraArgs = "--all-features --lib";
   };
 
   # The same for the integration suite.  It drives whole strategies against a
@@ -141,7 +119,7 @@ in
     # only the test crate's source.  `--tests` therefore also re-runs the lib's
     # unit tests, which costs a few seconds and makes this report a superset of
     # the unit one.
-    cargoExtraArgs = "--features ${allFeaturesOnePool} --tests";
+    cargoExtraArgs = "--all-features --tests";
   };
 }
 // hoprStrategyPlatformPackages

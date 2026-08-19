@@ -41,7 +41,9 @@ strategy-closure-finalizer = []
 # feature on `hopr-crypto-packet` — an entirely separate crate. Enabling this alone gives the
 # generic engine and `PixStrategy::build_with_pool`, for a consumer bringing its own pool.
 #
-# Consumers that want a bundled pool pick one of the two pairings below instead.
+# Consumers that want a bundled pool also enable one of the two pairings below. Those two are
+# additive, not exclusive: each lives in its own module with its own builder, so enabling both is
+# well-defined and is what `--all-features` does. Which pool runs is decided at the call site.
 strategy-pix = [
   "dep:backon",
   "dep:chacha20poly1305",

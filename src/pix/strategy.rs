@@ -9,12 +9,13 @@
 //! * `D` — The deposit pool implementation.
 //! * `N` — The node type that emits PIX events via [`ActionableEventSource`].
 //!
-//! When the pool bundled with the enabled `strategy-pix-*` feature is sufficient, use
-//! [`PixStrategy::build_default_pool`] — it selects whichever of
-//! [`NonAnonymousDepositPool`](crate::pix::non_anonymous_pool::NonAnonymousDepositPool) or
-//! [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool) the build chose, so a caller
-//! does not name a pool and needs no edit when the choice changes. For a custom pool, construct
-//! it first and pass it to [`PixStrategy::build_with_pool`].
+//! One builder per bundled pool, each taking that pool's own config: `build_non_anonymous` for
+//! `secp256k1::NonAnonymousDepositPool` and `build_curvy` for `curvy::CurvyDepositPool`. Each
+//! exists whenever its own `strategy-pix-*` feature does, and both may exist at once, so the pool
+//! is named at the call site rather than inferred from the feature graph. For a custom pool,
+//! construct it first and pass it to [`PixStrategy::build_with_pool`].
+// The two builders above are code spans, not intra-doc links: each exists only when its own
+// `strategy-pix-*` feature is on, so linking them warns on every single-pool build.
 
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -35,12 +36,6 @@ use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-#[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
-use crate::pix::curvy_pool::CurvyDepositPool;
-#[cfg(feature = "strategy-pix-secp256k1")]
-use crate::pix::non_anonymous_pool::NonAnonymousDepositPool;
-#[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
-use crate::pix::{PoolConfig, PoolKeypair};
 use crate::{
     errors::{Result, StrategyError},
     pix::recovery_store::PixRecoveryStore,
@@ -96,6 +91,13 @@ lazy_static::lazy_static! {
 // ---------------------------------------------------------------------------
 
 /// Configuration for [`PixStrategy`].
+///
+/// Deliberately pool-agnostic: a pool's own configuration is passed to the builder that names it
+/// (`build_non_anonymous`, `build_curvy`) rather than nested here. The two pool configs share
+/// **no** fields by contract, so a single `pool` field would have to be typed by whichever
+/// `strategy-pix-*` feature was on — which is exactly what made the two features mutually
+/// exclusive. Keeping settlement config out of strategy config is what lets both pools be
+/// compiled together.
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
 pub struct PixStrategyConfig {
     /// wxHOPR paid per byte of SSA quota.
@@ -106,13 +108,6 @@ pub struct PixStrategyConfig {
     #[default(HoprBalance::new_base(100))]
     #[serde(default)]
     pub max_ssa_allocation: HoprBalance,
-    /// Configuration for the deposit pool bundled with the enabled `strategy-pix-*` feature.
-    ///
-    /// Absent when neither pairing is enabled — that build has no bundled pool to configure and
-    /// supplies its own through [`PixStrategy::build_with_pool`].
-    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
-    #[serde(default)]
-    pub pool: PoolConfig,
     /// If set, recovered private keys are persisted to redb at this path.
     ///
     /// Strongly recommended in production. A `PrivateKeyRecovered` event can arrive before
@@ -159,44 +154,135 @@ impl PixStrategy {
         Self { cfg }
     }
 
-    /// Build with the deposit pool bundled with the enabled `strategy-pix-*` feature.
+    /// Build with the [`NonAnonymousDepositPool`](crate::pix::secp256k1::NonAnonymousDepositPool),
+    /// settling to secp256k1 (`Address`) deposit addresses.
     ///
-    /// This is the curve-agnostic entry point: it names neither pool, so a caller needs no edit
-    /// when the build switches between them. Which one it selects is decided entirely by the
-    /// feature graph, and [`PoolKeypair`] is the alias to assert the resulting deposit-address
-    /// type against.
+    /// `A` is the deposit-address type the node's PIX spec produces, and the `PoolKeypair:
+    /// Keypair<Public = A>` bound makes naming it the whole compatibility check. Pass
+    /// `<HoprPixSpec as PixSpec>::DepositAddress` and a build that paired this pool with the wrong
+    /// `hopr-lib/pix-*` feature stops here, at the call site:
     ///
-    /// Note that with `strategy-pix-curvy` the selected pool is
-    /// [`CurvyDepositPool`](crate::pix::curvy_pool::CurvyDepositPool), which is a stub: building
-    /// succeeds and the first deposit panics.
-    #[cfg(any(feature = "strategy-pix-secp256k1", feature = "strategy-pix-curvy"))]
-    pub fn build_default_pool<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
+    /// ```text
+    /// error[E0271]: type mismatch resolving `<EthDepositKey as Keypair>::Public == BjjPublicKey`
+    /// ```
+    ///
+    /// The check has to live in the caller because it cannot live here: `PixDepositAddress` is a
+    /// runtime enum over *every* scheme, so the strategy's narrowing to `K::Public` is a
+    /// `TryFrom` that this crate can only fail at runtime — once per event, having deposited
+    /// nothing. `A` is what converts that into a compile error. It appears only in the bound, so
+    /// it must be named explicitly; that is deliberate, not an oversight.
+    ///
+    /// The sweep destination is `node.identity().safe_address`. All operations are fully visible
+    /// on-chain — **not for production use.**
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::{
+    ///     node::{ActionableEventSource, HasChainApi},
+    ///     types::primitive::prelude::Address,
+    /// };
+    /// use hopr_strategy::pix::strategy::{PixStrategy, PixStrategyConfig};
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// # fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>)
+    /// #     -> hopr_strategy::errors::Result<()> {
+    /// // In `hoprd` this is `<HoprPixSpec as PixSpec>::DepositAddress`, not a literal `Address`.
+    /// let _strategy =
+    ///     PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(node, Default::default())?;
+    /// # Ok(()) }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Pairing this pool with Baby JubJub deposit addresses does not compile:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::{
+    ///     node::{ActionableEventSource, HasChainApi},
+    ///     types::crypto::prelude::BjjPublicKey,
+    /// };
+    /// use hopr_strategy::pix::strategy::{PixStrategy, PixStrategyConfig};
+    ///
+    /// fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>) {
+    ///     // `NonAnonymousDepositPool` settles to `Address`, so this pairing is rejected here
+    ///     // rather than failing on every event at runtime.
+    ///     let _ = PixStrategy::new(PixStrategyConfig::default())
+    ///         .build_non_anonymous::<_, BjjPublicKey>(node, Default::default());
+    /// }
+    /// ```
+    #[cfg(feature = "strategy-pix-secp256k1")]
+    pub fn build_non_anonymous<N, A>(
+        self,
+        node: Arc<N>,
+        pool_cfg: crate::pix::secp256k1::PoolConfig,
+    ) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
+        A: crate::pix::DepositAddressOf<crate::pix::secp256k1::PoolKeypair>,
     {
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
-        #[cfg(feature = "strategy-pix-secp256k1")]
-        let pool = Arc::new(NonAnonymousDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
-        #[cfg(all(feature = "strategy-pix-curvy", not(feature = "strategy-pix-secp256k1")))]
-        let pool = Arc::new(CurvyDepositPool::new(Arc::clone(&node), self.cfg.pool.clone()));
-
+        let pool = Arc::new(crate::pix::secp256k1::NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg,
+        ));
         let safe_address = node.identity().safe_address;
 
         // The key is named rather than inferred: it is the choice this builder exists to make.
-        self.build_with_pool::<_, _, PoolKeypair>(pool, node, safe_address)
+        self.build_with_pool::<_, _, crate::pix::secp256k1::PoolKeypair>(pool, node, safe_address)
     }
 
-    /// Build with the [`NonAnonymousDepositPool`], by name.
+    /// Build with the [`CurvyDepositPool`](crate::pix::curvy::CurvyDepositPool), settling to Baby
+    /// JubJub (`BjjPublicKey`) deposit addresses.
     ///
-    /// Prefer [`build_default_pool`](Self::build_default_pool) unless the caller genuinely
-    /// requires *this* pool rather than the configured one.
-    #[cfg(feature = "strategy-pix-secp256k1")]
-    pub fn build_non_anonymous<N>(self, node: Arc<N>) -> Result<Box<dyn StrategyTrait + Send>>
+    /// `A` is the deposit-address type the node's PIX spec produces; see
+    /// `build_non_anonymous` for why naming it is the compatibility
+    /// check and why it cannot be checked inside this crate. Pass
+    /// `<HoprPixSpec as PixSpec>::DepositAddress`; `hopr-lib/pix-bjj` is the default, so a consumer
+    /// enabling only this feature already agrees.
+    ///
+    /// Note that this pool is a **stub**: building succeeds and the first deposit panics. See
+    /// [`crate::pix::curvy`].
+    ///
+    /// # Examples
+    ///
+    /// Pairing this pool with secp256k1 deposit addresses does not compile:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::{
+    ///     node::{ActionableEventSource, HasChainApi},
+    ///     types::primitive::prelude::Address,
+    /// };
+    /// use hopr_strategy::pix::strategy::{PixStrategy, PixStrategyConfig};
+    ///
+    /// fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>) {
+    ///     // `CurvyDepositPool` settles to `BjjPublicKey`, so this pairing is rejected here
+    ///     // rather than failing on every event at runtime.
+    ///     let _ = PixStrategy::new(PixStrategyConfig::default())
+    ///         .build_curvy::<_, Address>(node, Default::default());
+    /// }
+    /// ```
+    #[cfg(feature = "strategy-pix-curvy")]
+    pub fn build_curvy<N, A>(
+        self,
+        node: Arc<N>,
+        pool_cfg: crate::pix::curvy::PoolConfig,
+    ) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
+        A: crate::pix::DepositAddressOf<crate::pix::curvy::PoolKeypair>,
     {
-        self.build_default_pool(node)
+        let pool = Arc::new(crate::pix::curvy::CurvyDepositPool::new(Arc::clone(&node), pool_cfg));
+        let safe_address = node.identity().safe_address;
+
+        self.build_with_pool::<_, _, crate::pix::curvy::PoolKeypair>(pool, node, safe_address)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
@@ -401,14 +487,26 @@ where
                     return Err(StrategyError::CriteriaNotSatisfied);
                 }
 
-                // The single narrowing from the wire form to the one this pool settles. It
-                // cannot fail once the node's PIX spec and the pool agree on a scheme, which is
-                // what the caller asserts at compile time — but the event type is a sum over
-                // every scheme, so the conversion still has to be written.
-                let dest_addr: K::Public = new_deposit_address
-                    .address
-                    .try_into()
-                    .map_err(|_| StrategyError::GeneralError(GeneralError::InvalidInput))?;
+                // The single narrowing from the wire form to the one this pool settles. It cannot
+                // fail once the node's PIX spec and the pool agree on a scheme, which is what the
+                // `A` witness on the builder makes a compile error — but the event type is a sum
+                // over every scheme, so the conversion still has to be written.
+                //
+                // Logged with the same detail as the Exit-side narrowing below: a mismatch here
+                // fires on every event and deposits nothing, and `run` only reports the returned
+                // error, so a bare `InvalidInput` would leave an operator with no way to tell a
+                // curve mismatch from any other rejected event.
+                let address_type = new_deposit_address.address.address_type();
+                let dest_addr: K::Public = new_deposit_address.address.try_into().map_err(|_| {
+                    tracing::error!(
+                        pix_id = ?new_deposit_address.id,
+                        ?address_type,
+                        "deposit address is not the form this pool settles - the node's PIX spec and the selected \
+                         deposit pool disagree on the address scheme; pair `strategy-pix-*` with the matching \
+                         `hopr-lib/pix-*` feature"
+                    );
+                    StrategyError::GeneralError(GeneralError::InvalidInput)
+                })?;
                 if self.in_flight_destinations.contains_key(&dest_addr) {
                     tracing::warn!(?dest_addr, "withdrawal already in flight to this destination, skipping");
                     return Ok(());
@@ -431,10 +529,17 @@ where
                 let deposit_updated = deposit_address_recv.deposit_updated;
                 let target_deposit = self.cfg.price_per_byte * deposit_address_recv.quota;
 
+                let address_type = deposit_address_recv.address.address_type();
                 let track_addr: K::Public = match deposit_address_recv.address.try_into() {
                     Ok(a) => a,
                     Err(_) => {
-                        tracing::error!(?pix_id, "deposit address is not the form this pool settles");
+                        tracing::error!(
+                            ?pix_id,
+                            ?address_type,
+                            "deposit address is not the form this pool settles - the node's PIX spec and the selected \
+                             deposit pool disagree on the address scheme; pair `strategy-pix-*` with the matching \
+                             `hopr-lib/pix-*` feature"
+                        );
                         return Err(StrategyError::GeneralError(GeneralError::InvalidInput));
                     }
                 };
@@ -948,7 +1053,7 @@ mod tests {
     use super::{PixStrategy, PixStrategyConfig, PixStrategyInner};
     use crate::{
         errors::StrategyError,
-        pix::{non_anonymous_pool::NonAnonymousDepositPool, recovery_store::PixRecoveryStore},
+        pix::{recovery_store::PixRecoveryStore, secp256k1::NonAnonymousDepositPool},
         testing::{BlokliTestStateBuilder, TestChainConnector},
     };
 
@@ -1047,7 +1152,7 @@ mod tests {
     /// Every test using this helper asserts on the outcome of a single attempt, so retrying
     /// would only add real backoff sleeps to the suite. Tests that are *about* retrying use
     /// [`pool_cfg_with_retries`].
-    fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
+    fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::secp256k1::NonAnonymousDepositPoolConfig {
         pool_cfg_with_retries(t, g, 0, 0)
     }
 
@@ -1056,8 +1161,8 @@ mod tests {
         g: XDaiBalance,
         max_deposit_retries: usize,
         max_sweep_retries: usize,
-    ) -> crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
-        crate::pix::non_anonymous_pool::NonAnonymousDepositPoolConfig {
+    ) -> crate::pix::secp256k1::NonAnonymousDepositPoolConfig {
+        crate::pix::secp256k1::NonAnonymousDepositPoolConfig {
             max_deposit_tracking_time: t,
             gas_xdai_per_sweep: g,
             max_deposit_retries,
@@ -1098,7 +1203,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1147,7 +1251,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1190,7 +1293,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(10),
             max_ssa_allocation: HoprBalance::new_base(50),
-            pool: pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1230,7 +1332,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1282,7 +1383,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1306,7 +1406,6 @@ mod tests {
         validator::Validate::validate(&PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: Default::default(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1330,13 +1429,12 @@ mod tests {
         let s = PixStrategy::new(PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: Default::default(),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
         })
-        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))))?;
+        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default())?;
         assert_eq!(s.to_string(), "pix");
         fn assert_send<T: Send>(_: &T) {}
         assert_send(&s);
@@ -1369,7 +1467,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1415,13 +1512,12 @@ mod tests {
         PixStrategy::new(PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: Default::default(),
             pix_recovery_db_path: Some(db.clone()),
             pix_recovery_password_env: Some(BUILD_PASSWORD_ENV.to_string()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
         })
-        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))))?;
+        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default())?;
         assert!(db.exists());
         // SAFETY: as above.
         unsafe { std::env::remove_var(BUILD_PASSWORD_ENV) };
@@ -1460,7 +1556,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1511,11 +1606,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = pool
-            .withdraw_deposit(
-                &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
-                *BOB,
-                None,
-            )
+            .withdraw_deposit(&crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?, *BOB, None)
             .await;
 
         assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)));
@@ -1567,11 +1658,7 @@ mod tests {
         });
 
         let result = pool
-            .withdraw_deposit(
-                &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
-                *CHRIS,
-                None,
-            )
+            .withdraw_deposit(&crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?, *CHRIS, None)
             .await;
         landing.await??;
 
@@ -1621,12 +1708,8 @@ mod tests {
         let safe_before = hopr_balance(&*cc, *BOB).await?;
         let dst_before = hopr_balance(&*cc, *CHRIS).await?;
 
-        pool.pool_transfer(
-            &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
-            *CHRIS,
-            None,
-        )
-        .await?;
+        pool.pool_transfer(&crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?, *CHRIS, None)
+            .await?;
 
         assert_eq!(
             hopr_balance(&*cc, ra).await?,
@@ -1674,11 +1757,7 @@ mod tests {
         let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
 
         let result = pool
-            .pool_transfer(
-                &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
-                *CHRIS,
-                None,
-            )
+            .pool_transfer(&crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?, *CHRIS, None)
             .await;
 
         assert!(
@@ -1729,11 +1808,7 @@ mod tests {
         });
 
         let result = pool
-            .pool_transfer(
-                &crate::pix::non_anonymous_pool::EthDepositKey::from_secret(&rk)?,
-                *CHRIS,
-                None,
-            )
+            .pool_transfer(&crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?, *CHRIS, None)
             .await;
         landing.await??;
 
@@ -1802,7 +1877,7 @@ mod tests {
 
         let keys: Vec<_> = rks
             .iter()
-            .map(|rk| crate::pix::non_anonymous_pool::EthDepositKey::from_secret(rk).expect("valid test secret"))
+            .map(|rk| crate::pix::secp256k1::EthDepositKey::from_secret(rk).expect("valid test secret"))
             .collect();
         let results = pool.withdraw_multiple_deposits(&keys, *CHRIS).await?;
         landing.await??;
@@ -1877,7 +1952,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 5),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -1944,7 +2018,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             // Flush immediately: this test asserts on the outcome of the sweep itself.
@@ -1988,13 +2061,12 @@ mod tests {
         let r = PixStrategy::new(PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: Default::default(),
             pix_recovery_db_path: Some("/tmp/nonexistent/pix.redb".into()),
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
         })
-        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))));
+        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default());
         // The message must name the field that is missing, not just report a failed criterion.
         let error = r
             .err()
@@ -2024,13 +2096,12 @@ mod tests {
         let r = PixStrategy::new(PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: Default::default(),
             pix_recovery_db_path: Some("/tmp/nonexistent/pix.redb".into()),
             pix_recovery_password_env: Some(ev.to_string()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
         })
-        .build_non_anonymous(Arc::new(ChainNode(Arc::new(cc))));
+        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default());
         assert!(r.is_err());
         Ok(())
     }
@@ -2063,7 +2134,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
@@ -2128,7 +2198,6 @@ mod tests {
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
-            pool: pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
             pix_recovery_db_path: None,
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
