@@ -1,22 +1,19 @@
 [advisories]
+# Every entry must still fire against *this* crate's `Cargo.lock`. An ignore for an advisory that
+# no longer resolves suppresses nothing today and hides a real finding tomorrow — and most of the
+# list this replaces was inherited from the hoprnet monorepo, naming crates (libp2p, pprof,
+# hickory-proto) that are not in this dependency graph at all.
+#
+# To re-check: empty this list, run `cargo audit`, and confirm every ID below reappears and
+# nothing else does. Each comment records the path that keeps the ignore alive plus what unblocks
+# removing it; a path that no longer resolves means the entry goes.
 ignore = [
-  "RUSTSEC-2024-0388", # 'derivative' in 'alloy' [unmaintained],
-  "RUSTSEC-2024-0436", # 'paste' dependency in 'libp2p' [unmaintained]
-  "RUSTSEC-2025-0073", # 'alloy-dyn-abi' in 'alloy' - will be removed in 4.0
-  "RUSTSEC-2025-0137", # `alloy` - held back until removed, see https://github.com/hoprnet/hoprnet/issues/7707
-  "RUSTSEC-2026-0049", # `rustls-webpki` - needs alloy removal
-  "RUSTSEC-2026-0097", # workspace already pins `rand` 0.10.1, but Cargo.lock still contains transitive `rand` 0.9.3; remove this ignore once upstream deps stop pulling 0.9.3
-  "RUSTSEC-2026-0098", # `rustls-webpki` 0.101.7 pulled transitively by blokli-client -> eventsource-client 0.16.2 -> hyper-rustls 0.24.2; our own `rustls-webpki` bumped to >=0.103.12 in Cargo.lock. Drop once blokli-client upgrades eventsource-client (see https://github.com/hoprnet/blokli/issues/107)
-  "RUSTSEC-2026-0118", # `hickory-proto` 0.25.2 pulled by libp2p-dns 0.44.0 -> libp2p 0.56.0; no fix for 0.25.x; cannot remove without a major libp2p bump
-  "RUSTSEC-2026-0119", # same root cause as 0118 (different advisory DB version); hickory-proto 0.26.x is fixed via hickory-proto 0.26.1
-  "RUSTSEC-2026-0173", # `proc-macro-error2` unmaintained; pulled by validator_derive -> validator -> hopr-transport-tag-allocator; drop once validator upgrades or is replaced
-  "RUSTSEC-2026-0185", # needs libp2p-quic and reqwest patch
-  "RUSTSEC-2026-0194", # quick-xml 0.26.0 via pprof → inferno; pprof is dev-only (profiling feature); not reachable in production
-  "RUSTSEC-2026-0195", # quick-xml 0.26.0 via pprof → inferno; same root cause as 0194 (different advisory DB entry); dev-only
-  "RUSTSEC-2026-0220", # ruint <1.20.0 pulled transitively by nybbles → alloy-trie → alloy; upgrade blocked on alloy bump
-  "RUSTSEC-2026-0249", # `smartstring` unmaintained, requires `opentelemetry-prometheus-text-exporter` > 0.3.0
-  "RUSTSEC-2026-0253", # `lru` <0.18.2 use-after-free if a key's `Drop` panics in `pop()`; pinned at 0.16.4 by alloy-provider 2.2.0 (via hopr-bindings -> hopr-types). 0.18.2 is semver-incompatible, so this needs an alloy bump — same blocker as RUSTSEC-2026-0220
-  "RUSTSEC-2026-0258", # `h2` unbounded empty DATA frames, requires new version of `cynic` in `blokli-client`
+  "RUSTSEC-2024-0388", # `derivative` unmaintained; ark-ff 0.4.2 -> ruint -> alloy-primitives/alloy-trie -> alloy. Blocked on an alloy bump.
+  "RUSTSEC-2024-0436", # `paste` unmaintained; syn-solidity -> alloy-sol-macro-input -> alloy. Blocked on an alloy bump.
+  "RUSTSEC-2026-0173", # `proc-macro-error2` unmaintained; two paths: aquamarine -> hopr-types, and alloy-sol-macro-expander -> alloy-sol-types. Needs both upstreams to move.
+  "RUSTSEC-2026-0249", # `smartstring` unmaintained; opentelemetry-prometheus-text-exporter 0.3.0 -> hopr-types. Requires that crate > 0.3.0.
+  "RUSTSEC-2026-0253", # `lru` <0.18.2 use-after-free if a key's `Drop` panics in `pop()`; pinned at 0.16.4 by alloy-provider 2.1.1. 0.18.2 is semver-incompatible, so this needs an alloy bump.
+  "RUSTSEC-2026-0258", # `h2` <0.4.16 unbounded empty DATA frames; reqwest 0.13.4 -> cynic -> blokli-client, and reqwest -> alloy-transport-http. Needs a cynic bump in blokli-client.
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
@@ -32,12 +29,14 @@ stale = false
 url   = "https://github.com/RustSec/advisory-db.git"
 
 [output]
-# TODO: restore `deny = ["warnings"]` once `core2` (yanked, transitive via libp2p's multihash) is resolved upstream.
-# cargo-audit has no per-package yanked ignore — see https://github.com/rustsec/rustsec/issues/1453
-deny      = ["unmaintained", "unsound"]
-format    = "terminal"                  # "terminal" (human readable report) or "json"
-quiet     = false                       # Only print information on error
-show_tree = true                        # Show inverse dependency trees along with advisories (default: true)
+# Denies every warning category, not just unmaintained/unsound. The narrower list this replaces
+# was a workaround for yanked `core2`, which cargo-audit cannot ignore per-package
+# (https://github.com/rustsec/rustsec/issues/1453). `core2` is no longer in the graph, so the
+# workaround is no longer needed.
+deny      = ["warnings"]
+format    = "terminal"   # "terminal" (human readable report) or "json"
+quiet     = false        # Only print information on error
+show_tree = true         # Show inverse dependency trees along with advisories (default: true)
 
 [target]
 arch = [
@@ -51,7 +50,8 @@ os = [
 ] # Ignore advisories for operating systems other than these
 
 [yanked]
-# Disabled: `core2` 0.4.0 is yanked but hard-pinned by `multihash` 0.19.3 → `libp2p-identity` 0.2.13 (latest).
-# cargo-audit has no per-crate yanked ignore; re-enable once libp2p drops the core2 dependency.
-enabled      = false
-update_index = true  # Auto-update the crates.io index (default: true)
+# Re-enabled: this was off because yanked `core2` 0.4.0 was hard-pinned by `multihash` 0.19.3 →
+# `libp2p-identity` 0.2.13, and cargo-audit has no per-crate yanked ignore. `core2` has since left
+# the graph (`multihash` is 0.19.5, `libp2p-identity` 0.2.14), so the check passes again.
+enabled      = true
+update_index = true # Auto-update the crates.io index (default: true)
