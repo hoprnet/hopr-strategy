@@ -22,10 +22,13 @@ wasm-pack.log
 # RustRover / JetBrains
 #.idea/
 
-# keep committed cargo config, ignore locally installed binaries
+# keep committed cargo config, ignore locally installed binaries.
+# `/*` rather than `/` on purpose: git does not descend into an excluded directory, so a `!` rule
+# can never re-include a file beneath one. Excluding the *contents* leaves the directory itself
+# visible, which is what lets the two negations below take effect.
+/.cargo/*
 !/.cargo/config.toml
 !/.cargo/audit.toml
-/.cargo/
 
 # nix generated files
 result
