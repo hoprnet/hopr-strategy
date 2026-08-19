@@ -14,7 +14,10 @@ use std::{
     collections::HashSet,
     io,
     str::FromStr,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -32,7 +35,7 @@ use hopr_api::{
     node::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus, ComponentStatusReporter,
         EventWaitResult, HasChainApi, HasGraphView, HasNetworkView, HasTicketManagement, NodeOnchainIdentity,
-        PacketTransport, TicketEvent,
+        PacketTransport, PixEvent, TicketEvent,
     },
     tickets::{ChannelStats, RedemptionResult, TicketManagement},
     types::{
@@ -617,6 +620,103 @@ where
     }
 }
 
+/// Chain-only node with a caller-supplied on-chain identity and an injectable
+/// PIX event stream, as required by the PIX strategy.
+///
+/// Unlike the other adapters, the [`NodeOnchainIdentity`] is held per instance
+/// rather than served from a `static` cell. The PIX strategy captures
+/// `identity().safe_address` at build time as the sweep destination, so a shared
+/// identity would make every test in a binary sweep into the first test's safe.
+pub struct PixNode<C> {
+    chain: C,
+    identity: NodeOnchainIdentity,
+    /// Sender for events injected via [`PixNode::inject_pix`].
+    injected_tx: futures::channel::mpsc::UnboundedSender<ActionableEvent>,
+    /// Receiver, taken on the first `subscribe_to_actionable_events` call and
+    /// merged into the actionable-event stream.
+    injected_rx: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<ActionableEvent>>>,
+}
+
+impl<C> PixNode<C> {
+    pub fn new(chain: C, identity: NodeOnchainIdentity) -> Self {
+        let (injected_tx, injected_rx) = futures::channel::mpsc::unbounded();
+        Self {
+            chain,
+            identity,
+            injected_tx,
+            injected_rx: Mutex::new(Some(injected_rx)),
+        }
+    }
+
+    /// Emits a PIX actionable event, mirroring what the real node's event source
+    /// produces. The unbounded channel buffers it, so injecting before the
+    /// strategy has subscribed is safe.
+    pub fn inject_pix(&self, event: PixEvent) {
+        let _ = self.injected_tx.unbounded_send(ActionableEvent::Pix(event));
+    }
+}
+
+impl<C> HasChainApi for PixNode<C>
+where
+    C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
+{
+    type ChainApi = C;
+    type ChainError = <C as HoprChainApi>::ChainError;
+
+    fn identity(&self) -> &NodeOnchainIdentity {
+        &self.identity
+    }
+
+    fn chain_api(&self) -> &C {
+        &self.chain
+    }
+
+    fn status(&self) -> ComponentStatus {
+        self.chain.component_status()
+    }
+
+    fn wait_for_on_chain_event<F>(
+        &self,
+        _predicate: F,
+        _context: String,
+        _timeout: Duration,
+    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
+    where
+        F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
+    {
+        unimplemented!("tests do not call wait_for_on_chain_event")
+    }
+}
+
+impl<C> ActionableEventSource for PixNode<C>
+where
+    C: ChainEvents + Send + Sync + 'static,
+{
+    fn subscribe_to_actionable_events(
+        &self,
+        _filter: Option<&[ActionableEventDiscriminant]>,
+    ) -> Result<BoxStream<'static, ActionableEvent>, String> {
+        let chain = self
+            .chain
+            .subscribe()
+            .map_err(|error| error.to_string())?
+            .map(ActionableEvent::Chain);
+        // Merge in injected PIX events on the first subscription. Chain events stay
+        // in the stream deliberately: the real event source is unfiltered too, and
+        // the strategy discards non-PIX variants itself.
+        match self.injected_rx.lock().expect("injected event lock poisoned").take() {
+            Some(injected) => Ok(futures::stream::select(chain, injected).boxed()),
+            None => Ok(chain.boxed()),
+        }
+    }
+}
+
+impl<C: PacketTransport> PacketTransport for PixNode<C> {
+    fn packet_payload_size() -> usize {
+        C::packet_payload_size()
+    }
+}
+
 // ─── TestChainConnector ──────────────────────────────────────────────────────
 
 /// A noop key mapper that always returns `None` for all key lookups.
@@ -935,8 +1035,12 @@ pub struct TestChainConnector<M: BlokliTestStateMutator> {
     ticket_price: std::sync::Arc<std::sync::OnceLock<hopr_api::types::primitive::prelude::HoprBalance>>,
     /// Minimum winning probability from chain info, populated on `connect()` for synchronous access.
     ticket_win_prob: std::sync::Arc<std::sync::OnceLock<hopr_api::types::internal::prelude::WinningProbability>>,
-    /// Nonce counter for transaction sequencing.
-    nonce: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Nonce counters for transaction sequencing, one per signing address.
+    ///
+    /// Keyed by signer because `withdraw_from_signer` signs with a caller-supplied key: a
+    /// single shared counter would hand that key a nonce advanced by the connector's own
+    /// transactions, and then reuse a nonce for the connector.
+    nonces: std::sync::Arc<dashmap::DashMap<hopr_api::types::primitive::prelude::Address, Arc<AtomicU64>>>,
     /// Accounts cache: chain address → AccountEntry, populated on `connect()`.
     accounts: std::sync::Arc<
         dashmap::DashMap<
@@ -956,7 +1060,7 @@ pub struct TestChainConnector<M: BlokliTestStateMutator> {
 }
 
 impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnector<M> {
-    fn new(
+    pub fn new(
         client: BlokliTestClient<M>,
         my_addr: hopr_api::types::primitive::prelude::Address,
         chain_key: hopr_api::types::crypto::prelude::ChainKeypair,
@@ -974,7 +1078,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             chain_id: Default::default(),
             ticket_price: Default::default(),
             ticket_win_prob: Default::default(),
-            nonce: Default::default(),
+            nonces: Default::default(),
             accounts: Default::default(),
             channels: Default::default(),
             faults: Default::default(),
@@ -1184,6 +1288,14 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
             .build()?)
     }
 
+    /// Nonce counter for `signer`, created on first use.
+    ///
+    /// Always pair this with the key that actually signs the transaction — see the note on
+    /// [`TestChainConnector::nonces`].
+    fn nonce_for(&self, signer: &hopr_api::types::primitive::prelude::Address) -> Arc<AtomicU64> {
+        self.nonces.entry(*signer).or_default().clone()
+    }
+
     /// Waits until this connector's own channel view satisfies `predicate`.
     ///
     /// The emulated RPC wraps the chain, not the other way round: the tx has
@@ -1225,7 +1337,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
         tx_req: hopr_api::types::chain::payload::TransactionRequest,
         chain_id: u64,
         chain_key: &hopr_api::types::crypto::prelude::ChainKeypair,
-        nonce: &std::sync::atomic::AtomicU64,
+        nonce: &AtomicU64,
     ) -> anyhow::Result<hopr_api::chain::ChainReceipt> {
         let n = nonce.fetch_add(1, Ordering::Relaxed);
         let signed = tx_req.sign_and_encode_to_eip2718(n, chain_id, None, chain_key).await?;
@@ -1360,23 +1472,57 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
 
     async fn withdraw<C: hopr_api::types::primitive::prelude::Currency + Send>(
         &self,
-        _balance: hopr_api::types::primitive::prelude::Balance<C>,
-        _recipient: &hopr_api::types::primitive::prelude::Address,
+        balance: hopr_api::types::primitive::prelude::Balance<C>,
+        recipient: &hopr_api::types::primitive::prelude::Address,
     ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
-        Err(TestConnectorError::from(anyhow::anyhow!(
-            "not supported by TestChainConnector"
-        )))
+        let tx_req = self
+            .payload_gen()
+            .map_err(TestConnectorError::from)?
+            .transfer(*recipient, balance)
+            .map_err(|e| TestConnectorError::from(anyhow::anyhow!("{e}")))?;
+
+        let client = self.client.clone();
+        let chain_id = self.chain_id().map_err(TestConnectorError::from)?;
+        let chain_key = self.chain_key.clone();
+        let nonce = self.nonce_for(&self.my_addr);
+
+        Ok(Box::pin(async move {
+            Self::send_tx(&client, tx_req, chain_id, &chain_key, &nonce)
+                .await
+                .map_err(TestConnectorError::from)
+        }))
     }
 
     async fn withdraw_from_signer<C: hopr_api::types::primitive::prelude::Currency + Send>(
         &self,
-        _signer: &hopr_api::types::crypto::prelude::ChainKeypair,
-        _balance: hopr_api::types::primitive::prelude::Balance<C>,
-        _recipient: &hopr_api::types::primitive::prelude::Address,
+        signer: &hopr_api::types::crypto::prelude::ChainKeypair,
+        balance: hopr_api::types::primitive::prelude::Balance<C>,
+        recipient: &hopr_api::types::primitive::prelude::Address,
     ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
-        Err(TestConnectorError::from(anyhow::anyhow!(
-            "not supported by TestChainConnector"
-        )))
+        let tx_req = self
+            .payload_gen()
+            .map_err(TestConnectorError::from)?
+            .transfer(*recipient, balance)
+            .map_err(|e| TestConnectorError::from(anyhow::anyhow!("{e}")))?;
+
+        let client = self.client.clone();
+        let chain_id = self.chain_id().map_err(TestConnectorError::from)?;
+        // The caller's key signs this one, so it needs that key's own nonce sequence.
+        let nonce = self.nonce_for(&signer.public().to_address());
+        let signer = signer.clone();
+
+        Ok(Box::pin(async move {
+            let n = nonce.fetch_add(1, Ordering::Relaxed);
+            let signed = tx_req
+                .sign_and_encode_to_eip2718(n, chain_id, None, &signer)
+                .await
+                .map_err(|e| TestConnectorError::from(anyhow::anyhow!("{e}")))?;
+            let receipt = client
+                .submit_and_confirm_transaction(&signed, 1)
+                .await
+                .map_err(TestConnectorError::from)?;
+            Ok(hopr_api::chain::ChainReceipt::from(receipt))
+        }))
     }
 
     async fn register_safe(
@@ -1427,7 +1573,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             .chain_id()
             .map_err(hopr_api::chain::SafeRegistrationError::processing)?;
         let chain_key = self.chain_key.clone();
-        let nonce = self.nonce.clone();
+        let nonce = self.nonce_for(&self.my_addr);
         Ok(Box::pin(async move {
             Self::send_tx(&client, tx_req, chain_id, &chain_key, &nonce)
                 .await
@@ -1489,9 +1635,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
 
         let channel_id = generate_channel_id(&self.my_addr, dst);
         let tx_req = self.payload_gen()?.fund_channel(*dst, amount)?;
-        let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
-            .await
-            .map_err(TestConnectorError::from)?;
+        let receipt = Self::send_tx(
+            &self.client,
+            tx_req,
+            self.chain_id()?,
+            &self.chain_key,
+            &self.nonce_for(&self.my_addr),
+        )
+        .await
+        .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
         let channels = self.channels.clone();
         let in_flight = faults.enter_in_flight(ChainOp::OpenChannel);
@@ -1518,9 +1670,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
 
         let tx_req = self.payload_gen()?.fund_channel(channel.destination, amount)?;
         let funded_to = channel.balance + amount;
-        let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
-            .await
-            .map_err(TestConnectorError::from)?;
+        let receipt = Self::send_tx(
+            &self.client,
+            tx_req,
+            self.chain_id()?,
+            &self.chain_key,
+            &self.nonce_for(&self.my_addr),
+        )
+        .await
+        .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
         let channels = self.channels.clone();
         let channel_id = *channel_id;
@@ -1556,9 +1714,15 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
         };
 
         let previous_status = channel.status;
-        let receipt = Self::send_tx(&self.client, tx_req, self.chain_id()?, &self.chain_key, &self.nonce)
-            .await
-            .map_err(TestConnectorError::from)?;
+        let receipt = Self::send_tx(
+            &self.client,
+            tx_req,
+            self.chain_id()?,
+            &self.chain_key,
+            &self.nonce_for(&self.my_addr),
+        )
+        .await
+        .map_err(TestConnectorError::from)?;
         let faults = self.faults.clone();
         let channels = self.channels.clone();
         let channel_id = *channel_id;
@@ -1927,7 +2091,7 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
             hopr_api::chain::TicketRedeemError::ProcessingError(verified_ticket, TestConnectorError::from(e))
         })?;
         let chain_key = self.chain_key.clone();
-        let nonce = self.nonce.clone();
+        let nonce = self.nonce_for(&self.my_addr);
         let client = self.client.clone();
 
         Ok(Box::pin(async move {

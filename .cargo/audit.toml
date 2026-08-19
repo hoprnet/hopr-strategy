@@ -1,0 +1,57 @@
+[advisories]
+# Every entry must still fire against *this* crate's `Cargo.lock`. An ignore for an advisory that
+# no longer resolves suppresses nothing today and hides a real finding tomorrow — and most of the
+# list this replaces was inherited from the hoprnet monorepo, naming crates (libp2p, pprof,
+# hickory-proto) that are not in this dependency graph at all.
+#
+# To re-check: empty this list, run `cargo audit`, and confirm every ID below reappears and
+# nothing else does. Each comment records the path that keeps the ignore alive plus what unblocks
+# removing it; a path that no longer resolves means the entry goes.
+ignore = [
+  "RUSTSEC-2024-0388", # `derivative` unmaintained; ark-ff 0.4.2 -> ruint -> alloy-primitives/alloy-trie -> alloy. Blocked on an alloy bump.
+  "RUSTSEC-2024-0436", # `paste` unmaintained; syn-solidity -> alloy-sol-macro-input -> alloy. Blocked on an alloy bump.
+  "RUSTSEC-2026-0173", # `proc-macro-error2` unmaintained; two paths: aquamarine -> hopr-types, and alloy-sol-macro-expander -> alloy-sol-types. Needs both upstreams to move.
+  "RUSTSEC-2026-0249", # `smartstring` unmaintained; opentelemetry-prometheus-text-exporter 0.3.0 -> hopr-types. Requires that crate > 0.3.0.
+  "RUSTSEC-2026-0253", # `lru` <0.18.2 use-after-free if a key's `Drop` panics in `pop()`; pinned at 0.16.4 by alloy-provider 2.1.1. 0.18.2 is semver-incompatible, so this needs an alloy bump.
+  "RUSTSEC-2026-0258", # `h2` <0.4.16 unbounded empty DATA frames; reqwest 0.13.4 -> cynic -> blokli-client, and reqwest -> alloy-transport-http. Needs a cynic bump in blokli-client.
+]
+informational_warnings = ["unmaintained"]
+severity_threshold = "low"
+
+[database]
+# No `path` key on purpose. cargo-audit does not expand `~` read from this file: it takes the value
+# literally, relative to the working directory, so `path = "~/.cargo/advisory-db"` made `cargo audit`
+# clone ~40 MB into a directory actually named `~` in the repo root — untracked, ungitignored, and
+# re-cloned per repo. The `--db` default is already `~/.cargo/advisory-db` and *is* expanded
+# correctly, so naming it here only broke the thing it was restating.
+fetch = true
+stale = false
+url   = "https://github.com/RustSec/advisory-db.git"
+
+[output]
+# Denies every warning category, not just unmaintained/unsound. The narrower list this replaces
+# was a workaround for yanked `core2`, which cargo-audit cannot ignore per-package
+# (https://github.com/rustsec/rustsec/issues/1453). `core2` is no longer in the graph, so the
+# workaround is no longer needed.
+deny      = ["warnings"]
+format    = "terminal"   # "terminal" (human readable report) or "json"
+quiet     = false        # Only print information on error
+show_tree = true         # Show inverse dependency trees along with advisories (default: true)
+
+[target]
+arch = [
+  "aarch64",
+  "x86_64",
+] # Ignore advisories for CPU architectures other than these
+os = [
+  "linux",
+  "macos",
+  "windows",
+] # Ignore advisories for operating systems other than these
+
+[yanked]
+# Re-enabled: this was off because yanked `core2` 0.4.0 was hard-pinned by `multihash` 0.19.3 →
+# `libp2p-identity` 0.2.13, and cargo-audit has no per-crate yanked ignore. `core2` has since left
+# the graph (`multihash` is 0.19.5, `libp2p-identity` 0.2.14), so the check passes again.
+enabled      = true
+update_index = true # Auto-update the crates.io index (default: true)

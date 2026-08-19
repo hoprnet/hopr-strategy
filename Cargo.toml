@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "0.28.0"
+version      = "1.0.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -34,6 +34,38 @@ strategy-auto-funding      = []
 strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
+# The PIX strategy engine, without a deposit pool.
+#
+# `DepositPool` is generic over its keypair, and `K::Public` is the deposit address the pool can
+# settle to. That has to match the address type `HoprPixSpec` produces, which is chosen by a
+# feature on `hopr-crypto-packet` — an entirely separate crate. Enabling this alone gives the
+# generic engine and `PixStrategy::build_with_pool`, for a consumer bringing its own pool.
+#
+# Consumers that want a bundled pool also enable one of the two pairings below. Those two are
+# additive, not exclusive: each lives in its own module with its own builder, so enabling both is
+# well-defined and is what `--all-features` does. Which pool runs is decided at the call site.
+strategy-pix = [
+  "dep:backon",
+  "dep:chacha20poly1305",
+  "dep:redb",
+  "dep:scrypt",
+  "dep:subtle",
+  "dep:tokio",
+]
+# `NonAnonymousDepositPool`, keyed on `EthDepositKey` (Ethereum deposit addresses).
+#
+# Pair with `hopr-crypto-packet/pix-secp256k1` — reached through `hopr-lib/pix-secp256k1` — or
+# the pool cannot spend the addresses the events carry. Cargo cannot express "these two must
+# agree" across crates, so the consumer states both and `hoprd::strategy` asserts the result.
+strategy-pix-secp256k1 = ["strategy-pix"]
+# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses).
+#
+# Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
+# feature and nothing else already agrees.
+#
+# NOTE: the pool itself is a stub whose methods panic. The feature wiring is final; the
+# implementation is not.
+strategy-pix-curvy = ["strategy-pix"]
 
 [dependencies]
 anyhow              = { workspace = true }
@@ -72,7 +104,17 @@ tokio = { workspace = true, optional = true, features = [
   "macros",
   "rt",
   "sync",
+  "time",
 ] }
+
+# PIX (non-anonymous) strategy support — enabled via the `strategy-pix` feature.
+backon = { workspace = true, features = [
+  "futures-timer-sleep",
+], optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 
 [dev-dependencies]
 chrono = { workspace = true, default-features = false, features = [
@@ -86,6 +128,7 @@ insta = { workspace = true, features = ["redactions", "yaml"] }
 mockall = { workspace = true }
 rstest = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
 tokio = { workspace = true, features = [
   "macros",
@@ -101,8 +144,10 @@ resolver = "3"
 anyhow              = "1.0.104"
 async-broadcast     = "0.7.2"
 async-trait         = "0.1.91"
+backon              = { version = "1.6.0", default-features = false }
 blokli-client       = "0.31.0"
 bytesize            = { version = "2.4.2", features = ["serde"] }
+chacha20poly1305    = "0.11.0"
 chrono              = { version = "0.4.45", default-features = false }
 dashmap             = "6.2.1"
 futures             = "0.3.33"
@@ -119,12 +164,16 @@ mockall             = "0.15.0"
 moka                = "0.12.15"
 multiaddr           = "0.18.2"
 parking_lot         = "0.12.5"
+redb                = "4.1.0"
 rstest              = "0.26.1"
+scrypt              = "0.12.0"
 serde               = "1.0.229"
 serde_json          = "1.0.151"
 serde_with          = "3.21.0"
 smart-default       = "0.7.1"
 statrs              = "0.19.0"
+subtle              = "2.6.1"
+tempfile            = "3.27.0"
 test-log            = "0.2.21"
 thiserror           = "2.0.19"
 tokio               = "1.53.1"

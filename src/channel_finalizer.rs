@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use hopr_api::{
     chain::{ChainReadChannelOperations, ChainWriteChannelOperations, ChannelSelector},
@@ -158,7 +157,7 @@ impl<N: HasChainApi> Display for ClosureFinalizerStrategyInner<N> {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl<N> StrategyTrait for ClosureFinalizerStrategyInner<N>
 where
     N: HasChainApi + Send + Sync + 'static,
