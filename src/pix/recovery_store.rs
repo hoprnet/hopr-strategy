@@ -1,4 +1,5 @@
-//! Persistent encrypted store for Exit-side [`PixEvent::PrivateKeyRecovered`] events.
+//! Persistent encrypted store for Exit-side
+//! [`PixEvent::PrivateKeyRecovered`](hopr_api::node::PixEvent::PrivateKeyRecovered) events.
 //!
 //! # Encryption scheme
 //!
@@ -128,6 +129,37 @@ const VERIFIER_PLAINTEXT: [u8; 32] = *b"hopr-pix-recovery-store-verifier";
 const VERIFIER_AAD: [u8; KEY_SIZE] = [0u8; KEY_SIZE];
 
 /// Persistent encrypted recovery key store backed by `redb`.
+///
+/// # Examples
+///
+/// The Exit-side lifecycle of one recovered key: persist it as soon as the event arrives, sweep
+/// it, then drop it once the funds have moved. The insert happens *before* the sweep is
+/// attempted, which is what lets an unfinished sweep be replayed from [`Self::iter`] on the next
+/// start.
+///
+/// ```no_run
+/// use hopr_api::{chain::PixDepositSecret, node::PixAddressId};
+/// use hopr_strategy::pix::recovery_store::PixRecoveryStore;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let store = PixRecoveryStore::open("/var/lib/hoprd/pix_recovery.db", "correct horse battery")?;
+///
+/// # let id: PixAddressId = unimplemented!();
+/// # let secret: PixDepositSecret = unimplemented!();
+/// // A `PrivateKeyRecovered` event arrived: persist before doing anything with it.
+/// if store.insert(&id, &secret)? {
+///     // ... hand the secret to the pool's `withdraw_deposit` ...
+///     // Only once the funds have moved does the entry go.
+///     store.remove(&id)?;
+/// }
+///
+/// // On the next start, whatever never made it through the sweep is still here.
+/// for (id, secret) in store.iter()? {
+///     let _ = (id, secret);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct PixRecoveryStore {
     db: Arc<Database>,
@@ -284,6 +316,28 @@ impl PixRecoveryStore {
     ///
     /// A database created before the verifier existed has no verifier record; the first open
     /// writes one and adopts the password in use at that point.
+    ///
+    /// Any missing parent directories of `path` are created.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use hopr_strategy::pix::recovery_store::{PixRecoveryStore, PixRecoveryStoreError};
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let path = "/var/lib/hoprd/pix_recovery.db";
+    /// let store = PixRecoveryStore::open(path, "correct horse battery")?;
+    ///
+    /// // A mistyped or rotated password is rejected here rather than yielding a store that
+    /// // merely looks empty — every persisted key would otherwise be silently abandoned.
+    /// assert!(matches!(
+    ///     PixRecoveryStore::open(path, "wrong password"),
+    ///     Err(PixRecoveryStoreError::WrongPassword)
+    /// ));
+    /// # let _ = store;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn open(path: impl AsRef<Path>, password: &str) -> Result<Self, PixRecoveryStoreError> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
@@ -342,6 +396,24 @@ impl PixRecoveryStore {
     }
 
     /// Check whether a key has already been persisted.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use hopr_api::node::PixAddressId;
+    /// use hopr_strategy::pix::recovery_store::PixRecoveryStore;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let store: PixRecoveryStore = unimplemented!();
+    /// # let id: PixAddressId = unimplemented!();
+    /// // Cheaper than `iter()` when only the presence of one entry matters: this reads a single
+    /// // row and decrypts nothing.
+    /// if !store.contains(&id)? {
+    ///     // ... nothing persisted for this deposit yet ...
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn contains(&self, id: &PixAddressId) -> Result<bool, PixRecoveryStoreError> {
         let key = encode_key(id);
         let read_tx = self.db.begin_read()?;
@@ -357,6 +429,25 @@ impl PixRecoveryStore {
     /// The check happens inside the write transaction: doing it in a separate read transaction
     /// would double the I/O and leave a window in which another writer could insert the same
     /// key in between.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use hopr_api::{chain::PixDepositSecret, node::PixAddressId};
+    /// use hopr_strategy::pix::recovery_store::PixRecoveryStore;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let store: PixRecoveryStore = unimplemented!();
+    /// # let id: PixAddressId = unimplemented!();
+    /// # let secret: PixDepositSecret = unimplemented!();
+    /// assert!(store.insert(&id, &secret)?);
+    ///
+    /// // The same event replayed is not an error and does not disturb the stored ciphertext —
+    /// // the `false` is how a duplicate sweep is recognised.
+    /// assert!(!store.insert(&id, &secret)?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn insert(&self, id: &PixAddressId, secret: &PixDepositSecret) -> Result<bool, PixRecoveryStoreError> {
         let key = encode_key(id);
         let write_tx = self.db.begin_write()?;
@@ -377,6 +468,26 @@ impl PixRecoveryStore {
     }
 
     /// Remove an entry from the store. Returns whether an entry was actually removed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use hopr_api::node::PixAddressId;
+    /// use hopr_strategy::pix::recovery_store::PixRecoveryStore;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let store: PixRecoveryStore = unimplemented!();
+    /// # let id: PixAddressId = unimplemented!();
+    /// // Call this only after the sweep has succeeded: dropping the entry earlier discards the
+    /// // only means of moving those funds.
+    /// let was_present = store.remove(&id)?;
+    ///
+    /// // Removing an absent entry is a no-op, so a replayed cleanup is harmless.
+    /// assert!(!store.remove(&id)?);
+    /// # let _ = was_present;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn remove(&self, id: &PixAddressId) -> Result<bool, PixRecoveryStoreError> {
         let key = encode_key(id);
         let write_tx = self.db.begin_write()?;
@@ -397,6 +508,24 @@ impl PixRecoveryStore {
     /// single bad entry does not block recovery for the rest. Every skip is logged, and a
     /// summary is emitted when any entry was dropped: each one is a deposit that will not be
     /// swept, so it must not pass unnoticed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use hopr_strategy::pix::recovery_store::PixRecoveryStore;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let store = PixRecoveryStore::open("/var/lib/hoprd/pix_recovery.db", "correct horse battery")?;
+    ///
+    /// // Everything still here on startup is a sweep that never completed. Note this decrypts
+    /// // every entry eagerly into a `Vec`, so it is a startup-replay call, not a hot path.
+    /// for (id, secret) in store.iter()? {
+    ///     // ... re-submit the withdrawal, then `store.remove(&id)` once funds have moved ...
+    ///     let _ = (id, secret);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn iter(&self) -> Result<Vec<(PixAddressId, PixDepositSecret)>, PixRecoveryStoreError> {
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(PIX_RECOVERED_KEYS)?;
