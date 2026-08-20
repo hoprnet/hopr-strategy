@@ -35,6 +35,7 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance},
     },
 };
+use validator::Validate;
 
 use crate::errors::StrategyError;
 
@@ -74,6 +75,13 @@ fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
 
+fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationError> {
+    if duration.as_secs() < 1 {
+        return Err(validator::ValidationError::new("must be at least 1 second"));
+    }
+    Ok(())
+}
+
 /// Configuration for [`CurvyDepositPool`].
 ///
 /// **Shares nothing with `secp256k1::NonAnonymousDepositPoolConfig` by design.** The two pools
@@ -91,7 +99,7 @@ fn default_max_deposit_tracking_time() -> Duration {
 /// to keep it — and stays otherwise empty until the settlement design says what belongs here.
 /// A consumer that wants both pools configured writes the two separately; nothing lets a value
 /// intended for one silently reach the other.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
 pub struct CurvyDepositPoolConfig {
     /// How long [`DepositPool::notify_deposit`]'s future waits before resolving to an error.
     /// Default: 60 seconds.
@@ -100,6 +108,7 @@ pub struct CurvyDepositPoolConfig {
     /// non-anonymous pool has a field of the same name.
     #[default(default_max_deposit_tracking_time())]
     #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
+    #[validate(custom(function = "validate_min_1sec"))]
     pub max_deposit_tracking_time: Duration,
 }
 
