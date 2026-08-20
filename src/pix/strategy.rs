@@ -107,6 +107,13 @@ fn default_withdrawal_buffer_period() -> Duration {
     Duration::from_millis(500)
 }
 
+fn validate_min_100ms(duration: &Duration) -> std::result::Result<(), validator::ValidationError> {
+    if duration.as_millis() < 100 {
+        return Err(validator::ValidationError::new("must be at least 100ms"));
+    }
+    Ok(())
+}
+
 /// Configuration for [`PixStrategy`].
 ///
 /// Deliberately pool-agnostic: a pool's own configuration is passed to the builder that names it
@@ -116,7 +123,7 @@ fn default_withdrawal_buffer_period() -> Duration {
 /// exclusive. Keeping settlement config out of strategy config is what lets both pools be
 /// compiled together.
 #[serde_as]
-#[derive(Clone, Debug, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
 #[serde(deny_unknown_fields)]
 pub struct PixStrategyConfig {
     /// wxHOPR paid per byte of SSA quota.
@@ -144,11 +151,13 @@ pub struct PixStrategyConfig {
     /// Default: 500ms (debounced — resets on each new event).
     #[default(default_deposit_buffer_period())]
     #[serde(with = "humantime_serde", default = "default_deposit_buffer_period")]
+    #[validate(custom(function = "validate_min_100ms"))]
     pub deposit_buffer_period: Duration,
     /// How long to wait for additional withdrawal events before flushing the batch.
     /// Default: 500ms (debounced — resets on each new event).
     #[default(default_withdrawal_buffer_period())]
     #[serde(with = "humantime_serde", default = "default_withdrawal_buffer_period")]
+    #[validate(custom(function = "validate_min_100ms"))]
     pub withdrawal_buffer_period: Duration,
 }
 

@@ -31,6 +31,7 @@ use hopr_api::{
 };
 use serde_with::{DisplayFromStr, serde_as};
 use subtle::{Choice, ConstantTimeEq};
+use validator::Validate;
 
 use crate::errors::StrategyError;
 
@@ -152,6 +153,13 @@ fn default_max_sweep_retries() -> usize {
     5
 }
 
+fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationError> {
+    if duration.as_secs() < 1 {
+        return Err(validator::ValidationError::new("must be at least 1 second"));
+    }
+    Ok(())
+}
+
 /// Configuration for [`NonAnonymousDepositPool`].
 ///
 /// Every field names its own default through a function, so that
@@ -178,13 +186,14 @@ fn default_max_sweep_retries() -> usize {
 /// assert_eq!(cfg.gas_xdai_per_sweep, "0.01 xdai".parse().unwrap());
 /// ```
 #[serde_as]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct NonAnonymousDepositPoolConfig {
     /// How long to keep polling a stealth address for the expected deposit before
     /// giving up.  Default: 60 seconds.
     #[default(default_max_deposit_tracking_time())]
     #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
+    #[validate(custom(function = "validate_min_1sec"))]
     pub max_deposit_tracking_time: Duration,
 
     /// Amount of xDai to send from the Safe to a recovered stealth address that
@@ -200,6 +209,7 @@ pub struct NonAnonymousDepositPoolConfig {
     /// destination balance before each transfer.
     #[default(default_max_deposit_retries())]
     #[serde(default = "default_max_deposit_retries")]
+    #[validate(range(min = 1))]
     pub max_deposit_retries: usize,
 
     /// Attempts *in addition to* the first for a withdrawal sweep.  Default: 5.
@@ -209,6 +219,7 @@ pub struct NonAnonymousDepositPoolConfig {
     /// chance for the deposit to arrive.
     #[default(default_max_sweep_retries())]
     #[serde(default = "default_max_sweep_retries")]
+    #[validate(range(min = 1))]
     pub max_sweep_retries: usize,
 }
 
