@@ -36,6 +36,7 @@ use hopr_api::{
     },
 };
 use validator::Validate;
+
 use crate::errors::StrategyError;
 
 // ---------------------------------------------------------------------------
