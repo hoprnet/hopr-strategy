@@ -29,6 +29,7 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance, XDaiBalance},
     },
 };
+use serde_with::{DisplayFromStr, serde_as};
 use subtle::{Choice, ConstantTimeEq};
 
 use crate::errors::StrategyError;
@@ -176,6 +177,7 @@ fn default_max_sweep_retries() -> usize {
 /// assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(60));
 /// assert_eq!(cfg.gas_xdai_per_sweep, "0.01 xdai".parse().unwrap());
 /// ```
+#[serde_as]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
 pub struct NonAnonymousDepositPoolConfig {
     /// How long to keep polling a stealth address for the expected deposit before
@@ -187,6 +189,7 @@ pub struct NonAnonymousDepositPoolConfig {
     /// Amount of xDai to send from the Safe to a recovered stealth address that
     /// has run out of gas for the withdrawal sweep.  Default: 0.01 xDai.
     #[default(default_gas_xdai())]
+    #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_gas_xdai")]
     pub gas_xdai_per_sweep: XDaiBalance,
 

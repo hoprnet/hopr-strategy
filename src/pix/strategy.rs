@@ -34,6 +34,7 @@ use hopr_api::{
 };
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, serde_as};
 use validator::Validate;
 
 use crate::{
@@ -90,6 +91,14 @@ lazy_static::lazy_static! {
 // Config
 // ---------------------------------------------------------------------------
 
+fn default_price_per_byte() -> HoprBalance {
+    HoprBalance::new_base(1)
+}
+
+fn default_max_ssa_allocation() -> HoprBalance {
+    HoprBalance::new_base(100)
+}
+
 /// Configuration for [`PixStrategy`].
 ///
 /// Deliberately pool-agnostic: a pool's own configuration is passed to the builder that names it
@@ -98,15 +107,18 @@ lazy_static::lazy_static! {
 /// `strategy-pix-*` feature was on — which is exactly what made the two features mutually
 /// exclusive. Keeping settlement config out of strategy config is what lets both pools be
 /// compiled together.
+#[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
 pub struct PixStrategyConfig {
     /// wxHOPR paid per byte of SSA quota.
-    #[default(HoprBalance::new_base(1))]
-    #[serde(default)]
+    #[default(default_price_per_byte())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_price_per_byte")]
     pub price_per_byte: HoprBalance,
     /// Maximum wxHOPR the strategy will send to a single deposit address.
-    #[default(HoprBalance::new_base(100))]
-    #[serde(default)]
+    #[default(default_max_ssa_allocation())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_max_ssa_allocation")]
     pub max_ssa_allocation: HoprBalance,
     /// If set, recovered private keys are persisted to redb at this path.
     ///
