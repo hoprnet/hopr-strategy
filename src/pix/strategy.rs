@@ -34,6 +34,7 @@ use hopr_api::{
 };
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, serde_as};
 use validator::Validate;
 
 use crate::{
@@ -90,6 +91,22 @@ lazy_static::lazy_static! {
 // Config
 // ---------------------------------------------------------------------------
 
+fn default_price_per_byte() -> HoprBalance {
+    HoprBalance::new_base(1)
+}
+
+fn default_max_ssa_allocation() -> HoprBalance {
+    HoprBalance::new_base(100)
+}
+
+fn default_deposit_buffer_period() -> Duration {
+    Duration::from_millis(500)
+}
+
+fn default_withdrawal_buffer_period() -> Duration {
+    Duration::from_millis(500)
+}
+
 /// Configuration for [`PixStrategy`].
 ///
 /// Deliberately pool-agnostic: a pool's own configuration is passed to the builder that names it
@@ -98,15 +115,19 @@ lazy_static::lazy_static! {
 /// `strategy-pix-*` feature was on — which is exactly what made the two features mutually
 /// exclusive. Keeping settlement config out of strategy config is what lets both pools be
 /// compiled together.
-#[derive(Clone, Debug, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
+#[serde(deny_unknown_fields)]
 pub struct PixStrategyConfig {
     /// wxHOPR paid per byte of SSA quota.
-    #[default(HoprBalance::new_base(1))]
-    #[serde(default)]
+    #[default(default_price_per_byte())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_price_per_byte")]
     pub price_per_byte: HoprBalance,
     /// Maximum wxHOPR the strategy will send to a single deposit address.
-    #[default(HoprBalance::new_base(100))]
-    #[serde(default)]
+    #[default(default_max_ssa_allocation())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_max_ssa_allocation")]
     pub max_ssa_allocation: HoprBalance,
     /// If set, recovered private keys are persisted to redb at this path.
     ///
@@ -121,13 +142,13 @@ pub struct PixStrategyConfig {
     pub pix_recovery_password_env: Option<String>,
     /// How long to wait for additional deposit events before flushing the batch.
     /// Default: 500ms (debounced — resets on each new event).
-    #[default(Duration::from_millis(500))]
-    #[serde(with = "humantime_serde", default)]
+    #[default(default_deposit_buffer_period())]
+    #[serde(with = "humantime_serde", default = "default_deposit_buffer_period")]
     pub deposit_buffer_period: Duration,
     /// How long to wait for additional withdrawal events before flushing the batch.
     /// Default: 500ms (debounced — resets on each new event).
-    #[default(Duration::from_millis(500))]
-    #[serde(with = "humantime_serde", default)]
+    #[default(default_withdrawal_buffer_period())]
+    #[serde(with = "humantime_serde", default = "default_withdrawal_buffer_period")]
     pub withdrawal_buffer_period: Duration,
 }
 
