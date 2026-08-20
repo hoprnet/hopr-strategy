@@ -99,6 +99,14 @@ fn default_max_ssa_allocation() -> HoprBalance {
     HoprBalance::new_base(100)
 }
 
+fn default_deposit_buffer_period() -> Duration {
+    Duration::from_millis(500)
+}
+
+fn default_withdrawal_buffer_period() -> Duration {
+    Duration::from_millis(500)
+}
+
 /// Configuration for [`PixStrategy`].
 ///
 /// Deliberately pool-agnostic: a pool's own configuration is passed to the builder that names it
@@ -109,6 +117,7 @@ fn default_max_ssa_allocation() -> HoprBalance {
 /// compiled together.
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
+#[serde(deny_unknown_fields)]
 pub struct PixStrategyConfig {
     /// wxHOPR paid per byte of SSA quota.
     #[default(default_price_per_byte())]
@@ -133,13 +142,13 @@ pub struct PixStrategyConfig {
     pub pix_recovery_password_env: Option<String>,
     /// How long to wait for additional deposit events before flushing the batch.
     /// Default: 500ms (debounced — resets on each new event).
-    #[default(Duration::from_millis(500))]
-    #[serde(with = "humantime_serde", default)]
+    #[default(default_deposit_buffer_period())]
+    #[serde(with = "humantime_serde", default = "default_deposit_buffer_period")]
     pub deposit_buffer_period: Duration,
     /// How long to wait for additional withdrawal events before flushing the batch.
     /// Default: 500ms (debounced — resets on each new event).
-    #[default(Duration::from_millis(500))]
-    #[serde(with = "humantime_serde", default)]
+    #[default(default_withdrawal_buffer_period())]
+    #[serde(with = "humantime_serde", default = "default_withdrawal_buffer_period")]
     pub withdrawal_buffer_period: Duration,
 }
 

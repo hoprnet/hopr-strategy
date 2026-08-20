@@ -179,6 +179,7 @@ fn default_max_sweep_retries() -> usize {
 /// ```
 #[serde_as]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, smart_default::SmartDefault)]
+#[serde(deny_unknown_fields)]
 pub struct NonAnonymousDepositPoolConfig {
     /// How long to keep polling a stealth address for the expected deposit before
     /// giving up.  Default: 60 seconds.
