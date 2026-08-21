@@ -26,6 +26,7 @@ fn pix_config(price_per_byte: HoprBalance, max_ssa_allocation: HoprBalance) -> P
         pix_recovery_password_env: None,
         deposit_buffer_period: Duration::ZERO,
         withdrawal_buffer_period: Duration::ZERO,
+        ..Default::default()
     }
 }
 
@@ -233,6 +234,79 @@ async fn sweeps_recovered_deposit_to_safe(fixture: IntegrationFixture) -> Result
     assert_eq!(
         scenario.hopr_balance(scenario.safe_addr).await?,
         safe_before + deposited
+    );
+
+    assert!(!handle.is_finished(), "pix strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
+/// The gas top-up, exercised with the *shipped* `gas_xdai_per_sweep` rather than the zeroed
+/// [`pool_config`] every other test here uses.
+///
+/// A deposit address with no xDai cannot sign its own sweep, so the top-up is on the critical
+/// path. It is paid from the node's account: the node's Safe holds wxHOPR and no xDai at all —
+/// which is what `with_generated_accounts` produces and what a real deployment looks like — so a
+/// sweep that consulted the Safe's balance before topping up would refuse to move at all.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn tops_up_sweep_gas_from_the_node_before_sweeping(fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [node, deposit] = fixture.claim_accounts::<2>();
+
+    let deposited = HoprBalance::new_base(40u32);
+    let scenario = fixture
+        .open_pix_scenario(
+            &node,
+            PixScenarioOpts::new(&[deposit.address])?
+                .with_deposited(deposit.address, deposited)
+                .with_native(deposit.address, XDaiBalance::zero()),
+        )
+        .await?;
+
+    assert!(
+        scenario.native_balance(scenario.safe_addr).await?.is_zero(),
+        "the premise of this test is a Safe with no xDai to lend"
+    );
+
+    let safe_before = scenario.hopr_balance(scenario.safe_addr).await?;
+    let node_xdai_before = scenario.native_balance(scenario.node_addr).await?;
+
+    // The default `gas_xdai_per_sweep`, unlike `pool_config`.
+    let pool_cfg = NonAnonymousDepositPoolConfig {
+        max_deposit_tracking_time: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut strategy = PixStrategy::new(pix_config(HoprBalance::new_base(1u32), HoprBalance::new_base(100u32)))
+        .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_cfg)?;
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
+
+    scenario.inject(PixEvent::PrivateKeyRecovered(PixPrivateKeyRecovered {
+        id: pix_address_id(0x55, 1),
+        secret: deposit_secret(&deposit)?,
+    }));
+
+    scenario
+        .await_hopr_balance(
+            deposit.address,
+            timeouts.action,
+            "deposit address swept by strategy",
+            |balance| balance.is_zero(),
+        )
+        .await
+        .context("strategy did not sweep the deposit address within the timeout")?;
+
+    assert_eq!(
+        scenario.hopr_balance(scenario.safe_addr).await?,
+        safe_before + deposited
+    );
+    assert!(
+        !scenario.native_balance(deposit.address).await?.is_zero(),
+        "the deposit address must have been topped up with gas to sign its sweep"
+    );
+    assert!(
+        scenario.native_balance(scenario.node_addr).await? < node_xdai_before,
+        "the top-up must have been paid by the node, not the Safe"
     );
 
     assert!(!handle.is_finished(), "pix strategy exited unexpectedly");
