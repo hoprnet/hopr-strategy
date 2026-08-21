@@ -1,7 +1,12 @@
 //! ## Non-anonymous [`DepositPool`] implementation — secp256k1 deposit addresses
 //!
-//! A [`DepositPool`] that uses plain Ethereum transactions from the node's Safe
+//! A [`DepositPool`] that uses plain Ethereum transactions from the node's own account
 //! to fund deposit addresses.  All operations are fully visible on-chain.
+//!
+//! The node account is the payer throughout — for both the wxHOPR deposit and the xDai gas
+//! top-up — because the Safe payload generator wraps channel and ticket calls in the Safe
+//! module but emits a plain, node-signed transfer for `transfer`. Recovered deposits are
+//! nevertheless swept *to* the Safe; see [`crate::pix::strategy`].
 //!
 //! **DO NOT USE IN PRODUCTION.**
 //!
@@ -141,6 +146,10 @@ fn default_gas_xdai() -> XDaiBalance {
     "0.01 xdai".parse().expect("valid static xDai amount")
 }
 
+fn default_node_xdai_reserve() -> XDaiBalance {
+    "0.01 xdai".parse().expect("valid static xDai amount")
+}
+
 fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
@@ -184,6 +193,7 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// assert_eq!(cfg.max_deposit_retries, 3);
 /// assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(60));
 /// assert_eq!(cfg.gas_xdai_per_sweep, "0.01 xdai".parse().unwrap());
+/// assert_eq!(cfg.min_node_xdai_reserve, "0.01 xdai".parse().unwrap());
 /// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
@@ -196,12 +206,33 @@ pub struct NonAnonymousDepositPoolConfig {
     #[validate(custom(function = "validate_min_1sec"))]
     pub max_deposit_tracking_time: Duration,
 
-    /// Amount of xDai to send from the Safe to a recovered stealth address that
-    /// has run out of gas for the withdrawal sweep.  Default: 0.01 xDai.
+    /// Amount of xDai to send from the node's account to a recovered stealth address
+    /// that has run out of gas for the withdrawal sweep.  Default: 0.01 xDai.
+    ///
+    /// Zero disables the top-up entirely, which is only viable where something else
+    /// keeps deposit addresses in gas.
     #[default(default_gas_xdai())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_gas_xdai")]
     pub gas_xdai_per_sweep: XDaiBalance,
+
+    /// xDai the node's account must still hold after paying for a sweep's gas.
+    /// Default: 0.01 xDai.
+    ///
+    /// The top-up in [`Self::gas_xdai_per_sweep`] is paid by the node's own account —
+    /// the same account that pays gas for announcements, ticket redemptions and every
+    /// channel operation. Without a floor, a run of recovered addresses can spend the
+    /// node down to nothing and leave it unable to transact at all; the deposits are
+    /// then no more recoverable than they were before, and the rest of the node is
+    /// stuck too.
+    ///
+    /// The default matches one sweep's gas budget, so the node always keeps back at
+    /// least what it just handed out. Zero opts out, leaving only the plain
+    /// affordability check.
+    #[default(default_node_xdai_reserve())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_node_xdai_reserve")]
+    pub min_node_xdai_reserve: XDaiBalance,
 
     /// Attempts *in addition to* the first for a deposit transfer.  Default: 3.
     ///
@@ -297,7 +328,7 @@ pub struct NonAnonymousDepositPool<N: HasChainApi> {
 }
 
 impl<N: HasChainApi> NonAnonymousDepositPool<N> {
-    /// Creates a pool that funds deposit addresses from `node`'s Safe.
+    /// Creates a pool that funds deposit addresses from `node`'s own account.
     ///
     /// # Examples
     ///
@@ -338,7 +369,7 @@ fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
 ///
 /// The transfer is not idempotent, so the destination balance is re-read before every
 /// attempt: if a previous attempt was submitted but its confirmation was lost, re-sending
-/// would deposit `amount` a second time and the Safe would lose the surplus.
+/// would deposit `amount` a second time and the node would lose the surplus.
 ///
 /// A failed balance read is propagated instead of being ignored — a retry after an
 /// unreadable balance is exactly the case this guard exists for.
@@ -370,12 +401,24 @@ async fn deposit_once(
 }
 
 /// Ensure the recovered stealth address has enough xDai for gas.
+///
+/// The top-up is paid by the **node's own account**, not by the Safe, and the pre-flight balance
+/// check reads that same account. [`ChainWriteAccountOperations::withdraw`] is documented as
+/// withdrawing "from the Safe or node account (depends on the used `PayloadGenerator`)", but for a
+/// *native* transfer no generator in `hopr-types` routes through the Safe: `transfer` returns a
+/// plain value transfer rather than wrapping the call in the Safe module's
+/// `execTransactionFromModule`, and the connector signs it with the node key. Reading the Safe
+/// here would refuse every top-up on a normal deployment, where the Safe holds wxHOPR and no xDai
+/// at all.
+///
+/// [`NonAnonymousDepositPoolConfig::min_node_xdai_reserve`] is what the node keeps back, so
+/// funding a sweep cannot leave it without gas for its own transactions.
 async fn fund_sweep_gas(
     node: &impl HasChainApi,
-    gas_xdai_per_sweep: XDaiBalance,
+    cfg: &NonAnonymousDepositPoolConfig,
     recovered_address: Address,
 ) -> Result<(), StrategyError> {
-    if gas_xdai_per_sweep.is_zero() {
+    if cfg.gas_xdai_per_sweep.is_zero() {
         return Ok(());
     }
 
@@ -385,25 +428,26 @@ async fn fund_sweep_gas(
         .await
         .map_err(StrategyError::other)?;
 
-    if recovered_xdai >= gas_xdai_per_sweep {
+    if recovered_xdai >= cfg.gas_xdai_per_sweep {
         return Ok(());
     }
 
-    let deficit = gas_xdai_per_sweep - recovered_xdai;
+    let deficit = cfg.gas_xdai_per_sweep - recovered_xdai;
 
-    let safe_address = node.identity().safe_address;
-    let safe_xdai: XDaiBalance = node
-        .chain_api()
-        .balance(safe_address)
-        .await
-        .map_err(StrategyError::other)?;
+    let payer = node.identity().node_address;
+    let payer_xdai: XDaiBalance = node.chain_api().balance(payer).await.map_err(StrategyError::other)?;
 
-    if safe_xdai < deficit {
+    // `Balance` addition saturates rather than wrapping, so an absurd reserve refuses the top-up
+    // instead of silently permitting it.
+    let required = deficit + cfg.min_node_xdai_reserve;
+
+    if payer_xdai < required {
         tracing::warn!(
-            safe = %safe_address,
+            node = %payer,
             deficit = %deficit,
-            available = %safe_xdai,
-            "insufficient xDai in safe to fund sweep gas"
+            reserve = %cfg.min_node_xdai_reserve,
+            available = %payer_xdai,
+            "insufficient xDai in the node account to fund sweep gas"
         );
         return Err(StrategyError::CriteriaNotSatisfied);
     }
@@ -414,7 +458,7 @@ async fn fund_sweep_gas(
         .await
         .map_err(StrategyError::other)?;
 
-    tracing::info!(amount = %deficit, %recovered_address, "funded sweep gas from safe");
+    tracing::info!(amount = %deficit, %recovered_address, "funded sweep gas from the node account");
 
     Ok(())
 }
@@ -448,7 +492,7 @@ async fn sweep_single(
         return Err(StrategyError::CriteriaNotSatisfied);
     }
 
-    fund_sweep_gas(&*node, cfg.gas_xdai_per_sweep, recovered_address).await?;
+    fund_sweep_gas(&*node, cfg, recovered_address).await?;
 
     node.chain_api()
         .withdraw_from_signer(chain_key, balance, &dst)
@@ -472,7 +516,7 @@ where
     type Error = StrategyError;
     type Receipt = ();
 
-    /// Deposit funds from the node's Safe to a deposit address, retrying up to
+    /// Deposit funds from the node's own account to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
     ///
     /// What makes the retry safe is that every attempt re-reads the destination balance and
@@ -617,5 +661,274 @@ where
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         self.withdraw_deposit(key, dst, amount).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Tests for the sweep gas top-up.
+///
+/// The node and the Safe are given **different** addresses here, which the strategy's own tests
+/// do not do — their node adapter reports `safe_address == node_address`, and that collapse is
+/// what let the top-up gate read the wrong account unnoticed.
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use hex_literal::hex;
+    use hopr_api::{
+        chain::{ChainValues, DepositPool},
+        node::NodeOnchainIdentity,
+        types::{
+            crypto::{
+                keypairs::Keypair,
+                prelude::{ChainKeypair, OffchainKeypair},
+            },
+            internal::prelude::{AccountEntry, AccountType},
+            primitive::prelude::{Address, HoprBalance, XDaiBalance},
+        },
+    };
+
+    use super::{EthDepositKey, NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    use crate::{
+        errors::StrategyError,
+        testing::{
+            BlokliTestStateBuilder, FullStateEmulator, PixNode, TestChainConnector, create_test_blokli_connector,
+        },
+    };
+
+    const MODULE_ADDRESS: [u8; 20] = [1u8; 20];
+
+    /// Named explicitly instead of letting `with_generated_accounts` derive one, so a test can
+    /// stock the Safe with xDai at build time and show that the top-up ignores it.
+    const SAFE_ADDRESS: [u8; 20] = [0x5au8; 20];
+
+    const NODE_SECRET: [u8; 32] = hex!("492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775");
+    const DEPOSIT_SECRET: [u8; 32] = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+    /// wxHOPR the Safe starts with, so a sweep's arrival is visible as a delta.
+    fn safe_hopr() -> HoprBalance {
+        HoprBalance::new_base(1000)
+    }
+
+    /// The deposit waiting on the stealth address in every sweep test here.
+    fn deposited() -> HoprBalance {
+        HoprBalance::new_base(40)
+    }
+
+    /// Retry budgets zeroed: every test asserts on a single attempt, so retrying would only add
+    /// real backoff sleeps. The gas knobs keep their shipped defaults unless a test names them.
+    fn cfg() -> NonAnonymousDepositPoolConfig {
+        NonAnonymousDepositPoolConfig {
+            max_deposit_retries: 0,
+            max_sweep_retries: 0,
+            ..Default::default()
+        }
+    }
+
+    type Connector = Arc<TestChainConnector<FullStateEmulator>>;
+
+    struct Fixture {
+        cc: Connector,
+        pool: NonAnonymousDepositPool<PixNode<Connector>>,
+        node_addr: Address,
+        safe_addr: Address,
+        deposit_addr: Address,
+    }
+
+    impl Fixture {
+        async fn hopr(&self, address: Address) -> anyhow::Result<HoprBalance> {
+            ChainValues::balance(&*self.cc, address).await.map_err(Into::into)
+        }
+
+        async fn xdai(&self, address: Address) -> anyhow::Result<XDaiBalance> {
+            ChainValues::balance(&*self.cc, address).await.map_err(Into::into)
+        }
+
+        /// Sweeps the deposit address into the Safe, which is what the strategy always does.
+        async fn sweep(&self) -> Result<(), StrategyError> {
+            let key = EthDepositKey::from_secret(&DEPOSIT_SECRET).expect("valid test secret");
+            self.pool.withdraw_deposit(&key, self.safe_addr, None).await
+        }
+    }
+
+    /// Builds a node whose Safe is a *different* account, with each of the three balances that
+    /// matter set independently.
+    async fn fixture(
+        node_xdai: XDaiBalance,
+        safe_xdai: XDaiBalance,
+        deposit_xdai: XDaiBalance,
+        cfg: NonAnonymousDepositPoolConfig,
+    ) -> anyhow::Result<Fixture> {
+        let node_kp = ChainKeypair::from_secret(&NODE_SECRET)?;
+        let node_addr = node_kp.public().to_address();
+        let safe_addr: Address = SAFE_ADDRESS.into();
+        let deposit_addr = ChainKeypair::from_secret(&DEPOSIT_SECRET)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_accounts([(
+                AccountEntry {
+                    public_key: *OffchainKeypair::from_secret(&NODE_SECRET)?.public(),
+                    chain_addr: node_addr,
+                    entry_type: AccountType::NotAnnounced,
+                    safe_address: Some(safe_addr),
+                    key_id: 0u32.into(),
+                },
+                safe_hopr(),
+                node_xdai,
+            )])
+            // `with_accounts` always zeroes the Safe's xDai — mirroring a real deployment, where
+            // the Safe holds wxHOPR and the node holds the gas. Override it where a test needs to.
+            .with_balances([(safe_addr, safe_xdai)])
+            .with_balances([(deposit_addr, deposited())])
+            .with_balances([(deposit_addr, deposit_xdai)])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+
+        let cc = Arc::new(create_test_blokli_connector(&node_kp, sim, MODULE_ADDRESS.into()).await?);
+        let node = Arc::new(PixNode::new(
+            Arc::clone(&cc),
+            NodeOnchainIdentity {
+                node_address: node_addr,
+                safe_address: safe_addr,
+                module_address: MODULE_ADDRESS.into(),
+            },
+        ));
+
+        Ok(Fixture {
+            pool: NonAnonymousDepositPool::new(node, cfg),
+            cc,
+            node_addr,
+            safe_addr,
+            deposit_addr,
+        })
+    }
+
+    /// The regression test for the gate/payer mismatch.
+    ///
+    /// A Safe with no xDai is the normal case, not a corner one — it holds wxHOPR and the node
+    /// holds the gas. Gating the top-up on the Safe therefore refused *every* sweep of an
+    /// address that could not already pay its own way.
+    #[test_log::test(tokio::test)]
+    async fn sweep_tops_up_gas_from_the_node_when_the_safe_holds_no_xdai() -> anyhow::Result<()> {
+        let f = fixture(
+            XDaiBalance::new_base(1),
+            XDaiBalance::zero(),
+            XDaiBalance::zero(),
+            cfg(),
+        )
+        .await?;
+
+        f.sweep().await?;
+
+        assert!(
+            f.hopr(f.deposit_addr).await?.is_zero(),
+            "the deposit address must be swept dry"
+        );
+        assert_eq!(
+            f.hopr(f.safe_addr).await?,
+            safe_hopr() + deposited(),
+            "the deposit must land in the Safe"
+        );
+        assert!(
+            !f.xdai(f.deposit_addr).await?.is_zero(),
+            "the deposit address must have been topped up with gas to sign the sweep"
+        );
+        Ok(())
+    }
+
+    /// The Safe's xDai is not the pool's to spend, so having plenty of it must not let a top-up
+    /// through. Without this the fix could be reverted by symmetry and still pass the test above.
+    #[test_log::test(tokio::test)]
+    async fn sweep_gas_gate_ignores_a_flush_safe_when_the_node_is_empty() -> anyhow::Result<()> {
+        let f = fixture(
+            XDaiBalance::zero(),
+            XDaiBalance::new_base(100),
+            XDaiBalance::zero(),
+            NonAnonymousDepositPoolConfig {
+                // Isolates the affordability check from the reserve floor below.
+                min_node_xdai_reserve: XDaiBalance::zero(),
+                ..cfg()
+            },
+        )
+        .await?;
+
+        assert!(matches!(f.sweep().await, Err(StrategyError::CriteriaNotSatisfied)));
+        assert_eq!(
+            f.hopr(f.deposit_addr).await?,
+            deposited(),
+            "a refused top-up must leave the deposit untouched"
+        );
+        Ok(())
+    }
+
+    /// The node pays gas for its own announcements, redemptions and channel operations out of the
+    /// same account, so a top-up it can technically afford must still be refused when it would
+    /// breach the reserve.
+    #[test_log::test(tokio::test)]
+    async fn sweep_gas_top_up_stops_at_the_node_reserve() -> anyhow::Result<()> {
+        let reserve: XDaiBalance = "0.01 xdai".parse()?;
+        // More than one top-up's worth, so the shortfall is the reserve rather than the transfer:
+        // the default 0.01 xDai top-up is affordable here, `0.01 + reserve` is not.
+        let node_xdai: XDaiBalance = "0.015 xdai".parse()?;
+
+        let refused = fixture(
+            node_xdai,
+            XDaiBalance::zero(),
+            XDaiBalance::zero(),
+            NonAnonymousDepositPoolConfig {
+                min_node_xdai_reserve: reserve,
+                ..cfg()
+            },
+        )
+        .await?;
+
+        assert!(matches!(
+            refused.sweep().await,
+            Err(StrategyError::CriteriaNotSatisfied)
+        ));
+        assert_eq!(
+            refused.xdai(refused.node_addr).await?,
+            node_xdai,
+            "a refused top-up must not spend anything"
+        );
+
+        // Same balances, reserve opted out — proving the refusal above is the reserve talking and
+        // not a plain shortfall. The leftover also has to cover the top-up transaction's own gas,
+        // which is the concrete thing the reserve protects: a node drained to exactly zero cannot
+        // even send the transfer that drained it.
+        let allowed = fixture(
+            node_xdai,
+            XDaiBalance::zero(),
+            XDaiBalance::zero(),
+            NonAnonymousDepositPoolConfig {
+                min_node_xdai_reserve: XDaiBalance::zero(),
+                ..cfg()
+            },
+        )
+        .await?;
+
+        allowed.sweep().await?;
+        assert!(
+            allowed.hopr(allowed.deposit_addr).await?.is_zero(),
+            "with the reserve opted out the same node can fund the sweep"
+        );
+        Ok(())
+    }
+
+    /// The struct's docs promise that omitting a field in a config document and taking
+    /// [`Default`] agree. Nothing tested that for any field; the new one is the occasion to.
+    #[test]
+    fn config_omitting_the_reserve_falls_back_to_the_documented_default() -> anyhow::Result<()> {
+        let parsed: NonAnonymousDepositPoolConfig = serde_json::from_str(r#"{"max_sweep_retries": 8}"#)?;
+
+        assert_eq!(parsed.max_sweep_retries, 8);
+        assert_eq!(
+            parsed.min_node_xdai_reserve,
+            NonAnonymousDepositPoolConfig::default().min_node_xdai_reserve
+        );
+        assert_eq!(parsed.min_node_xdai_reserve, "0.01 xdai".parse()?);
+        Ok(())
     }
 }

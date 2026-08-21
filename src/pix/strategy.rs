@@ -1188,6 +1188,7 @@ mod tests {
             gas_xdai_per_sweep: g,
             max_deposit_retries,
             max_sweep_retries,
+            ..Default::default()
         }
     }
 
