@@ -26,6 +26,7 @@ fn pix_config(price_per_byte: HoprBalance, max_ssa_allocation: HoprBalance) -> P
         pix_recovery_password_env: None,
         deposit_buffer_period: Duration::ZERO,
         withdrawal_buffer_period: Duration::ZERO,
+        ..Default::default()
     }
 }
 

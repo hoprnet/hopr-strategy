@@ -15,6 +15,7 @@
 | `hopr_strategy_closure_auto_finalization_count`       | SimpleCounter | Count of channels where closure finalizing was initiated automatically                |                  |
 | `hopr_strategy_pix_deposit_tracking_total`            | MultiCounter  | Outcomes of the Exit waiting for an SSA deposit to land                               | keys: outcome    |
 | `hopr_strategy_pix_deposits_failed_total`             | SimpleCounter | Count of SSA deposits that failed after exhausting retries                            |                  |
+| `hopr_strategy_pix_deposits_over_budget_total`        | SimpleCounter | Count of SSA deposits refused because they would cross max_spend_per_window           |                  |
 | `hopr_strategy_pix_deposits_rejected_total`           | SimpleCounter | Count of SSA deposits refused because they exceed max_ssa_allocation                  |                  |
 | `hopr_strategy_pix_deposits_total`                    | SimpleCounter | Count of SSA deposits successfully sent by the Entry                                  |                  |
 | `hopr_strategy_pix_keys_recovered_total`              | SimpleCounter | Count of SSA stealth address private keys reconstructed by the Exit                   |                  |

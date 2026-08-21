@@ -194,6 +194,7 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(60));
 /// assert_eq!(cfg.gas_xdai_per_sweep, "0.01 xdai".parse().unwrap());
 /// assert_eq!(cfg.min_node_xdai_reserve, "0.01 xdai".parse().unwrap());
+/// assert!(cfg.min_node_hopr_reserve.is_zero());
 /// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
@@ -233,6 +234,21 @@ pub struct NonAnonymousDepositPoolConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_node_xdai_reserve")]
     pub min_node_xdai_reserve: XDaiBalance,
+
+    /// wxHOPR the node's account must still hold after funding a deposit.  Default: 0.
+    ///
+    /// Unlike [`Self::min_node_xdai_reserve`] this defaults to zero, because the node's wxHOPR
+    /// *is* the deposit float — nothing else in this strategy spends it, so drawing it down is
+    /// the intended behaviour rather than a hazard. Set it where the same account is funded for
+    /// something else too.
+    ///
+    /// The affordability check it participates in runs either way: a deposit the node cannot
+    /// cover is refused with [`StrategyError::CriteriaNotSatisfied`] instead of being submitted
+    /// and reverted.
+    #[default(HoprBalance::zero())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "HoprBalance::zero")]
+    pub min_node_hopr_reserve: HoprBalance,
 
     /// Attempts *in addition to* the first for a deposit transfer.  Default: 3.
     ///
@@ -373,8 +389,16 @@ fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
 ///
 /// A failed balance read is propagated instead of being ignored — a retry after an
 /// unreadable balance is exactly the case this guard exists for.
+///
+/// The payer's balance is checked before transferring, so a deposit the node cannot cover is
+/// refused rather than submitted and reverted — an operator then sees the reason instead of an
+/// opaque transaction failure. The check is per-deposit and the balance read is not atomic with
+/// the transfer, so a *batch* fanned out through
+/// [`DepositPool::deposit_funds_to_multiple`] can still collectively overshoot; bounding the
+/// aggregate is `PixStrategyConfig::max_spend_per_window`'s job, not this one's.
 async fn deposit_once(
     node: Arc<impl HasChainApi>,
+    cfg: &NonAnonymousDepositPoolConfig,
     dest_addr: Address,
     amount: HoprBalance,
 ) -> Result<(), StrategyError> {
@@ -389,6 +413,23 @@ async fn deposit_once(
             "deposit address is already funded, not sending another transfer"
         );
         return Ok(());
+    }
+
+    let payer = node.identity().node_address;
+    let payer_hopr: HoprBalance = node.chain_api().balance(payer).await.map_err(StrategyError::other)?;
+
+    // Saturating addition, so an absurd reserve refuses the deposit rather than wrapping.
+    let required = amount + cfg.min_node_hopr_reserve;
+
+    if payer_hopr < required {
+        tracing::warn!(
+            node = %payer,
+            %amount,
+            reserve = %cfg.min_node_hopr_reserve,
+            available = %payer_hopr,
+            "insufficient wxHOPR in the node account to fund the deposit"
+        );
+        return Err(StrategyError::CriteriaNotSatisfied);
     }
 
     node.chain_api()
@@ -526,9 +567,9 @@ where
     /// address also satisfies the check.
     async fn deposit_funds_to(&self, dst: Address, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
         let dest_addr = dst;
-        let node = &self.node;
+        let (node, cfg) = (&self.node, &self.cfg);
 
-        (move || deposit_once(Arc::clone(node), dest_addr, amount))
+        (move || deposit_once(Arc::clone(node), cfg, dest_addr, amount))
             .retry(retry_policy(self.cfg.max_deposit_retries))
             .sleep(backon::FuturesTimerSleeper)
             .notify(|error, dur| {
@@ -705,6 +746,10 @@ mod tests {
     /// stock the Safe with xDai at build time and show that the top-up ignores it.
     const SAFE_ADDRESS: [u8; 20] = [0x5au8; 20];
 
+    /// A fresh deposit *destination* — distinct from the stealth address the sweep tests spend
+    /// from, and created empty so `deposit_once` does not short-circuit on it.
+    const DEST_ADDRESS: [u8; 20] = [0xdeu8; 20];
+
     const NODE_SECRET: [u8; 32] = hex!("492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775");
     const DEPOSIT_SECRET: [u8; 32] = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
@@ -713,7 +758,7 @@ mod tests {
         HoprBalance::new_base(1000)
     }
 
-    /// The deposit waiting on the stealth address in every sweep test here.
+    /// The deposit waiting on the stealth address in the sweep tests.
     fn deposited() -> HoprBalance {
         HoprBalance::new_base(40)
     }
@@ -728,6 +773,30 @@ mod tests {
         }
     }
 
+    /// The starting balances a test cares about, named rather than positional — most tests vary
+    /// one of them and inherit the rest.
+    struct Balances {
+        node_xdai: XDaiBalance,
+        node_hopr: HoprBalance,
+        safe_xdai: XDaiBalance,
+        deposit_hopr: HoprBalance,
+        deposit_xdai: XDaiBalance,
+    }
+
+    impl Default for Balances {
+        /// The shape a real deployment has: the node holds the gas and the float, the Safe holds
+        /// wxHOPR and no xDai, and a stealth address holding a deposit cannot pay to move it.
+        fn default() -> Self {
+            Self {
+                node_xdai: XDaiBalance::new_base(1),
+                node_hopr: HoprBalance::new_base(1000),
+                safe_xdai: XDaiBalance::zero(),
+                deposit_hopr: deposited(),
+                deposit_xdai: XDaiBalance::zero(),
+            }
+        }
+    }
+
     type Connector = Arc<TestChainConnector<FullStateEmulator>>;
 
     struct Fixture {
@@ -736,6 +805,7 @@ mod tests {
         node_addr: Address,
         safe_addr: Address,
         deposit_addr: Address,
+        dest_addr: Address,
     }
 
     impl Fixture {
@@ -752,19 +822,20 @@ mod tests {
             let key = EthDepositKey::from_secret(&DEPOSIT_SECRET).expect("valid test secret");
             self.pool.withdraw_deposit(&key, self.safe_addr, None).await
         }
+
+        /// Deposits into the fresh destination, which is what the Entry side does.
+        async fn deposit(&self, amount: HoprBalance) -> Result<(), StrategyError> {
+            self.pool.deposit_funds_to(self.dest_addr, amount).await
+        }
     }
 
-    /// Builds a node whose Safe is a *different* account, with each of the three balances that
-    /// matter set independently.
-    async fn fixture(
-        node_xdai: XDaiBalance,
-        safe_xdai: XDaiBalance,
-        deposit_xdai: XDaiBalance,
-        cfg: NonAnonymousDepositPoolConfig,
-    ) -> anyhow::Result<Fixture> {
+    /// Builds a node whose Safe is a *different* account, with each balance that matters set
+    /// independently.
+    async fn fixture(balances: Balances, cfg: NonAnonymousDepositPoolConfig) -> anyhow::Result<Fixture> {
         let node_kp = ChainKeypair::from_secret(&NODE_SECRET)?;
         let node_addr = node_kp.public().to_address();
         let safe_addr: Address = SAFE_ADDRESS.into();
+        let dest_addr: Address = DEST_ADDRESS.into();
         let deposit_addr = ChainKeypair::from_secret(&DEPOSIT_SECRET)?.public().to_address();
 
         let sim = BlokliTestStateBuilder::default()
@@ -777,13 +848,20 @@ mod tests {
                     key_id: 0u32.into(),
                 },
                 safe_hopr(),
-                node_xdai,
+                balances.node_xdai,
             )])
-            // `with_accounts` always zeroes the Safe's xDai — mirroring a real deployment, where
-            // the Safe holds wxHOPR and the node holds the gas. Override it where a test needs to.
-            .with_balances([(safe_addr, safe_xdai)])
-            .with_balances([(deposit_addr, deposited())])
-            .with_balances([(deposit_addr, deposit_xdai)])
+            // `with_accounts` puts the wxHOPR on the Safe and zeroes both of the node's balances,
+            // so the node's own float has to be credited after the fact. It also zeroes the
+            // Safe's xDai, which mirrors a real deployment; a test overrides it to prove the gas
+            // top-up ignores it.
+            .with_balances([(node_addr, balances.node_hopr)])
+            .with_balances([(safe_addr, balances.safe_xdai)])
+            .with_balances([(deposit_addr, balances.deposit_hopr)])
+            .with_balances([(deposit_addr, balances.deposit_xdai)])
+            // Both entries must exist or the balance query fails outright, which would look like
+            // a refusal rather than the absence of one.
+            .with_balances([(dest_addr, HoprBalance::zero())])
+            .with_balances([(dest_addr, XDaiBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
 
         let cc = Arc::new(create_test_blokli_connector(&node_kp, sim, MODULE_ADDRESS.into()).await?);
@@ -802,6 +880,7 @@ mod tests {
             node_addr,
             safe_addr,
             deposit_addr,
+            dest_addr,
         })
     }
 
@@ -812,13 +891,7 @@ mod tests {
     /// address that could not already pay its own way.
     #[test_log::test(tokio::test)]
     async fn sweep_tops_up_gas_from_the_node_when_the_safe_holds_no_xdai() -> anyhow::Result<()> {
-        let f = fixture(
-            XDaiBalance::new_base(1),
-            XDaiBalance::zero(),
-            XDaiBalance::zero(),
-            cfg(),
-        )
-        .await?;
+        let f = fixture(Balances::default(), cfg()).await?;
 
         f.sweep().await?;
 
@@ -843,9 +916,11 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn sweep_gas_gate_ignores_a_flush_safe_when_the_node_is_empty() -> anyhow::Result<()> {
         let f = fixture(
-            XDaiBalance::zero(),
-            XDaiBalance::new_base(100),
-            XDaiBalance::zero(),
+            Balances {
+                node_xdai: XDaiBalance::zero(),
+                safe_xdai: XDaiBalance::new_base(100),
+                ..Default::default()
+            },
             NonAnonymousDepositPoolConfig {
                 // Isolates the affordability check from the reserve floor below.
                 min_node_xdai_reserve: XDaiBalance::zero(),
@@ -874,9 +949,10 @@ mod tests {
         let node_xdai: XDaiBalance = "0.015 xdai".parse()?;
 
         let refused = fixture(
-            node_xdai,
-            XDaiBalance::zero(),
-            XDaiBalance::zero(),
+            Balances {
+                node_xdai,
+                ..Default::default()
+            },
             NonAnonymousDepositPoolConfig {
                 min_node_xdai_reserve: reserve,
                 ..cfg()
@@ -899,9 +975,10 @@ mod tests {
         // which is the concrete thing the reserve protects: a node drained to exactly zero cannot
         // even send the transfer that drained it.
         let allowed = fixture(
-            node_xdai,
-            XDaiBalance::zero(),
-            XDaiBalance::zero(),
+            Balances {
+                node_xdai,
+                ..Default::default()
+            },
             NonAnonymousDepositPoolConfig {
                 min_node_xdai_reserve: XDaiBalance::zero(),
                 ..cfg()
@@ -913,6 +990,74 @@ mod tests {
         assert!(
             allowed.hopr(allowed.deposit_addr).await?.is_zero(),
             "with the reserve opted out the same node can fund the sweep"
+        );
+        Ok(())
+    }
+
+    /// A deposit the node cannot cover is refused up front rather than submitted and reverted.
+    ///
+    /// The pool used to transfer blind: nothing read the payer's balance, so running the float
+    /// dry surfaced as an opaque transaction failure with no indication of the cause.
+    #[test_log::test(tokio::test)]
+    async fn deposit_is_refused_when_the_node_cannot_cover_it() -> anyhow::Result<()> {
+        let f = fixture(
+            Balances {
+                node_hopr: HoprBalance::new_base(10),
+                ..Default::default()
+            },
+            cfg(),
+        )
+        .await?;
+
+        let result = f.deposit(HoprBalance::new_base(25)).await;
+
+        assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)));
+        assert!(
+            f.hopr(f.dest_addr).await?.is_zero(),
+            "a refused deposit must not move anything"
+        );
+        assert_eq!(
+            f.hopr(f.node_addr).await?,
+            HoprBalance::new_base(10),
+            "and must not spend anything either"
+        );
+        Ok(())
+    }
+
+    /// `min_node_hopr_reserve` holds back a floor the deposits may not eat into, for an operator
+    /// funding the node's account for something other than the PIX float.
+    #[test_log::test(tokio::test)]
+    async fn deposit_stops_at_the_node_hopr_reserve() -> anyhow::Result<()> {
+        let balances = || Balances {
+            node_hopr: HoprBalance::new_base(30),
+            ..Default::default()
+        };
+        let amount = HoprBalance::new_base(25);
+
+        let refused = fixture(
+            balances(),
+            NonAnonymousDepositPoolConfig {
+                min_node_hopr_reserve: HoprBalance::new_base(10),
+                ..cfg()
+            },
+        )
+        .await?;
+
+        assert!(matches!(
+            refused.deposit(amount).await,
+            Err(StrategyError::CriteriaNotSatisfied)
+        ));
+        assert!(refused.hopr(refused.dest_addr).await?.is_zero());
+
+        // Same balances, default (zero) reserve — so the refusal above is the floor talking and
+        // not a shortfall.
+        let allowed = fixture(balances(), cfg()).await?;
+
+        allowed.deposit(amount).await?;
+        assert_eq!(
+            allowed.hopr(allowed.dest_addr).await?,
+            amount,
+            "with no reserve configured the same node funds the deposit"
         );
         Ok(())
     }
@@ -929,6 +1074,7 @@ mod tests {
             NonAnonymousDepositPoolConfig::default().min_node_xdai_reserve
         );
         assert_eq!(parsed.min_node_xdai_reserve, "0.01 xdai".parse()?);
+        assert!(parsed.min_node_hopr_reserve.is_zero());
         Ok(())
     }
 }
