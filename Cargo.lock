@@ -1589,7 +1589,7 @@ dependencies = [
  "futures",
  "futures-time",
  "hex",
- "hopr-types",
+ "hopr-types 2.3.0",
  "http",
  "indexmap 2.14.0",
  "launchdarkly-sdk-transport",
@@ -3318,9 +3318,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b888d2f2d08002d003db1789f732c812ebe2709375780cc6b12eeba09930452c"
+version = "2.0.1"
+source = "git+https://github.com/hoprnet/hopr-api?rev=683c13a710ca6d8ac22455bc104e2dfe876f9d86#683c13a710ca6d8ac22455bc104e2dfe876f9d86"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3328,7 +3327,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-concurrency",
- "hopr-types",
+ "hopr-types 2.4.0",
  "libp2p-identity",
  "serde",
  "strum",
@@ -3417,6 +3416,57 @@ name = "hopr-types"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a19fe24538d5d68590496763119afbb5f8ccb466f88abbf36cda7a8c7d49e1f1"
+dependencies = [
+ "aes",
+ "aquamarine",
+ "ark-bn254 0.6.0",
+ "ark-ec 0.6.0",
+ "ark-ff 0.6.0",
+ "ark-serialize 0.6.0",
+ "arrayvec",
+ "async-trait",
+ "babyjubjub-ec",
+ "bigdecimal",
+ "blake3",
+ "chacha20",
+ "chrono",
+ "cipher",
+ "const-hex",
+ "ctr",
+ "curve25519-dalek 5.0.0",
+ "digest 0.11.3",
+ "ed25519-dalek 3.0.0",
+ "elliptic-curve 0.14.1",
+ "float-cmp",
+ "hash2curve",
+ "hex-literal",
+ "hybrid-array",
+ "k256 0.14.0",
+ "lazy_static",
+ "libp2p-identity",
+ "multiaddr",
+ "num_enum",
+ "poly1305",
+ "primitive-types 0.14.0",
+ "rand 0.10.2",
+ "rayon",
+ "regex",
+ "secp256k1 0.31.1",
+ "sha2 0.11.0",
+ "sha3 0.12.0",
+ "smart-default",
+ "strum",
+ "subtle",
+ "thiserror 2.0.20",
+ "tracing",
+ "typenum",
+ "zeroize",
+]
+
+[[package]]
+name = "hopr-types"
+version = "2.4.0"
+source = "git+https://github.com/hoprnet/hopr-types?rev=19c6eec0357f75ac544536ae435ffc10da7b222f#19c6eec0357f75ac544536ae435ffc10da7b222f"
 dependencies = [
  "aes",
  "anyhow",

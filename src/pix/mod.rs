@@ -45,7 +45,7 @@
 //! | feature | module | pool | `K::Public` | pair with |
 //! |---|---|---|---|---|
 //! | `strategy-pix-secp256k1` | `pix::secp256k1` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
-//! | `strategy-pix-curvy` | `pix::curvy` | `CurvyDepositPool` (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
+//! | `strategy-pix-curvy` | consumer-provided | Curvy connector pool | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
 //!
 //! Both features may be enabled at once, and enabling both is what `--all-features` does. Nothing
 //! is selected *by* the feature graph: each module exports its own `PoolKeypair` / `PoolConfig`
@@ -82,8 +82,6 @@
 //! consumer supplying its own via
 //! [`PixStrategy::build_with_pool`](strategy::PixStrategy::build_with_pool).
 
-#[cfg(feature = "strategy-pix-curvy")]
-pub mod curvy;
 pub mod recovery_store;
 #[cfg(feature = "strategy-pix-secp256k1")]
 pub mod secp256k1;
@@ -117,3 +115,9 @@ pub mod strategy;
             `hopr-lib/pix-bjj` (`BjjPublicKey`)"
 )]
 pub trait DepositAddressOf<P> {}
+
+#[cfg(feature = "strategy-pix-curvy")]
+impl DepositAddressOf<hopr_api::types::crypto::prelude::BjjKeypair>
+    for hopr_api::types::crypto::prelude::BjjPublicKey
+{
+}
