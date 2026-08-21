@@ -88,7 +88,7 @@
 //! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] and
 //! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env`] are both set).
 
-use std::{num::NonZeroU32, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
@@ -97,13 +97,13 @@ use chacha20poly1305::{
 use hopr_api::{
     chain::PixDepositSecret,
     node::PixAddressId,
-    types::{crypto_random::random_bytes, internal::prelude::HoprPseudonym, primitive::traits::BytesRepresentable},
+    types::crypto_random::random_bytes,
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use scrypt::{Params as ScryptParams, scrypt};
 
-// Key = pseudonym (10 bytes) + ssa_index (4 bytes)
-const KEY_SIZE: usize = HoprPseudonym::SIZE + 4;
+// Stable PixAddressId bytes: pseudonym followed by the non-zero SSA index.
+const KEY_SIZE: usize = PixAddressId::SIZE;
 
 // Value = nonce (12 bytes) + ciphertext (32 + 16 tag)
 const NONCE_SIZE: usize = 12;
@@ -218,27 +218,11 @@ impl From<redb::CommitError> for PixRecoveryStoreError {
 // Every offset is derived from `HoprPseudonym::SIZE` so the layout follows the type.
 
 fn encode_key(id: &PixAddressId) -> [u8; KEY_SIZE] {
-    let (pseudonym, ssa_index) = id;
-    let pseudonym_bytes: &[u8] = pseudonym.as_ref();
-    let ssa_bytes = ssa_index.get().to_be_bytes();
-    let mut out = [0u8; KEY_SIZE];
-    out[..HoprPseudonym::SIZE].copy_from_slice(pseudonym_bytes);
-    out[HoprPseudonym::SIZE..].copy_from_slice(&ssa_bytes);
-    out
+    id.to_bytes()
 }
 
 fn decode_key(bytes: &[u8; KEY_SIZE]) -> Result<PixAddressId, PixRecoveryStoreError> {
-    let pseudonym = HoprPseudonym::from(
-        <[u8; HoprPseudonym::SIZE]>::try_from(&bytes[..HoprPseudonym::SIZE])
-            .map_err(|_| PixRecoveryStoreError::CorruptKey("pseudonym slice".into()))?,
-    );
-
-    let ssa_index_bytes: [u8; 4] = <[u8; 4]>::try_from(&bytes[HoprPseudonym::SIZE..KEY_SIZE])
-        .map_err(|_| PixRecoveryStoreError::CorruptKey("ssa index slice".into()))?;
-    let ssa_index = NonZeroU32::new(u32::from_be_bytes(ssa_index_bytes))
-        .ok_or_else(|| PixRecoveryStoreError::CorruptKey("zero ssa index".into()))?;
-
-    Ok((pseudonym, ssa_index))
+    PixAddressId::try_from(bytes.as_slice()).map_err(|error| PixRecoveryStoreError::CorruptKey(error.to_string()))
 }
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
@@ -577,18 +561,20 @@ impl PixRecoveryStore {
 
 #[cfg(test)]
 mod tests {
-    use hopr_api::types::crypto_random::Randomizable;
+    use std::num::NonZeroU32;
+
+    use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
 
     use super::{
-        HoprPseudonym, NonZeroU32, PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore,
-        PixRecoveryStoreError, ReadableDatabase, VALUE_SIZE, encode_key,
+        PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore, PixRecoveryStoreError, ReadableDatabase,
+        VALUE_SIZE, encode_key,
     };
 
     const TEST_PASSWORD: &str = "test-password-for-unit-tests";
     const ALT_PASSWORD: &str = "password-a";
 
     fn make_id(index: u32) -> PixAddressId {
-        (HoprPseudonym::random(), NonZeroU32::new(index).unwrap())
+        (HoprPseudonym::random(), NonZeroU32::new(index).unwrap()).into()
     }
 
     fn make_secret(byte: u8) -> PixDepositSecret {
@@ -747,8 +733,8 @@ mod tests {
     fn test_key_uniqueness_per_pseudonym_and_index() {
         let (store, _dir) = open_temp_store();
         let pseudo = HoprPseudonym::random();
-        let id_a = (pseudo, NonZeroU32::new(1).unwrap());
-        let id_b = (pseudo, NonZeroU32::new(2).unwrap());
+        let id_a: PixAddressId = (pseudo, NonZeroU32::new(1).unwrap()).into();
+        let id_b: PixAddressId = (pseudo, NonZeroU32::new(2).unwrap()).into();
         let sec_a = make_secret(0xaa);
         let sec_b = make_secret(0xbb);
 
