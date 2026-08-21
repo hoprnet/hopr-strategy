@@ -251,22 +251,22 @@ pub struct NonAnonymousDepositPoolConfig {
     pub min_node_hopr_reserve: HoprBalance,
 
     /// Attempts *in addition to* the first for a deposit transfer.  Default: 3.
+    /// Zero means a single attempt with no backoff.
     ///
     /// Retrying is safe because [`DepositPool::deposit_funds_to`] re-reads the
     /// destination balance before each transfer.
     #[default(default_max_deposit_retries())]
     #[serde(default = "default_max_deposit_retries")]
-    #[validate(range(min = 1))]
     pub max_deposit_retries: usize,
 
     /// Attempts *in addition to* the first for a withdrawal sweep.  Default: 5.
+    /// Zero means a single attempt with no backoff.
     ///
     /// The budget is deliberately larger than [`Self::max_deposit_retries`]: a sweep
     /// of an address whose deposit has not landed yet fails, and each retry is another
     /// chance for the deposit to arrive.
     #[default(default_max_sweep_retries())]
     #[serde(default = "default_max_sweep_retries")]
-    #[validate(range(min = 1))]
     pub max_sweep_retries: usize,
 }
 

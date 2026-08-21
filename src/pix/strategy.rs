@@ -307,6 +307,11 @@ impl PixStrategy {
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
         A: crate::pix::DepositAddressOf<crate::pix::secp256k1::PoolKeypair>,
     {
+        // Each builder validates the config it owns: the pool's here, the strategy's inside
+        // `build_with_pool`. Checked before anything is constructed, so a build that is going to
+        // fail does not first open a recovery store on disk.
+        StrategyError::validate_config(&pool_cfg)?;
+
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
         let pool = Arc::new(crate::pix::secp256k1::NonAnonymousDepositPool::new(
@@ -361,6 +366,9 @@ impl PixStrategy {
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
         A: crate::pix::DepositAddressOf<crate::pix::curvy::PoolKeypair>,
     {
+        // See `build_non_anonymous`: the pool config is this builder's to validate.
+        StrategyError::validate_config(&pool_cfg)?;
+
         let pool = Arc::new(crate::pix::curvy::CurvyDepositPool::new(Arc::clone(&node), pool_cfg));
         let safe_address = node.identity().safe_address;
 
@@ -1792,6 +1800,70 @@ mod tests {
 
         let result = PixStrategy::new(spend_cfg(HoprBalance::new_base(50), StdDuration::ZERO))
             .build_non_anonymous::<_, Address>(node, Default::default());
+
+        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        Ok(())
+    }
+
+    // ── Builder config validation ──────────────────────────────────
+
+    /// The *pool* config is validated too, not just the strategy's.
+    ///
+    /// `NonAnonymousDepositPoolConfig` has carried validators since it was written and derived
+    /// `Validate` for them, but no builder ever ran them — a tracking time the pool's own
+    /// constraint forbids was accepted and turned into a polling interval of zero.
+    #[test_log::test(tokio::test)]
+    async fn test_build_non_anonymous_rejects_an_invalid_pool_config() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(
+            node,
+            crate::pix::secp256k1::PoolConfig {
+                max_deposit_tracking_time: StdDuration::ZERO,
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        Ok(())
+    }
+
+    /// Zero retries means "one attempt, no backoff" — the documented meaning of a budget counted
+    /// *in addition to* the first attempt, and what most of the tests in this file rely on.
+    ///
+    /// It was declared `range(min = 1)`, contradicting that. Harmless while nothing validated;
+    /// turning validation on would have made a legitimate config unbuildable.
+    #[test_log::test(tokio::test)]
+    async fn test_build_non_anonymous_accepts_zero_retry_budgets() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(
+            node,
+            crate::pix::secp256k1::PoolConfig {
+                max_deposit_retries: 0,
+                max_sweep_retries: 0,
+                ..Default::default()
+            },
+        )?;
+
+        Ok(())
+    }
+
+    /// The curvy builder validates its own pool config on the same footing, even though the pool
+    /// behind it is still a stub.
+    #[cfg(feature = "strategy-pix-curvy")]
+    #[test_log::test(tokio::test)]
+    async fn test_build_curvy_rejects_an_invalid_pool_config() -> anyhow::Result<()> {
+        use hopr_api::types::crypto::prelude::BjjPublicKey;
+
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+            node,
+            crate::pix::curvy::PoolConfig {
+                max_deposit_tracking_time: StdDuration::ZERO,
+            },
+        );
 
         assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
         Ok(())
