@@ -89,6 +89,34 @@ pub mod recovery_store;
 pub mod secp256k1;
 pub mod strategy;
 
+use hopr_api::types::primitive::prelude::GeneralError;
+
+/// [`DepositData`](hopr_api::chain::DepositPool::DepositData) for a pool that carries no PIX
+/// side-channel payload.
+///
+/// `DepositPool::DepositData` is deliberately unbounded upstream — hopr-api never decodes it — so
+/// the requirement that it be recoverable from the bytes a `PixEvent` carries lives on
+/// [`PixStrategy`](strategy::PixStrategy)'s driver instead. A pool with nothing to carry therefore
+/// still needs *some* decodable type; it cannot use `()`, which has no `TryFrom<&[u8]>` impl.
+///
+/// Shared by both pool modules rather than defined in either, because each is behind its own
+/// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmptyDepositData;
+
+impl TryFrom<&[u8]> for EmptyDepositData {
+    type Error = GeneralError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        // Rejected rather than ignored. The strategy only decodes when the peer actually sent
+        // data, so anything arriving here means the Entry sent PIX deposit data to an Exit whose
+        // pool cannot use it — the two ends disagree about which pool is running. Swallowing it
+        // reproduces exactly the failure this module's `curvy` docs describe: no deposits, no
+        // diagnostic.
+        bytes.is_empty().then_some(Self).ok_or(GeneralError::InvalidInput)
+    }
+}
+
 /// Witness that `Self` is exactly the deposit address the pool keyed on `P` settles to.
 ///
 /// `A: DepositAddressOf<P>` holds only when `P::Public == A`, so naming the node's

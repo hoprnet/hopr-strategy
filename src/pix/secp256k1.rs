@@ -23,7 +23,7 @@ use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
     chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool},
-    node::HasChainApi,
+    node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
         primitive::prelude::{Address, HoprBalance, XDaiBalance},
@@ -33,7 +33,7 @@ use serde_with::{DisplayFromStr, serde_as};
 use subtle::{Choice, ConstantTimeEq};
 use validator::Validate;
 
-use crate::errors::StrategyError;
+use crate::{errors::StrategyError, pix::EmptyDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -272,21 +272,24 @@ impl Drop for DepositTrackerSlot {
 ///
 /// use hopr_api::{
 ///     chain::DepositPool,
-///     node::HasChainApi,
+///     node::{HasChainApi, PixAddressId},
 ///     types::primitive::prelude::{Address, HoprBalance},
 /// };
 /// use hopr_strategy::pix::secp256k1::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
 ///
 /// // `dst` is an `Address` — the pool settles to `EthDepositKey::Public`, not to the
-/// // curve-agnostic `PixDepositAddress` the events carry.
-/// async fn deposit<N>(node: Arc<N>, dst: Address) -> anyhow::Result<()>
+/// // curve-agnostic `PixDepositAddress` the events carry. `id` names the allocation the
+/// // deposit belongs to; it comes from the `PixEvent` that asked for the deposit.
+/// async fn deposit<N>(node: Arc<N>, id: PixAddressId, dst: Address) -> anyhow::Result<()>
 /// where
 ///     N: HasChainApi + Send + Sync + 'static,
 /// {
 ///     let pool = NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default());
 ///
-///     // The pool owns the retries; a single call is best effort by itself.
-///     pool.deposit_funds_to(dst, HoprBalance::new_base(20)).await?;
+///     // The pool owns the retries; a single call is best effort by itself. This pool carries
+///     // no side-channel payload, so the additional data is always `None`.
+///     pool.deposit_funds_to(&id, &dst, HoprBalance::new_base(20), None)
+///         .await?;
 ///     Ok(())
 /// }
 /// ```
@@ -472,6 +475,13 @@ where
     type Error = StrategyError;
     type Receipt = ();
 
+    /// Nothing travels alongside a deposit here.
+    ///
+    /// A deposit address in this pool is an ordinary Ethereum account and a deposit is a plain
+    /// transfer; there is no note, commitment or blinding factor for the Entry to hand the Exit.
+    /// See [`EmptyDepositData`] for why this is not `()`.
+    type DepositData = EmptyDepositData;
+
     /// Deposit funds from the node's Safe to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
     ///
@@ -480,15 +490,25 @@ where
     /// transfer whose confirmation was lost is therefore not sent twice. The guarantee is
     /// balance-based rather than transaction-based, so a third party funding the same
     /// address also satisfies the check.
-    async fn deposit_funds_to(&self, dst: Address, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
-        let dest_addr = dst;
+    ///
+    /// `id` is carried for logging only: the destination address is what identifies the deposit
+    /// on-chain, and this pool keeps no allocation-indexed state of its own.
+    async fn deposit_funds_to(
+        &self,
+        id: &PixAddressId,
+        dst: &Address,
+        amount: HoprBalance,
+        _additional_data: Option<Self::DepositData>,
+    ) -> Result<Self::Receipt, Self::Error> {
+        let dest_addr = *dst;
         let node = &self.node;
+        let id = *id;
 
         (move || deposit_once(Arc::clone(node), dest_addr, amount))
             .retry(retry_policy(self.cfg.max_deposit_retries))
             .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, %dest_addr, ?dur, "deposit failed, retrying in");
+            .notify(move |error, dur| {
+                tracing::warn!(%error, ?id, %dest_addr, ?dur, "deposit failed, retrying in");
             })
             .await
     }
@@ -502,6 +522,7 @@ where
     /// out what the bound should be.
     fn notify_deposit(
         &self,
+        id: PixAddressId,
         dst: Address,
         min_amount: HoprBalance,
     ) -> Result<DepositNotification<'static, Address, Self::Error>, Self::Error> {
@@ -529,7 +550,7 @@ where
             let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
-                return Ok((dst, balance));
+                return Ok((id, dst, balance));
             }
 
             futures_time::task::sleep(phase_jitter.into()).await;
@@ -559,12 +580,12 @@ where
             )
             .await
             {
-                Ok(Some(balance)) => Ok((dst, balance)),
+                Ok(Some(balance)) => Ok((id, dst, balance)),
                 Ok(None) => Err(StrategyError::other(anyhow::anyhow!(
                     "deposit balance stream ended unexpectedly"
                 ))),
                 Err(_) => {
-                    tracing::warn!(%address, %target, ?max_tracking, "gave up waiting for the deposit");
+                    tracing::warn!(?id, %address, %target, ?max_tracking, "gave up waiting for the deposit");
                     Err(StrategyError::other(anyhow::anyhow!(
                         "deposit to {address} did not reach {target} within {max_tracking:?}"
                     )))
@@ -585,17 +606,19 @@ where
     /// one belonging to a different scheme.
     async fn withdraw_deposit(
         &self,
+        id: &PixAddressId,
         key: &EthDepositKey,
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         let (node, cfg, chain_key) = (&self.node, &self.cfg, key.chain_key());
+        let id = *id;
 
         (move || sweep_single(Arc::clone(node), cfg, chain_key, dst))
             .retry(retry_policy(cfg.max_sweep_retries))
             .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, %dst, ?dur, "sweep failed, retrying in");
+            .notify(move |error, dur| {
+                tracing::warn!(%error, ?id, %dst, ?dur, "sweep failed, retrying in");
             })
             .await
             .map(|_| ())
@@ -610,12 +633,20 @@ where
     ///
     /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
     /// anonymity set while a withdrawal leaves it.
+    ///
+    /// Only `src_id` is used — it identifies the allocation whose key is being spent, which is
+    /// what the underlying sweep acts on. `dst_id` names an allocation on the receiving side, a
+    /// notion this pool does not have: the destination is just another Ethereum account, and
+    /// nothing here is filed per allocation.
     async fn pool_transfer(
         &self,
+        src_id: &PixAddressId,
         key: &EthDepositKey,
+        _dst_id: &PixAddressId,
         dst: Address,
+        _additional_dst_data: Option<Self::DepositData>,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        self.withdraw_deposit(key, dst, amount).await
+        self.withdraw_deposit(src_id, key, dst, amount).await
     }
 }

@@ -29,7 +29,7 @@ use std::{sync::Arc, time::Duration};
 
 use hopr_api::{
     chain::{DepositNotification, DepositPool},
-    node::HasChainApi,
+    node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::{BjjKeypair, BjjPublicKey},
         primitive::prelude::{Address, HoprBalance},
@@ -37,7 +37,7 @@ use hopr_api::{
 };
 use validator::Validate;
 
-use crate::errors::StrategyError;
+use crate::{errors::StrategyError, pix::EmptyDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -152,12 +152,27 @@ where
     type Error = StrategyError;
     type Receipt = ();
 
-    async fn deposit_funds_to(&self, _dst: BjjPublicKey, _amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
+    /// `EmptyDepositData` until the settlement logic lands.
+    ///
+    /// An anonymous pool is the case `DepositData` exists for — a Curvy deposit plausibly needs a
+    /// note or commitment carried from Entry to Exit — so this is the one associated type here
+    /// that is a placeholder for a real decision rather than a permanent answer. Whatever it
+    /// becomes must decode from the `PixEvent`'s `additional_data` bytes.
+    type DepositData = EmptyDepositData;
+
+    async fn deposit_funds_to(
+        &self,
+        _id: &PixAddressId,
+        _dst: &BjjPublicKey,
+        _amount: HoprBalance,
+        _additional_data: Option<Self::DepositData>,
+    ) -> Result<Self::Receipt, Self::Error> {
         not_implemented!("deposit_funds_to")
     }
 
     fn notify_deposit(
         &self,
+        _id: PixAddressId,
         _dst: BjjPublicKey,
         _min_amount: HoprBalance,
     ) -> Result<DepositNotification<'static, BjjPublicKey, Self::Error>, Self::Error> {
@@ -166,6 +181,7 @@ where
 
     async fn withdraw_deposit(
         &self,
+        _id: &PixAddressId,
         _key: &BjjKeypair,
         _dst: Address,
         _amount: Option<HoprBalance>,
@@ -175,8 +191,11 @@ where
 
     async fn pool_transfer(
         &self,
+        _src_id: &PixAddressId,
         _key: &BjjKeypair,
+        _dst_id: &PixAddressId,
         _dst: BjjPublicKey,
+        _additional_dst_data: Option<Self::DepositData>,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         not_implemented!("pool_transfer")

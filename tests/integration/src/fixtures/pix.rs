@@ -196,8 +196,8 @@ impl IntegrationFixture {
 
 /// Builds a deterministic [`PixAddressId`] from a seed byte and an SSA index.
 pub fn pix_address_id(seed: u8, ssa_index: u32) -> PixAddressId {
-    (
-        HoprPseudonym::from([seed; HoprPseudonym::SIZE]),
+    PixAddressId::new(
+        &HoprPseudonym::from([seed; HoprPseudonym::SIZE]),
         NonZeroU32::new(ssa_index).expect("ssa index must be non-zero"),
     )
 }

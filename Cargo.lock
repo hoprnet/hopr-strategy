@@ -1589,7 +1589,7 @@ dependencies = [
  "futures",
  "futures-time",
  "hex",
- "hopr-types",
+ "hopr-types 2.3.0",
  "http",
  "indexmap 2.14.0",
  "launchdarkly-sdk-transport",
@@ -3318,9 +3318,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "2.0.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b888d2f2d08002d003db1789f732c812ebe2709375780cc6b12eeba09930452c"
+checksum = "ea04294008efbd07089c4ee1d1fa60c0b178b1b8637ed76935940595efe61eb9"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3328,7 +3328,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-concurrency",
- "hopr-types",
+ "hopr-types 3.0.0",
  "libp2p-identity",
  "serde",
  "strum",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "1.0.2"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -3419,6 +3419,58 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a19fe24538d5d68590496763119afbb5f8ccb466f88abbf36cda7a8c7d49e1f1"
 dependencies = [
  "aes",
+ "aquamarine",
+ "ark-bn254 0.6.0",
+ "ark-ec 0.6.0",
+ "ark-ff 0.6.0",
+ "ark-serialize 0.6.0",
+ "arrayvec",
+ "async-trait",
+ "babyjubjub-ec",
+ "bigdecimal",
+ "blake3",
+ "chacha20",
+ "chrono",
+ "cipher",
+ "const-hex",
+ "ctr",
+ "curve25519-dalek 5.0.0",
+ "digest 0.11.3",
+ "ed25519-dalek 3.0.0",
+ "elliptic-curve 0.14.1",
+ "float-cmp",
+ "hash2curve",
+ "hex-literal",
+ "hybrid-array",
+ "k256 0.14.0",
+ "lazy_static",
+ "libp2p-identity",
+ "multiaddr",
+ "num_enum",
+ "poly1305",
+ "primitive-types 0.14.0",
+ "rand 0.10.2",
+ "rayon",
+ "regex",
+ "secp256k1 0.31.1",
+ "sha2 0.11.0",
+ "sha3 0.12.0",
+ "smart-default",
+ "strum",
+ "subtle",
+ "thiserror 2.0.20",
+ "tracing",
+ "typenum",
+ "zeroize",
+]
+
+[[package]]
+name = "hopr-types"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a497683452629aacda6776373e801c0686edfda2f2e97fa3fb22c74577ec3d9"
+dependencies = [
+ "aes",
  "anyhow",
  "aquamarine",
  "ark-bn254 0.6.0",
@@ -3475,9 +3527,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-utilities"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7de9a46fe251a9aa6ee3ab7e2edd7720ac6f09ad4f01566dd6c056913615cc43"
+checksum = "0c0b56012e914f380e83db462aa68e3b3f40fc1a762b68cee80214f140c462f0"
 dependencies = [
  "anyhow",
  "auto_impl",
