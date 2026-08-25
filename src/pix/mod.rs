@@ -44,7 +44,7 @@
 // reason in `strategy.rs` for the two builders. Please leave them unlinked.
 //! | feature | module | pool | `K::Public` | pair with |
 //! |---|---|---|---|---|
-//! | `strategy-pix-secp256k1` | `pix::secp256k1` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
+//! | `strategy-pix-test` | `pix::secp256k1` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
 //! | `strategy-pix-curvy` | `pix::curvy` | `CurvyDepositPool` (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
 //!
 //! Both features may be enabled at once, and enabling both is what `--all-features` does. Nothing
@@ -85,7 +85,7 @@
 #[cfg(feature = "strategy-pix-curvy")]
 pub mod curvy;
 pub mod recovery_store;
-#[cfg(feature = "strategy-pix-secp256k1")]
+#[cfg(feature = "strategy-pix-test")]
 pub mod secp256k1;
 pub mod strategy;
 
@@ -140,8 +140,8 @@ impl TryFrom<&[u8]> for EmptyDepositData {
 #[diagnostic::on_unimplemented(
     message = "the selected PIX deposit pool cannot settle to `{Self}` deposit addresses",
     label = "the node's PIX spec produces `{Self}`, which is not the address type this pool settles to",
-    note = "the `strategy-pix-*` feature and the node's `hopr-lib/pix-*` feature must agree: pair \
-            `strategy-pix-secp256k1` with `hopr-lib/pix-secp256k1` (`Address`), or `strategy-pix-curvy` with \
-            `hopr-lib/pix-bjj` (`BjjPublicKey`)"
+    note = "the `strategy-pix-*` feature and the node's `hopr-lib/pix-*` feature must agree: pair `strategy-pix-test` \
+            with `hopr-lib/pix-secp256k1` (`Address`), or `strategy-pix-curvy` with `hopr-lib/pix-bjj` \
+            (`BjjPublicKey`)"
 )]
 pub trait DepositAddressOf<P> {}

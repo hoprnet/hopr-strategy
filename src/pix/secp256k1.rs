@@ -5,7 +5,7 @@
 //!
 //! **DO NOT USE IN PRODUCTION.**
 //!
-//! Enabled by `strategy-pix-secp256k1`, and to be paired with `hopr-lib/pix-secp256k1` so that
+//! Enabled by `strategy-pix-test`, and to be paired with `hopr-lib/pix-secp256k1` so that
 //! `HoprPixSpec` produces the `Address` deposit addresses this pool can settle to. Built through
 //! [`PixStrategy::build_non_anonymous`](crate::pix::strategy::PixStrategy::build_non_anonymous).
 

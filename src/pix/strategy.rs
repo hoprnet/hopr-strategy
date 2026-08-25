@@ -236,7 +236,7 @@ impl PixStrategy {
     ///         .build_non_anonymous::<_, BjjPublicKey>(node, Default::default());
     /// }
     /// ```
-    #[cfg(feature = "strategy-pix-secp256k1")]
+    #[cfg(feature = "strategy-pix-test")]
     pub fn build_non_anonymous<N, A>(
         self,
         node: Arc<N>,
@@ -1110,7 +1110,7 @@ where
 // strategy. The bjj pairing has no equivalent yet because its pool is a stub — when
 // `CurvyDepositPool` is implemented, the engine-level cases here are the ones worth
 // generalising over `PoolKeypair` rather than duplicating.
-#[cfg(all(test, feature = "strategy-pix-secp256k1"))]
+#[cfg(all(test, feature = "strategy-pix-test"))]
 mod tests {
     use std::{num::NonZeroU32, sync::Arc, time::Duration as StdDuration};
 

@@ -137,7 +137,7 @@ macro_rules! not_implemented {
     ($what:literal) => {
         unimplemented!(
             "CurvyDepositPool::{} is not implemented — this build selected the Baby JubJub deposit pool via \
-             `strategy-pix-curvy`, which is currently a stub. For a working pool build with `strategy-pix-secp256k1` \
+             `strategy-pix-curvy`, which is currently a stub. For a working pool build with `strategy-pix-test` \
              instead (and `hopr-lib/pix-secp256k1` with it).",
             $what
         )
