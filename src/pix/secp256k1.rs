@@ -472,15 +472,14 @@ impl<N> DepositPool<EthDepositKey> for NonAnonymousDepositPool<N>
 where
     N: HasChainApi + Send + Sync + 'static,
 {
-    type Error = StrategyError;
-    type Receipt = ();
-
     /// Nothing travels alongside a deposit here.
     ///
     /// A deposit address in this pool is an ordinary Ethereum account and a deposit is a plain
     /// transfer; there is no note, commitment or blinding factor for the Entry to hand the Exit.
     /// See [`EmptyDepositData`] for why this is not `()`.
     type DepositData = EmptyDepositData;
+    type Error = StrategyError;
+    type Receipt = ();
 
     /// Deposit funds from the node's Safe to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.

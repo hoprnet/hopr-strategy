@@ -149,9 +149,6 @@ impl<N> DepositPool<BjjKeypair> for CurvyDepositPool<N>
 where
     N: HasChainApi + Send + Sync + 'static,
 {
-    type Error = StrategyError;
-    type Receipt = ();
-
     /// `EmptyDepositData` until the settlement logic lands.
     ///
     /// An anonymous pool is the case `DepositData` exists for — a Curvy deposit plausibly needs a
@@ -159,6 +156,8 @@ where
     /// that is a placeholder for a real decision rather than a permanent answer. Whatever it
     /// becomes must decode from the `PixEvent`'s `additional_data` bytes.
     type DepositData = EmptyDepositData;
+    type Error = StrategyError;
+    type Receipt = ();
 
     async fn deposit_funds_to(
         &self,
@@ -199,5 +198,97 @@ where
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         not_implemented!("pool_transfer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU32, sync::Arc};
+
+    use hopr_api::{
+        ChainKeypair,
+        chain::DepositPool,
+        node::PixAddressId,
+        types::{
+            crypto::prelude::{BjjKeypair, Keypair},
+            crypto_random::Randomizable,
+            internal::prelude::HoprPseudonym,
+            primitive::prelude::{Address, HoprBalance, XDaiBalance},
+        },
+    };
+
+    use super::{CurvyDepositPool, CurvyDepositPoolConfig};
+    use crate::testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector};
+
+    /// Builds a pool over a real chain connector, so that a panic observed below is the stub's own
+    /// and not an unrelated failure while standing the pool up.
+    async fn stub_pool() -> anyhow::Result<CurvyDepositPool<impl hopr_api::node::HasChainApi>> {
+        let me = ChainKeypair::from_secret(&hex_literal::hex!(
+            "492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775"
+        ))?;
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&me.public().to_address()],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(Address::from([1u8; 20]));
+        let connector = create_test_blokli_connector(&me, sim, Address::from([1u8; 20])).await?;
+        Ok(CurvyDepositPool::new(
+            Arc::new(ChainNode(Arc::new(connector))),
+            CurvyDepositPoolConfig::default(),
+        ))
+    }
+
+    fn an_id() -> PixAddressId {
+        PixAddressId::new(&HoprPseudonym::random(), NonZeroU32::new(1).unwrap())
+    }
+
+    // Each method must panic, and the panic must name the feature that selected this pool. The
+    // assertion is on the *message*, not merely on the unwind: a stub returning `Ok(())` or a
+    // plain error would look like a working pool that simply never deposits, which is the failure
+    // this module's docs describe as having cost a day to diagnose. The message is the part that
+    // does the work, so the message is what is pinned.
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_deposit_funds_to_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let _ = pool
+            .deposit_funds_to(&an_id(), BjjKeypair::random().public(), HoprBalance::new_base(1), None)
+            .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_notify_deposit_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let _ = pool.notify_deposit(an_id(), BjjKeypair::random().public().clone(), HoprBalance::new_base(1));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_withdraw_deposit_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let _ = pool
+            .withdraw_deposit(&an_id(), &BjjKeypair::random(), Address::from([1u8; 20]), None)
+            .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_pool_transfer_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let _ = pool
+            .pool_transfer(
+                &an_id(),
+                &BjjKeypair::random(),
+                &an_id(),
+                BjjKeypair::random().public().clone(),
+                None,
+                None,
+            )
+            .await;
     }
 }

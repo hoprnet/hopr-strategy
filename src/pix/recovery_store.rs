@@ -570,11 +570,9 @@ impl PixRecoveryStore {
 
 #[cfg(test)]
 mod tests {
-    use hopr_api::types::crypto_random::Randomizable;
-
     use std::num::NonZeroU32;
 
-    use hopr_api::types::internal::prelude::HoprPseudonym;
+    use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
 
     use super::{
         BytesRepresentable, KEY_SIZE, PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore,
