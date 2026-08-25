@@ -9,7 +9,7 @@ version = "0.1.0"
 anyhow   = { workspace = true }
 futures  = { workspace = true }
 hopr-api = { workspace = true, features = ["node", "serde"] }
-# `strategy-pix-secp256k1` rather than bare `strategy-pix`: the latter is the pool-less engine,
+# `strategy-pix-test` rather than bare `strategy-pix`: the latter is the pool-less engine,
 # and `tests/pix.rs` drives a concrete pool — `build_non_anonymous` and
 # `secp256k1::NonAnonymousDepositPoolConfig` exist only once that pool's feature is on. Only
 # secp256k1 is enabled because it is the only implemented pool; `strategy-pix-curvy` is a stub
@@ -21,7 +21,7 @@ hopr-strategy = { workspace = true, features = [
   "strategy-auto-redeeming",
   "strategy-channel-lifecycle",
   "strategy-closure-finalizer",
-  "strategy-pix-secp256k1",
+  "strategy-pix-test",
   "testing",
 ] }
 rstest = { workspace = true }

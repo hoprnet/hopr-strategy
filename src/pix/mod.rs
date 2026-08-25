@@ -44,7 +44,7 @@
 // reason in `strategy.rs` for the two builders. Please leave them unlinked.
 //! | feature | module | pool | `K::Public` | pair with |
 //! |---|---|---|---|---|
-//! | `strategy-pix-secp256k1` | `pix::secp256k1` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
+//! | `strategy-pix-test` | `pix::secp256k1` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
 //! | `strategy-pix-curvy` | `pix::curvy` | `CurvyDepositPool` (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
 //!
 //! Both features may be enabled at once, and enabling both is what `--all-features` does. Nothing
@@ -85,9 +85,37 @@
 #[cfg(feature = "strategy-pix-curvy")]
 pub mod curvy;
 pub mod recovery_store;
-#[cfg(feature = "strategy-pix-secp256k1")]
+#[cfg(feature = "strategy-pix-test")]
 pub mod secp256k1;
 pub mod strategy;
+
+use hopr_api::types::primitive::prelude::GeneralError;
+
+/// [`DepositData`](hopr_api::chain::DepositPool::DepositData) for a pool that carries no PIX
+/// side-channel payload.
+///
+/// `DepositPool::DepositData` is deliberately unbounded upstream — hopr-api never decodes it — so
+/// the requirement that it be recoverable from the bytes a `PixEvent` carries lives on
+/// [`PixStrategy`](strategy::PixStrategy)'s driver instead. A pool with nothing to carry therefore
+/// still needs *some* decodable type; it cannot use `()`, which has no `TryFrom<&[u8]>` impl.
+///
+/// Shared by both pool modules rather than defined in either, because each is behind its own
+/// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmptyDepositData;
+
+impl TryFrom<&[u8]> for EmptyDepositData {
+    type Error = GeneralError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        // Rejected rather than ignored. The strategy only decodes when the peer actually sent
+        // data, so anything arriving here means the Entry sent PIX deposit data to an Exit whose
+        // pool cannot use it — the two ends disagree about which pool is running. Swallowing it
+        // reproduces exactly the failure this module's `curvy` docs describe: no deposits, no
+        // diagnostic.
+        bytes.is_empty().then_some(Self).ok_or(GeneralError::InvalidInput)
+    }
+}
 
 /// Witness that `Self` is exactly the deposit address the pool keyed on `P` settles to.
 ///
@@ -112,8 +140,8 @@ pub mod strategy;
 #[diagnostic::on_unimplemented(
     message = "the selected PIX deposit pool cannot settle to `{Self}` deposit addresses",
     label = "the node's PIX spec produces `{Self}`, which is not the address type this pool settles to",
-    note = "the `strategy-pix-*` feature and the node's `hopr-lib/pix-*` feature must agree: pair \
-            `strategy-pix-secp256k1` with `hopr-lib/pix-secp256k1` (`Address`), or `strategy-pix-curvy` with \
-            `hopr-lib/pix-bjj` (`BjjPublicKey`)"
+    note = "the `strategy-pix-*` feature and the node's `hopr-lib/pix-*` feature must agree: pair `strategy-pix-test` \
+            with `hopr-lib/pix-secp256k1` (`Address`), or `strategy-pix-curvy` with `hopr-lib/pix-bjj` \
+            (`BjjPublicKey`)"
 )]
 pub trait DepositAddressOf<P> {}

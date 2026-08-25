@@ -7,7 +7,7 @@
 //! - auto redeeming strategy (`auto_redeeming` module, feature `strategy-auto-redeeming`)
 //! - closure finalizer (`channel_finalizer` module, feature `strategy-closure-finalizer`)
 //! - channel lifecycle strategy (`channel_lifecycle` module, feature `strategy-channel-lifecycle`)
-//! - PIX strategy (`pix` module, feature `strategy-pix`; a bundled deposit pool needs `strategy-pix-secp256k1` or
+//! - PIX strategy (`pix` module, feature `strategy-pix`; a bundled deposit pool needs `strategy-pix-test` or
 //!   `strategy-pix-curvy` in addition)
 //! - [multiple strategy chains](crate::strategy)
 //!
