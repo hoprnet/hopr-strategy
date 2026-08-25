@@ -286,9 +286,12 @@ impl Drop for DepositTrackerSlot {
 /// {
 ///     let pool = NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default());
 ///
-///     // The pool owns the retries; a single call is best effort by itself. This pool carries
-///     // no side-channel payload, so the additional data is always `None`.
-///     pool.deposit_funds_to(&id, &dst, HoprBalance::new_base(20), None)
+///     // The payload is the pool's own to make, so it is asked for rather than assembled here.
+///     // This pool carries no side-channel data, so what comes back is empty but for `id`.
+///     let deposit_data = pool.generate_deposit_data(&id).await?;
+///
+///     // The pool owns the retries; a single call is best effort by itself.
+///     pool.deposit_funds_to(&id, &dst, HoprBalance::new_base(20), deposit_data)
 ///         .await?;
 ///     Ok(())
 /// }
@@ -476,10 +479,19 @@ where
     ///
     /// A deposit address in this pool is an ordinary Ethereum account and a deposit is a plain
     /// transfer; there is no note, commitment or blinding factor for the Entry to hand the Exit.
-    /// See [`EmptyDepositData`] for why this is not `()`.
-    type DepositData = EmptyDepositData;
+    /// See [`EmptyDepositData`] for why this is not `()`, and why it still carries the allocation
+    /// id even though the bytes are empty.
     type Error = StrategyError;
+    type PoolDepositData = EmptyDepositData;
     type Receipt = ();
+
+    /// Always the empty payload for `id`.
+    ///
+    /// Infallible in practice: there is nothing to derive, commit to or prove, so the only thing
+    /// the Exit gets back is the allocation id it asked about.
+    async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
+        Ok(EmptyDepositData::for_id(*id))
+    }
 
     /// Deposit funds from the node's Safe to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
@@ -497,7 +509,7 @@ where
         id: &PixAddressId,
         dst: &Address,
         amount: HoprBalance,
-        _additional_data: Option<Self::DepositData>,
+        _additional_data: Self::PoolDepositData,
     ) -> Result<Self::Receipt, Self::Error> {
         let dest_addr = *dst;
         let node = &self.node;
@@ -643,7 +655,7 @@ where
         key: &EthDepositKey,
         _dst_id: &PixAddressId,
         dst: Address,
-        _additional_dst_data: Option<Self::DepositData>,
+        _additional_dst_data: Self::PoolDepositData,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         self.withdraw_deposit(src_id, key, dst, amount).await

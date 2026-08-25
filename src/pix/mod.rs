@@ -8,13 +8,17 @@
 //!
 //! | event | the strategy | the pool |
 //! |---|---|---|
-//! | `NewDepositAddress` | prices the quota at `price_per_byte`, refuses anything above `max_ssa_allocation`, narrows the address to `K::Public`, drops duplicates, buffers | `deposit_funds_to`, or `deposit_funds_to_multiple` for a batch |
+//! | `DepositDataRequest` | spawns a task that streams one payload per requested id back through the event's channel | `generate_deposit_data`, once per id |
+//! | `NewDepositAddress` | prices the quota at `price_per_byte`, refuses anything above `max_ssa_allocation`, narrows the address to `K::Public`, checks the payload is the pool's and is filed under the event's own id, drops duplicates, buffers | `deposit_funds_to`, or `deposit_funds_to_multiple` for a batch |
 //! | `DepositAddressReceived` | spawns the returned future and reports the confirmed balance back through the event's notifier | `notify_deposit` |
 //! | `PrivateKeyRecovered` | persists the key to the [`recovery_store`], drops duplicate sweeps, buffers | `withdraw_deposit` / `withdraw_multiple_deposits`, always to the node's Safe |
 //!
 //! Deposits and withdrawals are debounced (`deposit_buffer_period`, `withdrawal_buffer_period`)
 //! and flushed together, which is why two rows name both a single- and a multi-address call: the
 //! batch form is used whenever more than one event arrived inside the window.
+//!
+//! `DepositDataRequest` is *not* debounced: the Exit is blocked on the event's channel before it
+//! can send its PIX request at all, so it is answered as it arrives.
 //!
 //! ## Where the boundary sits
 //!
@@ -23,6 +27,11 @@
 //! abandoned for that flush, and a withdrawal keeps its persisted key so a later start can try
 //! again. The deposit-tracking deadline is the pool's for the same reason — it is reported
 //! through the failure channel of `notify_deposit`'s future.
+//!
+//! The side-channel payload is the pool's too, in both directions: the pool *generates* it
+//! (`generate_deposit_data`) and owns its wire form, since `DepositPool::PoolDepositData` must
+//! round-trip through `PixDepositData` itself. The strategy neither reads nor constructs those
+//! bytes; it only routes them, and rejects a payload whose conversion the pool refuses.
 //!
 //! What the strategy keeps is what the pool cannot see: pricing and the allocation cap, the
 //! in-flight guards that stop one SSA being funded or swept twice, the debounce windows, and the
@@ -89,31 +98,76 @@ pub mod recovery_store;
 pub mod secp256k1;
 pub mod strategy;
 
-use hopr_api::types::primitive::prelude::GeneralError;
+use hopr_api::{
+    node::{PixAddressId, PixDepositData},
+    types::primitive::prelude::GeneralError,
+};
 
-/// [`DepositData`](hopr_api::chain::DepositPool::DepositData) for a pool that carries no PIX
-/// side-channel payload.
+use crate::errors::StrategyError;
+
+/// [`PoolDepositData`](hopr_api::chain::DepositPool::PoolDepositData) for a pool that carries no
+/// PIX side-channel payload.
 ///
-/// `DepositPool::DepositData` is deliberately unbounded upstream — hopr-api never decodes it — so
-/// the requirement that it be recoverable from the bytes a `PixEvent` carries lives on
-/// [`PixStrategy`](strategy::PixStrategy)'s driver instead. A pool with nothing to carry therefore
-/// still needs *some* decodable type; it cannot use `()`, which has no `TryFrom<&[u8]>` impl.
+/// A pool with nothing to carry still cannot use `()`: the associated type must round-trip through
+/// [`PixDepositData`] in both directions, and `PixDepositData` is a *pair* — an
+/// allocation id plus the bytes. Producing one back therefore needs the id, and the conversion is
+/// on the payload type rather than on the pool, so this is where the id has to be kept. The bytes
+/// are what is empty here; the id never is.
 ///
 /// Shared by both pool modules rather than defined in either, because each is behind its own
 /// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct EmptyDepositData;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmptyDepositData(PixAddressId);
 
-impl TryFrom<&[u8]> for EmptyDepositData {
-    type Error = GeneralError;
+impl EmptyDepositData {
+    /// The empty payload for the allocation named by `id`.
+    pub fn for_id(id: PixAddressId) -> Self {
+        Self(id)
+    }
 
-    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        // Rejected rather than ignored. The strategy only decodes when the peer actually sent
-        // data, so anything arriving here means the Entry sent PIX deposit data to an Exit whose
-        // pool cannot use it — the two ends disagree about which pool is running. Swallowing it
-        // reproduces exactly the failure this module's `curvy` docs describe: no deposits, no
-        // diagnostic.
-        bytes.is_empty().then_some(Self).ok_or(GeneralError::InvalidInput)
+    /// The allocation this payload belongs to.
+    pub fn id(&self) -> &PixAddressId {
+        &self.0
+    }
+}
+
+impl From<PixAddressId> for EmptyDepositData {
+    fn from(id: PixAddressId) -> Self {
+        Self::for_id(id)
+    }
+}
+
+impl TryFrom<PixDepositData> for EmptyDepositData {
+    // Pinned to `StrategyError` rather than `GeneralError` because `DepositPool` requires both
+    // conversions to fail with the pool's own `Error`, and both pools here use `StrategyError`.
+    type Error = StrategyError;
+
+    fn try_from(data: PixDepositData) -> Result<Self, Self::Error> {
+        // A non-empty payload is rejected rather than ignored: it means the Entry sent PIX deposit
+        // data to an Exit whose pool cannot use it — the two ends disagree about which pool is
+        // running. Swallowing it reproduces exactly the failure this module's `curvy` docs
+        // describe: no deposits, no diagnostic.
+        //
+        // An *empty* payload is not the same thing, and is accepted: it is what both pools here
+        // generate.
+        data.is_empty()
+            .then_some(Self(data.id))
+            .ok_or(StrategyError::GeneralError(GeneralError::InvalidInput))
+    }
+}
+
+// Deliberately `TryFrom` and not the infallible `From`, even though it cannot fail. `DepositPool`
+// requires `TryInto<PixDepositData, Error = Self::Error>`, and a `From` impl would instead supply
+// the blanket `TryFrom` with `Error = Infallible` — which does not satisfy that bound, and which
+// coherence forbids overriding. So the fallible form is the only one that can exist here.
+impl TryFrom<EmptyDepositData> for PixDepositData {
+    type Error = StrategyError;
+
+    fn try_from(value: EmptyDepositData) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.0,
+            data: Box::default(),
+        })
     }
 }
 

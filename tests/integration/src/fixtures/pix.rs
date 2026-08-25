@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use hopr_api::{
     chain::{AccountSelector, ChainReadAccountOperations, ChainValues, PixDepositSecret},
-    node::{NodeOnchainIdentity, PixAddressId, PixEvent},
+    node::{DepositDataCreated, NodeOnchainIdentity, PixAddressId, PixDepositData, PixEvent},
     types::{
         internal::prelude::HoprPseudonym,
         primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
@@ -200,6 +200,26 @@ pub fn pix_address_id(seed: u8, ssa_index: u32) -> PixAddressId {
         &HoprPseudonym::from([seed; HoprPseudonym::SIZE]),
         NonZeroU32::new(ssa_index).expect("ssa index must be non-zero"),
     )
+}
+
+/// The payload both bundled pools generate: no bytes, filed under `id`.
+///
+/// `PixDepositData` is no longer optional on the events, so a test that has nothing to carry says
+/// so with empty bytes. The id must match the event's own, which is why it is a parameter rather
+/// than generated here.
+pub fn empty_deposit_data(id: PixAddressId) -> PixDepositData {
+    PixDepositData {
+        id,
+        data: Box::default(),
+    }
+}
+
+/// Creates the channel the Exit hands the strategy through
+/// `PixDepositDataRequest::deposit_data_created`, and on which the generated payloads come back.
+///
+/// Sibling of [`deposit_notifier`](super::deposit_notifier) — same shape, other direction.
+pub fn deposit_data_channel() -> (DepositDataCreated, futures::channel::mpsc::Receiver<PixDepositData>) {
+    futures::channel::mpsc::channel(1)
 }
 
 /// The PIX deposit secret of a deposit address claimed as a [`TestAccount`], so a

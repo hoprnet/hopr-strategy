@@ -1582,6 +1582,84 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain:
     }
 }
 
+// ── Service registry ─────────────────────────────────────────────────────────
+//
+// `HoprChainApi` gained the two service-registry traits, so a chain API has to answer for them
+// even though no strategy in this crate reads or writes the registry — none is about services.
+// The Blokli emulator behind this connector does not model the registry at all, so these are
+// stubs rather than a thin layer over it.
+//
+// Reads answer as an *empty* registry: that is a truthful answer for a chain where nothing was
+// ever registered, and it keeps a caller that merely surveys the registry working. Writes report
+// "not supported", matching `announce` above — silently accepting a registration the emulator
+// cannot store would make a later read look like a lost write.
+
+#[async_trait::async_trait]
+impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain::ChainReadServiceOperations
+    for TestChainConnector<M>
+{
+    type Error = TestConnectorError;
+
+    fn stream_services(
+        &self,
+        _selector: hopr_api::chain::ServiceSelector,
+    ) -> Result<futures::stream::BoxStream<'_, hopr_api::chain::ServiceEntry>, Self::Error> {
+        Ok(futures::stream::empty().boxed())
+    }
+
+    async fn count_services(&self, _selector: hopr_api::chain::ServiceSelector) -> Result<usize, Self::Error> {
+        Ok(0)
+    }
+
+    async fn get_service_type_config(
+        &self,
+        _service_type: hopr_api::chain::ServiceType,
+    ) -> Result<Option<hopr_api::chain::ServiceTypeConfig>, Self::Error> {
+        Ok(None)
+    }
+
+    async fn get_service_registry_config(&self) -> Result<hopr_api::chain::ServiceRegistryConfig, Self::Error> {
+        Ok(hopr_api::chain::ServiceRegistryConfig {
+            type_registration_fee: HoprBalance::zero(),
+            node_safe_registry: Address::default(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain::ChainWriteServiceOperations
+    for TestChainConnector<M>
+{
+    type Error = TestConnectorError;
+
+    async fn register_service(
+        &self,
+        _service_type: hopr_api::chain::ServiceType,
+        _metadata: hopr_api::chain::ServiceMetadata,
+    ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        Err(unsupported_by_test_connector("register_service"))
+    }
+
+    async fn update_service(
+        &self,
+        _service_type: hopr_api::chain::ServiceType,
+        _metadata: hopr_api::chain::ServiceMetadata,
+    ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        Err(unsupported_by_test_connector("update_service"))
+    }
+
+    async fn deregister_service(
+        &self,
+        _service_type: hopr_api::chain::ServiceType,
+    ) -> Result<futures::future::BoxFuture<'_, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error> {
+        Err(unsupported_by_test_connector("deregister_service"))
+    }
+}
+
+fn unsupported_by_test_connector(what: &str) -> TestConnectorError {
+    TestConnectorError::from(anyhow::anyhow!("{what} is not supported by TestChainConnector"))
+}
+
 // ── ChainReadChannelOperations ────────────────────────────────────────────────
 
 impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> hopr_api::chain::ChainReadChannelOperations

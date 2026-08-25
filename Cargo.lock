@@ -3318,9 +3318,26 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "3.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea04294008efbd07089c4ee1d1fa60c0b178b1b8637ed76935940595efe61eb9"
+checksum = "224e2ecb9821e45905ce5a5ad9e8b06a29cb85daf9f3f024b3efbaf665686e49"
+dependencies = [
+ "async-trait",
+ "auto_impl",
+ "chrono",
+ "futures",
+ "futures-concurrency",
+ "hopr-types 3.1.0",
+ "libp2p-identity",
+ "strum",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "hopr-api"
+version = "4.0.0"
+source = "git+https://github.com/hoprnet/hopr-api?branch=main#1a3e64e3b166dfcc53fdea856fce0dd828a41baf"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3328,9 +3345,10 @@ dependencies = [
  "chrono",
  "futures",
  "futures-concurrency",
- "hopr-types 3.0.0",
+ "hopr-types 3.1.0",
  "libp2p-identity",
  "serde",
+ "serde_bytes",
  "strum",
  "thiserror 2.0.20",
  "tracing",
@@ -3338,9 +3356,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-bindings"
-version = "4.13.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8be6fd9b90421c230f80c6ba872cd02c65cfd5e84cdb99956edbd8a6dac6334c"
+checksum = "13cb248171e67e6bf5891c2e60e5a02389ba3121da8a1aa77b3f435e75c6099f"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3356,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -3371,7 +3389,7 @@ dependencies = [
  "futures-concurrency",
  "futures-time",
  "hex-literal",
- "hopr-api",
+ "hopr-api 4.0.0",
  "hopr-utilities",
  "humantime-serde",
  "insta",
@@ -3404,7 +3422,7 @@ dependencies = [
  "anyhow",
  "bytesize",
  "futures",
- "hopr-api",
+ "hopr-api 4.0.0",
  "hopr-strategy",
  "rstest",
  "test-log",
@@ -3466,9 +3484,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-types"
-version = "3.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a497683452629aacda6776373e801c0686edfda2f2e97fa3fb22c74577ec3d9"
+checksum = "6994bdc05812ab588d3fa970c1df9a7bea3d8808907baf30c0596a54b84458f3"
 dependencies = [
  "aes",
  "anyhow",
@@ -3536,7 +3554,7 @@ dependencies = [
  "blokli-client",
  "const-hex",
  "futures",
- "hopr-api",
+ "hopr-api 3.1.0",
  "indexmap 2.14.0",
  "serde_json",
  "tokio",

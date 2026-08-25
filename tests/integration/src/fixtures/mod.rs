@@ -14,7 +14,7 @@ use rstest::fixture;
 mod pix;
 mod scenario;
 
-pub use pix::{PixScenario, PixScenarioOpts, deposit_secret, pix_address_id};
+pub use pix::{PixScenario, PixScenarioOpts, deposit_data_channel, deposit_secret, empty_deposit_data, pix_address_id};
 pub use scenario::{
     ChannelParty, ChannelScenario, MultiChannelScenario, ScenarioOpts, assert_channel_never, await_channel,
     await_channel_where,

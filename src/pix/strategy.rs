@@ -26,7 +26,9 @@ use std::{
 use futures::{SinkExt, StreamExt};
 use hopr_api::{
     chain::{DepositPool, PixDepositAddress, PixDepositSecret},
-    node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixAddressId, PixEvent},
+    node::{
+        ActionableEventDiscriminant, ActionableEventSource, HasChainApi, PixAddressId, PixDepositDataRequest, PixEvent,
+    },
     types::{
         crypto::prelude::Keypair,
         primitive::prelude::{Address, GeneralError, HoprBalance},
@@ -63,6 +65,12 @@ lazy_static::lazy_static! {
         hopr_api::types::telemetry::SimpleCounter::new(
             "hopr_strategy_pix_deposits_failed_total",
             "Count of SSA deposits that failed after exhausting retries",
+        ).unwrap();
+    static ref METRIC_PIX_DEPOSIT_DATA: hopr_api::types::telemetry::MultiCounter =
+        hopr_api::types::telemetry::MultiCounter::new(
+            "hopr_strategy_pix_deposit_data_total",
+            "Outcomes of the Exit asking its pool to generate PIX deposit data, per allocation",
+            &["outcome"],
         ).unwrap();
     static ref METRIC_PIX_DEPOSIT_TRACKING: hopr_api::types::telemetry::MultiCounter =
         hopr_api::types::telemetry::MultiCounter::new(
@@ -330,10 +338,6 @@ impl PixStrategy {
             + Sync
             + 'static,
         D::Error: Into<StrategyError>,
-        // See the note on `PixStrategyInner::on_pix_event`'s impl block: the decoding requirement
-        // is the driver's, not the pool implementor's. It surfaces here because this returns a
-        // boxed `StrategyTrait`, which is where the driver is instantiated.
-        D::DepositData: for<'a> TryFrom<&'a [u8], Error = GeneralError>,
         N: ActionableEventSource + Send + Sync + 'static,
     {
         let recovery_store = open_recovery_store(
@@ -403,7 +407,7 @@ type BufferedDeposit<D, K> = (
     PixAddressId,
     <K as Keypair>::Public,
     HoprBalance,
-    Option<<D as DepositPool<K>>::DepositData>,
+    <D as DepositPool<K>>::PoolDepositData,
 );
 
 /// The generic PIX strategy runner.
@@ -483,7 +487,11 @@ where
 
 impl<D, N, K> PixStrategyInner<D, N, K>
 where
-    D: DepositPool<K> + Sync,
+    // `Clone + Send + 'static` on top of what the rest of this block needs, because
+    // the `DepositDataRequest` arm hands the pool to a spawned task. The
+    // `StrategyTrait` impl below already required exactly this, so no caller
+    // gains a bound.
+    D: DepositPool<K> + Clone + Send + Sync + 'static,
     N: ActionableEventSource + Send + Sync + 'static,
     K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress>
@@ -496,18 +504,13 @@ where
         + Sync
         + 'static,
     D::Error: Into<StrategyError>,
-    // `DepositPool::DepositData` is unbounded upstream, because hopr-api never decodes it. The
-    // requirement that it be recoverable from a `PixEvent`'s `additional_data` bytes belongs to
-    // whoever does the decoding, which is here — so it is stated here rather than forced onto
-    // every pool implementor. The error is pinned to `GeneralError` so a failure can be reported
-    // without an HRTB clause on the associated error type at each call site.
-    D::DepositData: for<'a> TryFrom<&'a [u8], Error = GeneralError>,
 {
     /// Validate and buffer a PIX event for batched execution.
     ///
     /// [`NewDepositAddress`] and [`PrivateKeyRecovered`] events are pushed into
     /// debounced buffers and flushed later by [`flush_deposits`] / [`flush_withdrawals`].
-    /// [`DepositAddressReceived`] is handled immediately (spawns a polling task).
+    /// [`DepositAddressReceived`] and [`DepositDataRequest`] are handled immediately, each in a
+    /// task of its own.
     async fn on_pix_event(&mut self, event: PixEvent) -> Result<()> {
         match event {
             PixEvent::NewDepositAddress(new_deposit_address) => {
@@ -555,35 +558,101 @@ where
                     return Ok(());
                 }
 
-                // Decoded before the in-flight guard is claimed: a payload this pool cannot read
+                // The payload now carries its own allocation id, so there are two in this event and
+                // they have to agree. A disagreement means the Entry was handed deposit data filed
+                // under a different allocation than the one it is being asked to fund — the pool
+                // would settle against `id` while the payload described another SSA — so it is
+                // refused before any funds move, rather than passed on for the pool to reconcile.
+                if new_deposit_address.deposit_data.id != new_deposit_address.id {
+                    tracing::error!(
+                        pix_id = ?new_deposit_address.id,
+                        deposit_data_id = ?new_deposit_address.deposit_data.id,
+                        "deposit data belongs to a different allocation than the deposit address it arrived with"
+                    );
+                    return Err(StrategyError::GeneralError(GeneralError::InvalidInput));
+                }
+
+                // Converted before the in-flight guard is claimed: a payload this pool cannot read
                 // means the two ends disagree about which pool is running, and marking the
                 // destination in flight for a deposit that is about to be rejected would block
                 // the retry that a corrected peer would send.
-                let additional_data = new_deposit_address
-                    .additional_data
-                    .as_deref()
-                    .map(D::DepositData::try_from)
-                    .transpose()
-                    .map_err(|error| {
-                        tracing::error!(
-                            %error,
-                            pix_id = ?new_deposit_address.id,
-                            "additional deposit data is not the form this pool reads - the Entry and this node's \
-                             deposit pool disagree on the payload format"
-                        );
-                        StrategyError::GeneralError(error)
-                    })?;
+                let deposit_data = D::PoolDepositData::try_from(new_deposit_address.deposit_data).map_err(|error| {
+                    let error: StrategyError = error.into();
+                    tracing::error!(
+                        %error,
+                        pix_id = ?new_deposit_address.id,
+                        "additional deposit data is not the form this pool reads - the Entry and this node's \
+                         deposit pool disagree on the payload format"
+                    );
+                    error
+                })?;
 
                 self.in_flight_destinations.insert(dest_addr.clone(), ());
 
                 self.deposit_buffer
-                    .push((new_deposit_address.id, dest_addr, target_deposit, additional_data));
+                    .push((new_deposit_address.id, dest_addr, target_deposit, deposit_data));
 
                 tracing::info!(%target_deposit, "deposit buffered, pending flush");
 
                 if self.cfg.deposit_buffer_period.is_zero() {
                     self.flush_deposits().await;
                 }
+            }
+            PixEvent::DepositDataRequest(request) => {
+                tracing::info!(count = request.deposit_ids.len(), "deposit data requested");
+
+                // Not debounced, unlike the deposit and withdrawal arms: the Exit is blocked on
+                // this channel before it can send its PIX request at all, so delaying the answer
+                // delays the deposit that the answer is a precondition for.
+                //
+                // Spawned rather than awaited inline for the same reason `DepositAddressReceived`
+                // is: what generation costs is the pool's business and is not bounded by anything
+                // this strategy knows, and the event loop it would otherwise block is what feeds
+                // every other event — including the flush deadlines.
+                let pool = self.pool.clone();
+                hopr_utils::runtime::prelude::spawn(async move {
+                    let PixDepositDataRequest {
+                        deposit_ids,
+                        mut deposit_data_created,
+                    } = request;
+
+                    // Sequentially, in the order asked. The Exit matches payloads by their own
+                    // `id`, so nothing depends on the order — but a batch is unbounded and
+                    // fanning it all at the pool at once is not obviously kinder than pacing it.
+                    for id in deposit_ids {
+                        let generated = pool
+                            .generate_deposit_data(&id)
+                            .await
+                            .map_err(Into::<StrategyError>::into)
+                            .and_then(|data| data.try_into().map_err(Into::<StrategyError>::into));
+
+                        match generated {
+                            Ok(deposit_data) => {
+                                if deposit_data_created.send(deposit_data).await.is_err() {
+                                    // The Exit dropped the receiver: it is no longer waiting, so
+                                    // the rest of the batch has nowhere to go.
+                                    tracing::warn!(?id, "deposit data receiver is gone, abandoning the rest");
+                                    break;
+                                }
+                                #[cfg(all(feature = "telemetry", not(test)))]
+                                METRIC_PIX_DEPOSIT_DATA.increment_by(&["generated"], 1);
+                            }
+                            // Skipped rather than fatal to the batch: every other id in the
+                            // request can still be answered. The Exit sees a payload missing when
+                            // the channel closes below and rejects the Session, which is where
+                            // that decision belongs.
+                            Err(error) => {
+                                tracing::error!(%error, ?id, "failed to generate deposit data");
+                                #[cfg(all(feature = "telemetry", not(test)))]
+                                METRIC_PIX_DEPOSIT_DATA.increment_by(&["failed"], 1);
+                            }
+                        }
+                    }
+
+                    // `deposit_data_created` drops here, closing the channel. That is the only
+                    // signal the Exit gets that the set is complete — or, after an error above,
+                    // that it never will be.
+                });
             }
             PixEvent::DepositAddressReceived(deposit_address_recv) => {
                 tracing::info!(?deposit_address_recv, "deposit address received");
@@ -689,9 +758,9 @@ where
         let pool = &self.pool;
 
         if count == 1 {
-            let (id, dest_addr, amount, additional_data) = batch.into_iter().next().unwrap();
+            let (id, dest_addr, amount, deposit_data) = batch.into_iter().next().unwrap();
             let result = pool
-                .deposit_funds_to(&id, &dest_addr, amount, additional_data)
+                .deposit_funds_to(&id, &dest_addr, amount, deposit_data)
                 .await
                 .map_err(Into::<StrategyError>::into);
 
@@ -997,8 +1066,6 @@ where
         + Sync
         + 'static,
     D::Error: Into<StrategyError>,
-    // `run` drives `on_pix_event`, which decodes the events' additional data.
-    D::DepositData: for<'a> TryFrom<&'a [u8], Error = GeneralError>,
     N: ActionableEventSource + Send + Sync + 'static,
 {
     /// Consume PIX events until the stream ends.
@@ -1125,7 +1192,7 @@ mod tests {
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
             ComponentStatusReporter, EventWaitResult, HasChainApi, NodeOnchainIdentity, PixAddressId,
-            PixDepositAddressReceived, PixEvent,
+            PixDepositAddressReceived, PixDepositData, PixDepositDataRequest, PixEvent,
         },
         types::{
             crypto::{keypairs::Keypair, prelude::ChainKeypair},
@@ -1139,7 +1206,7 @@ mod tests {
     use super::{PixStrategy, PixStrategyConfig, PixStrategyInner};
     use crate::{
         errors::StrategyError,
-        pix::{recovery_store::PixRecoveryStore, secp256k1::NonAnonymousDepositPool},
+        pix::{EmptyDepositData, recovery_store::PixRecoveryStore, secp256k1::NonAnonymousDepositPool},
         testing::{BlokliTestStateBuilder, TestChainConnector},
     };
 
@@ -1169,6 +1236,17 @@ mod tests {
             &HoprPseudonym::random(),
             NonZeroU32::new(ssa_index).expect("ssa index must be non-zero"),
         )
+    }
+
+    /// The payload both bundled pools generate: no bytes, filed under `id`.
+    ///
+    /// `id` has to be the same value the event carries, so callers bind it to a local first rather
+    /// than calling `pix_id` twice — [`pix_id`] is random per call.
+    fn empty_deposit_data(id: PixAddressId) -> PixDepositData {
+        PixDepositData {
+            id,
+            data: Box::default(),
+        }
     }
 
     struct ChainNode<C>(C);
@@ -1306,12 +1384,13 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+        let id = pix_id(1);
         s.on_pix_event(PixEvent::DepositAddressReceived(PixDepositAddressReceived {
-            id: pix_id(1),
+            id,
             address: addr.into(),
             quota: 100,
             deposit_updated: Some(tx),
-            additional_data: None,
+            deposit_data: empty_deposit_data(id),
         }))
         .await?;
         let n = timeout(StdDuration::from_secs(10), rx.next())
@@ -1355,11 +1434,12 @@ mod tests {
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
+        let id = pix_id(1);
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: pix_id(1),
+            id,
             address: da.into(),
             quota: 20,
-            additional_data: None,
+            deposit_data: empty_deposit_data(id),
         }))
         .await?;
         s.flush_deposits().await;
@@ -1396,19 +1476,20 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+        let id = pix_id(1);
         let r = s
             .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-                id: pix_id(1),
+                id,
                 address: Address::from([0x42u8; 20]).into(),
                 quota: 10,
-                additional_data: None,
+                deposit_data: empty_deposit_data(id),
             }))
             .await;
         assert!(matches!(r, Err(StrategyError::CriteriaNotSatisfied)));
         Ok(())
     }
 
-    /// Additional deposit data this pool cannot read must be reported, not ignored.
+    /// Deposit data this pool cannot read must be reported, not ignored.
     ///
     /// `NonAnonymousDepositPool` carries no side-channel payload, so `EmptyDepositData` rejects
     /// any non-empty bytes. Bytes arriving here mean the Entry and this node's pool disagree on
@@ -1419,7 +1500,7 @@ mod tests {
     /// same address has to get through, which it cannot if the failed attempt left the address
     /// marked as busy.
     #[test_log::test(tokio::test)]
-    async fn test_new_deposit_address_rejects_unreadable_additional_data() -> anyhow::Result<()> {
+    async fn test_new_deposit_address_rejects_unreadable_deposit_data() -> anyhow::Result<()> {
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],
@@ -1447,18 +1528,22 @@ mod tests {
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
         let dest_addr = Address::from([0x42u8; 20]);
+        let id = pix_id(1);
         let r = s
             .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-                id: pix_id(1),
+                id,
                 address: dest_addr.into(),
                 quota: 10,
-                additional_data: Some(vec![0xde, 0xad, 0xbe, 0xef].into()),
+                deposit_data: PixDepositData {
+                    id,
+                    data: vec![0xde, 0xad, 0xbe, 0xef].into(),
+                },
             }))
             .await;
 
         assert!(
             matches!(r, Err(StrategyError::GeneralError(_))),
-            "unreadable additional data must be rejected, got {r:?}"
+            "unreadable deposit data must be rejected, got {r:?}"
         );
         assert!(
             s.deposit_buffer.is_empty(),
@@ -1469,17 +1554,182 @@ mod tests {
             "the destination must stay free so a corrected retry can get through"
         );
 
-        // An empty payload is not the same thing as an unreadable one: `None` and `Some(&[])` both
-        // mean "nothing to carry", and both have to be accepted.
+        // An empty payload is not the same thing as an unreadable one. `PixDepositData` is no
+        // longer optional, so "nothing to carry" is now expressed as empty bytes — and that has to
+        // be accepted, because it is what both bundled pools generate.
         let accepted = s
+            .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+                id,
+                address: dest_addr.into(),
+                quota: 10,
+                deposit_data: empty_deposit_data(id),
+            }))
+            .await;
+        assert!(accepted.is_ok(), "an empty payload must be accepted, got {accepted:?}");
+        Ok(())
+    }
+
+    /// Deposit data filed under a different allocation than the address it arrived with is refused.
+    ///
+    /// `PixDepositData` carries its own id, so this event has two — and if they disagree, the pool
+    /// would be told to settle against one allocation using a payload describing another. Refused
+    /// before any funds move, and, as with an unreadable payload, without leaving the destination
+    /// marked in flight.
+    #[test_log::test(tokio::test)]
+    async fn test_new_deposit_address_rejects_deposit_data_for_another_allocation() -> anyhow::Result<()> {
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(cc)));
+        let pool = Arc::new(NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(1000),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+        };
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        let dest_addr = Address::from([0x43u8; 20]);
+        let r = s
             .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
                 id: pix_id(1),
                 address: dest_addr.into(),
                 quota: 10,
-                additional_data: Some(Vec::new().into()),
+                // A well-formed, readable, *empty* payload — it is only the id that is wrong, so
+                // this cannot be mistaken for the payload-format rejection above.
+                deposit_data: empty_deposit_data(pix_id(2)),
             }))
             .await;
-        assert!(accepted.is_ok(), "an empty payload must be accepted, got {accepted:?}");
+
+        assert!(
+            matches!(r, Err(StrategyError::GeneralError(_))),
+            "deposit data for another allocation must be rejected, got {r:?}"
+        );
+        assert!(
+            s.deposit_buffer.is_empty(),
+            "a rejected event must not leave a deposit buffered"
+        );
+        assert!(
+            !s.in_flight_destinations.contains_key(&dest_addr),
+            "the destination must stay free so a corrected retry can get through"
+        );
+        Ok(())
+    }
+
+    /// The Exit asks for deposit data and gets exactly one payload per requested allocation.
+    ///
+    /// Both bundled pools carry nothing, so every payload is empty but for its id — what is under
+    /// test is the routing: one payload per id, each filed under the id that was asked for, and the
+    /// channel closed afterwards so the Exit can tell the set is complete. The handler is spawned,
+    /// hence the timeout on the read rather than a bare `next()`.
+    #[test_log::test(tokio::test)]
+    async fn test_deposit_data_request_answers_every_requested_allocation() -> anyhow::Result<()> {
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(cc)));
+        let pool = Arc::new(NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(1000),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+        };
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        let requested = vec![pix_id(1), pix_id(2), pix_id(3)];
+        // Unbuffered, so a handler that sent everything before yielding would deadlock against a
+        // receiver that is only read after `on_pix_event` returns — which is exactly the shape a
+        // spawned handler must survive.
+        let (tx, rx) = mpsc::channel(0);
+
+        s.on_pix_event(PixEvent::DepositDataRequest(PixDepositDataRequest {
+            deposit_ids: requested.clone(),
+            deposit_data_created: tx,
+        }))
+        .await?;
+
+        let delivered: Vec<_> = timeout(StdDuration::from_secs(10), rx.collect()).await?;
+
+        assert_eq!(
+            delivered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            requested,
+            "one payload per requested allocation, in the order asked"
+        );
+        assert!(
+            delivered.iter().all(|d| d.is_empty()),
+            "the non-anonymous pool carries no side-channel bytes"
+        );
+        Ok(())
+    }
+
+    /// A request the Exit has abandoned does not keep the strategy generating.
+    ///
+    /// Dropping the receiver is the only signal that the Exit gave up, and the send failure it
+    /// causes has to end the batch rather than be logged once per remaining id.
+    #[test_log::test(tokio::test)]
+    async fn test_deposit_data_request_stops_when_the_receiver_is_gone() -> anyhow::Result<()> {
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(cc)));
+        let pool = Arc::new(NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(1000),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+        };
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        let (tx, rx) = mpsc::channel(0);
+        drop(rx);
+
+        // The event itself still succeeds: the handler is spawned, so the failure is the task's and
+        // is reported through the log. What must not happen is a hang or a panic.
+        s.on_pix_event(PixEvent::DepositDataRequest(PixDepositDataRequest {
+            deposit_ids: vec![pix_id(1), pix_id(2)],
+            deposit_data_created: tx,
+        }))
+        .await?;
+
         Ok(())
     }
 
@@ -1651,7 +1901,7 @@ mod tests {
                 id,
                 address: da.into(),
                 quota: 20,
-                additional_data: None,
+                deposit_data: empty_deposit_data(id),
             })
         };
         let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
@@ -1890,12 +2140,13 @@ mod tests {
         let safe_before = hopr_balance(&*cc, *BOB).await?;
         let dst_before = hopr_balance(&*cc, *CHRIS).await?;
 
+        let dst_id = pix_id(2);
         pool.pool_transfer(
             &pix_id(1),
             &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
-            &pix_id(2),
+            &dst_id,
             *CHRIS,
-            None,
+            EmptyDepositData::for_id(dst_id),
             None,
         )
         .await?;
@@ -1945,13 +2196,14 @@ mod tests {
         let node = Arc::new(ChainNode(Arc::new(cc)));
         let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
 
+        let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
                 &pix_id(1),
                 &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
-                &pix_id(2),
+                &dst_id,
                 *CHRIS,
-                None,
+                EmptyDepositData::for_id(dst_id),
                 None,
             )
             .await;
@@ -2003,13 +2255,14 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
+        let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
                 &pix_id(1),
                 &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
-                &pix_id(2),
+                &dst_id,
                 *CHRIS,
-                None,
+                EmptyDepositData::for_id(dst_id),
                 None,
             )
             .await;
@@ -2171,11 +2424,12 @@ mod tests {
         let mut s = PixStrategyInner::new(pool, Arc::clone(&node), cfg, *BOB, Some(store));
 
         let running = tokio::spawn(async move { s.run().await });
+        let id = pix_id(1);
         node.inject_pix(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: pix_id(1),
+            id,
             address: da.into(),
             quota,
-            additional_data: None,
+            deposit_data: empty_deposit_data(id),
         }));
 
         let landed = timeout(StdDuration::from_secs(10), async {
@@ -2360,18 +2614,20 @@ mod tests {
         let bb = hopr_balance(&*cc, *BOB).await?;
         let amount1 = HoprBalance::new_base(20);
         let amount2 = HoprBalance::new_base(30);
+        let id1 = pix_id(1);
+        let id2 = pix_id(2);
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: pix_id(1),
+            id: id1,
             address: da1.into(),
             quota: 20,
-            additional_data: None,
+            deposit_data: empty_deposit_data(id1),
         }))
         .await?;
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-            id: pix_id(2),
+            id: id2,
             address: da2.into(),
             quota: 30,
-            additional_data: None,
+            deposit_data: empty_deposit_data(id2),
         }))
         .await?;
         // Nothing has moved yet: the window is still open.
@@ -2571,7 +2827,10 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        let result = pool.deposit_funds_to(&pix_id(1), &dst, amount, None).await;
+        let id = pix_id(1);
+        let result = pool
+            .deposit_funds_to(&id, &dst, amount, EmptyDepositData::for_id(id))
+            .await;
         appearing.await??;
 
         assert!(
@@ -2614,6 +2873,37 @@ mod tests {
             "tracking must give up on its own deadline, got {:?}",
             result.map(|(_, a, b)| (a, b))
         );
+        Ok(())
+    }
+
+    /// The non-anonymous pool generates an empty payload, filed under the allocation asked about.
+    ///
+    /// Asserted through the round trip to `PixDepositData` rather than on `EmptyDepositData`
+    /// directly, because the wire form is what the Exit actually puts on the request — and the
+    /// conversion is the pool's own, so it is part of what is under test.
+    #[test_log::test(tokio::test)]
+    async fn test_generate_deposit_data_is_empty_and_carries_the_id() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let node = Arc::new(ChainNode(Arc::new(connector)));
+        let pool =
+            NonAnonymousDepositPool::new(Arc::new(node), pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()));
+
+        let id = pix_id(1);
+        let wire: PixDepositData = pool.generate_deposit_data(&id).await?.try_into()?;
+
+        assert_eq!(wire.id, id, "the payload must be filed under the requested allocation");
+        assert!(wire.is_empty(), "a plain transfer has no side-channel payload");
         Ok(())
     }
 
