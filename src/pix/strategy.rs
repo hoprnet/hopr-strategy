@@ -619,6 +619,15 @@ where
                     // Sequentially, in the order asked. The Exit matches payloads by their own
                     // `id`, so nothing depends on the order — but a batch is unbounded and
                     // fanning it all at the pool at once is not obviously kinder than pacing it.
+                    //
+                    // Unbounded is not the same as unpaced, which is why there is no cap on
+                    // `deposit_ids` here. `DepositDataCreated` is a *bounded* sender, and the loop
+                    // strictly alternates generate-then-send, so it advances only as fast as the
+                    // Exit consumes and parks on backpressure otherwise. A cap would also have to
+                    // drop ids to be worth anything, and the Exit rejects the Session when a
+                    // payload is missing — so capping trades work the Exit asked for against
+                    // sessions that cannot start. The request comes from this node's own PIX layer
+                    // for one Session's SSAs, not from a peer, so its size is upstream's to bound.
                     for id in deposit_ids {
                         let generated = pool
                             .generate_deposit_data(&id)

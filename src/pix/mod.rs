@@ -116,16 +116,109 @@ use crate::errors::StrategyError;
 ///
 /// Shared by both pool modules rather than defined in either, because each is behind its own
 /// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
+///
+/// # Examples
+///
+/// A payload that carries nothing still names the allocation it belongs to, which is what makes it
+/// convertible back to the wire form:
+///
+/// ```
+/// use std::num::NonZeroU32;
+///
+/// use hopr_api::{
+///     node::{PixAddressId, PixDepositData},
+///     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
+/// };
+/// use hopr_strategy::pix::EmptyDepositData;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let id = PixAddressId::new(
+///     &HoprPseudonym::from([0xaa; HoprPseudonym::SIZE]),
+///     NonZeroU32::new(1).expect("non-zero"),
+/// );
+///
+/// let wire: PixDepositData = EmptyDepositData::for_id(id).try_into()?;
+/// assert_eq!(wire.id, id);
+/// assert!(wire.is_empty());
+/// # Ok(()) }
+/// ```
+///
+/// The reverse conversion accepts an empty payload and rejects one carrying bytes, because bytes
+/// arriving at a pool that cannot read them mean the two ends disagree about which pool is running:
+///
+/// ```
+/// use std::num::NonZeroU32;
+///
+/// use hopr_api::{
+///     node::{PixAddressId, PixDepositData},
+///     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
+/// };
+/// use hopr_strategy::pix::EmptyDepositData;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let id = PixAddressId::new(
+///     &HoprPseudonym::from([0xbb; HoprPseudonym::SIZE]),
+///     NonZeroU32::new(1).expect("non-zero"),
+/// );
+///
+/// let empty = PixDepositData {
+///     id,
+///     data: Box::default(),
+/// };
+/// assert_eq!(EmptyDepositData::try_from(empty)?.id(), &id);
+///
+/// let carries_bytes = PixDepositData {
+///     id,
+///     data: vec![0xde, 0xad].into(),
+/// };
+/// assert!(EmptyDepositData::try_from(carries_bytes).is_err());
+/// # Ok(()) }
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EmptyDepositData(PixAddressId);
 
 impl EmptyDepositData {
     /// The empty payload for the allocation named by `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::num::NonZeroU32;
+    /// # use hopr_api::{
+    /// #     node::PixAddressId,
+    /// #     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
+    /// # };
+    /// use hopr_strategy::pix::EmptyDepositData;
+    ///
+    /// # let id = PixAddressId::new(
+    /// #     &HoprPseudonym::from([0xcc; HoprPseudonym::SIZE]),
+    /// #     NonZeroU32::new(1).expect("non-zero"),
+    /// # );
+    /// // `id` names some allocation the pool was asked about.
+    /// assert_eq!(EmptyDepositData::for_id(id), id.into());
+    /// ```
     pub fn for_id(id: PixAddressId) -> Self {
         Self(id)
     }
 
     /// The allocation this payload belongs to.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::num::NonZeroU32;
+    /// # use hopr_api::{
+    /// #     node::PixAddressId,
+    /// #     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
+    /// # };
+    /// use hopr_strategy::pix::EmptyDepositData;
+    ///
+    /// # let id = PixAddressId::new(
+    /// #     &HoprPseudonym::from([0xdd; HoprPseudonym::SIZE]),
+    /// #     NonZeroU32::new(1).expect("non-zero"),
+    /// # );
+    /// assert_eq!(EmptyDepositData::for_id(id).id(), &id);
+    /// ```
     pub fn id(&self) -> &PixAddressId {
         &self.0
     }
