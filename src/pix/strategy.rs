@@ -694,9 +694,11 @@ where
                         // The allocation id comes back from the pool rather than being captured
                         // from the event, so what is reported cannot drift from what was tracked.
                         Ok((id, _addr, balance)) => {
-                            if let Some(mut notifier) = deposit_updated {
-                                let _ = notifier.send((id, balance)).await;
-                            }
+                            // The notifier is not optional: the Exit always wants to hear that the
+                            // deposit landed. A send failure only means it stopped listening, which
+                            // is its business, so it is dropped rather than reported.
+                            let mut notifier = deposit_updated;
+                            let _ = notifier.send((id, balance)).await;
                             #[cfg(all(feature = "telemetry", not(test)))]
                             METRIC_PIX_DEPOSIT_TRACKING.increment_by(&["confirmed"], 1);
                             tracing::info!("deposit tracking completed");
@@ -787,15 +789,38 @@ where
                 .map_err(Into::<StrategyError>::into);
 
             match result {
-                Ok(_receipts) => {
-                    for (id, dest_addr, ..) in &batch {
-                        self.processed_deposits.insert(*id, ());
+                Ok(outcomes) => {
+                    // Every destination is released whatever happened, and only the allocations
+                    // that actually settled are recorded as processed. `BatchOutcomes` carries the
+                    // id in each outcome, so a partially failed batch no longer marks its failures
+                    // done — the duplicate guard would otherwise drop the retry a peer resends.
+                    for (_, dest_addr, ..) in &batch {
                         self.in_flight_destinations.invalidate(dest_addr);
                     }
-                    tracing::info!(count, "batch deposit flushed successfully");
+
+                    let mut deposited = 0u64;
+                    for outcome in outcomes {
+                        match outcome {
+                            Ok((id, _receipt)) => {
+                                self.processed_deposits.insert(id, ());
+                                deposited += 1;
+                            }
+                            Err(error) => {
+                                let error: StrategyError = error.into();
+                                tracing::error!(%error, "deposit within the batch failed");
+                            }
+                        }
+                    }
+
+                    tracing::info!(count, deposited, "batch deposit flushed");
                     #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS.increment_by(count as u64);
+                    {
+                        METRIC_PIX_DEPOSITS.increment_by(deposited);
+                        METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64 - deposited);
+                    }
                 }
+                // The batch itself could not be attempted, as distinct from its items failing
+                // individually above.
                 Err(error) => {
                     for (_, dest_addr, ..) in &batch {
                         self.in_flight_destinations.invalidate(dest_addr);
@@ -881,19 +906,32 @@ where
                 .map_err(Into::<StrategyError>::into);
 
             match result {
-                Ok(results) => {
-                    let mut swept = 0u64;
-                    // Indexed rather than zipped: an implementation is allowed to return fewer
-                    // results than keys, and every attempted id must still be released from the
-                    // in-flight guard so a later start can retry it.
-                    for (i, (id, _)) in keys.iter().enumerate() {
+                Ok(outcomes) => {
+                    // Every attempted id is released whatever happened, so a later start can retry
+                    // one that did not move.
+                    for (id, _) in &keys {
                         self.in_flight_sweeps.invalidate(id);
-                        if results.get(i).is_some_and(|r| r.is_ok()) {
-                            swept += 1;
-                            if let Some(ref store) = self.recovery_store
-                                && let Err(error) = store.remove(id)
-                            {
-                                tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
+                    }
+
+                    // Keyed by the id in each outcome, not by position. `BatchOutcomes` carries the
+                    // allocation it belongs to, so nothing here has to assume the pool returned one
+                    // result per key in the order given — an assumption that, when this took a bare
+                    // `&[K]`, silently attributed sweep outcomes to the wrong allocations.
+                    let mut swept = 0u64;
+                    for outcome in outcomes {
+                        match outcome {
+                            Ok((id, _receipt)) => {
+                                swept += 1;
+                                if let Some(ref store) = self.recovery_store
+                                    && let Err(error) = store.remove(&id)
+                                {
+                                    tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
+                                }
+                            }
+                            // Keeps its persisted key, so the next start replays it.
+                            Err(error) => {
+                                let error: StrategyError = error.into();
+                                tracing::error!(%error, "withdrawal within the batch failed");
                             }
                         }
                     }
@@ -1389,7 +1427,7 @@ mod tests {
             id,
             address: addr.into(),
             quota: 100,
-            deposit_updated: Some(tx),
+            deposit_updated: tx,
             deposit_data: empty_deposit_data(id),
         }))
         .await?;

@@ -160,7 +160,7 @@ futures             = "0.3.34"
 futures-concurrency = "7.7.1"
 futures-time        = "3.1.0"
 hex-literal         = "1.1.0"
-hopr-api            = { git = "https://github.com/hoprnet/hopr-api", branch = "main" }
+hopr-api            = "4.0.0"
 hopr-strategy       = { path = "." }
 hopr-utils          = { package = "hopr-utilities", version = "0.10.0", default-features = false }
 humantime-serde     = "1.1.1"

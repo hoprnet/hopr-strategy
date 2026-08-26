@@ -177,7 +177,7 @@ async fn notifies_when_deposit_arrives(fixture: IntegrationFixture) -> Result<()
         id,
         address: deposit.address.into(),
         quota,
-        deposit_updated: Some(notifier),
+        deposit_updated: notifier,
         deposit_data: empty_deposit_data(id),
     }));
 
@@ -287,7 +287,7 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         id,
         address: deposit.address.into(),
         quota,
-        deposit_updated: Some(notifier),
+        deposit_updated: notifier,
         deposit_data: empty_deposit_data(id),
     }));
 
