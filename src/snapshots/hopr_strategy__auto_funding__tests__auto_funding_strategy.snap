@@ -154,6 +154,17 @@ channels:
     source: 2
     status: PENDINGTOCLOSE
     ticket_index: "0"
+services: {}
+service_types:
+  "gvpn:exit":
+    service_type: "gvpn:exit"
+    owner: f39fd6e51aad88f6f4ce6ab8827279cfffb92266
+    requirement: ~
+    registration_burn: 1000 wxHOPR
+    update_burn: 100 wxHOPR
+service_registry_config:
+  type_registration_fee: 1 wxHOPR
+  node_safe_registry: 0165878a594ca255338adfa4d48449f69242eb8f
 chain_info:
   channel_closure_grace_period: "300"
   channel_dst: "0000000000000000000000000000000000000000000000000000000000000000"
