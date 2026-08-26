@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use futures::{StreamExt, channel::mpsc};
 use hopr_api::{
     node::{
-        DepositUpdated, PixAddressId, PixDepositAddressReceived, PixEvent, PixNewDepositAddress, PixPrivateKeyRecovered,
+        DepositUpdated, PixAddressId, PixDepositAddressReceived, PixDepositDataRequest, PixEvent, PixNewDepositAddress,
+        PixPrivateKeyRecovered,
     },
     types::primitive::prelude::{Address, HoprBalance, XDaiBalance},
 };
@@ -13,7 +14,10 @@ use hopr_strategy::pix::{
     strategy::{PixStrategy, PixStrategyConfig},
 };
 use hopr_strategy_integration_tests::{
-    fixtures::{IntegrationFixture, PixScenarioOpts, deposit_secret, integration_fixture as fixture, pix_address_id},
+    fixtures::{
+        IntegrationFixture, PixScenarioOpts, deposit_data_channel, deposit_secret, empty_deposit_data,
+        integration_fixture as fixture, pix_address_id,
+    },
     task::StrategyTask,
 };
 use rstest::rstest;
@@ -70,11 +74,12 @@ async fn deposits_to_new_deposit_address(fixture: IntegrationFixture) -> Result<
         .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
+    let id = pix_address_id(0x11, 1);
     scenario.inject(PixEvent::NewDepositAddress(PixNewDepositAddress {
-        id: pix_address_id(0x11, 1),
+        id,
         address: deposit.address.into(),
         quota,
-        additional_data: None,
+        deposit_data: empty_deposit_data(id),
     }));
 
     let deposited = scenario
@@ -117,11 +122,12 @@ async fn skips_deposit_exceeding_max_ssa_allocation(fixture: IntegrationFixture)
             .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
     let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
 
+    let id = pix_address_id(0x22, 1);
     scenario.inject(PixEvent::NewDepositAddress(PixNewDepositAddress {
-        id: pix_address_id(0x22, 1),
+        id,
         address: deposit.address.into(),
         quota: 10,
-        additional_data: None,
+        deposit_data: empty_deposit_data(id),
     }));
 
     scenario
@@ -171,8 +177,8 @@ async fn notifies_when_deposit_arrives(fixture: IntegrationFixture) -> Result<()
         id,
         address: deposit.address.into(),
         quota,
-        deposit_updated: Some(notifier),
-        additional_data: None,
+        deposit_updated: notifier,
+        deposit_data: empty_deposit_data(id),
     }));
 
     let (notified_id, notified_balance) = tokio::time::timeout(timeouts.action, notifications.next())
@@ -281,8 +287,8 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         id,
         address: deposit.address.into(),
         quota,
-        deposit_updated: Some(notifier),
-        additional_data: None,
+        deposit_updated: notifier,
+        deposit_data: empty_deposit_data(id),
     }));
 
     // 2. Entry side funds the very same address.
@@ -290,7 +296,7 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         id,
         address: deposit.address.into(),
         quota,
-        additional_data: None,
+        deposit_data: empty_deposit_data(id),
     }));
 
     let deposited = scenario
@@ -330,6 +336,53 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         .context("strategy did not sweep the deposit address within the timeout")?;
 
     assert_eq!(scenario.hopr_balance(scenario.safe_addr).await?, safe_before + target);
+
+    assert!(!handle.is_finished(), "pix strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
+/// Exit side, step 1 of the PIX flow: the strategy answers a `DepositDataRequest` from its pool.
+///
+/// This is the only test that drives the request path through the real `run` loop, which is where
+/// the answer is produced in a task of its own. `NonAnonymousDepositPool` carries no side-channel
+/// payload, so what comes back is empty but for the allocation id — the routing is what is under
+/// test, not the contents.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn generates_deposit_data_for_every_requested_allocation(fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [node, deposit] = fixture.claim_accounts::<2>();
+
+    let scenario = fixture
+        .open_pix_scenario(&node, PixScenarioOpts::new(&[deposit.address])?)
+        .await?;
+
+    let mut strategy =
+        PixStrategy::new(pix_config(HoprBalance::new_base(1u32), HoprBalance::new_base(100u32)))
+            .build_non_anonymous::<_, Address>(scenario.node.clone(), pool_config(Duration::from_secs(60)))?;
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
+
+    let requested = vec![pix_address_id(0x66, 1), pix_address_id(0x66, 2)];
+    let (created, mut payloads) = deposit_data_channel();
+
+    scenario.inject(PixEvent::DepositDataRequest(PixDepositDataRequest {
+        deposit_ids: requested.clone(),
+        deposit_data_created: created,
+    }));
+
+    for expected in &requested {
+        let payload = tokio::time::timeout(timeouts.action, payloads.next())
+            .await
+            .context("strategy did not generate deposit data within the timeout")?
+            .context("deposit data channel closed before every allocation was answered")?;
+
+        assert_eq!(&payload.id, expected, "payloads must arrive in the order asked");
+        assert!(
+            payload.is_empty(),
+            "the non-anonymous pool carries no side-channel bytes"
+        );
+    }
 
     assert!(!handle.is_finished(), "pix strategy exited unexpectedly");
     handle.stop().await;
