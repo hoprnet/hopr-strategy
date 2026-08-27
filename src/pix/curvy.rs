@@ -4,7 +4,6 @@
 //! `secp256k1::NonAnonymousDepositPool` for the
 //! Baby JubJub instantiation of `HoprPixSpec`, where a deposit address is a curve point rather
 //! than an Ethereum account.
-//!
 use std::{sync::Arc, time::Duration};
 
 use hopr_api::{
