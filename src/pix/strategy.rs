@@ -144,6 +144,51 @@ fn default_withdrawal_buffer_period() -> Duration {
 /// `strategy-pix-*` feature was on — which is exactly what made the two features mutually
 /// exclusive. Keeping settlement config out of strategy config is what lets both pools be
 /// compiled together.
+///
+/// # Examples
+///
+/// The two spend controls are independent: [`Self::max_ssa_allocation`] caps a single deposit,
+/// while [`Self::max_spend_per_window`] caps the total committed across a rolling
+/// [`Self::spend_window`] — so a stream of individually-acceptable deposits is bounded too.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hopr_api::types::primitive::prelude::HoprBalance;
+/// use hopr_strategy::pix::strategy::PixStrategyConfig;
+///
+/// // At most 100 wxHOPR to any one deposit address, and at most 1 000 wxHOPR in total
+/// // over any 10-minute stretch.
+/// let cfg = PixStrategyConfig {
+///     max_ssa_allocation: HoprBalance::new_base(100),
+///     max_spend_per_window: HoprBalance::new_base(1_000),
+///     spend_window: Duration::from_secs(600),
+///     ..Default::default()
+/// };
+///
+/// assert_eq!(cfg.max_spend_per_window, HoprBalance::new_base(1_000));
+/// assert_eq!(cfg.spend_window, Duration::from_secs(600));
+/// ```
+///
+/// The window limit is opt-out rather than opt-in: it is armed by default, and only a zero
+/// budget disables it. The defaults are 10 000 wxHOPR per hour.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hopr_api::types::primitive::prelude::HoprBalance;
+/// use hopr_strategy::pix::strategy::PixStrategyConfig;
+///
+/// let armed = PixStrategyConfig::default();
+/// assert_eq!(armed.max_spend_per_window, HoprBalance::new_base(10_000));
+/// assert_eq!(armed.spend_window, Duration::from_secs(3600));
+///
+/// let unlimited = PixStrategyConfig {
+///     max_spend_per_window: HoprBalance::zero(),
+///     ..Default::default()
+/// };
+/// assert!(unlimited.max_spend_per_window.is_zero());
+/// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
 #[serde(deny_unknown_fields)]
@@ -2107,14 +2152,15 @@ mod tests {
     /// soon as the event has been handled.
     fn spend_cfg(max_spend_per_window: HoprBalance, spend_window: StdDuration) -> PixStrategyConfig {
         PixStrategyConfig {
-            price_per_byte: HoprBalance::new_base(1),
-            max_ssa_allocation: HoprBalance::new_base(100),
             max_spend_per_window,
             spend_window,
-            pix_recovery_db_path: None,
-            pix_recovery_password_env: None,
+            // Stated rather than inherited: these tests price a quota and then assert on the
+            // resulting deposit, so the arithmetic depends on both.
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         }
     }
 

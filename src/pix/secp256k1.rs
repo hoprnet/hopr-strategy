@@ -196,6 +196,27 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// assert_eq!(cfg.min_node_xdai_reserve, "0.01 xdai".parse().unwrap());
 /// assert!(cfg.min_node_hopr_reserve.is_zero());
 /// ```
+///
+/// Both floors guard the *node's own account*, which is the payer for a deposit and for a sweep's
+/// gas alike. Raise them where that account is funded for something other than PIX — the wxHOPR
+/// floor defaults to zero precisely because it usually is not:
+///
+/// ```
+/// use hopr_api::types::primitive::prelude::HoprBalance;
+/// use hopr_strategy::pix::secp256k1::NonAnonymousDepositPoolConfig;
+///
+/// let cfg = NonAnonymousDepositPoolConfig {
+///     // Keep enough xDai back to pay gas for the node's own transactions...
+///     min_node_xdai_reserve: "0.5 xdai".parse()?,
+///     // ...and leave 200 wxHOPR that PIX deposits will not draw on.
+///     min_node_hopr_reserve: HoprBalance::new_base(200),
+///     ..Default::default()
+/// };
+///
+/// assert_eq!(cfg.min_node_xdai_reserve, "0.5 xdai".parse()?);
+/// assert_eq!(cfg.min_node_hopr_reserve, HoprBalance::new_base(200));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
 #[serde(deny_unknown_fields)]
@@ -230,6 +251,19 @@ pub struct NonAnonymousDepositPoolConfig {
     /// The default matches one sweep's gas budget, so the node always keeps back at
     /// least what it just handed out. Zero opts out, leaving only the plain
     /// affordability check.
+    ///
+    /// **Approximate, in two known ways.** It is a pre-flight check on a balance that is not
+    /// held, rather than a reservation, so it can be undershot rather than strictly enforced:
+    ///
+    /// * Concurrent sweeps race it. `withdraw_multiple_deposits` funds gas for each key concurrently, and a recovery
+    ///   replay runs alongside the event loop, so several top-ups can each observe the same pre-transfer balance and
+    ///   all proceed — overshooting the floor by up to one deficit per concurrent sweep.
+    /// * The native transaction fee is not counted. `required` covers the transferred deficit and this floor, but the
+    ///   transfer's own gas is paid from the same account, so a balance of exactly `required` ends just below the
+    ///   floor.
+    ///
+    /// Size it as a soft cushion rather than a hard minimum: set it comfortably above the smallest
+    /// balance the node can still function at, not exactly at it.
     #[default(default_node_xdai_reserve())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_node_xdai_reserve")]
@@ -486,6 +520,12 @@ async fn fund_sweep_gas(
 
     // `Balance` addition saturates rather than wrapping, so an absurd reserve refuses the top-up
     // instead of silently permitting it.
+    //
+    // A pre-flight check, not a reservation: nothing holds `payer_xdai` between the read above and
+    // the transfer below, and `required` excludes the transfer's own gas. Concurrent sweeps can
+    // therefore each pass this and collectively undershoot the floor. See
+    // `NonAnonymousDepositPoolConfig::min_node_xdai_reserve`, which documents the floor as a soft
+    // cushion for exactly these two reasons.
     let required = deficit + cfg.min_node_xdai_reserve;
 
     if payer_xdai < required {
