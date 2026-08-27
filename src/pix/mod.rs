@@ -98,24 +98,26 @@ pub mod recovery_store;
 pub mod secp256k1;
 pub mod strategy;
 
-use hopr_api::{
-    node::{PixAddressId, PixDepositData},
-    types::primitive::prelude::GeneralError,
-};
+use hopr_api::node::{PixAddressId, PixDepositData};
 
 use crate::errors::StrategyError;
 
-/// [`PoolDepositData`](hopr_api::chain::DepositPool::PoolDepositData) for a pool that carries no
-/// PIX side-channel payload.
+/// [`PoolDepositData`](hopr_api::chain::DepositPool::PoolDepositData) for a pool whose PIX
+/// side-channel payload is a plain byte string.
 ///
 /// A pool with nothing to carry still cannot use `()`: the associated type must round-trip through
 /// [`PixDepositData`] in both directions, and `PixDepositData` is a *pair* — an
 /// allocation id plus the bytes. Producing one back therefore needs the id, and the conversion is
-/// on the payload type rather than on the pool, so this is where the id has to be kept. The bytes
-/// are what is empty here; the id never is.
+/// on the payload type rather than on the pool, so this is where the id has to be kept. This type
+/// is that pair and nothing more: the bytes pass through verbatim in both directions, and may be
+/// empty — which is how "nothing to carry" is spelled, since `PixDepositData` is not optional on
+/// the events. [`for_id`](Self::for_id) is that case.
 ///
-/// Shared by both pool modules rather than defined in either, because each is behind its own
-/// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
+/// What the bytes *mean* is the pool's own business, so no meaning is imposed here: a pool that
+/// requires a particular payload checks for it itself, where the payload reaches it. A check here
+/// would instead apply to every pool, and this type is shared by both pool modules rather than
+/// defined in either, because each is behind its own feature: a `strategy-pix-curvy`-only build
+/// cannot reach into `pix::secp256k1`.
 ///
 /// # Examples
 ///
@@ -129,7 +131,7 @@ use crate::errors::StrategyError;
 ///     node::{PixAddressId, PixDepositData},
 ///     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
 /// };
-/// use hopr_strategy::pix::EmptyDepositData;
+/// use hopr_strategy::pix::ByteDepositData;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// let id = PixAddressId::new(
@@ -137,14 +139,14 @@ use crate::errors::StrategyError;
 ///     NonZeroU32::new(1).expect("non-zero"),
 /// );
 ///
-/// let wire: PixDepositData = EmptyDepositData::for_id(id).try_into()?;
+/// let wire: PixDepositData = ByteDepositData::for_id(id).try_into()?;
 /// assert_eq!(wire.id, id);
 /// assert!(wire.is_empty());
 /// # Ok(()) }
 /// ```
 ///
-/// The reverse conversion accepts an empty payload and rejects one carrying bytes, because bytes
-/// arriving at a pool that cannot read them mean the two ends disagree about which pool is running:
+/// Bytes survive both conversions unchanged, so what one pool put on the wire is exactly what the
+/// peer's pool is handed — and judging it is that pool's job, not this type's:
 ///
 /// ```
 /// use std::num::NonZeroU32;
@@ -153,7 +155,7 @@ use crate::errors::StrategyError;
 ///     node::{PixAddressId, PixDepositData},
 ///     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
 /// };
-/// use hopr_strategy::pix::EmptyDepositData;
+/// use hopr_strategy::pix::ByteDepositData;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// let id = PixAddressId::new(
@@ -161,24 +163,24 @@ use crate::errors::StrategyError;
 ///     NonZeroU32::new(1).expect("non-zero"),
 /// );
 ///
-/// let empty = PixDepositData {
-///     id,
-///     data: Box::default(),
-/// };
-/// assert_eq!(EmptyDepositData::try_from(empty)?.id(), &id);
-///
-/// let carries_bytes = PixDepositData {
+/// let received = PixDepositData {
 ///     id,
 ///     data: vec![0xde, 0xad].into(),
 /// };
-/// assert!(EmptyDepositData::try_from(carries_bytes).is_err());
+///
+/// let payload = ByteDepositData::try_from(received)?;
+/// assert_eq!(payload.id(), &id);
+/// assert_eq!(payload.payload(), &[0xde, 0xad]);
+///
+/// let wire: PixDepositData = payload.try_into()?;
+/// assert_eq!(&*wire.data, &[0xde, 0xad]);
 /// # Ok(()) }
 /// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EmptyDepositData(PixAddressId);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ByteDepositData(PixAddressId, Box<[u8]>);
 
-impl EmptyDepositData {
-    /// The empty payload for the allocation named by `id`.
+impl ByteDepositData {
+    /// The empty payload for the allocation named by `id` — nothing to carry.
     ///
     /// # Examples
     ///
@@ -188,17 +190,44 @@ impl EmptyDepositData {
     /// #     node::PixAddressId,
     /// #     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
     /// # };
-    /// use hopr_strategy::pix::EmptyDepositData;
+    /// use hopr_strategy::pix::ByteDepositData;
     ///
     /// # let id = PixAddressId::new(
     /// #     &HoprPseudonym::from([0xcc; HoprPseudonym::SIZE]),
     /// #     NonZeroU32::new(1).expect("non-zero"),
     /// # );
     /// // `id` names some allocation the pool was asked about.
-    /// assert_eq!(EmptyDepositData::for_id(id), id.into());
+    /// assert_eq!(ByteDepositData::for_id(id), id.into());
+    /// assert!(ByteDepositData::for_id(id).payload().is_empty());
     /// ```
     pub fn for_id(id: PixAddressId) -> Self {
-        Self(id)
+        Self(id, Box::default())
+    }
+
+    /// The payload carrying `data`, for the allocation named by `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::num::NonZeroU32;
+    /// # use hopr_api::{
+    /// #     node::PixAddressId,
+    /// #     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
+    /// # };
+    /// use hopr_strategy::pix::ByteDepositData;
+    ///
+    /// # let id = PixAddressId::new(
+    /// #     &HoprPseudonym::from([0xcc; HoprPseudonym::SIZE]),
+    /// #     NonZeroU32::new(1).expect("non-zero"),
+    /// # );
+    /// let data = ByteDepositData::new(id, [0xde, 0xad]);
+    /// assert_eq!(data.payload(), &[0xde, 0xad]);
+    ///
+    /// // An empty `data` is the same thing as `for_id`.
+    /// assert_eq!(ByteDepositData::new(id, []), ByteDepositData::for_id(id));
+    /// ```
+    pub fn new(id: PixAddressId, data: impl Into<Box<[u8]>>) -> Self {
+        Self(id, data.into())
     }
 
     /// The allocation this payload belongs to.
@@ -211,41 +240,45 @@ impl EmptyDepositData {
     /// #     node::PixAddressId,
     /// #     types::{internal::prelude::HoprPseudonym, primitive::prelude::BytesRepresentable},
     /// # };
-    /// use hopr_strategy::pix::EmptyDepositData;
+    /// use hopr_strategy::pix::ByteDepositData;
     ///
     /// # let id = PixAddressId::new(
     /// #     &HoprPseudonym::from([0xdd; HoprPseudonym::SIZE]),
     /// #     NonZeroU32::new(1).expect("non-zero"),
     /// # );
-    /// assert_eq!(EmptyDepositData::for_id(id).id(), &id);
+    /// assert_eq!(ByteDepositData::for_id(id).id(), &id);
     /// ```
     pub fn id(&self) -> &PixAddressId {
         &self.0
     }
+
+    /// The bytes travelling alongside the deposit, empty when there are none.
+    ///
+    /// What they mean is the receiving pool's business — see the type documentation.
+    pub fn payload(&self) -> &[u8] {
+        &self.1
+    }
 }
 
-impl From<PixAddressId> for EmptyDepositData {
+impl From<PixAddressId> for ByteDepositData {
     fn from(id: PixAddressId) -> Self {
         Self::for_id(id)
     }
 }
 
-impl TryFrom<PixDepositData> for EmptyDepositData {
+impl TryFrom<PixDepositData> for ByteDepositData {
     // Pinned to `StrategyError` rather than `GeneralError` because `DepositPool` requires both
     // conversions to fail with the pool's own `Error`, and both pools here use `StrategyError`.
+    // Nothing here can actually fail — see the note on the reverse conversion for why the
+    // fallible form is still the only one that can exist.
     type Error = StrategyError;
 
     fn try_from(data: PixDepositData) -> Result<Self, Self::Error> {
-        // A non-empty payload is rejected rather than ignored: it means the Entry sent PIX deposit
-        // data to an Exit whose pool cannot use it — the two ends disagree about which pool is
-        // running. Swallowing it reproduces exactly the failure this module's `curvy` docs
-        // describe: no deposits, no diagnostic.
-        //
-        // An *empty* payload is not the same thing, and is accepted: it is what both pools here
-        // generate.
-        data.is_empty()
-            .then_some(Self(data.id))
-            .ok_or(StrategyError::GeneralError(GeneralError::InvalidInput))
+        // Total on purpose: whether a given payload is acceptable depends on which pool is
+        // receiving it, and this conversion is shared by every pool. A pool that only reads one
+        // shape of payload rejects the others where it is handed them — see
+        // `secp256k1::check_deposit_payload`.
+        Ok(Self(data.id, data.data))
     }
 }
 
@@ -253,13 +286,13 @@ impl TryFrom<PixDepositData> for EmptyDepositData {
 // requires `TryInto<PixDepositData, Error = Self::Error>`, and a `From` impl would instead supply
 // the blanket `TryFrom` with `Error = Infallible` — which does not satisfy that bound, and which
 // coherence forbids overriding. So the fallible form is the only one that can exist here.
-impl TryFrom<EmptyDepositData> for PixDepositData {
+impl TryFrom<ByteDepositData> for PixDepositData {
     type Error = StrategyError;
 
-    fn try_from(value: EmptyDepositData) -> Result<Self, Self::Error> {
+    fn try_from(value: ByteDepositData) -> Result<Self, Self::Error> {
         Ok(Self {
             id: value.0,
-            data: Box::default(),
+            data: value.1,
         })
     }
 }

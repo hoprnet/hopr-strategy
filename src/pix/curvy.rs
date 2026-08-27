@@ -45,7 +45,7 @@ use hopr_api::{
 };
 use validator::Validate;
 
-use crate::{errors::StrategyError, pix::EmptyDepositData};
+use crate::{errors::StrategyError, pix::ByteDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -159,15 +159,17 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     type Error = StrategyError;
-    /// `EmptyDepositData` until the settlement logic lands.
+    /// [`ByteDepositData`], carrying nothing until the settlement logic lands.
     ///
     /// An anonymous pool is the case `PoolDepositData` exists for — a Curvy deposit plausibly needs
     /// a note or commitment carried from Exit to Entry — so this is the one associated type here
-    /// that is a placeholder for a real decision rather than a permanent answer. Whatever it
-    /// becomes must round-trip through
-    /// [`PixDepositData`](hopr_api::node::PixDepositData) in both directions, which is what makes
-    /// the wire form the pool's own business.
-    type PoolDepositData = EmptyDepositData;
+    /// whose *contents* are a placeholder for a real decision rather than a permanent answer. The
+    /// type itself need not change to accommodate that: `ByteDepositData` is an opaque byte string,
+    /// so a note or commitment is a matter of what
+    /// [`generate_deposit_data`](Self::generate_deposit_data) puts in it and what
+    /// [`deposit_funds_to`](Self::deposit_funds_to) makes of it, both of which are this pool's own
+    /// business. What it carries today is nothing at all.
+    type PoolDepositData = ByteDepositData;
     type Receipt = ();
 
     /// The empty payload for `id` — the one method here that does not panic.
@@ -177,7 +179,7 @@ where
     /// stub should be discovered. A Curvy build therefore gets this far and then fails at
     /// [`deposit_funds_to`](Self::deposit_funds_to).
     async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
-        Ok(EmptyDepositData::for_id(*id))
+        Ok(ByteDepositData::for_id(*id))
     }
 
     async fn deposit_funds_to(
@@ -240,7 +242,7 @@ mod tests {
 
     use super::{CurvyDepositPool, CurvyDepositPoolConfig};
     use crate::{
-        pix::EmptyDepositData,
+        pix::ByteDepositData,
         testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector},
     };
 
@@ -287,7 +289,7 @@ mod tests {
                 &id,
                 BjjKeypair::random().public(),
                 HoprBalance::new_base(1),
-                EmptyDepositData::for_id(id),
+                ByteDepositData::for_id(id),
             )
             .await;
     }
@@ -337,7 +339,7 @@ mod tests {
                 &BjjKeypair::random(),
                 &dst_id,
                 *BjjKeypair::random().public(),
-                EmptyDepositData::for_id(dst_id),
+                ByteDepositData::for_id(dst_id),
                 None,
             )
             .await;

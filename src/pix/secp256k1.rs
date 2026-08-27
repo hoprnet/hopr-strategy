@@ -26,14 +26,14 @@ use hopr_api::{
     node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
-        primitive::prelude::{Address, HoprBalance, XDaiBalance},
+        primitive::prelude::{Address, GeneralError, HoprBalance, XDaiBalance},
     },
 };
 use serde_with::{DisplayFromStr, serde_as};
 use subtle::{Choice, ConstantTimeEq};
 use validator::Validate;
 
-use crate::{errors::StrategyError, pix::EmptyDepositData};
+use crate::{errors::StrategyError, pix::ByteDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -70,6 +70,67 @@ pub type DepositAddress = <PoolKeypair as Keypair>::Public;
 /// [`PixStrategy::build_non_anonymous`](crate::pix::strategy::PixStrategy::build_non_anonymous) is
 /// therefore accepted, and naming any other address type is a compile error at that call site.
 impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
+
+// ---------------------------------------------------------------------------
+// Deposit payload
+// ---------------------------------------------------------------------------
+
+/// Length of [`DEPOSIT_MARKER_PAYLOAD`], in bytes.
+pub const DEPOSIT_MARKER_PAYLOAD_LEN: usize = 64;
+
+/// The payload every deposit in this pool carries: `b"test"` followed by 60 zero bytes.
+///
+/// A deposit here is a plain Ethereum transfer, so there is no note, commitment or blinding factor
+/// for the Exit to hand the Entry — nothing this pool needs to send. The payload is therefore a
+/// fixed marker rather than derived data, and it exists for one reason: this is the only
+/// implemented pool, so without it the PIX side-channel path (generated on the Exit, carried over
+/// the wire, checked on the Entry) is code that nothing can run until an anonymous pool lands. A
+/// marker that is generated, transported and verified on every deposit keeps that path exercised.
+///
+/// Both the marker and the padding are part of the contract: [`check_deposit_payload`] accepts this
+/// exact byte string and nothing else, so a peer running a different pool — or a different version
+/// of this one — is caught rather than silently tolerated.
+///
+/// `pub` because the integration test crate builds wire-form events against it.
+pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
+    let mut payload = [0u8; DEPOSIT_MARKER_PAYLOAD_LEN];
+    let marker = *b"test";
+
+    // Written a byte at a time because `copy_from_slice` is not `const`.
+    let mut i = 0;
+    while i < marker.len() {
+        payload[i] = marker[i];
+        i += 1;
+    }
+
+    payload
+};
+
+/// Rejects any payload that is not [`DEPOSIT_MARKER_PAYLOAD`].
+///
+/// A mismatch means the Entry sent deposit data this pool cannot read — the two ends disagree about
+/// which pool is running, the same class of failure as a wrong curve. It is reported rather than
+/// ignored, and before any funds move: swallowing it would reproduce exactly the failure the
+/// `pix::curvy` docs describe, a deposit that quietly drops what the peer sent.
+///
+/// Compared with `==` rather than [`ConstantTimeEq`]: the expected value is a public constant, so
+/// there is no secret for a timing side channel to leak, and a constant-time comparison here would
+/// only suggest to a reader that there is one.
+fn check_deposit_payload(id: &PixAddressId, data: &ByteDepositData) -> Result<(), StrategyError> {
+    if data.payload() == DEPOSIT_MARKER_PAYLOAD {
+        return Ok(());
+    }
+
+    tracing::error!(
+        pix_id = ?id,
+        expected_len = DEPOSIT_MARKER_PAYLOAD_LEN,
+        actual_len = data.payload().len(),
+        "additional deposit data is not the form this pool reads - the Entry and this node's deposit pool \
+         disagree on the payload format"
+    );
+
+    Err(StrategyError::GeneralError(GeneralError::InvalidInput))
+}
 
 // ---------------------------------------------------------------------------
 // Pool key
@@ -475,22 +536,23 @@ impl<N> DepositPool<EthDepositKey> for NonAnonymousDepositPool<N>
 where
     N: HasChainApi + Send + Sync + 'static,
 {
-    /// Nothing travels alongside a deposit here.
+    type Error = StrategyError;
+    /// A byte payload carrying [`DEPOSIT_MARKER_PAYLOAD`], filed under the allocation id.
     ///
     /// A deposit address in this pool is an ordinary Ethereum account and a deposit is a plain
-    /// transfer; there is no note, commitment or blinding factor for the Entry to hand the Exit.
-    /// See [`EmptyDepositData`] for why this is not `()`, and why it still carries the allocation
-    /// id even though the bytes are empty.
-    type Error = StrategyError;
-    type PoolDepositData = EmptyDepositData;
+    /// transfer, so there is nothing this pool genuinely needs to send alongside one. What it sends
+    /// instead is a fixed marker, so that the side-channel path is exercised rather than dormant —
+    /// see [`DEPOSIT_MARKER_PAYLOAD`]. See [`ByteDepositData`] for why this is not `()`, and why it
+    /// carries the allocation id as well as the bytes.
+    type PoolDepositData = ByteDepositData;
     type Receipt = ();
 
-    /// Always the empty payload for `id`.
+    /// Always [`DEPOSIT_MARKER_PAYLOAD`], filed under `id`.
     ///
-    /// Infallible in practice: there is nothing to derive, commit to or prove, so the only thing
-    /// the Exit gets back is the allocation id it asked about.
+    /// Infallible in practice: there is nothing to derive, commit to or prove, so the payload is
+    /// the same constant for every allocation and only the id it is filed under differs.
     async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
-        Ok(EmptyDepositData::for_id(*id))
+        Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
     }
 
     /// Deposit funds from the node's Safe to a deposit address, retrying up to
@@ -504,13 +566,19 @@ where
     ///
     /// `id` is carried for logging only: the destination address is what identifies the deposit
     /// on-chain, and this pool keeps no allocation-indexed state of its own.
+    ///
+    /// `additional_data` must carry [`DEPOSIT_MARKER_PAYLOAD`]. It is checked *before* the first
+    /// attempt rather than inside the retry closure: a payload the pool cannot read is not a
+    /// transient failure, and spending the retry budget on it would only delay the diagnostic.
     async fn deposit_funds_to(
         &self,
         id: &PixAddressId,
         dst: &Address,
         amount: HoprBalance,
-        _additional_data: Self::PoolDepositData,
+        additional_data: Self::PoolDepositData,
     ) -> Result<Self::Receipt, Self::Error> {
+        check_deposit_payload(id, &additional_data)?;
+
         let dest_addr = *dst;
         let node = &self.node;
         let id = *id;
@@ -645,19 +713,26 @@ where
     /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
     /// anonymity set while a withdrawal leaves it.
     ///
-    /// Only `src_id` is used — it identifies the allocation whose key is being spent, which is
-    /// what the underlying sweep acts on. `dst_id` names an allocation on the receiving side, a
-    /// notion this pool does not have: the destination is just another Ethereum account, and
-    /// nothing here is filed per allocation.
+    /// `src_id` identifies the allocation whose key is being spent, which is what the underlying
+    /// sweep acts on. `dst_id` names an allocation on the receiving side, a notion this pool does
+    /// not have — the destination is just another Ethereum account, and nothing here is filed per
+    /// allocation — so it is used only to attribute a rejected `additional_dst_data`.
+    ///
+    /// `additional_dst_data` is checked exactly as in
+    /// [`deposit_funds_to`](Self::deposit_funds_to), and for the same reason: every payload this
+    /// pool is handed is one it has to be able to read, and a transfer that moves funds while
+    /// dropping an unreadable payload is the silent failure the check exists to prevent.
     async fn pool_transfer(
         &self,
         src_id: &PixAddressId,
         key: &EthDepositKey,
-        _dst_id: &PixAddressId,
+        dst_id: &PixAddressId,
         dst: Address,
-        _additional_dst_data: Self::PoolDepositData,
+        additional_dst_data: Self::PoolDepositData,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
+        check_deposit_payload(dst_id, &additional_dst_data)?;
+
         self.withdraw_deposit(src_id, key, dst, amount).await
     }
 }

@@ -10,13 +10,13 @@ use hopr_api::{
     types::primitive::prelude::{Address, HoprBalance, XDaiBalance},
 };
 use hopr_strategy::pix::{
-    secp256k1::NonAnonymousDepositPoolConfig,
+    secp256k1::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPoolConfig},
     strategy::{PixStrategy, PixStrategyConfig},
 };
 use hopr_strategy_integration_tests::{
     fixtures::{
-        IntegrationFixture, PixScenarioOpts, deposit_data_channel, deposit_secret, empty_deposit_data,
-        integration_fixture as fixture, pix_address_id,
+        IntegrationFixture, PixScenarioOpts, deposit_data_channel, deposit_secret, integration_fixture as fixture,
+        pix_address_id, pool_deposit_data,
     },
     task::StrategyTask,
 };
@@ -79,7 +79,7 @@ async fn deposits_to_new_deposit_address(fixture: IntegrationFixture) -> Result<
         id,
         address: deposit.address.into(),
         quota,
-        deposit_data: empty_deposit_data(id),
+        deposit_data: pool_deposit_data(id),
     }));
 
     let deposited = scenario
@@ -127,7 +127,7 @@ async fn skips_deposit_exceeding_max_ssa_allocation(fixture: IntegrationFixture)
         id,
         address: deposit.address.into(),
         quota: 10,
-        deposit_data: empty_deposit_data(id),
+        deposit_data: pool_deposit_data(id),
     }));
 
     scenario
@@ -178,7 +178,7 @@ async fn notifies_when_deposit_arrives(fixture: IntegrationFixture) -> Result<()
         address: deposit.address.into(),
         quota,
         deposit_updated: notifier,
-        deposit_data: empty_deposit_data(id),
+        deposit_data: pool_deposit_data(id),
     }));
 
     let (notified_id, notified_balance) = tokio::time::timeout(timeouts.action, notifications.next())
@@ -288,7 +288,7 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         address: deposit.address.into(),
         quota,
         deposit_updated: notifier,
-        deposit_data: empty_deposit_data(id),
+        deposit_data: pool_deposit_data(id),
     }));
 
     // 2. Entry side funds the very same address.
@@ -296,7 +296,7 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
         id,
         address: deposit.address.into(),
         quota,
-        deposit_data: empty_deposit_data(id),
+        deposit_data: pool_deposit_data(id),
     }));
 
     let deposited = scenario
@@ -345,9 +345,10 @@ async fn completes_deposit_notification_and_withdrawal_roundtrip(fixture: Integr
 /// Exit side, step 1 of the PIX flow: the strategy answers a `DepositDataRequest` from its pool.
 ///
 /// This is the only test that drives the request path through the real `run` loop, which is where
-/// the answer is produced in a task of its own. `NonAnonymousDepositPool` carries no side-channel
-/// payload, so what comes back is empty but for the allocation id — the routing is what is under
-/// test, not the contents.
+/// the answer is produced in a task of its own. Routing is the point — every requested allocation
+/// answered, in order — but the contents are checked too: what comes back is what the peer's pool
+/// will verify on arrival, so a payload that survives generation and hand-off but not the peer's
+/// check would be a failure this test is placed to catch.
 #[rstest]
 #[test_log::test(tokio::test)]
 async fn generates_deposit_data_for_every_requested_allocation(fixture: IntegrationFixture) -> Result<()> {
@@ -378,9 +379,9 @@ async fn generates_deposit_data_for_every_requested_allocation(fixture: Integrat
             .context("deposit data channel closed before every allocation was answered")?;
 
         assert_eq!(&payload.id, expected, "payloads must arrive in the order asked");
-        assert!(
-            payload.is_empty(),
-            "the non-anonymous pool carries no side-channel bytes"
+        assert_eq!(
+            &*payload.data, &DEPOSIT_MARKER_PAYLOAD,
+            "the payload must be the marker the receiving pool checks for"
         );
     }
 
