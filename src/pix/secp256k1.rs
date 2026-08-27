@@ -87,9 +87,9 @@ pub const DEPOSIT_MARKER_PAYLOAD_LEN: usize = 64;
 /// the wire, checked on the Entry) is code that nothing can run until an anonymous pool lands. A
 /// marker that is generated, transported and verified on every deposit keeps that path exercised.
 ///
-/// Both the marker and the padding are part of the contract: [`check_deposit_payload`] accepts this
-/// exact byte string and nothing else, so a peer running a different pool — or a different version
-/// of this one — is caught rather than silently tolerated.
+/// Both the marker and the padding are part of the contract: this pool accepts this exact byte
+/// string and nothing else, so a peer running a different pool — or a different version of this one
+/// — is caught rather than silently tolerated.
 ///
 /// `pub` because the integration test crate builds wire-form events against it.
 pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
@@ -537,13 +537,18 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     type Error = StrategyError;
-    /// A byte payload carrying [`DEPOSIT_MARKER_PAYLOAD`], filed under the allocation id.
+    /// [`ByteDepositData`] carrying [`DEPOSIT_MARKER_PAYLOAD`], filed under the allocation id.
     ///
     /// A deposit address in this pool is an ordinary Ethereum account and a deposit is a plain
     /// transfer, so there is nothing this pool genuinely needs to send alongside one. What it sends
     /// instead is a fixed marker, so that the side-channel path is exercised rather than dormant —
     /// see [`DEPOSIT_MARKER_PAYLOAD`]. See [`ByteDepositData`] for why this is not `()`, and why it
     /// carries the allocation id as well as the bytes.
+    ///
+    /// This is the pool `ByteDepositData` is written for, and between them they are the worked
+    /// example of what a `PoolDepositData` has to do — not a pattern to copy into a production
+    /// pool. A pool that carries something real should define a type of its own that names it; one
+    /// that carries nothing at all can use an empty `ByteDepositData` and stop there.
     type PoolDepositData = ByteDepositData;
     type Receipt = ();
 

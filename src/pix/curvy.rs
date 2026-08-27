@@ -159,16 +159,18 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     type Error = StrategyError;
-    /// [`ByteDepositData`], carrying nothing until the settlement logic lands.
+    /// [`ByteDepositData`], empty — a placeholder until the settlement logic lands.
     ///
-    /// An anonymous pool is the case `PoolDepositData` exists for — a Curvy deposit plausibly needs
-    /// a note or commitment carried from Exit to Entry — so this is the one associated type here
-    /// whose *contents* are a placeholder for a real decision rather than a permanent answer. The
-    /// type itself need not change to accommodate that: `ByteDepositData` is an opaque byte string,
-    /// so a note or commitment is a matter of what
-    /// [`generate_deposit_data`](Self::generate_deposit_data) puts in it and what
-    /// [`deposit_funds_to`](Self::deposit_funds_to) makes of it, both of which are this pool's own
-    /// business. What it carries today is nothing at all.
+    /// This pool carries nothing today, and an empty [`ByteDepositData`] is the supported way to say
+    /// so: the associated type cannot be `()`, for the reasons that type's documentation gives.
+    ///
+    /// It is not the answer once Curvy actually settles. An anonymous pool is the case
+    /// `PoolDepositData` exists for — a Curvy deposit plausibly needs a note or commitment carried
+    /// from Exit to Entry — and when there is something to carry, this should become a type of this
+    /// module's own that names it, parsed and validated once on the way in from
+    /// [`PixDepositData`](hopr_api::node::PixDepositData). `ByteDepositData` hands bytes on unread
+    /// and is an example rather than a production payload; borrowing it to carry a real commitment
+    /// would push that parsing into every method that touches one.
     type PoolDepositData = ByteDepositData;
     type Receipt = ();
 

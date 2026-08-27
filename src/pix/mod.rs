@@ -102,22 +102,31 @@ use hopr_api::node::{PixAddressId, PixDepositData};
 
 use crate::errors::StrategyError;
 
-/// [`PoolDepositData`](hopr_api::chain::DepositPool::PoolDepositData) for a pool whose PIX
-/// side-channel payload is a plain byte string.
+/// An example [`PoolDepositData`](hopr_api::chain::DepositPool::PoolDepositData): the allocation id
+/// plus an uninterpreted byte string.
 ///
-/// A pool with nothing to carry still cannot use `()`: the associated type must round-trip through
-/// [`PixDepositData`] in both directions, and `PixDepositData` is a *pair* — an
-/// allocation id plus the bytes. Producing one back therefore needs the id, and the conversion is
-/// on the payload type rather than on the pool, so this is where the id has to be kept. This type
-/// is that pair and nothing more: the bytes pass through verbatim in both directions, and may be
-/// empty — which is how "nothing to carry" is spelled, since `PixDepositData` is not optional on
-/// the events. [`for_id`](Self::for_id) is that case.
+/// **Not a production type.** It is the payload of `secp256k1::NonAnonymousDepositPool` — itself a
+/// development-and-testing pool — and it exists mainly to show what the associated type has to look
+/// like. A real pool should define its own, naming the note, commitment or blinding factor it
+/// actually carries, so that the wire form is parsed and validated once, at the boundary, into
+/// something the rest of that pool can use without re-checking. `ByteDepositData` deliberately does
+/// none of that: it hands the bytes on unread.
 ///
-/// What the bytes *mean* is the pool's own business, so no meaning is imposed here: a pool that
-/// requires a particular payload checks for it itself, where the payload reaches it. A check here
-/// would instead apply to every pool, and this type is shared by both pool modules rather than
-/// defined in either, because each is behind its own feature: a `strategy-pix-curvy`-only build
-/// cannot reach into `pix::secp256k1`.
+/// The one case where reaching for it is reasonable in a pool of your own is the *empty* one, via
+/// [`for_id`](Self::for_id) — a pool with no side-channel payload at all still cannot use `()`. The
+/// associated type must round-trip through [`PixDepositData`] in both directions, and
+/// `PixDepositData` is a *pair*: an allocation id plus the bytes. Producing one back therefore
+/// needs the id, and the conversion is on the payload type rather than on the pool, so the id has
+/// to be kept somewhere. `PixDepositData` is not optional on the events either, so "nothing to
+/// carry" is spelled as empty bytes rather than as an absent payload.
+///
+/// What any bytes *mean* is the receiving pool's business, so no meaning is imposed here: a pool
+/// that requires a particular payload checks for it itself, where the payload reaches it — see
+/// `secp256k1::DEPOSIT_MARKER_PAYLOAD` for what that looks like. A check on this type would instead
+/// apply to every pool using it.
+///
+/// Defined here rather than in either pool module because both use it and each is behind its own
+/// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
 ///
 /// # Examples
 ///
@@ -182,6 +191,10 @@ pub struct ByteDepositData(PixAddressId, Box<[u8]>);
 impl ByteDepositData {
     /// The empty payload for the allocation named by `id` — nothing to carry.
     ///
+    /// This is the one constructor a pool outside this crate has reason to reach for: a pool with
+    /// no side-channel payload can use `ByteDepositData` this way instead of defining a type of its
+    /// own. A pool that *does* carry something should define that type — see the type documentation.
+    ///
     /// # Examples
     ///
     /// ```
@@ -205,6 +218,10 @@ impl ByteDepositData {
     }
 
     /// The payload carrying `data`, for the allocation named by `id`.
+    ///
+    /// Used by `secp256k1::NonAnonymousDepositPool` to carry its marker. A pool with a real payload
+    /// is better served by a type that names it than by an uninterpreted byte string — see the type
+    /// documentation.
     ///
     /// # Examples
     ///
