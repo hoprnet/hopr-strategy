@@ -10,7 +10,7 @@
 //!
 //! **DO NOT USE IN PRODUCTION.**
 //!
-//! Enabled by `strategy-pix-secp256k1`, and to be paired with `hopr-lib/pix-secp256k1` so that
+//! Enabled by `strategy-pix-test`, and to be paired with `hopr-lib/pix-secp256k1` so that
 //! `HoprPixSpec` produces the `Address` deposit addresses this pool can settle to. Built through
 //! [`PixStrategy::build_non_anonymous`](crate::pix::strategy::PixStrategy::build_non_anonymous).
 
@@ -28,7 +28,7 @@ use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
     chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool},
-    node::HasChainApi,
+    node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
         primitive::prelude::{Address, HoprBalance, XDaiBalance},
@@ -38,7 +38,7 @@ use serde_with::{DisplayFromStr, serde_as};
 use subtle::{Choice, ConstantTimeEq};
 use validator::Validate;
 
-use crate::errors::StrategyError;
+use crate::{errors::StrategyError, pix::EmptyDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -319,21 +319,27 @@ impl Drop for DepositTrackerSlot {
 ///
 /// use hopr_api::{
 ///     chain::DepositPool,
-///     node::HasChainApi,
+///     node::{HasChainApi, PixAddressId},
 ///     types::primitive::prelude::{Address, HoprBalance},
 /// };
 /// use hopr_strategy::pix::secp256k1::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
 ///
 /// // `dst` is an `Address` — the pool settles to `EthDepositKey::Public`, not to the
-/// // curve-agnostic `PixDepositAddress` the events carry.
-/// async fn deposit<N>(node: Arc<N>, dst: Address) -> anyhow::Result<()>
+/// // curve-agnostic `PixDepositAddress` the events carry. `id` names the allocation the
+/// // deposit belongs to; it comes from the `PixEvent` that asked for the deposit.
+/// async fn deposit<N>(node: Arc<N>, id: PixAddressId, dst: Address) -> anyhow::Result<()>
 /// where
 ///     N: HasChainApi + Send + Sync + 'static,
 /// {
 ///     let pool = NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default());
 ///
+///     // The payload is the pool's own to make, so it is asked for rather than assembled here.
+///     // This pool carries no side-channel data, so what comes back is empty but for `id`.
+///     let deposit_data = pool.generate_deposit_data(&id).await?;
+///
 ///     // The pool owns the retries; a single call is best effort by itself.
-///     pool.deposit_funds_to(dst, HoprBalance::new_base(20)).await?;
+///     pool.deposit_funds_to(&id, &dst, HoprBalance::new_base(20), deposit_data)
+///         .await?;
 ///     Ok(())
 /// }
 /// ```
@@ -554,8 +560,23 @@ impl<N> DepositPool<EthDepositKey> for NonAnonymousDepositPool<N>
 where
     N: HasChainApi + Send + Sync + 'static,
 {
+    /// Nothing travels alongside a deposit here.
+    ///
+    /// A deposit address in this pool is an ordinary Ethereum account and a deposit is a plain
+    /// transfer; there is no note, commitment or blinding factor for the Entry to hand the Exit.
+    /// See [`EmptyDepositData`] for why this is not `()`, and why it still carries the allocation
+    /// id even though the bytes are empty.
     type Error = StrategyError;
+    type PoolDepositData = EmptyDepositData;
     type Receipt = ();
+
+    /// Always the empty payload for `id`.
+    ///
+    /// Infallible in practice: there is nothing to derive, commit to or prove, so the only thing
+    /// the Exit gets back is the allocation id it asked about.
+    async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
+        Ok(EmptyDepositData::for_id(*id))
+    }
 
     /// Deposit funds from the node's own account to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
@@ -565,15 +586,26 @@ where
     /// transfer whose confirmation was lost is therefore not sent twice. The guarantee is
     /// balance-based rather than transaction-based, so a third party funding the same
     /// address also satisfies the check.
-    async fn deposit_funds_to(&self, dst: Address, amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
-        let dest_addr = dst;
+    ///
+    /// `id` is carried for logging only: the destination address is what identifies the deposit
+    /// on-chain, and this pool keeps no allocation-indexed state of its own.
+    async fn deposit_funds_to(
+        &self,
+        id: &PixAddressId,
+        dst: &Address,
+        amount: HoprBalance,
+        _additional_data: Self::PoolDepositData,
+    ) -> Result<Self::Receipt, Self::Error> {
+        let dest_addr = *dst;
+        // `cfg` as well as `node`: `deposit_once` reads `min_node_hopr_reserve` from it.
         let (node, cfg) = (&self.node, &self.cfg);
+        let id = *id;
 
         (move || deposit_once(Arc::clone(node), cfg, dest_addr, amount))
             .retry(retry_policy(self.cfg.max_deposit_retries))
             .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, %dest_addr, ?dur, "deposit failed, retrying in");
+            .notify(move |error, dur| {
+                tracing::warn!(%error, ?id, %dest_addr, ?dur, "deposit failed, retrying in");
             })
             .await
     }
@@ -587,6 +619,7 @@ where
     /// out what the bound should be.
     fn notify_deposit(
         &self,
+        id: PixAddressId,
         dst: Address,
         min_amount: HoprBalance,
     ) -> Result<DepositNotification<'static, Address, Self::Error>, Self::Error> {
@@ -614,7 +647,7 @@ where
             let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
-                return Ok((dst, balance));
+                return Ok((id, dst, balance));
             }
 
             futures_time::task::sleep(phase_jitter.into()).await;
@@ -644,12 +677,12 @@ where
             )
             .await
             {
-                Ok(Some(balance)) => Ok((dst, balance)),
+                Ok(Some(balance)) => Ok((id, dst, balance)),
                 Ok(None) => Err(StrategyError::other(anyhow::anyhow!(
                     "deposit balance stream ended unexpectedly"
                 ))),
                 Err(_) => {
-                    tracing::warn!(%address, %target, ?max_tracking, "gave up waiting for the deposit");
+                    tracing::warn!(?id, %address, %target, ?max_tracking, "gave up waiting for the deposit");
                     Err(StrategyError::other(anyhow::anyhow!(
                         "deposit to {address} did not reach {target} within {max_tracking:?}"
                     )))
@@ -670,17 +703,19 @@ where
     /// one belonging to a different scheme.
     async fn withdraw_deposit(
         &self,
+        id: &PixAddressId,
         key: &EthDepositKey,
         dst: Address,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         let (node, cfg, chain_key) = (&self.node, &self.cfg, key.chain_key());
+        let id = *id;
 
         (move || sweep_single(Arc::clone(node), cfg, chain_key, dst))
             .retry(retry_policy(cfg.max_sweep_retries))
             .sleep(backon::FuturesTimerSleeper)
-            .notify(|error, dur| {
-                tracing::warn!(%error, %dst, ?dur, "sweep failed, retrying in");
+            .notify(move |error, dur| {
+                tracing::warn!(%error, ?id, %dst, ?dur, "sweep failed, retrying in");
             })
             .await
             .map(|_| ())
@@ -695,13 +730,21 @@ where
     ///
     /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
     /// anonymity set while a withdrawal leaves it.
+    ///
+    /// Only `src_id` is used — it identifies the allocation whose key is being spent, which is
+    /// what the underlying sweep acts on. `dst_id` names an allocation on the receiving side, a
+    /// notion this pool does not have: the destination is just another Ethereum account, and
+    /// nothing here is filed per allocation.
     async fn pool_transfer(
         &self,
+        src_id: &PixAddressId,
         key: &EthDepositKey,
+        _dst_id: &PixAddressId,
         dst: Address,
+        _additional_dst_data: Self::PoolDepositData,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        self.withdraw_deposit(key, dst, amount).await
+        self.withdraw_deposit(src_id, key, dst, amount).await
     }
 }
 
@@ -716,25 +759,26 @@ where
 /// what let the top-up gate read the wrong account unnoticed.
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{num::NonZeroU32, sync::Arc};
 
     use hex_literal::hex;
     use hopr_api::{
         chain::{ChainValues, DepositPool},
-        node::NodeOnchainIdentity,
+        node::{NodeOnchainIdentity, PixAddressId},
         types::{
             crypto::{
                 keypairs::Keypair,
                 prelude::{ChainKeypair, OffchainKeypair},
             },
-            internal::prelude::{AccountEntry, AccountType},
-            primitive::prelude::{Address, HoprBalance, XDaiBalance},
+            internal::prelude::{AccountEntry, AccountType, HoprPseudonym},
+            primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
         },
     };
 
     use super::{EthDepositKey, NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
     use crate::{
         errors::StrategyError,
+        pix::EmptyDepositData,
         testing::{
             BlokliTestStateBuilder, FullStateEmulator, PixNode, TestChainConnector, create_test_blokli_connector,
         },
@@ -752,6 +796,18 @@ mod tests {
 
     const NODE_SECRET: [u8; 32] = hex!("492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775");
     const DEPOSIT_SECRET: [u8; 32] = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+
+    /// An allocation id for the pool calls below.
+    ///
+    /// Fixed rather than random, and shared by every call: this pool keeps no allocation-indexed
+    /// state and carries the id for logging only, so nothing in these tests depends on two calls
+    /// having different ones.
+    fn an_id() -> PixAddressId {
+        PixAddressId::new(
+            &HoprPseudonym::from([0x7au8; HoprPseudonym::SIZE]),
+            NonZeroU32::new(1).expect("non-zero"),
+        )
+    }
 
     /// wxHOPR the Safe starts with, so a sweep's arrival is visible as a delta.
     fn safe_hopr() -> HoprBalance {
@@ -820,12 +876,15 @@ mod tests {
         /// Sweeps the deposit address into the Safe, which is what the strategy always does.
         async fn sweep(&self) -> Result<(), StrategyError> {
             let key = EthDepositKey::from_secret(&DEPOSIT_SECRET).expect("valid test secret");
-            self.pool.withdraw_deposit(&key, self.safe_addr, None).await
+            self.pool.withdraw_deposit(&an_id(), &key, self.safe_addr, None).await
         }
 
         /// Deposits into the fresh destination, which is what the Entry side does.
         async fn deposit(&self, amount: HoprBalance) -> Result<(), StrategyError> {
-            self.pool.deposit_funds_to(self.dest_addr, amount).await
+            let id = an_id();
+            self.pool
+                .deposit_funds_to(&id, &self.dest_addr, amount, EmptyDepositData::for_id(id))
+                .await
         }
     }
 

@@ -88,7 +88,7 @@
 //! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] and
 //! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env`] are both set).
 
-use std::{num::NonZeroU32, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
@@ -97,13 +97,14 @@ use chacha20poly1305::{
 use hopr_api::{
     chain::PixDepositSecret,
     node::PixAddressId,
-    types::{crypto_random::random_bytes, internal::prelude::HoprPseudonym, primitive::traits::BytesRepresentable},
+    types::{crypto_random::random_bytes, primitive::traits::BytesRepresentable},
 };
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use scrypt::{Params as ScryptParams, scrypt};
 
-// Key = pseudonym (10 bytes) + ssa_index (4 bytes)
-const KEY_SIZE: usize = HoprPseudonym::SIZE + 4;
+// Key = pseudonym (10 bytes) + ssa_index (4 bytes), which is exactly the
+// `PixAddressId` byte representation.
+const KEY_SIZE: usize = PixAddressId::SIZE;
 
 // Value = nonce (12 bytes) + ciphertext (32 + 16 tag)
 const NONCE_SIZE: usize = 12;
@@ -214,31 +215,23 @@ impl From<redb::CommitError> for PixRecoveryStoreError {
 }
 
 // ── Key encoding ─────────────────────────────────────────────────────────────
-// Key: `HoprPseudonym::SIZE` bytes of pseudonym + 4 bytes big-endian NonZeroU32.
-// Every offset is derived from `HoprPseudonym::SIZE` so the layout follows the type.
+// The database key *is* the `PixAddressId` byte representation: `HoprPseudonym::SIZE` bytes of
+// pseudonym followed by 4 bytes of big-endian non-zero SSA index. This used to be encoded and
+// decoded by hand here, back when `PixAddressId` was a bare `(HoprPseudonym, NonZeroU32)` tuple
+// with no byte form of its own. It now has one, and it is byte-for-byte the layout this store
+// already wrote — so existing databases keep working unchanged. `test_key_layout_is_the_address_id`
+// pins that down.
 
 fn encode_key(id: &PixAddressId) -> [u8; KEY_SIZE] {
-    let (pseudonym, ssa_index) = id;
-    let pseudonym_bytes: &[u8] = pseudonym.as_ref();
-    let ssa_bytes = ssa_index.get().to_be_bytes();
-    let mut out = [0u8; KEY_SIZE];
-    out[..HoprPseudonym::SIZE].copy_from_slice(pseudonym_bytes);
-    out[HoprPseudonym::SIZE..].copy_from_slice(&ssa_bytes);
-    out
+    id.as_ref()
+        .try_into()
+        .expect("PixAddressId must encode to KEY_SIZE bytes")
 }
 
 fn decode_key(bytes: &[u8; KEY_SIZE]) -> Result<PixAddressId, PixRecoveryStoreError> {
-    let pseudonym = HoprPseudonym::from(
-        <[u8; HoprPseudonym::SIZE]>::try_from(&bytes[..HoprPseudonym::SIZE])
-            .map_err(|_| PixRecoveryStoreError::CorruptKey("pseudonym slice".into()))?,
-    );
-
-    let ssa_index_bytes: [u8; 4] = <[u8; 4]>::try_from(&bytes[HoprPseudonym::SIZE..KEY_SIZE])
-        .map_err(|_| PixRecoveryStoreError::CorruptKey("ssa index slice".into()))?;
-    let ssa_index = NonZeroU32::new(u32::from_be_bytes(ssa_index_bytes))
-        .ok_or_else(|| PixRecoveryStoreError::CorruptKey("zero ssa index".into()))?;
-
-    Ok((pseudonym, ssa_index))
+    // `TryFrom` validates both halves, so a zero SSA index is rejected here rather than
+    // surfacing later as a panic from `PixAddressId::ssa_index`.
+    PixAddressId::try_from(bytes.as_slice()).map_err(|error| PixRecoveryStoreError::CorruptKey(error.to_string()))
 }
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
@@ -577,10 +570,12 @@ impl PixRecoveryStore {
 
 #[cfg(test)]
 mod tests {
-    use hopr_api::types::crypto_random::Randomizable;
+    use std::num::NonZeroU32;
+
+    use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
 
     use super::{
-        HoprPseudonym, NonZeroU32, PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore,
+        BytesRepresentable, KEY_SIZE, PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore,
         PixRecoveryStoreError, ReadableDatabase, VALUE_SIZE, encode_key,
     };
 
@@ -588,7 +583,7 @@ mod tests {
     const ALT_PASSWORD: &str = "password-a";
 
     fn make_id(index: u32) -> PixAddressId {
-        (HoprPseudonym::random(), NonZeroU32::new(index).unwrap())
+        PixAddressId::new(&HoprPseudonym::random(), NonZeroU32::new(index).unwrap())
     }
 
     fn make_secret(byte: u8) -> PixDepositSecret {
@@ -747,8 +742,8 @@ mod tests {
     fn test_key_uniqueness_per_pseudonym_and_index() {
         let (store, _dir) = open_temp_store();
         let pseudo = HoprPseudonym::random();
-        let id_a = (pseudo, NonZeroU32::new(1).unwrap());
-        let id_b = (pseudo, NonZeroU32::new(2).unwrap());
+        let id_a = PixAddressId::new(&pseudo, NonZeroU32::new(1).unwrap());
+        let id_b = PixAddressId::new(&pseudo, NonZeroU32::new(2).unwrap());
         let sec_a = make_secret(0xaa);
         let sec_b = make_secret(0xbb);
 
@@ -757,6 +752,39 @@ mod tests {
         assert!(store.contains(&id_a).unwrap());
         assert!(store.contains(&id_b).unwrap());
         assert_eq!(store.iter().unwrap().len(), 2);
+    }
+
+    /// The key is now delegated to `PixAddressId`'s own byte form rather than encoded here, so
+    /// this pins the layout that databases written by the previous hand-rolled encoder used:
+    /// pseudonym bytes followed by the big-endian SSA index. If `PixAddressId` ever reorders or
+    /// re-sizes its representation, every existing recovery database silently stops resolving its
+    /// entries — and a pending sweep that cannot be found is a deposit that is never swept.
+    #[test]
+    fn test_key_layout_is_the_address_id() {
+        let pseudonym = HoprPseudonym::random();
+        let ssa_index = NonZeroU32::new(0x0102_0304).unwrap();
+        let id = PixAddressId::new(&pseudonym, ssa_index);
+
+        let encoded = encode_key(&id);
+
+        let pseudonym_bytes: &[u8] = pseudonym.as_ref();
+        assert_eq!(&encoded[..HoprPseudonym::SIZE], pseudonym_bytes);
+        assert_eq!(&encoded[HoprPseudonym::SIZE..], &ssa_index.get().to_be_bytes());
+        assert_eq!(KEY_SIZE, HoprPseudonym::SIZE + 4);
+        assert_eq!(super::decode_key(&encoded).unwrap(), id, "the key must round-trip");
+    }
+
+    /// A zero SSA index is unrepresentable in `PixAddressId`, so a tampered or truncated key must
+    /// be reported rather than decoded into something whose accessors panic later.
+    #[test]
+    fn test_decode_key_rejects_zero_ssa_index() {
+        let mut bytes = encode_key(&make_id(1));
+        bytes[HoprPseudonym::SIZE..].fill(0);
+
+        assert!(matches!(
+            super::decode_key(&bytes),
+            Err(PixRecoveryStoreError::CorruptKey(_))
+        ));
     }
 
     #[test]

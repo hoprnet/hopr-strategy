@@ -7,14 +7,22 @@
 //!
 //! # Status
 //!
-//! **Every trait method panics.** This module exists so that the feature wiring, the key type
-//! and the compile-time invariant that binds them are all in place and exercised by the build
-//! *before* the settlement logic lands. What is final here is the shape; what is missing is the
-//! implementation.
+//! **Every method that moves or tracks funds panics.** This module exists so that the feature
+//! wiring, the key type and the compile-time invariant that binds them are all in place and
+//! exercised by the build *before* the settlement logic lands. What is final here is the shape;
+//! what is missing is the implementation.
 //!
 //! The panic is deliberate rather than a silent no-op or an error return. A pool that quietly
 //! did nothing is precisely the failure this whole arrangement exists to prevent — hoprnet
 //! `27b4b255f9` cost a day because a mis-selected curve produced no deposits and no diagnostic.
+//!
+//! [`DepositPool::generate_deposit_data`] is the one exception: it answers with an empty payload.
+//! Deposit data is generated on the Exit *before* any deposit exists, and a panic there would take
+//! down the request path without ever reaching the settlement calls that are the honest place to
+//! discover this pool is a stub. Returning empty keeps the whole `DepositDataRequest` route
+//! exercisable, and a Curvy build still fails loudly — one step later, at
+//! [`DepositPool::deposit_funds_to`]. What the real payload becomes is part of the settlement
+//! design; see [`CurvyDepositPool::PoolDepositData`].
 //!
 //! # Why no newtype
 //!
@@ -29,7 +37,7 @@ use std::{sync::Arc, time::Duration};
 
 use hopr_api::{
     chain::{DepositNotification, DepositPool},
-    node::HasChainApi,
+    node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::{BjjKeypair, BjjPublicKey},
         primitive::prelude::{Address, HoprBalance},
@@ -37,7 +45,7 @@ use hopr_api::{
 };
 use validator::Validate;
 
-use crate::errors::StrategyError;
+use crate::{errors::StrategyError, pix::EmptyDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -114,8 +122,9 @@ pub struct CurvyDepositPoolConfig {
 
 /// A [`DepositPool`] for Baby JubJub deposit addresses.
 ///
-/// See the module documentation: **every method panics**. The type, its key and its config are
-/// final; the settlement logic is not written.
+/// See the module documentation: **every method that moves or tracks funds panics**, and
+/// [`generate_deposit_data`](DepositPool::generate_deposit_data) answers with an empty payload. The
+/// type, its key and its config are final; the settlement logic is not written.
 pub struct CurvyDepositPool<N> {
     #[allow(dead_code)]
     node: Arc<N>,
@@ -137,7 +146,7 @@ macro_rules! not_implemented {
     ($what:literal) => {
         unimplemented!(
             "CurvyDepositPool::{} is not implemented — this build selected the Baby JubJub deposit pool via \
-             `strategy-pix-curvy`, which is currently a stub. For a working pool build with `strategy-pix-secp256k1` \
+             `strategy-pix-curvy`, which is currently a stub. For a working pool build with `strategy-pix-test` \
              instead (and `hopr-lib/pix-secp256k1` with it).",
             $what
         )
@@ -150,14 +159,40 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     type Error = StrategyError;
+    /// `EmptyDepositData` until the settlement logic lands.
+    ///
+    /// An anonymous pool is the case `PoolDepositData` exists for — a Curvy deposit plausibly needs
+    /// a note or commitment carried from Exit to Entry — so this is the one associated type here
+    /// that is a placeholder for a real decision rather than a permanent answer. Whatever it
+    /// becomes must round-trip through
+    /// [`PixDepositData`](hopr_api::node::PixDepositData) in both directions, which is what makes
+    /// the wire form the pool's own business.
+    type PoolDepositData = EmptyDepositData;
     type Receipt = ();
 
-    async fn deposit_funds_to(&self, _dst: BjjPublicKey, _amount: HoprBalance) -> Result<Self::Receipt, Self::Error> {
+    /// The empty payload for `id` — the one method here that does not panic.
+    ///
+    /// See the module docs: this runs on the Exit before any deposit exists, so panicking would
+    /// break the request path rather than the settlement path, and the settlement path is where a
+    /// stub should be discovered. A Curvy build therefore gets this far and then fails at
+    /// [`deposit_funds_to`](Self::deposit_funds_to).
+    async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
+        Ok(EmptyDepositData::for_id(*id))
+    }
+
+    async fn deposit_funds_to(
+        &self,
+        _id: &PixAddressId,
+        _dst: &BjjPublicKey,
+        _amount: HoprBalance,
+        _additional_data: Self::PoolDepositData,
+    ) -> Result<Self::Receipt, Self::Error> {
         not_implemented!("deposit_funds_to")
     }
 
     fn notify_deposit(
         &self,
+        _id: PixAddressId,
         _dst: BjjPublicKey,
         _min_amount: HoprBalance,
     ) -> Result<DepositNotification<'static, BjjPublicKey, Self::Error>, Self::Error> {
@@ -166,6 +201,7 @@ where
 
     async fn withdraw_deposit(
         &self,
+        _id: &PixAddressId,
         _key: &BjjKeypair,
         _dst: Address,
         _amount: Option<HoprBalance>,
@@ -175,10 +211,135 @@ where
 
     async fn pool_transfer(
         &self,
+        _src_id: &PixAddressId,
         _key: &BjjKeypair,
+        _dst_id: &PixAddressId,
         _dst: BjjPublicKey,
+        _additional_dst_data: Self::PoolDepositData,
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         not_implemented!("pool_transfer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroU32, sync::Arc};
+
+    use hopr_api::{
+        ChainKeypair,
+        chain::DepositPool,
+        node::PixAddressId,
+        types::{
+            crypto::prelude::{BjjKeypair, Keypair},
+            crypto_random::Randomizable,
+            internal::prelude::HoprPseudonym,
+            primitive::prelude::{Address, HoprBalance, XDaiBalance},
+        },
+    };
+
+    use super::{CurvyDepositPool, CurvyDepositPoolConfig};
+    use crate::{
+        pix::EmptyDepositData,
+        testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector},
+    };
+
+    /// Builds a pool over a real chain connector, so that a panic observed below is the stub's own
+    /// and not an unrelated failure while standing the pool up.
+    async fn stub_pool() -> anyhow::Result<CurvyDepositPool<impl hopr_api::node::HasChainApi>> {
+        let me = ChainKeypair::from_secret(&hex_literal::hex!(
+            "492057cf93e99b31d2a85bc5e98a9c3aa0021feec52c227cc8170e8f7d047775"
+        ))?;
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&me.public().to_address()],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(Address::from([1u8; 20]));
+        let connector = create_test_blokli_connector(&me, sim, Address::from([1u8; 20])).await?;
+        Ok(CurvyDepositPool::new(
+            Arc::new(ChainNode(Arc::new(connector))),
+            CurvyDepositPoolConfig::default(),
+        ))
+    }
+
+    fn an_id() -> PixAddressId {
+        PixAddressId::new(&HoprPseudonym::random(), NonZeroU32::new(1).unwrap())
+    }
+
+    // Each settlement method must panic, and the panic must name the feature that selected this
+    // pool. The assertion is on the *message*, not merely on the unwind: a stub returning `Ok(())`
+    // or a plain error would look like a working pool that simply never deposits, which is the
+    // failure this module's docs describe as having cost a day to diagnose. The message is the part
+    // that does the work, so the message is what is pinned.
+    //
+    // `generate_deposit_data` is the exception, and has its own test below.
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_deposit_funds_to_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let id = an_id();
+        let _ = pool
+            .deposit_funds_to(
+                &id,
+                BjjKeypair::random().public(),
+                HoprBalance::new_base(1),
+                EmptyDepositData::for_id(id),
+            )
+            .await;
+    }
+
+    /// The one method that must *not* panic.
+    ///
+    /// Deposit data is generated on the Exit before any deposit exists, so a panic here would break
+    /// the `DepositDataRequest` path rather than the settlement path — and the settlement path is
+    /// where this pool being a stub should be discovered. See the module docs.
+    #[tokio::test]
+    async fn test_generate_deposit_data_returns_an_empty_payload() -> anyhow::Result<()> {
+        let pool = stub_pool().await?;
+        let id = an_id();
+
+        let generated = pool.generate_deposit_data(&id).await?;
+        let wire: hopr_api::node::PixDepositData = generated.try_into()?;
+
+        assert_eq!(wire.id, id, "the payload must be filed under the requested allocation");
+        assert!(wire.is_empty(), "the curvy stub carries no bytes yet");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_notify_deposit_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let _ = pool.notify_deposit(an_id(), *BjjKeypair::random().public(), HoprBalance::new_base(1));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_withdraw_deposit_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let _ = pool
+            .withdraw_deposit(&an_id(), &BjjKeypair::random(), Address::from([1u8; 20]), None)
+            .await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strategy-pix-curvy")]
+    async fn test_pool_transfer_panics_naming_the_feature() {
+        let pool = stub_pool().await.expect("pool must stand up");
+        let dst_id = an_id();
+        let _ = pool
+            .pool_transfer(
+                &an_id(),
+                &BjjKeypair::random(),
+                &dst_id,
+                *BjjKeypair::random().public(),
+                EmptyDepositData::for_id(dst_id),
+                None,
+            )
+            .await;
     }
 }
