@@ -106,30 +106,50 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
     payload
 };
 
-/// Rejects any payload that is not [`DEPOSIT_MARKER_PAYLOAD`].
+/// Rejects deposit data that is not [`DEPOSIT_MARKER_PAYLOAD`] filed under `id`.
 ///
-/// A mismatch means the Entry sent deposit data this pool cannot read — the two ends disagree about
-/// which pool is running, the same class of failure as a wrong curve. It is reported rather than
-/// ignored, and before any funds move: swallowing it would reproduce exactly the failure the
-/// `pix::curvy` docs describe, a deposit that quietly drops what the peer sent.
+/// Both halves are checked, because [`ByteDepositData`] is a pair and either half can disagree:
+///
+/// - A payload that is not the marker means the Entry sent deposit data this pool cannot read — the
+///   two ends disagree about which pool is running, the same class of failure as a wrong curve.
+/// - A payload filed under another allocation means the pool is being asked to settle against `id`
+///   using data that describes a different SSA. This pool keeps no allocation-indexed state, so
+///   nothing here would actually be corrupted by it — but the disagreement is real, and the id is
+///   carried in the payload precisely so that it can be checked rather than assumed.
+///
+/// Both are reported rather than ignored, and before any funds move: swallowing either would
+/// reproduce exactly the failure the `pix::curvy` docs describe, a deposit that quietly drops what
+/// the peer sent. The strategy makes the same id comparison on the wire form in its
+/// `NewDepositAddress` arm; this one covers every other way into the pool, including callers that
+/// do not go through the strategy at all.
 ///
 /// Compared with `==` rather than [`ConstantTimeEq`]: the expected value is a public constant, so
 /// there is no secret for a timing side channel to leak, and a constant-time comparison here would
 /// only suggest to a reader that there is one.
 fn check_deposit_payload(id: &PixAddressId, data: &ByteDepositData) -> Result<(), StrategyError> {
-    if data.payload() == DEPOSIT_MARKER_PAYLOAD {
-        return Ok(());
+    if data.id() != id {
+        tracing::error!(
+            pix_id = ?id,
+            deposit_data_id = ?data.id(),
+            "deposit data belongs to a different allocation than the deposit it was handed for"
+        );
+
+        return Err(StrategyError::GeneralError(GeneralError::InvalidInput));
     }
 
-    tracing::error!(
-        pix_id = ?id,
-        expected_len = DEPOSIT_MARKER_PAYLOAD_LEN,
-        actual_len = data.payload().len(),
-        "additional deposit data is not the form this pool reads - the Entry and this node's deposit pool \
-         disagree on the payload format"
-    );
+    if data.payload() != DEPOSIT_MARKER_PAYLOAD {
+        tracing::error!(
+            pix_id = ?id,
+            expected_len = DEPOSIT_MARKER_PAYLOAD_LEN,
+            actual_len = data.payload().len(),
+            "additional deposit data is not the form this pool reads - the Entry and this node's deposit pool \
+             disagree on the payload format"
+        );
 
-    Err(StrategyError::GeneralError(GeneralError::InvalidInput))
+        return Err(StrategyError::GeneralError(GeneralError::InvalidInput));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -569,12 +589,14 @@ where
     /// balance-based rather than transaction-based, so a third party funding the same
     /// address also satisfies the check.
     ///
-    /// `id` is carried for logging only: the destination address is what identifies the deposit
-    /// on-chain, and this pool keeps no allocation-indexed state of its own.
+    /// `id` does not select anything to settle against — the destination address is what identifies
+    /// the deposit on-chain, and this pool keeps no allocation-indexed state of its own. Beyond
+    /// logging it is used only to check `additional_data` against.
     ///
-    /// `additional_data` must carry [`DEPOSIT_MARKER_PAYLOAD`]. It is checked *before* the first
-    /// attempt rather than inside the retry closure: a payload the pool cannot read is not a
-    /// transient failure, and spending the retry budget on it would only delay the diagnostic.
+    /// `additional_data` must carry [`DEPOSIT_MARKER_PAYLOAD`] and be filed under `id`. It is
+    /// checked *before* the first attempt rather than inside the retry closure: deposit data the
+    /// pool cannot accept is not a transient failure, and spending the retry budget on it would
+    /// only delay the diagnostic.
     async fn deposit_funds_to(
         &self,
         id: &PixAddressId,
@@ -721,12 +743,15 @@ where
     /// `src_id` identifies the allocation whose key is being spent, which is what the underlying
     /// sweep acts on. `dst_id` names an allocation on the receiving side, a notion this pool does
     /// not have — the destination is just another Ethereum account, and nothing here is filed per
-    /// allocation — so it is used only to attribute a rejected `additional_dst_data`.
+    /// allocation — so it is used only to check `additional_dst_data` against, and to attribute it
+    /// when that check fails.
     ///
     /// `additional_dst_data` is checked exactly as in
     /// [`deposit_funds_to`](Self::deposit_funds_to), and for the same reason: every payload this
-    /// pool is handed is one it has to be able to read, and a transfer that moves funds while
-    /// dropping an unreadable payload is the silent failure the check exists to prevent.
+    /// pool is handed is one it has to be able to accept, and a transfer that moves funds while
+    /// dropping deposit data it disagreed with is the silent failure the check exists to prevent.
+    /// This is the only guard on `dst_id`: unlike a deposit, a transfer has no arm in the strategy
+    /// that compares the ids on the wire form first.
     async fn pool_transfer(
         &self,
         src_id: &PixAddressId,

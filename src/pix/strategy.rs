@@ -2380,6 +2380,97 @@ mod tests {
         Ok(())
     }
 
+    /// Deposit data filed under a different allocation than the deposit it arrived with is refused
+    /// by the pool, even when the payload itself is the marker.
+    ///
+    /// The pool-level sibling of
+    /// [`test_new_deposit_address_rejects_deposit_data_for_another_allocation`], and not redundant
+    /// with it: that one covers the strategy's `NewDepositAddress` arm, which compares the ids on
+    /// the wire form. `pool_transfer` has no such arm — the strategy never calls it — so a
+    /// misfiled `dst_id` reaches the pool unchecked by anything else, and a caller that does not go
+    /// through the strategy at all bypasses that comparison for deposits too.
+    ///
+    /// Nothing in this pool is filed per allocation, so a mismatch corrupts no state of its own.
+    /// What it means is that the two ends disagree, and the id travels inside the payload precisely
+    /// so that can be noticed rather than assumed. Settling regardless would make carrying it
+    /// pointless.
+    #[test_log::test(tokio::test)]
+    async fn test_pool_refuses_deposit_data_for_another_allocation() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let dest_addr = Address::from([0x42u8; 20]);
+        let deposit = HoprBalance::new_base(7);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(dest_addr, HoprBalance::zero())])
+            // A funded deposit address with gas of its own to pay for the transfer.
+            .with_balances([(ra, deposit)])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+
+        let dst_before = hopr_balance(&*cc, *CHRIS).await?;
+
+        // The payload is exactly what the pool generates — only the allocation it is filed under
+        // differs, so the id comparison is the only thing that can refuse these calls.
+        let id = pix_id(1);
+        let other_id = pix_id(2);
+        let misfiled = ByteDepositData::new(other_id, DEPOSIT_MARKER_PAYLOAD);
+
+        let deposited = pool
+            .deposit_funds_to(&id, &dest_addr, HoprBalance::new_base(10), misfiled.clone())
+            .await;
+        assert!(
+            matches!(deposited, Err(StrategyError::GeneralError(_))),
+            "deposit_funds_to must refuse deposit data filed under another allocation, got {deposited:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, dest_addr).await?,
+            HoprBalance::zero(),
+            "a refused deposit must move nothing"
+        );
+
+        let dst_id = pix_id(3);
+        let transferred = pool
+            .pool_transfer(
+                &id,
+                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &dst_id,
+                *CHRIS,
+                misfiled,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(transferred, Err(StrategyError::GeneralError(_))),
+            "pool_transfer must refuse deposit data filed under another allocation, got {transferred:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, ra).await?,
+            deposit,
+            "a refused transfer must leave the deposit where it was"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, *CHRIS).await?,
+            dst_before,
+            "a refused transfer must move nothing"
+        );
+        Ok(())
+    }
+
     /// `pool_transfer` inherits the sweep's retry budget, because it is the same operation.
     ///
     /// Worth pinning: the delegation is what makes this true, and someone giving
