@@ -110,12 +110,12 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
 ///
 /// Both halves are checked, because [`ByteDepositData`] is a pair and either half can disagree:
 ///
-/// - A payload that is not the marker means the Entry sent deposit data this pool cannot read — the
-///   two ends disagree about which pool is running, the same class of failure as a wrong curve.
-/// - A payload filed under another allocation means the pool is being asked to settle against `id`
-///   using data that describes a different SSA. This pool keeps no allocation-indexed state, so
-///   nothing here would actually be corrupted by it — but the disagreement is real, and the id is
-///   carried in the payload precisely so that it can be checked rather than assumed.
+/// - A payload that is not the marker means the Entry sent deposit data this pool cannot read — the two ends disagree
+///   about which pool is running, the same class of failure as a wrong curve.
+/// - A payload filed under another allocation means the pool is being asked to settle against `id` using data that
+///   describes a different SSA. This pool keeps no allocation-indexed state, so nothing here would actually be
+///   corrupted by it — but the disagreement is real, and the id is carried in the payload precisely so that it can be
+///   checked rather than assumed.
 ///
 /// Both are reported rather than ignored, and before any funds move: swallowing either would
 /// reproduce exactly the failure the `pix::curvy` docs describe, a deposit that quietly drops what
