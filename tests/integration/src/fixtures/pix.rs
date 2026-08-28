@@ -17,7 +17,10 @@ use hopr_api::{
         primitive::prelude::{Address, BytesRepresentable, HoprBalance, XDaiBalance},
     },
 };
-use hopr_strategy::testing::{BlokliTestStateBuilder, PixNode, create_test_blokli_connector, register_test_safe};
+use hopr_strategy::{
+    pix::secp256k1::DEPOSIT_MARKER_PAYLOAD,
+    testing::{BlokliTestStateBuilder, PixNode, create_test_blokli_connector, register_test_safe},
+};
 
 use super::{IntegrationFixture, TestAccount, module_address, poll_stable, poll_until};
 use crate::{
@@ -202,15 +205,17 @@ pub fn pix_address_id(seed: u8, ssa_index: u32) -> PixAddressId {
     )
 }
 
-/// The payload both bundled pools generate: no bytes, filed under `id`.
+/// The wire payload `NonAnonymousDepositPool` generates and accepts, filed under `id`.
 ///
-/// `PixDepositData` is no longer optional on the events, so a test that has nothing to carry says
-/// so with empty bytes. The id must match the event's own, which is why it is a parameter rather
-/// than generated here.
-pub fn empty_deposit_data(id: PixAddressId) -> PixDepositData {
+/// These tests drive that pool, and it settles a deposit only when the payload is exactly
+/// [`DEPOSIT_MARKER_PAYLOAD`] — so this is what an event has to carry to get past it. A test that
+/// wants the rejection path builds its own `PixDepositData` instead.
+///
+/// The id must match the event's own, which is why it is a parameter rather than generated here.
+pub fn pool_deposit_data(id: PixAddressId) -> PixDepositData {
     PixDepositData {
         id,
-        data: Box::default(),
+        data: DEPOSIT_MARKER_PAYLOAD.into(),
     }
 }
 

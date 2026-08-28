@@ -4,35 +4,6 @@
 //! `secp256k1::NonAnonymousDepositPool` for the
 //! Baby JubJub instantiation of `HoprPixSpec`, where a deposit address is a curve point rather
 //! than an Ethereum account.
-//!
-//! # Status
-//!
-//! **Every method that moves or tracks funds panics.** This module exists so that the feature
-//! wiring, the key type and the compile-time invariant that binds them are all in place and
-//! exercised by the build *before* the settlement logic lands. What is final here is the shape;
-//! what is missing is the implementation.
-//!
-//! The panic is deliberate rather than a silent no-op or an error return. A pool that quietly
-//! did nothing is precisely the failure this whole arrangement exists to prevent — hoprnet
-//! `27b4b255f9` cost a day because a mis-selected curve produced no deposits and no diagnostic.
-//!
-//! [`DepositPool::generate_deposit_data`] is the one exception: it answers with an empty payload.
-//! Deposit data is generated on the Exit *before* any deposit exists, and a panic there would take
-//! down the request path without ever reaching the settlement calls that are the honest place to
-//! discover this pool is a stub. Returning empty keeps the whole `DepositDataRequest` route
-//! exercisable, and a Curvy build still fails loudly — one step later, at
-//! [`DepositPool::deposit_funds_to`]. What the real payload becomes is part of the settlement
-//! design; see [`CurvyDepositPool::PoolDepositData`].
-//!
-//! # Why no newtype
-//!
-//! The secp arm needs
-//! `secp256k1::EthDepositKey` because
-//! `ChainKeypair::Public` is a `PublicKey` while a deposit address is an `Address` — a *hash* of
-//! it, with no way back. Baby JubJub has no such gap: `BjjKeypair::Public` **is** `BjjPublicKey`,
-//! which is exactly what `PixDepositAddress::Bjj` carries, and hopr-types supplies the
-//! conversion both ways. So this pool is parameterised on the upstream keypair directly.
-
 use std::{sync::Arc, time::Duration};
 
 use hopr_api::{
@@ -45,7 +16,7 @@ use hopr_api::{
 };
 use validator::Validate;
 
-use crate::{errors::StrategyError, pix::EmptyDepositData};
+use crate::{errors::StrategyError, pix::ByteDepositData};
 
 // ---------------------------------------------------------------------------
 // Module-level aliases
@@ -91,22 +62,6 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 }
 
 /// Configuration for [`CurvyDepositPool`].
-///
-/// **Shares nothing with `secp256k1::NonAnonymousDepositPoolConfig` by design.** The two pools
-/// settle by different means, so neither one's knobs are evidence
-/// that the other needs them, in either direction:
-///
-/// * The non-anonymous pool's `gas_xdai_per_sweep` funds a recovered stealth address so it can pay for its own
-///   `withdraw_from_signer` transaction. That is a fact about settling on-chain from an EOA, not about deposit pools.
-///   This pool has no such field and should not acquire one by analogy.
-/// * Its `max_deposit_retries` / `max_sweep_retries` budget retries of a *transaction* against a chain that may drop
-///   it. What this pool retries, and whether retrying is even meaningful, is not yet decided.
-///
-/// So this carries only what the [`DepositPool`] contract itself forces — a pool owns the
-/// deadline on the future it returns from [`DepositPool::notify_deposit`], so it needs somewhere
-/// to keep it — and stays otherwise empty until the settlement design says what belongs here.
-/// A consumer that wants both pools configured writes the two separately; nothing lets a value
-/// intended for one silently reach the other.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
 pub struct CurvyDepositPoolConfig {
     /// How long [`DepositPool::notify_deposit`]'s future waits before resolving to an error.
@@ -159,15 +114,11 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     type Error = StrategyError;
-    /// `EmptyDepositData` until the settlement logic lands.
+    /// [`ByteDepositData`], empty — a placeholder until the settlement logic lands.
     ///
-    /// An anonymous pool is the case `PoolDepositData` exists for — a Curvy deposit plausibly needs
-    /// a note or commitment carried from Exit to Entry — so this is the one associated type here
-    /// that is a placeholder for a real decision rather than a permanent answer. Whatever it
-    /// becomes must round-trip through
-    /// [`PixDepositData`](hopr_api::node::PixDepositData) in both directions, which is what makes
-    /// the wire form the pool's own business.
-    type PoolDepositData = EmptyDepositData;
+    /// Curvy pool should replace it with its custom deposit data, which is convertible to/from
+    /// [`PixDepositData`](hopr_api::chain::PixDepositData).
+    type PoolDepositData = ByteDepositData;
     type Receipt = ();
 
     /// The empty payload for `id` — the one method here that does not panic.
@@ -177,7 +128,7 @@ where
     /// stub should be discovered. A Curvy build therefore gets this far and then fails at
     /// [`deposit_funds_to`](Self::deposit_funds_to).
     async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
-        Ok(EmptyDepositData::for_id(*id))
+        Ok(ByteDepositData::for_id(*id))
     }
 
     async fn deposit_funds_to(
@@ -240,7 +191,7 @@ mod tests {
 
     use super::{CurvyDepositPool, CurvyDepositPoolConfig};
     use crate::{
-        pix::EmptyDepositData,
+        pix::ByteDepositData,
         testing::{BlokliTestStateBuilder, ChainNode, create_test_blokli_connector},
     };
 
@@ -287,7 +238,7 @@ mod tests {
                 &id,
                 BjjKeypair::random().public(),
                 HoprBalance::new_base(1),
-                EmptyDepositData::for_id(id),
+                ByteDepositData::for_id(id),
             )
             .await;
     }
@@ -337,7 +288,7 @@ mod tests {
                 &BjjKeypair::random(),
                 &dst_id,
                 *BjjKeypair::random().public(),
-                EmptyDepositData::for_id(dst_id),
+                ByteDepositData::for_id(dst_id),
                 None,
             )
             .await;
