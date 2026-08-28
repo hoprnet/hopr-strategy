@@ -38,9 +38,10 @@ pub struct PixScenarioOpts {
     /// Deposit addresses to pre-create, with their initial wxHOPR and xDai.
     ///
     /// Both entries have to exist up front: balance queries against the stub chain
-    /// fail for an address with no entry at all, and every emulated transaction
-    /// charges its signer a native fee — so an address the strategy will later
-    /// sweep needs non-zero xDai even when its token balance starts at zero.
+    /// fail for an address with no entry at all. Every emulated transaction charges
+    /// its signer a native fee, so an address the strategy will later sweep needs
+    /// xDai — either pre-credited here, or supplied by the pool's gas top-up, which
+    /// [`Self::with_native`] can leave it dependent on.
     pub deposit_addresses: Vec<(Address, HoprBalance, XDaiBalance)>,
 }
 
@@ -64,6 +65,18 @@ impl PixScenarioOpts {
             None => self
                 .deposit_addresses
                 .push((address, balance, XDaiBalance::new_base(1u32))),
+        }
+        self
+    }
+
+    /// Overrides the xDai `address` starts with, which [`Self::new`] sets generously.
+    ///
+    /// Pass [`XDaiBalance::zero`] to create an address that cannot sign its own sweep, so the
+    /// pool's gas top-up is on the critical path rather than short-circuited.
+    pub fn with_native(mut self, address: Address, balance: XDaiBalance) -> Self {
+        match self.deposit_addresses.iter_mut().find(|(addr, ..)| *addr == address) {
+            Some(entry) => entry.2 = balance,
+            None => self.deposit_addresses.push((address, HoprBalance::zero(), balance)),
         }
         self
     }
@@ -91,6 +104,13 @@ impl PixScenario {
         ChainValues::balance(&*self.connector, address)
             .await
             .with_context(|| format!("failed to read wxHOPR balance of {address}"))
+    }
+
+    /// Reads the current xDai balance of `address`.
+    pub async fn native_balance(&self, address: Address) -> Result<XDaiBalance> {
+        ChainValues::balance(&*self.connector, address)
+            .await
+            .with_context(|| format!("failed to read xDai balance of {address}"))
     }
 
     /// Polls until `address` holds a wxHOPR balance satisfying `predicate`.

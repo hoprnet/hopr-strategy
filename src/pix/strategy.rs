@@ -61,6 +61,11 @@ lazy_static::lazy_static! {
             "hopr_strategy_pix_deposits_rejected_total",
             "Count of SSA deposits refused because they exceed max_ssa_allocation",
         ).unwrap();
+    static ref METRIC_PIX_DEPOSITS_OVER_BUDGET: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_deposits_over_budget_total",
+            "Count of SSA deposits refused because they would cross max_spend_per_window",
+        ).unwrap();
     static ref METRIC_PIX_DEPOSITS_FAILED: hopr_api::types::telemetry::SimpleCounter =
         hopr_api::types::telemetry::SimpleCounter::new(
             "hopr_strategy_pix_deposits_failed_total",
@@ -107,6 +112,22 @@ fn default_max_ssa_allocation() -> HoprBalance {
     HoprBalance::new_base(100)
 }
 
+fn default_max_spend_per_window() -> HoprBalance {
+    HoprBalance::new_base(10_000)
+}
+
+fn default_spend_window() -> Duration {
+    Duration::from_secs(3600)
+}
+
+// `Result` in this module is the crate alias, which fixes the error type.
+fn validate_min_1sec(duration: &Duration) -> std::result::Result<(), validator::ValidationError> {
+    if duration.as_secs() < 1 {
+        return Err(validator::ValidationError::new("must be at least 1 second"));
+    }
+    Ok(())
+}
+
 fn default_deposit_buffer_period() -> Duration {
     Duration::from_millis(500)
 }
@@ -123,6 +144,51 @@ fn default_withdrawal_buffer_period() -> Duration {
 /// `strategy-pix-*` feature was on — which is exactly what made the two features mutually
 /// exclusive. Keeping settlement config out of strategy config is what lets both pools be
 /// compiled together.
+///
+/// # Examples
+///
+/// The two spend controls are independent: [`Self::max_ssa_allocation`] caps a single deposit,
+/// while [`Self::max_spend_per_window`] caps the total committed across a rolling
+/// [`Self::spend_window`] — so a stream of individually-acceptable deposits is bounded too.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hopr_api::types::primitive::prelude::HoprBalance;
+/// use hopr_strategy::pix::strategy::PixStrategyConfig;
+///
+/// // At most 100 wxHOPR to any one deposit address, and at most 1 000 wxHOPR in total
+/// // over any 10-minute stretch.
+/// let cfg = PixStrategyConfig {
+///     max_ssa_allocation: HoprBalance::new_base(100),
+///     max_spend_per_window: HoprBalance::new_base(1_000),
+///     spend_window: Duration::from_secs(600),
+///     ..Default::default()
+/// };
+///
+/// assert_eq!(cfg.max_spend_per_window, HoprBalance::new_base(1_000));
+/// assert_eq!(cfg.spend_window, Duration::from_secs(600));
+/// ```
+///
+/// The window limit is opt-out rather than opt-in: it is armed by default, and only a zero
+/// budget disables it. The defaults are 10 000 wxHOPR per hour.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use hopr_api::types::primitive::prelude::HoprBalance;
+/// use hopr_strategy::pix::strategy::PixStrategyConfig;
+///
+/// let armed = PixStrategyConfig::default();
+/// assert_eq!(armed.max_spend_per_window, HoprBalance::new_base(10_000));
+/// assert_eq!(armed.spend_window, Duration::from_secs(3600));
+///
+/// let unlimited = PixStrategyConfig {
+///     max_spend_per_window: HoprBalance::zero(),
+///     ..Default::default()
+/// };
+/// assert!(unlimited.max_spend_per_window.is_zero());
+/// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate, smart_default::SmartDefault)]
 #[serde(deny_unknown_fields)]
@@ -133,10 +199,42 @@ pub struct PixStrategyConfig {
     #[serde(default = "default_price_per_byte")]
     pub price_per_byte: HoprBalance,
     /// Maximum wxHOPR the strategy will send to a single deposit address.
+    ///
+    /// A per-address ceiling only. It says nothing about how *many* addresses get funded — that
+    /// is [`Self::max_spend_per_window`]'s job.
     #[default(default_max_ssa_allocation())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_max_ssa_allocation")]
     pub max_ssa_allocation: HoprBalance,
+
+    /// Maximum wxHOPR the strategy will commit to deposits within any [`Self::spend_window`].
+    /// Default: 10 000 wxHOPR.  Zero disables the limit.
+    ///
+    /// The circuit breaker for a runaway or hostile event stream: distinct PIX ids to distinct
+    /// addresses each pass the dedupe, the in-flight guard and [`Self::max_ssa_allocation`], so
+    /// without an aggregate ceiling they are all funded until the node's wxHOPR is gone.
+    ///
+    /// Sized as a runaway detector rather than a throttle — the default is 100 deposits at the
+    /// default `max_ssa_allocation` — so reaching it means something is wrong, not that the node
+    /// is busy. A deposit that would cross it is refused with
+    /// [`StrategyError::CriteriaNotSatisfied`] and the event is dropped; it is not re-tried when
+    /// the window rolls forward.
+    ///
+    /// The ledger behind it is in memory, so a restart forgives the window. It bounds a burst,
+    /// not lifetime spend; `secp256k1::NonAnonymousDepositPoolConfig::min_node_hopr_reserve`
+    /// is the balance floor that survives restarts.
+    #[default(default_max_spend_per_window())]
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_max_spend_per_window")]
+    pub max_spend_per_window: HoprBalance,
+
+    /// Length of the rolling window for [`Self::max_spend_per_window`].  Default: 1 hour.
+    ///
+    /// Rolling rather than fixed: there is no reset instant for a burst to line up with.
+    #[default(default_spend_window())]
+    #[serde(with = "humantime_serde", default = "default_spend_window")]
+    #[validate(custom(function = "validate_min_1sec"))]
+    pub spend_window: Duration,
     /// If set, recovered private keys are persisted to redb at this path.
     ///
     /// Strongly recommended in production. A `PrivateKeyRecovered` event can arrive before
@@ -168,6 +266,14 @@ const PROCESSED_DEPOSITS_CAPACITY: u64 = 8192;
 const PROCESSED_DEPOSITS_TTL: Duration = Duration::from_secs(24 * 3600);
 const IN_FLIGHT_GUARD_CAPACITY: u64 = 1024;
 const IN_FLIGHT_GUARD_TTL: Duration = Duration::from_secs(600);
+
+/// Entries the spend ledger keeps before coalescing the oldest two.
+///
+/// The window cap already bounds the ledger for any sane configuration — entries stop being
+/// added once it trips — but `price_per_byte` is free to be tiny, which would let a large cap
+/// admit an unbounded number of minute deposits. Coalescing keeps that bounded without ever
+/// under-counting.
+const SPEND_LEDGER_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -254,6 +360,11 @@ impl PixStrategy {
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
         A: crate::pix::DepositAddressOf<crate::pix::secp256k1::PoolKeypair>,
     {
+        // Each builder validates the config it owns: the pool's here, the strategy's inside
+        // `build_with_pool`. Checked before anything is constructed, so a build that is going to
+        // fail does not first open a recovery store on disk.
+        StrategyError::validate_config(&pool_cfg)?;
+
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
         let pool = Arc::new(crate::pix::secp256k1::NonAnonymousDepositPool::new(
@@ -308,6 +419,9 @@ impl PixStrategy {
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
         A: crate::pix::DepositAddressOf<crate::pix::curvy::PoolKeypair>,
     {
+        // See `build_non_anonymous`: the pool config is this builder's to validate.
+        StrategyError::validate_config(&pool_cfg)?;
+
         let pool = Arc::new(crate::pix::curvy::CurvyDepositPool::new(Arc::clone(&node), pool_cfg));
         let safe_address = node.identity().safe_address;
 
@@ -340,6 +454,10 @@ impl PixStrategy {
         D::Error: Into<StrategyError>,
         N: ActionableEventSource + Send + Sync + 'static,
     {
+        // Every other strategy validates in its builder; this one derived `Validate` without ever
+        // calling it, so `spend_window`'s constraint would have been decorative.
+        StrategyError::validate_config(&self.cfg)?;
+
         let recovery_store = open_recovery_store(
             self.cfg.pix_recovery_db_path.as_ref(),
             self.cfg.pix_recovery_password_env.as_ref(),
@@ -365,6 +483,7 @@ impl PixStrategy {
                 .build(),
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
+            spend_ledger: std::collections::VecDeque::new(),
         }))
     }
 }
@@ -437,6 +556,9 @@ where
     deposit_buffer: Vec<BufferedDeposit<D, K>>,
     /// Debounced withdrawal buffer.
     withdrawal_buffer: Vec<(PixAddressId, PixDepositSecret)>,
+    /// Rolling record of deposits committed within [`PixStrategyConfig::spend_window`], oldest
+    /// first. Entries are appended when a deposit is accepted into the buffer and expire by age.
+    spend_ledger: std::collections::VecDeque<(std::time::Instant, HoprBalance)>,
 }
 
 #[cfg(test)]
@@ -481,6 +603,7 @@ where
                 .build(),
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
+            spend_ledger: std::collections::VecDeque::new(),
         }
     }
 }
@@ -505,6 +628,45 @@ where
         + 'static,
     D::Error: Into<StrategyError>,
 {
+    /// Drops ledger entries that have aged out of the window and returns what is still committed.
+    ///
+    /// Called on every deposit event, so eviction keeps pace with arrivals without a timer.
+    fn spent_in_window(&mut self) -> HoprBalance {
+        let (window, now) = (self.cfg.spend_window, std::time::Instant::now());
+
+        while let Some((at, _)) = self.spend_ledger.front() {
+            if now.duration_since(*at) < window {
+                break;
+            }
+            self.spend_ledger.pop_front();
+        }
+
+        self.spend_ledger
+            .iter()
+            .fold(HoprBalance::zero(), |total, (_, amount)| total + *amount)
+    }
+
+    /// Records `amount` against the window.
+    ///
+    /// Committed at the moment a deposit is accepted into the buffer rather than after it
+    /// settles, and never refunded on failure: `deposit_funds_to` retries internally and
+    /// re-reads the destination balance precisely because a transfer reported as failed may
+    /// still have landed. A ledger that only counted confirmed spend could therefore under-count
+    /// real ones, which is the wrong direction for a safety limit to err in.
+    fn commit_spend(&mut self, amount: HoprBalance) {
+        self.spend_ledger.push_back((std::time::Instant::now(), amount));
+
+        // Fold the oldest entry into its successor. The merged amount then expires with the
+        // *newer* timestamp, so it is counted for longer than it strictly should be — the
+        // conservative direction for a cap.
+        if self.spend_ledger.len() > SPEND_LEDGER_CAPACITY
+            && let Some((_, oldest)) = self.spend_ledger.pop_front()
+            && let Some((_, next)) = self.spend_ledger.front_mut()
+        {
+            *next += oldest;
+        }
+    }
+
     /// Validate and buffer a PIX event for batched execution.
     ///
     /// [`NewDepositAddress`] and [`PrivateKeyRecovered`] events are pushed into
@@ -531,6 +693,25 @@ where
                     #[cfg(all(feature = "telemetry", not(test)))]
                     METRIC_PIX_DEPOSITS_REJECTED.increment();
                     return Err(StrategyError::CriteriaNotSatisfied);
+                }
+
+                // Checked here, next to the per-address ceiling, but committed only once the
+                // event has cleared every other gate below — a deposit rejected for some other
+                // reason spends nothing and must not consume the window.
+                if !self.cfg.max_spend_per_window.is_zero() {
+                    let spent = self.spent_in_window();
+                    if spent + target_deposit > self.cfg.max_spend_per_window {
+                        tracing::warn!(
+                            %target_deposit,
+                            %spent,
+                            budget = %self.cfg.max_spend_per_window,
+                            window = ?self.cfg.spend_window,
+                            "deposit refused: it would cross the rolling spend limit"
+                        );
+                        #[cfg(all(feature = "telemetry", not(test)))]
+                        METRIC_PIX_DEPOSITS_OVER_BUDGET.increment();
+                        return Err(StrategyError::CriteriaNotSatisfied);
+                    }
                 }
 
                 // The single narrowing from the wire form to the one this pool settles. It cannot
@@ -589,6 +770,7 @@ where
 
                 self.in_flight_destinations.insert(dest_addr.clone(), ());
 
+                self.commit_spend(target_deposit);
                 self.deposit_buffer
                     .push((new_deposit_address.id, dest_addr, target_deposit, deposit_data));
 
@@ -1396,6 +1578,7 @@ mod tests {
             gas_xdai_per_sweep: g,
             max_deposit_retries,
             max_sweep_retries,
+            ..Default::default()
         }
     }
 
@@ -1436,6 +1619,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let id = pix_id(1);
@@ -1485,6 +1669,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
@@ -1528,6 +1713,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let id = pix_id(1);
@@ -1588,6 +1774,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
@@ -1667,6 +1854,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
@@ -1727,6 +1915,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
@@ -1784,6 +1973,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
@@ -1826,6 +2016,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let id = pix_id(1);
@@ -1877,6 +2068,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
@@ -1900,6 +2092,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         })?;
         Ok(())
     }
@@ -1923,11 +2116,323 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         })
         .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default())?;
         assert_eq!(s.to_string(), "pix");
         fn assert_send<T: Send>(_: &T) {}
         assert_send(&s);
+        Ok(())
+    }
+
+    // ── Rolling spend limit ────────────────────────────────────────
+
+    type SpendTestConnector = Arc<TestChainConnector<crate::testing::FullStateEmulator>>;
+    type SpendTestNode = ChainNode<SpendTestConnector>;
+
+    /// A connected Entry-side node with each of `destinations` pre-created empty.
+    ///
+    /// `deposit_funds_to` reads the destination balance before transferring, and the stub chain
+    /// has no entry for an address that was never funded.
+    async fn entry_side(
+        destinations: &[Address],
+    ) -> anyhow::Result<(
+        SpendTestConnector,
+        Arc<SpendTestNode>,
+        Arc<NonAnonymousDepositPool<SpendTestNode>>,
+    )> {
+        let mut builder = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))]);
+        for destination in destinations {
+            builder = builder.with_balances([(*destination, HoprBalance::zero())]);
+        }
+
+        let mut cc = TestChainConnector::new(
+            builder.build_dynamic_client(MODULE_ADDRESS.into()),
+            *BOB,
+            BOB_KP.clone(),
+            MODULE_ADDRESS.into(),
+        );
+        cc.connect().await?;
+        let cc = Arc::new(cc);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = Arc::new(NonAnonymousDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+        ));
+        Ok((cc, node, pool))
+    }
+
+    /// A `PixStrategyConfig` that flushes immediately, so a deposit's effect is observable as
+    /// soon as the event has been handled.
+    fn spend_cfg(max_spend_per_window: HoprBalance, spend_window: StdDuration) -> PixStrategyConfig {
+        PixStrategyConfig {
+            max_spend_per_window,
+            spend_window,
+            // Stated rather than inherited: these tests price a quota and then assert on the
+            // resulting deposit, so the arithmetic depends on both.
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
+        }
+    }
+
+    fn new_deposit(address: Address, quota: u64) -> PixEvent {
+        // `pix_id` is random per call, so every event carries a distinct allocation — which is
+        // what these tests need: distinct ids to distinct addresses clear the dedupe cache and the
+        // in-flight guard, leaving the spend limit as the only thing that can refuse them.
+        let id = pix_id(1);
+        PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+            id,
+            address: address.into(),
+            quota,
+            deposit_data: empty_deposit_data(id),
+        })
+    }
+
+    /// The aggregate ceiling the per-address one never provided.
+    ///
+    /// Distinct ids to distinct addresses clear the dedupe, the in-flight guard and
+    /// `max_ssa_allocation` alike, so before this limit existed a stream of them drained the
+    /// node's whole float one legitimate-looking deposit at a time.
+    #[test_log::test(tokio::test)]
+    async fn test_deposits_are_refused_once_the_rolling_spend_limit_is_crossed() -> anyhow::Result<()> {
+        let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, pool) = entry_side(&[first, second]).await?;
+
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::new_base(50), StdDuration::from_secs(3600)),
+            *BOB,
+            None,
+        );
+
+        s.on_pix_event(new_deposit(first, 30)).await?;
+        assert_eq!(hopr_balance(&*cc, first).await?, HoprBalance::new_base(30));
+
+        // 30 already committed + 30 more would be 60, past the 50 ceiling.
+        let result = s.on_pix_event(new_deposit(second, 30)).await;
+
+        assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)));
+        assert!(
+            hopr_balance(&*cc, second).await?.is_zero(),
+            "the refused deposit must not be funded"
+        );
+        Ok(())
+    }
+
+    /// The window rolls rather than resetting on a fixed boundary, so the budget frees up as the
+    /// oldest deposits age out and a node that tripped the limit recovers by itself.
+    #[test_log::test(tokio::test)]
+    async fn test_rolling_spend_limit_frees_up_as_the_window_advances() -> anyhow::Result<()> {
+        let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, pool) = entry_side(&[first, second]).await?;
+
+        // Buffered rather than flushed per event: a confirmation takes about a second on the stub
+        // chain, which would age the first deposit out of a window this short before the second
+        // one is even offered.
+        let mut cfg = spend_cfg(HoprBalance::new_base(30), StdDuration::from_secs(1));
+        cfg.deposit_buffer_period = StdDuration::from_secs(60);
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        s.on_pix_event(new_deposit(first, 30)).await?;
+        assert!(
+            matches!(
+                s.on_pix_event(new_deposit(second, 30)).await,
+                Err(StrategyError::CriteriaNotSatisfied)
+            ),
+            "the budget must be exhausted immediately after the first deposit"
+        );
+
+        tokio::time::sleep(StdDuration::from_millis(1300)).await;
+
+        s.on_pix_event(new_deposit(second, 30)).await?;
+        s.flush_deposits().await;
+        assert_eq!(
+            hopr_balance(&*cc, second).await?,
+            HoprBalance::new_base(30),
+            "the same deposit must succeed once the first has aged out of the window"
+        );
+        Ok(())
+    }
+
+    /// Zero opts out, matching how a zero `gas_xdai_per_sweep` disables the gas top-up.
+    #[test_log::test(tokio::test)]
+    async fn test_zero_spend_limit_disables_the_check() -> anyhow::Result<()> {
+        let addresses: [Address; 3] = [[0x42u8; 20].into(), [0x43u8; 20].into(), [0x44u8; 20].into()];
+        let (cc, node, pool) = entry_side(&addresses).await?;
+
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::zero(), StdDuration::from_secs(3600)),
+            *BOB,
+            None,
+        );
+
+        // Well past any of the defaults, and past the node's own float were it not for the pool's
+        // own affordability check.
+        for address in addresses {
+            s.on_pix_event(new_deposit(address, 100)).await?;
+            assert_eq!(hopr_balance(&*cc, address).await?, HoprBalance::new_base(100));
+        }
+        Ok(())
+    }
+
+    /// The window counts committed deposits, not attempted ones.
+    ///
+    /// The limit is checked alongside `max_ssa_allocation` but committed only after every other
+    /// gate has passed, so an event refused for an unrelated reason — which spends nothing — must
+    /// leave the budget where it was.
+    #[test_log::test(tokio::test)]
+    async fn test_deposit_rejected_for_another_reason_does_not_consume_the_window() -> anyhow::Result<()> {
+        let (oversized, ordinary): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, pool) = entry_side(&[oversized, ordinary]).await?;
+
+        let mut cfg = spend_cfg(HoprBalance::new_base(50), StdDuration::from_secs(3600));
+        cfg.max_ssa_allocation = HoprBalance::new_base(50);
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        // Refused by the per-address ceiling, which is checked first.
+        assert!(matches!(
+            s.on_pix_event(new_deposit(oversized, 100)).await,
+            Err(StrategyError::CriteriaNotSatisfied)
+        ));
+
+        // Would fail if the rejected event above had eaten the window's whole budget.
+        s.on_pix_event(new_deposit(ordinary, 50)).await?;
+        assert_eq!(hopr_balance(&*cc, ordinary).await?, HoprBalance::new_base(50));
+        Ok(())
+    }
+
+    /// The same invariant, for a gate that runs *after* the spend check rather than before it.
+    ///
+    /// `max_ssa_allocation` above is checked first, so that case never reaches the spend limit at
+    /// all. The deposit-data gates are the harder half: the limit has already been consulted and
+    /// passed by the time the payload is rejected, so only the fact that `commit_spend` runs last
+    /// keeps the budget intact. Moving the commit up beside its check would leave the test above
+    /// green and silently start charging the window for events that deposit nothing.
+    #[test_log::test(tokio::test)]
+    async fn test_deposit_rejected_after_the_spend_check_does_not_consume_the_window() -> anyhow::Result<()> {
+        let (mismatched, ordinary): (Address, Address) = ([0x44u8; 20].into(), [0x45u8; 20].into());
+        let (cc, node, pool) = entry_side(&[mismatched, ordinary]).await?;
+
+        // Budget is exactly one 50 wxHOPR deposit, and the per-address ceiling is high enough that
+        // it cannot be what refuses either event.
+        let mut cfg = spend_cfg(HoprBalance::new_base(50), StdDuration::from_secs(3600));
+        cfg.max_ssa_allocation = HoprBalance::new_base(100);
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        // Clears dedupe, the per-address ceiling and the spend limit; refused only because the
+        // payload names a different allocation than the address it arrived with.
+        let id = pix_id(1);
+        let refused = s
+            .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+                id,
+                address: mismatched.into(),
+                quota: 50,
+                deposit_data: empty_deposit_data(pix_id(2)),
+            }))
+            .await;
+        assert!(
+            matches!(refused, Err(StrategyError::GeneralError(_))),
+            "expected the id-mismatch rejection, got {refused:?}"
+        );
+        assert!(
+            hopr_balance(&*cc, mismatched).await?.is_zero(),
+            "a refused event must not deposit"
+        );
+
+        // Would fail if the refusal above had charged the window.
+        s.on_pix_event(new_deposit(ordinary, 50)).await?;
+        assert_eq!(hopr_balance(&*cc, ordinary).await?, HoprBalance::new_base(50));
+        Ok(())
+    }
+
+    /// A zero window would evict every entry the instant it was written, silently disabling a
+    /// limit the operator believes is armed. The builder is where that is caught — and it did not
+    /// validate its config at all before this.
+    #[test_log::test(tokio::test)]
+    async fn test_build_rejects_a_zero_spend_window() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        let result = PixStrategy::new(spend_cfg(HoprBalance::new_base(50), StdDuration::ZERO))
+            .build_non_anonymous::<_, Address>(node, Default::default());
+
+        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        Ok(())
+    }
+
+    // ── Builder config validation ──────────────────────────────────
+
+    /// The *pool* config is validated too, not just the strategy's.
+    ///
+    /// `NonAnonymousDepositPoolConfig` has carried validators since it was written and derived
+    /// `Validate` for them, but no builder ever ran them — a tracking time the pool's own
+    /// constraint forbids was accepted and turned into a polling interval of zero.
+    #[test_log::test(tokio::test)]
+    async fn test_build_non_anonymous_rejects_an_invalid_pool_config() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(
+            node,
+            crate::pix::secp256k1::PoolConfig {
+                max_deposit_tracking_time: StdDuration::ZERO,
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        Ok(())
+    }
+
+    /// Zero retries means "one attempt, no backoff" — the documented meaning of a budget counted
+    /// *in addition to* the first attempt, and what most of the tests in this file rely on.
+    ///
+    /// It was declared `range(min = 1)`, contradicting that. Harmless while nothing validated;
+    /// turning validation on would have made a legitimate config unbuildable.
+    #[test_log::test(tokio::test)]
+    async fn test_build_non_anonymous_accepts_zero_retry_budgets() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(
+            node,
+            crate::pix::secp256k1::PoolConfig {
+                max_deposit_retries: 0,
+                max_sweep_retries: 0,
+                ..Default::default()
+            },
+        )?;
+
+        Ok(())
+    }
+
+    /// The curvy builder validates its own pool config on the same footing, even though the pool
+    /// behind it is still a stub.
+    #[cfg(feature = "strategy-pix-curvy")]
+    #[test_log::test(tokio::test)]
+    async fn test_build_curvy_rejects_an_invalid_pool_config() -> anyhow::Result<()> {
+        use hopr_api::types::crypto::prelude::BjjPublicKey;
+
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+            node,
+            crate::pix::curvy::PoolConfig {
+                max_deposit_tracking_time: StdDuration::ZERO,
+            },
+        );
+
+        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
         Ok(())
     }
 
@@ -1961,6 +2466,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let id = pix_id(1);
@@ -2006,6 +2512,7 @@ mod tests {
             pix_recovery_password_env: Some(BUILD_PASSWORD_ENV.to_string()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         })
         .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default())?;
         assert!(db.exists());
@@ -2050,6 +2557,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, Some(store));
         let id = pix_id(1);
@@ -2676,6 +3184,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, Arc::clone(&node), cfg, *BOB, Some(store));
 
@@ -2744,6 +3253,7 @@ mod tests {
             // Flush immediately: this test asserts on the outcome of the sweep itself.
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, Some(store));
         let id = pix_id(1);
@@ -2786,6 +3296,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         })
         .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default());
         // The message must name the field that is missing, not just report a failed criterion.
@@ -2821,6 +3332,7 @@ mod tests {
             pix_recovery_password_env: Some(ev.to_string()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         })
         .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default());
         assert!(r.is_err());
@@ -2865,6 +3377,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::from_secs(60),
             withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         let bb = hopr_balance(&*cc, *BOB).await?;
@@ -2936,6 +3449,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::from_secs(60),
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
         s.on_pix_event(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
@@ -3008,6 +3522,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::from_secs(60),
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, Some(store.clone()));
 
@@ -3197,6 +3712,7 @@ mod tests {
             pix_recovery_password_env: None,
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::from_secs(60),
+            ..Default::default()
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
