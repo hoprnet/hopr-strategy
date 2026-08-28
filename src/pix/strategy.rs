@@ -1435,7 +1435,11 @@ mod tests {
     use super::{PixStrategy, PixStrategyConfig, PixStrategyInner};
     use crate::{
         errors::StrategyError,
-        pix::{EmptyDepositData, recovery_store::PixRecoveryStore, secp256k1::NonAnonymousDepositPool},
+        pix::{
+            ByteDepositData,
+            recovery_store::PixRecoveryStore,
+            secp256k1::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPool},
+        },
         testing::{BlokliTestStateBuilder, TestChainConnector},
     };
 
@@ -1467,14 +1471,17 @@ mod tests {
         )
     }
 
-    /// The payload both bundled pools generate: no bytes, filed under `id`.
+    /// The wire payload `NonAnonymousDepositPool` generates and accepts, filed under `id`.
+    ///
+    /// Every test here drives that pool, so this is what an event has to carry for the deposit to
+    /// be settled rather than refused — see `secp256k1::DEPOSIT_MARKER_PAYLOAD`.
     ///
     /// `id` has to be the same value the event carries, so callers bind it to a local first rather
     /// than calling `pix_id` twice — [`pix_id`] is random per call.
-    fn empty_deposit_data(id: PixAddressId) -> PixDepositData {
+    fn pool_deposit_data(id: PixAddressId) -> PixDepositData {
         PixDepositData {
             id,
-            data: Box::default(),
+            data: DEPOSIT_MARKER_PAYLOAD.into(),
         }
     }
 
@@ -1621,7 +1628,7 @@ mod tests {
             address: addr.into(),
             quota: 100,
             deposit_updated: tx,
-            deposit_data: empty_deposit_data(id),
+            deposit_data: pool_deposit_data(id),
         }))
         .await?;
         let n = timeout(StdDuration::from_secs(10), rx.next())
@@ -1671,7 +1678,7 @@ mod tests {
             id,
             address: da.into(),
             quota: 20,
-            deposit_data: empty_deposit_data(id),
+            deposit_data: pool_deposit_data(id),
         }))
         .await?;
         s.flush_deposits().await;
@@ -1715,25 +1722,31 @@ mod tests {
                 id,
                 address: Address::from([0x42u8; 20]).into(),
                 quota: 10,
-                deposit_data: empty_deposit_data(id),
+                deposit_data: pool_deposit_data(id),
             }))
             .await;
         assert!(matches!(r, Err(StrategyError::CriteriaNotSatisfied)));
         Ok(())
     }
 
-    /// Deposit data this pool cannot read must be reported, not ignored.
+    /// Deposit data this pool cannot read must stop the deposit, not be dropped on the way past.
     ///
-    /// `NonAnonymousDepositPool` carries no side-channel payload, so `EmptyDepositData` rejects
-    /// any non-empty bytes. Bytes arriving here mean the Entry and this node's pool disagree on
-    /// the payload format — the same class of mismatch as a wrong curve, and it deserves the same
-    /// loud failure rather than a deposit that silently drops what the peer sent.
+    /// `NonAnonymousDepositPool` accepts exactly `DEPOSIT_MARKER_PAYLOAD`; anything else means the
+    /// Entry and this node's pool disagree on the payload format — the same class of mismatch as a
+    /// wrong curve. Settling anyway would be the silent failure the check exists to prevent, so the
+    /// assertion that matters is that the destination is *not* funded.
     ///
-    /// The in-flight destination guard must survive the rejection: a corrected peer retrying the
-    /// same address has to get through, which it cannot if the failed attempt left the address
-    /// marked as busy.
+    /// The rejection happens inside the pool rather than at the `PixDepositData` conversion, which
+    /// is shared by every pool and so cannot know what any one of them reads. That puts it after
+    /// the event is buffered, which is why `on_pix_event` itself returns `Ok`: `flush_deposits`
+    /// reports the pool's error through the log and the failure metric rather than through its
+    /// return value.
+    ///
+    /// The in-flight destination guard must not survive the rejection: a corrected peer retrying
+    /// the same address has to get through, which the second half of the test exercises directly.
     #[test_log::test(tokio::test)]
-    async fn test_new_deposit_address_rejects_unreadable_deposit_data() -> anyhow::Result<()> {
+    async fn test_new_deposit_address_does_not_settle_unreadable_deposit_data() -> anyhow::Result<()> {
+        let dest_addr = Address::from([0x42u8; 20]);
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],
@@ -1741,6 +1754,10 @@ mod tests {
                 XDaiBalance::new_base(1),
                 HoprBalance::new_base(1000),
             )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            // `deposit_funds_to` reads the destination balance before transferring, and the
+            // stub chain has no entry for an address that was never funded.
+            .with_balances([(dest_addr, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
@@ -1761,45 +1778,49 @@ mod tests {
         };
         let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
 
-        let dest_addr = Address::from([0x42u8; 20]);
         let id = pix_id(1);
-        let r = s
-            .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+        s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+            id,
+            address: dest_addr.into(),
+            quota: 10,
+            deposit_data: PixDepositData {
                 id,
-                address: dest_addr.into(),
-                quota: 10,
-                deposit_data: PixDepositData {
-                    id,
-                    data: vec![0xde, 0xad, 0xbe, 0xef].into(),
-                },
-            }))
-            .await;
+                data: vec![0xde, 0xad, 0xbe, 0xef].into(),
+            },
+        }))
+        .await?;
 
-        assert!(
-            matches!(r, Err(StrategyError::GeneralError(_))),
-            "unreadable deposit data must be rejected, got {r:?}"
+        assert_eq!(
+            hopr_balance(&*cc, dest_addr).await?,
+            HoprBalance::zero(),
+            "a payload this pool cannot read must not be settled"
         );
         assert!(
-            s.deposit_buffer.is_empty(),
-            "a rejected event must not leave a deposit buffered"
+            !s.processed_deposits.contains_key(&id),
+            "a refused deposit must not be recorded as processed"
         );
+        assert!(s.deposit_buffer.is_empty(), "a refused deposit must not stay buffered");
         assert!(
             !s.in_flight_destinations.contains_key(&dest_addr),
-            "the destination must stay free so a corrected retry can get through"
+            "the destination must be freed so a corrected retry can get through"
         );
 
-        // An empty payload is not the same thing as an unreadable one. `PixDepositData` is no
-        // longer optional, so "nothing to carry" is now expressed as empty bytes — and that has to
-        // be accepted, because it is what both bundled pools generate.
-        let accepted = s
-            .on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
-                id,
-                address: dest_addr.into(),
-                quota: 10,
-                deposit_data: empty_deposit_data(id),
-            }))
-            .await;
-        assert!(accepted.is_ok(), "an empty payload must be accepted, got {accepted:?}");
+        // The payload is the only thing that differed, so the same allocation and the same
+        // destination now settle — which is what makes the assertions above about the payload
+        // rather than about the deposit path being broken in some unrelated way.
+        s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+            id,
+            address: dest_addr.into(),
+            quota: 10,
+            deposit_data: pool_deposit_data(id),
+        }))
+        .await?;
+
+        assert_eq!(
+            hopr_balance(&*cc, dest_addr).await?,
+            HoprBalance::new_base(10),
+            "the corrected retry must settle"
+        );
         Ok(())
     }
 
@@ -1845,7 +1866,7 @@ mod tests {
                 quota: 10,
                 // A well-formed, readable, *empty* payload — it is only the id that is wrong, so
                 // this cannot be mistaken for the payload-format rejection above.
-                deposit_data: empty_deposit_data(pix_id(2)),
+                deposit_data: pool_deposit_data(pix_id(2)),
             }))
             .await;
 
@@ -1918,8 +1939,8 @@ mod tests {
             "one payload per requested allocation, in the order asked"
         );
         assert!(
-            delivered.iter().all(|d| d.is_empty()),
-            "the non-anonymous pool carries no side-channel bytes"
+            delivered.iter().all(|d| *d.data == DEPOSIT_MARKER_PAYLOAD),
+            "every payload must be the marker the receiving pool checks for"
         );
         Ok(())
     }
@@ -2454,7 +2475,7 @@ mod tests {
                 id,
                 address: da.into(),
                 quota: 20,
-                deposit_data: empty_deposit_data(id),
+                deposit_data: pool_deposit_data(id),
             })
         };
         let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
@@ -2701,7 +2722,7 @@ mod tests {
             &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
             &dst_id,
             *CHRIS,
-            EmptyDepositData::for_id(dst_id),
+            ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
             None,
         )
         .await?;
@@ -2758,7 +2779,7 @@ mod tests {
                 &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
                 &dst_id,
                 *CHRIS,
-                EmptyDepositData::for_id(dst_id),
+                ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
                 None,
             )
             .await;
@@ -2766,6 +2787,194 @@ mod tests {
         assert!(
             matches!(result, Err(StrategyError::CriteriaNotSatisfied)),
             "an empty address must be refused, got {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Both entry points that are handed a payload refuse one this pool cannot read.
+    ///
+    /// Asserted at the pool rather than through the strategy because that is where the check lives:
+    /// the `PixDepositData` conversion is shared by every pool and cannot know what any one of them
+    /// reads, so `DEPOSIT_MARKER_PAYLOAD` is enforced here.
+    ///
+    /// Everything else is set up to succeed — the Safe is funded, the deposit address holds a
+    /// balance and its own gas — so the payload is the only thing that can be refusing these calls.
+    /// The balance assertions are the substance: a rejection that still moved the funds would be
+    /// the failure the check exists to prevent, and the error alone would not catch it.
+    #[test_log::test(tokio::test)]
+    async fn test_pool_refuses_a_payload_it_cannot_read() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let dest_addr = Address::from([0x42u8; 20]);
+        let deposit = HoprBalance::new_base(7);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            // `deposit_funds_to` reads the destination balance before transferring, and the
+            // stub chain has no entry for an address that was never funded.
+            .with_balances([(dest_addr, HoprBalance::zero())])
+            // A funded deposit address with gas of its own to pay for the transfer.
+            .with_balances([(ra, deposit)])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+
+        let dst_before = hopr_balance(&*cc, *CHRIS).await?;
+
+        let id = pix_id(1);
+        let unreadable = ByteDepositData::new(id, [0xde, 0xad, 0xbe, 0xef]);
+
+        let deposited = pool
+            .deposit_funds_to(&id, &dest_addr, HoprBalance::new_base(10), unreadable.clone())
+            .await;
+        assert!(
+            matches!(deposited, Err(StrategyError::GeneralError(_))),
+            "deposit_funds_to must refuse an unreadable payload, got {deposited:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, dest_addr).await?,
+            HoprBalance::zero(),
+            "a refused deposit must move nothing"
+        );
+
+        let dst_id = pix_id(2);
+        let transferred = pool
+            .pool_transfer(
+                &id,
+                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &dst_id,
+                *CHRIS,
+                ByteDepositData::new(dst_id, [0xde, 0xad, 0xbe, 0xef]),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(transferred, Err(StrategyError::GeneralError(_))),
+            "pool_transfer must refuse an unreadable payload, got {transferred:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, ra).await?,
+            deposit,
+            "a refused transfer must leave the deposit where it was"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, *CHRIS).await?,
+            dst_before,
+            "a refused transfer must move nothing"
+        );
+
+        // An empty payload is refused for the same reason a wrong one is: this pool reads exactly
+        // one shape, and "nothing" is not it. Pinned separately because empty bytes are what the
+        // type's own `for_id` produces, so this is the mistake most easily made.
+        let empty = pool
+            .deposit_funds_to(&id, &dest_addr, HoprBalance::new_base(10), ByteDepositData::for_id(id))
+            .await;
+        assert!(
+            matches!(empty, Err(StrategyError::GeneralError(_))),
+            "an empty payload must be refused too, got {empty:?}"
+        );
+        Ok(())
+    }
+
+    /// Deposit data filed under a different allocation than the deposit it arrived with is refused
+    /// by the pool, even when the payload itself is the marker.
+    ///
+    /// The pool-level sibling of
+    /// [`test_new_deposit_address_rejects_deposit_data_for_another_allocation`], and not redundant
+    /// with it: that one covers the strategy's `NewDepositAddress` arm, which compares the ids on
+    /// the wire form. `pool_transfer` has no such arm — the strategy never calls it — so a
+    /// misfiled `dst_id` reaches the pool unchecked by anything else, and a caller that does not go
+    /// through the strategy at all bypasses that comparison for deposits too.
+    ///
+    /// Nothing in this pool is filed per allocation, so a mismatch corrupts no state of its own.
+    /// What it means is that the two ends disagree, and the id travels inside the payload precisely
+    /// so that can be noticed rather than assumed. Settling regardless would make carrying it
+    /// pointless.
+    #[test_log::test(tokio::test)]
+    async fn test_pool_refuses_deposit_data_for_another_allocation() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let dest_addr = Address::from([0x42u8; 20]);
+        let deposit = HoprBalance::new_base(7);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(dest_addr, HoprBalance::zero())])
+            // A funded deposit address with gas of its own to pay for the transfer.
+            .with_balances([(ra, deposit)])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+
+        let dst_before = hopr_balance(&*cc, *CHRIS).await?;
+
+        // The payload is exactly what the pool generates — only the allocation it is filed under
+        // differs, so the id comparison is the only thing that can refuse these calls.
+        let id = pix_id(1);
+        let other_id = pix_id(2);
+        let misfiled = ByteDepositData::new(other_id, DEPOSIT_MARKER_PAYLOAD);
+
+        let deposited = pool
+            .deposit_funds_to(&id, &dest_addr, HoprBalance::new_base(10), misfiled.clone())
+            .await;
+        assert!(
+            matches!(deposited, Err(StrategyError::GeneralError(_))),
+            "deposit_funds_to must refuse deposit data filed under another allocation, got {deposited:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, dest_addr).await?,
+            HoprBalance::zero(),
+            "a refused deposit must move nothing"
+        );
+
+        let dst_id = pix_id(3);
+        let transferred = pool
+            .pool_transfer(
+                &id,
+                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &dst_id,
+                *CHRIS,
+                misfiled,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(transferred, Err(StrategyError::GeneralError(_))),
+            "pool_transfer must refuse deposit data filed under another allocation, got {transferred:?}"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, ra).await?,
+            deposit,
+            "a refused transfer must leave the deposit where it was"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, *CHRIS).await?,
+            dst_before,
+            "a refused transfer must move nothing"
         );
         Ok(())
     }
@@ -2817,7 +3026,7 @@ mod tests {
                 &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
                 &dst_id,
                 *CHRIS,
-                EmptyDepositData::for_id(dst_id),
+                ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
                 None,
             )
             .await;
@@ -2985,7 +3194,7 @@ mod tests {
             id,
             address: da.into(),
             quota,
-            deposit_data: empty_deposit_data(id),
+            deposit_data: pool_deposit_data(id),
         }));
 
         let landed = timeout(StdDuration::from_secs(10), async {
@@ -3180,14 +3389,14 @@ mod tests {
             id: id1,
             address: da1.into(),
             quota: 20,
-            deposit_data: empty_deposit_data(id1),
+            deposit_data: pool_deposit_data(id1),
         }))
         .await?;
         s.on_pix_event(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
             id: id2,
             address: da2.into(),
             quota: 30,
-            deposit_data: empty_deposit_data(id2),
+            deposit_data: pool_deposit_data(id2),
         }))
         .await?;
         // Nothing has moved yet: the window is still open.
@@ -3391,7 +3600,7 @@ mod tests {
 
         let id = pix_id(1);
         let result = pool
-            .deposit_funds_to(&id, &dst, amount, EmptyDepositData::for_id(id))
+            .deposit_funds_to(&id, &dst, amount, ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD))
             .await;
         appearing.await??;
 
@@ -3438,13 +3647,15 @@ mod tests {
         Ok(())
     }
 
-    /// The non-anonymous pool generates an empty payload, filed under the allocation asked about.
+    /// The non-anonymous pool generates its marker payload, filed under the allocation asked about.
     ///
-    /// Asserted through the round trip to `PixDepositData` rather than on `EmptyDepositData`
+    /// Asserted through the round trip to `PixDepositData` rather than on `ByteDepositData`
     /// directly, because the wire form is what the Exit actually puts on the request — and the
-    /// conversion is the pool's own, so it is part of what is under test.
+    /// conversion is the pool's own, so it is part of what is under test. What comes out has to be
+    /// byte-for-byte what the peer's copy of this pool will accept; the payload check on the
+    /// receiving side is what makes that a contract rather than a detail.
     #[test_log::test(tokio::test)]
-    async fn test_generate_deposit_data_is_empty_and_carries_the_id() -> anyhow::Result<()> {
+    async fn test_generate_deposit_data_carries_the_marker_and_the_id() -> anyhow::Result<()> {
         use hopr_api::chain::DepositPool;
 
         let sim = BlokliTestStateBuilder::default()
@@ -3465,7 +3676,10 @@ mod tests {
         let wire: PixDepositData = pool.generate_deposit_data(&id).await?.try_into()?;
 
         assert_eq!(wire.id, id, "the payload must be filed under the requested allocation");
-        assert!(wire.is_empty(), "a plain transfer has no side-channel payload");
+        assert_eq!(
+            &*wire.data, &DEPOSIT_MARKER_PAYLOAD,
+            "the payload must be the marker the receiving side checks for"
+        );
         Ok(())
     }
 
