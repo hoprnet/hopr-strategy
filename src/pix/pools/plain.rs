@@ -1,7 +1,8 @@
 //! ## Non-anonymous [`DepositPool`] implementation — plain on-chain settlement
 //!
-//! A [`DepositPool`] that uses plain Ethereum transactions from the node's own account
-//! to fund deposit addresses.  All operations are fully visible on-chain.
+//! A [`DepositPool`] that funds deposit addresses with plain Ethereum transactions: the node's Safe
+//! supplies the wxHOPR, the node key signs and pays the gas. All operations are fully visible
+//! on-chain.
 //!
 //! The module is named for *how* it settles rather than for the curve it settles on, matching its
 //! sibling [`curvy`](super::curvy): the deposit addresses happen to be secp256k1 `Address`es, but
@@ -589,6 +590,29 @@ impl<N: HasChainApi, C> NonAnonymousDepositPool<N, C> {
     /// be on the tested path rather than stubbed. Tests hand in the in-process
     /// `BlokliTestClient` here; production goes through [`Self::new`], and the two then run
     /// exactly the same code.
+    ///
+    /// `node_key` carries the same requirement as in [`Self::new`] — it must be the node's own
+    /// chain key, since it is what signs the gas top-ups.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::{ChainKeypair, node::HasChainApi};
+    /// use hopr_chain_connector::blokli_client::{BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient};
+    /// use hopr_strategy::pix::pools::plain::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    ///
+    /// // `C` is the client the pool's EOA-signing connectors are built on; passing it here
+    /// // bypasses `NonAnonymousDepositPoolConfig::blokli_url` entirely.
+    /// fn build<N, C>(node: Arc<N>, node_key: ChainKeypair, client: C) -> NonAnonymousDepositPool<N, C>
+    /// where
+    ///     N: HasChainApi,
+    ///     C: BlokliSubscriptionClient + BlokliQueryClient + BlokliTransactionClient + Clone + Send + Sync + 'static,
+    /// {
+    ///     NonAnonymousDepositPool::with_client(node, node_key, NonAnonymousDepositPoolConfig::default(), client)
+    /// }
+    /// ```
     pub fn with_client(node: Arc<N>, node_key: ChainKeypair, cfg: NonAnonymousDepositPoolConfig, client: C) -> Self {
         Self {
             node,
@@ -738,8 +762,10 @@ async fn deposit_once(
 
 /// Ensure the recovered stealth address has enough xDai for gas.
 ///
-/// The top-up is paid by the **node's own account**, not by the Safe, and the pre-flight balance
-/// check reads that same account.
+/// The top-up is paid by the **node's own account**, not by the Safe. The pre-flight check reads
+/// the balance of `node_key`'s own address rather than of `identity().node_address`, so the account
+/// gated is always the account debited. `build_non_anonymous_with_client` rejects a `node_key` that
+/// is not the node's, so on a correctly built pool the two are the same address anyway.
 ///
 /// That is a constraint rather than a preference. A Safe holds wxHOPR and no xDai on a normal
 /// deployment, so a top-up drawn from it would be refused every time and every recovered deposit
@@ -785,7 +811,10 @@ where
 
     let deficit = cfg.gas_xdai_per_sweep - recovered_xdai;
 
-    let payer = node.identity().node_address;
+    // Derived from `node_key` rather than read from `identity()`. The transfer below is signed by
+    // that key, so this is the account that pays *by construction* — the gate cannot end up
+    // guarding one account while the spend debits another.
+    let payer = node_key.public().to_address();
     let payer_xdai: XDaiBalance = node.chain_api().balance(payer).await.map_err(StrategyError::other)?;
 
     // `Balance` addition saturates rather than wrapping, so an absurd reserve refuses the top-up

@@ -24,18 +24,15 @@ use hopr_strategy::{
 };
 
 use super::{IntegrationFixture, TestAccount, module_address, poll_stable, poll_until};
-use crate::{
-    constants::{NODE_FUNDING, SAFE_FUNDING},
-    strategy_node::NodeConnector,
-};
+use crate::{constants::SAFE_FUNDING, strategy_node::NodeConnector};
 
 /// Poll interval for the balance helpers, matching `await_channel_where`.
 const BALANCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Parameters for [`IntegrationFixture::open_pix_scenario`].
 pub struct PixScenarioOpts {
-    /// wxHOPR credited to the node address — the source a PIX deposit draws on.
-    pub node_funding: HoprBalance,
+    /// wxHOPR credited to the node's Safe — the source a PIX deposit draws on.
+    pub safe_funding: HoprBalance,
     /// Deposit addresses to pre-create, with their initial wxHOPR and xDai.
     ///
     /// Both entries have to exist up front: balance queries against the stub chain
@@ -47,11 +44,11 @@ pub struct PixScenarioOpts {
 }
 
 impl PixScenarioOpts {
-    /// Defaults: node funded with `NODE_FUNDING`, each deposit address created
+    /// Defaults: Safe funded with `SAFE_FUNDING`, each deposit address created
     /// empty but with enough xDai to sign its own sweep.
     pub fn new(deposit_addresses: &[Address]) -> Result<Self> {
         Ok(Self {
-            node_funding: NODE_FUNDING.parse()?,
+            safe_funding: SAFE_FUNDING.parse()?,
             deposit_addresses: deposit_addresses
                 .iter()
                 .map(|address| (*address, HoprBalance::zero(), XDaiBalance::new_base(1u32)))
@@ -171,17 +168,12 @@ impl IntegrationFixture {
     /// [`PixNode`] carrying that node's real on-chain identity.
     pub async fn open_pix_scenario(&self, node: &TestAccount, opts: PixScenarioOpts) -> Result<PixScenario> {
         let client = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&node.address],
-                false,
-                XDaiBalance::new_base(1u32),
-                SAFE_FUNDING.parse()?,
-            )
-            // `with_generated_accounts` puts the token funding on the Safe and leaves
-            // the node address at zero. A PIX deposit is a transfer signed by the node
-            // key, and the emulator debits the signer, so credit the node directly.
+            // `with_generated_accounts` puts the token funding on the Safe and leaves the node
+            // address at an explicit zero. That is exactly right here: a PIX deposit is wrapped in
+            // the Safe module's `execTransactionFromModule`, so the Safe is what the emulator
+            // debits. The node's xDai is what pays gas and funds sweep top-ups.
+            .with_generated_accounts(&[&node.address], false, XDaiBalance::new_base(1u32), opts.safe_funding)
             // Unlike `with_generated_accounts`, `with_balances` may be called repeatedly.
-            .with_balances([(node.address, opts.node_funding)])
             .with_balances(opts.deposit_addresses.iter().map(|(addr, hopr, _)| (*addr, *hopr)))
             .with_balances(opts.deposit_addresses.iter().map(|(addr, _, native)| (*addr, *native)))
             .build_dynamic_client(module_address());

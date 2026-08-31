@@ -385,6 +385,36 @@ impl PixStrategy {
     /// [`build_non_anonymous`](Self::build_non_anonymous) delegates here rather than duplicating
     /// it. Also useful to a consumer that already holds a client and would rather not have a
     /// second one opened on its behalf.
+    ///
+    /// `node_key` must be the node's own chain key — the same requirement as
+    /// [`build_non_anonymous`](Self::build_non_anonymous), and rejected here rather than at the
+    /// first sweep.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::{
+    ///     ChainKeypair,
+    ///     node::{ActionableEventSource, HasChainApi},
+    ///     types::primitive::prelude::Address,
+    /// };
+    /// use hopr_chain_connector::blokli_client::{BlokliQueryClient, BlokliSubscriptionClient, BlokliTransactionClient};
+    /// use hopr_strategy::pix::strategy::{PixStrategy, PixStrategyConfig};
+    ///
+    /// fn build<N, C>(node: Arc<N>, node_key: ChainKeypair, client: C) -> anyhow::Result<()>
+    /// where
+    ///     N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
+    ///     C: BlokliSubscriptionClient + BlokliQueryClient + BlokliTransactionClient + Clone + Send + Sync + 'static,
+    /// {
+    ///     // The client stands in for the one `build_non_anonymous` would open from
+    ///     // `PoolConfig::blokli_url`; everything after this point is identical.
+    ///     let _strategy = PixStrategy::new(PixStrategyConfig::default())
+    ///         .build_non_anonymous_with_client::<_, Address, _>(node, node_key, Default::default(), client)?;
+    ///     Ok(())
+    /// }
+    /// ```
     #[cfg(feature = "strategy-pix-test")]
     pub fn build_non_anonymous_with_client<N, A, C>(
         self,
@@ -405,6 +435,18 @@ impl PixStrategy {
             + 'static,
     {
         StrategyError::validate_config(&pool_cfg)?;
+
+        // The pool signs sweep-gas top-ups with `node_key` directly, and its reserve gate reads
+        // that key's own balance. A key that is not the node's would therefore spend and gate an
+        // account unrelated to the one `node.chain_api()` settles deposits from — a wiring mistake
+        // worth catching at build time rather than at the first recovered deposit.
+        let key_address = node_key.public().to_address();
+        let node_address = node.identity().node_address;
+        if key_address != node_address {
+            return Err(StrategyError::InvalidConfiguration(format!(
+                "the given node key belongs to {key_address}, but the node's on-chain identity is {node_address}"
+            )));
+        }
 
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
@@ -2671,6 +2713,29 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        Ok(())
+    }
+
+    /// The pool signs sweep-gas top-ups with the key it is handed, and gates them on that same
+    /// key's balance. A key that is not the node's would therefore top up gas out of an account
+    /// unrelated to the one deposits settle from — silently, and only on the sweep path, which is
+    /// the hardest place to notice it. The builder is the one place that can see both.
+    #[test_log::test(tokio::test)]
+    async fn test_build_non_anonymous_rejects_a_key_that_is_not_the_nodes() -> anyhow::Result<()> {
+        let (cc, node, _pool) = entry_side(&[]).await?;
+
+        let stranger = ChainKeypair::from_secret(&[7u8; 32])?;
+        assert_ne!(stranger.public().to_address(), node.identity().node_address);
+
+        // Discarded rather than inspected: `Strategy` is `Display + Send`, not `Debug`.
+        let result = PixStrategy::new(PixStrategyConfig::default())
+            .build_non_anonymous_with_client::<_, Address, _>(node, stranger, Default::default(), cc.client())
+            .map(|_| ());
+
+        assert!(
+            matches!(result, Err(StrategyError::InvalidConfiguration(_))),
+            "a foreign node key must be refused, got {result:?}"
+        );
         Ok(())
     }
 
