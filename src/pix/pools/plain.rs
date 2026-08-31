@@ -252,6 +252,15 @@ fn default_blokli_url() -> Url {
     "http://localhost:8080/".parse().expect("valid static URL")
 }
 
+/// Mirrors `BlockchainConnectorConfig`'s own default rather than guessing a chain.
+///
+/// The pool has no idea what it is settling on, and a value chosen here would be wrong for
+/// somebody. Matching the library keeps this field purely additive: a consumer that never sets it
+/// gets exactly the behaviour it had before the field existed.
+fn default_tx_timeout_multiplier() -> u32 {
+    BlockchainConnectorConfig::default().tx_timeout_multiplier
+}
+
 fn default_gas_xdai() -> XDaiBalance {
     "0.01 xdai".parse().expect("valid static xDai amount")
 }
@@ -347,6 +356,25 @@ pub struct NonAnonymousDepositPoolConfig {
     #[serde(default = "default_blokli_url")]
     #[default(default_blokli_url())]
     pub blokli_url: Url,
+
+    /// How long the pool's own connectors wait for one of their transactions to confirm, as a
+    /// multiple of the chain's block time and finality.  Default: 2, minimum 1.
+    ///
+    /// This is [`BlockchainConnectorConfig::tx_timeout_multiplier`] for the connectors reached
+    /// through [`Self::blokli_url`], and it is here for the same reason that field is: those
+    /// connectors belong to the pool, so nothing an operator sets on the *node's* connector
+    /// reaches them. Without it they ran at the library default while the rest of the deployment
+    /// ran at whatever its chain actually needed.
+    ///
+    /// Raising it is how a sweep on a slow chain is waited out rather than abandoned. Too low is
+    /// the expensive direction to be wrong in: the transfer lands, the wait times out, the pool
+    /// records a failure, and every retry after it finds the address already emptied and reports
+    /// [`StrategyError::CriteriaNotSatisfied`]. The funds are safe; the accounting is not, and the
+    /// retry budget is spent on work that already succeeded.
+    #[default(default_tx_timeout_multiplier())]
+    #[serde(default = "default_tx_timeout_multiplier")]
+    #[validate(range(min = 1))]
+    pub tx_timeout_multiplier: u32,
 
     /// How long to keep polling a stealth address for the expected deposit before
     /// giving up.  Default: 60 seconds.
@@ -602,7 +630,20 @@ fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
 ///
 /// *Trustful*: the contract addresses come from the endpoint rather than from configuration, which
 /// is what lets this work against a test emulator unchanged.
-async fn eoa_connector<C>(client: C, key: &ChainKeypair) -> Result<HoprBlockchainBasicConnector<C>, StrategyError>
+/// `tx_timeout_multiplier` comes from the pool's config rather than the library default: these
+/// connectors are the pool's own, so the one an operator tuned for the node never reaches them,
+/// and the confirmation wait has to be the chain's, not a constant. See
+/// [`NonAnonymousDepositPoolConfig::tx_timeout_multiplier`].
+///
+/// The rest of [`BlockchainConnectorConfig`] is left at its default deliberately:
+/// `connection_sync_timeout` and `sync_tolerance` both govern
+/// [`connect`](hopr_chain_connector::api::HoprChainConnector::connect), which these connectors
+/// never call.
+async fn eoa_connector<C>(
+    client: C,
+    key: &ChainKeypair,
+    tx_timeout_multiplier: u32,
+) -> Result<HoprBlockchainBasicConnector<C>, StrategyError>
 where
     C: hopr_chain_connector::blokli_client::BlokliSubscriptionClient
         + hopr_chain_connector::blokli_client::BlokliQueryClient
@@ -611,9 +652,16 @@ where
         + Sync
         + 'static,
 {
-    create_trustful_safeless_hopr_blokli_connector(key, BlockchainConnectorConfig::default(), client)
-        .await
-        .map_err(StrategyError::other)
+    create_trustful_safeless_hopr_blokli_connector(
+        key,
+        BlockchainConnectorConfig {
+            tx_timeout_multiplier,
+            ..Default::default()
+        },
+        client,
+    )
+    .await
+    .map_err(StrategyError::other)
 }
 
 /// A single deposit attempt.  Called inside a retry loop (takes `Arc` to avoid borrow issues).
@@ -763,7 +811,7 @@ where
 
     // Signed by the node key on its own behalf, so the xDai leaves the account the gate just
     // checked. Going through `node.chain_api().withdraw` here would spend the Safe instead.
-    eoa_connector(client, node_key)
+    eoa_connector(client, node_key, cfg.tx_timeout_multiplier)
         .await?
         .withdraw(deficit, &recovered_address)
         .and_then(identity)
@@ -827,7 +875,7 @@ where
 
     fund_sweep_gas(&*node, client.clone(), node_key, cfg, recovered_address).await?;
 
-    eoa_connector(client, chain_key)
+    eoa_connector(client, chain_key, cfg.tx_timeout_multiplier)
         .await?
         .withdraw(balance, &dst)
         .and_then(identity)

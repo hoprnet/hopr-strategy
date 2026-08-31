@@ -530,6 +530,7 @@ impl PixStrategy {
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
             spend_ledger: std::collections::VecDeque::new(),
+            detach_flushes: false,
         }))
     }
 }
@@ -605,6 +606,16 @@ where
     /// Rolling record of deposits committed within [`PixStrategyConfig::spend_window`], oldest
     /// first. Entries are appended when a deposit is accepted into the buffer and expire by age.
     spend_ledger: std::collections::VecDeque<(std::time::Instant, HoprBalance)>,
+    /// Whether a zero buffer period flushes on a task instead of awaiting inline.
+    ///
+    /// Set by [`StrategyTrait::run`] and false otherwise, because it is a statement about who is
+    /// driving this instance rather than about how it is configured. Under `run` there is an event
+    /// loop to keep responsive and awaiting a flush inside a handler stalls it exactly as awaiting
+    /// one in the loop does — a zero period must not be a way back into the bug
+    /// [`Self::detach_flush_withdrawals`] exists to fix. Driven directly, as the tests do, there is
+    /// no loop to protect and "no debounce" is most useful meaning the work is done when
+    /// [`Self::on_pix_event`] returns.
+    detach_flushes: bool,
 }
 
 #[cfg(test)]
@@ -650,6 +661,7 @@ where
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
             spend_ledger: std::collections::VecDeque::new(),
+            detach_flushes: false,
         }
     }
 }
@@ -823,7 +835,11 @@ where
                 tracing::info!(%target_deposit, "deposit buffered, pending flush");
 
                 if self.cfg.deposit_buffer_period.is_zero() {
-                    self.flush_deposits().await;
+                    if self.detach_flushes {
+                        self.detach_flush_deposits();
+                    } else {
+                        self.flush_deposits().await;
+                    }
                 }
             }
             PixEvent::DepositDataRequest(request) => {
@@ -975,7 +991,11 @@ where
                 tracing::info!("withdrawal buffered, pending flush");
 
                 if self.cfg.withdrawal_buffer_period.is_zero() {
-                    self.flush_withdrawals().await;
+                    if self.detach_flushes {
+                        self.detach_flush_withdrawals();
+                    } else {
+                        self.flush_withdrawals().await;
+                    }
                 }
             }
         }
@@ -983,224 +1003,336 @@ where
         Ok(())
     }
 
-    /// Flush the buffered deposits using single or batch [`DepositPool`] methods.
+    /// Flush the buffered deposits, waiting for the pool to finish.
     ///
     /// Retries are the pool's responsibility, so an error here means the pool already
     /// exhausted its own budget and the deposit is abandoned for this flush.
+    ///
+    /// Used on the shutdown path, where there is no loop left to keep responsive and the work
+    /// must complete before `run` returns. Everywhere else the loop uses
+    /// [`Self::detach_flush_deposits`] — see there for why.
     async fn flush_deposits(&mut self) {
+        let batch = std::mem::take(&mut self.deposit_buffer);
+        flush_deposit_batch::<D, K>(
+            self.pool.clone(),
+            self.processed_deposits.clone(),
+            self.in_flight_destinations.clone(),
+            batch,
+        )
+        .await;
+    }
+
+    /// Hand the buffered deposits to a task and return immediately.
+    ///
+    /// The buffer is drained *here*, on the event loop, so a flush and the events that arrive
+    /// during it cannot see the same entry twice. What is spawned is only the pool call.
+    ///
+    /// Concurrent flushes are safe because the guards outlive them: `in_flight_destinations` is
+    /// populated in [`Self::on_pix_event`] before an entry is ever buffered and released by the
+    /// flush that owns it, and its [`Cache`] clones share state — so a second event for the same
+    /// destination is still refused while the first is in flight.
+    fn detach_flush_deposits(&mut self) {
         if self.deposit_buffer.is_empty() {
             return;
         }
 
         let batch = std::mem::take(&mut self.deposit_buffer);
-        let count = batch.len();
-        let pool = &self.pool;
+        let pool = self.pool.clone();
+        let processed_deposits = self.processed_deposits.clone();
+        let in_flight_destinations = self.in_flight_destinations.clone();
 
-        if count == 1 {
-            let (id, dest_addr, amount, deposit_data) = batch.into_iter().next().unwrap();
-            let result = pool
-                .deposit_funds_to(&id, &dest_addr, amount, deposit_data)
-                .await
-                .map_err(Into::<StrategyError>::into);
-
-            match result {
-                Ok(_) => {
-                    self.processed_deposits.insert(id, ());
-                    self.in_flight_destinations.invalidate(&dest_addr);
-                    tracing::info!(?id, %amount, "single deposit flushed successfully");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS.increment();
-                }
-                Err(error) => {
-                    self.in_flight_destinations.invalidate(&dest_addr);
-                    tracing::error!(%error, ?id, "single deposit flush failed");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS_FAILED.increment();
-                }
-            }
-        } else {
-            // The buffer is already the argument: see `deposit_buffer`.
-            let result = pool
-                .deposit_funds_to_multiple(&batch)
-                .await
-                .map_err(Into::<StrategyError>::into);
-
-            match result {
-                Ok(outcomes) => {
-                    // Every destination is released whatever happened, and only the allocations
-                    // that actually settled are recorded as processed. `BatchOutcomes` carries the
-                    // id in each outcome, so a partially failed batch no longer marks its failures
-                    // done — the duplicate guard would otherwise drop the retry a peer resends.
-                    for (_, dest_addr, ..) in &batch {
-                        self.in_flight_destinations.invalidate(dest_addr);
-                    }
-
-                    let mut deposited = 0u64;
-                    for outcome in outcomes {
-                        match outcome {
-                            Ok((id, _receipt)) => {
-                                self.processed_deposits.insert(id, ());
-                                deposited += 1;
-                            }
-                            Err(error) => {
-                                let error: StrategyError = error.into();
-                                tracing::error!(%error, "deposit within the batch failed");
-                            }
-                        }
-                    }
-
-                    tracing::info!(count, deposited, "batch deposit flushed");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    {
-                        METRIC_PIX_DEPOSITS.increment_by(deposited);
-                        METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64 - deposited);
-                    }
-                }
-                // The batch itself could not be attempted, as distinct from its items failing
-                // individually above.
-                Err(error) => {
-                    for (_, dest_addr, ..) in &batch {
-                        self.in_flight_destinations.invalidate(dest_addr);
-                    }
-                    tracing::error!(%error, count, "batch deposit flush failed");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
-                }
-            }
-        }
+        hopr_utils::runtime::prelude::spawn(async move {
+            flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, batch).await;
+        });
     }
 
-    /// Flush the buffered withdrawals using single or batch [`DepositPool`] methods.
+    /// Flush the buffered withdrawals, waiting for the pool to finish.
     ///
     /// Retries are the pool's responsibility. An entry that still fails keeps its persisted
-    /// key so a later start can try again — see [`Self::replay_pending_recoveries`].
+    /// key so a later start can try again — see [`replay_pending_recoveries`].
+    ///
+    /// Used on the shutdown path; the loop uses [`Self::detach_flush_withdrawals`].
     async fn flush_withdrawals(&mut self) {
+        let batch = std::mem::take(&mut self.withdrawal_buffer);
+        flush_withdrawal_batch::<D, K>(
+            self.pool.clone(),
+            self.safe_address,
+            self.in_flight_sweeps.clone(),
+            self.recovery_store.clone(),
+            batch,
+        )
+        .await;
+    }
+
+    /// Hand the buffered withdrawals to a task and return immediately.
+    ///
+    /// This is the one that matters. A sweep carries the pool's whole retry budget — five
+    /// attempts with exponential backoff, on the order of a minute — and awaiting it here stops
+    /// the loop dispatching *any* PIX event for that long. `DepositDataRequest` is the event that
+    /// cannot survive it: the Exit blocks on the answer and gives up after three seconds, closing
+    /// the Session with `MissingDepositData`. That arm is already spawned for exactly this
+    /// reason, which is worth nothing while the arm before it holds the loop.
+    ///
+    /// Safe for the same reason [`Self::detach_flush_deposits`] is: `in_flight_sweeps` is claimed
+    /// on the loop before the entry is buffered and released by the flush that owns it, and
+    /// [`Cache`] clones share state.
+    fn detach_flush_withdrawals(&mut self) {
         if self.withdrawal_buffer.is_empty() {
             return;
         }
 
         let batch = std::mem::take(&mut self.withdrawal_buffer);
-        let count = batch.len();
-        let pool = &self.pool;
+        let pool = self.pool.clone();
         let safe_address = self.safe_address;
+        let in_flight_sweeps = self.in_flight_sweeps.clone();
+        let recovery_store = self.recovery_store.clone();
 
-        if count == 1 {
-            let (id, secret) = batch.into_iter().next().unwrap();
-            let Ok(key) = key_from_secret::<K>(&secret) else {
-                self.in_flight_sweeps.invalidate(&id);
-                tracing::error!(?id, "stored recovery secret is not valid for this pool's scheme");
-                return;
-            };
-            let result = pool
-                .withdraw_deposit(&id, &key, safe_address, None)
-                .await
-                .map_err(Into::<StrategyError>::into);
+        hopr_utils::runtime::prelude::spawn(async move {
+            flush_withdrawal_batch::<D, K>(pool, safe_address, in_flight_sweeps, recovery_store, batch).await;
+        });
+    }
+}
 
-            match result {
-                Ok(_) => {
-                    self.in_flight_sweeps.invalidate(&id);
-                    if let Some(ref store) = self.recovery_store
-                        && let Err(error) = store.remove(&id)
-                    {
-                        tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
-                    }
-                    tracing::info!(?id, "single withdrawal flushed successfully");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_SWEEPS.increment();
-                }
-                Err(error) => {
-                    self.in_flight_sweeps.invalidate(&id);
-                    tracing::error!(%error, ?id, "single withdrawal flush failed");
-                }
+/// Deposit one drained buffer through the pool.
+///
+/// A free function so that both the awaiting and the detached caller share one body: the loop
+/// must not block on the pool (see [`PixStrategyInner::detach_flush_deposits`]), while shutdown
+/// and the tests must. Splitting the drain from the work is what makes the same code serve both —
+/// the buffer is emptied by the caller, on the event loop, and only this is spawned.
+async fn flush_deposit_batch<D, K>(
+    pool: D,
+    processed_deposits: Cache<PixAddressId, ()>,
+    in_flight_destinations: Cache<K::Public, ()>,
+    batch: Vec<BufferedDeposit<D, K>>,
+) where
+    // `Send + Sync + 'static` beyond what the work itself needs, so the future is spawnable. The
+    // `StrategyTrait` impl already requires exactly this of `D`, so no caller gains a bound.
+    D: DepositPool<K> + Send + Sync + 'static,
+    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K::Public: Into<PixDepositAddress>
+        + TryFrom<PixDepositAddress>
+        + Eq
+        + std::hash::Hash
+        + Clone
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    D::Error: Into<StrategyError>,
+{
+    let count = batch.len();
+    if count == 0 {
+        return;
+    }
+
+    if count == 1 {
+        let (id, dest_addr, amount, deposit_data) = batch.into_iter().next().unwrap();
+        let result = pool
+            .deposit_funds_to(&id, &dest_addr, amount, deposit_data)
+            .await
+            .map_err(Into::<StrategyError>::into);
+
+        match result {
+            Ok(_) => {
+                processed_deposits.insert(id, ());
+                in_flight_destinations.invalidate(&dest_addr);
+                tracing::info!(?id, %amount, "single deposit flushed successfully");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_DEPOSITS.increment();
             }
-        } else {
-            // Each key travels with the id it belongs to, which is what `withdraw_multiple_deposits`
-            // now takes. It used to take a bare `&[K]` alongside a separately built `Vec` of ids,
-            // and results were matched back to ids by position — so a single unparseable secret
-            // shortened the key list, shifted every later result, and attributed sweep outcomes to
-            // the wrong allocations. That correlation is no longer expressible.
-            let keys: Vec<(PixAddressId, K)> = batch
-                .iter()
-                .filter_map(|(id, secret)| match key_from_secret::<K>(secret) {
-                    Ok(key) => Some((*id, key)),
-                    Err(_) => {
-                        tracing::error!(?id, "stored recovery secret is not valid for this pool's scheme");
-                        self.in_flight_sweeps.invalidate(id);
-                        None
-                    }
-                })
-                .collect();
-
-            let attempted = keys.len();
-            if attempted == 0 {
-                tracing::error!(count, "no buffered withdrawal had a usable key, nothing to flush");
-                return;
+            Err(error) => {
+                in_flight_destinations.invalidate(&dest_addr);
+                tracing::error!(%error, ?id, "single deposit flush failed");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_DEPOSITS_FAILED.increment();
             }
+        }
+    } else {
+        // The buffer is already the argument: see `deposit_buffer`.
+        let result = pool
+            .deposit_funds_to_multiple(&batch)
+            .await
+            .map_err(Into::<StrategyError>::into);
 
-            let result = pool
-                .withdraw_multiple_deposits(&keys, safe_address)
-                .await
-                .map_err(Into::<StrategyError>::into);
+        match result {
+            Ok(outcomes) => {
+                // Every destination is released whatever happened, and only the allocations
+                // that actually settled are recorded as processed. `BatchOutcomes` carries the
+                // id in each outcome, so a partially failed batch no longer marks its failures
+                // done — the duplicate guard would otherwise drop the retry a peer resends.
+                for (_, dest_addr, ..) in &batch {
+                    in_flight_destinations.invalidate(dest_addr);
+                }
 
-            match result {
-                Ok(outcomes) => {
-                    // Every attempted id is released whatever happened, so a later start can retry
-                    // one that did not move.
-                    for (id, _) in &keys {
-                        self.in_flight_sweeps.invalidate(id);
-                    }
-
-                    // Keyed by the id in each outcome, not by position. `BatchOutcomes` carries the
-                    // allocation it belongs to, so nothing here has to assume the pool returned one
-                    // result per key in the order given — an assumption that, when this took a bare
-                    // `&[K]`, silently attributed sweep outcomes to the wrong allocations.
-                    let mut swept = 0u64;
-                    for outcome in outcomes {
-                        match outcome {
-                            Ok((id, _receipt)) => {
-                                swept += 1;
-                                if let Some(ref store) = self.recovery_store
-                                    && let Err(error) = store.remove(&id)
-                                {
-                                    tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
-                                }
-                            }
-                            // Keeps its persisted key, so the next start replays it.
-                            Err(error) => {
-                                let error: StrategyError = error.into();
-                                tracing::error!(%error, "withdrawal within the batch failed");
-                            }
+                let mut deposited = 0u64;
+                for outcome in outcomes {
+                    match outcome {
+                        Ok((id, _receipt)) => {
+                            processed_deposits.insert(id, ());
+                            deposited += 1;
+                        }
+                        Err(error) => {
+                            let error: StrategyError = error.into();
+                            tracing::error!(%error, "deposit within the batch failed");
                         }
                     }
-                    // Only the items that actually moved funds are counted; the rest keep their
-                    // persisted key for a later retry. `attempted` is reported separately from
-                    // `count` so keys dropped above are visible rather than looking like failures.
-                    tracing::info!(count, attempted, swept, "batch withdrawal flushed");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_SWEEPS.increment_by(swept);
                 }
-                Err(error) => {
-                    for (id, _) in &keys {
-                        self.in_flight_sweeps.invalidate(id);
-                    }
-                    tracing::error!(%error, count, attempted, "batch withdrawal flush failed");
+
+                tracing::info!(count, deposited, "batch deposit flushed");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                {
+                    METRIC_PIX_DEPOSITS.increment_by(deposited);
+                    METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64 - deposited);
                 }
+            }
+            // The batch itself could not be attempted, as distinct from its items failing
+            // individually above.
+            Err(error) => {
+                for (_, dest_addr, ..) in &batch {
+                    in_flight_destinations.invalidate(dest_addr);
+                }
+                tracing::error!(%error, count, "batch deposit flush failed");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
             }
         }
     }
 }
 
-/// Re-attempt the sweep for every persisted recovery entry.
-///
-/// Entries are swept sequentially. An entry whose deposit address is still empty fails
-/// with [`StrategyError::CriteriaNotSatisfied`] and is deliberately left in the store, so
-/// a deposit that lands later is picked up by a subsequent start rather than lost.
-///
-/// This is a free function rather than a method so that [`StrategyTrait::run`] can spawn it:
-/// each sweep carries the pool's own retry budget, and running the whole store inline would
-/// stop the strategy consuming PIX events for as long as that takes. `in_flight_sweeps` is a
-/// [`Cache`], whose clones share state, so the guard still excludes a concurrent sweep of the
-/// same id from the event loop.
+/// Sweep one drained buffer through the pool. The withdrawal counterpart of
+/// [`flush_deposit_batch`]; see [`PixStrategyInner::detach_flush_withdrawals`] for why the loop
+/// must not await it.
+async fn flush_withdrawal_batch<D, K>(
+    pool: D,
+    safe_address: Address,
+    in_flight_sweeps: Cache<PixAddressId, ()>,
+    recovery_store: Option<PixRecoveryStore>,
+    batch: Vec<(PixAddressId, PixDepositSecret)>,
+) where
+    // See [`flush_deposit_batch`].
+    D: DepositPool<K> + Send + Sync + 'static,
+    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K::Public: Into<PixDepositAddress>
+        + TryFrom<PixDepositAddress>
+        + Eq
+        + std::hash::Hash
+        + Clone
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    D::Error: Into<StrategyError>,
+{
+    let count = batch.len();
+    if count == 0 {
+        return;
+    }
+
+    if count == 1 {
+        let (id, secret) = batch.into_iter().next().unwrap();
+        let Ok(key) = key_from_secret::<K>(&secret) else {
+            in_flight_sweeps.invalidate(&id);
+            tracing::error!(?id, "stored recovery secret is not valid for this pool's scheme");
+            return;
+        };
+        let result = pool
+            .withdraw_deposit(&id, &key, safe_address, None)
+            .await
+            .map_err(Into::<StrategyError>::into);
+
+        match result {
+            Ok(_) => {
+                in_flight_sweeps.invalidate(&id);
+                if let Some(ref store) = recovery_store
+                    && let Err(error) = store.remove(&id)
+                {
+                    tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
+                }
+                tracing::info!(?id, "single withdrawal flushed successfully");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_SWEEPS.increment();
+            }
+            Err(error) => {
+                in_flight_sweeps.invalidate(&id);
+                tracing::error!(%error, ?id, "single withdrawal flush failed");
+            }
+        }
+    } else {
+        // Each key travels with the id it belongs to, which is what `withdraw_multiple_deposits`
+        // now takes. It used to take a bare `&[K]` alongside a separately built `Vec` of ids,
+        // and results were matched back to ids by position — so a single unparseable secret
+        // shortened the key list, shifted every later result, and attributed sweep outcomes to
+        // the wrong allocations. That correlation is no longer expressible.
+        let keys: Vec<(PixAddressId, K)> = batch
+            .iter()
+            .filter_map(|(id, secret)| match key_from_secret::<K>(secret) {
+                Ok(key) => Some((*id, key)),
+                Err(_) => {
+                    tracing::error!(?id, "stored recovery secret is not valid for this pool's scheme");
+                    in_flight_sweeps.invalidate(id);
+                    None
+                }
+            })
+            .collect();
+
+        let attempted = keys.len();
+        if attempted == 0 {
+            tracing::error!(count, "no buffered withdrawal had a usable key, nothing to flush");
+            return;
+        }
+
+        let result = pool
+            .withdraw_multiple_deposits(&keys, safe_address)
+            .await
+            .map_err(Into::<StrategyError>::into);
+
+        match result {
+            Ok(outcomes) => {
+                // Every attempted id is released whatever happened, so a later start can retry
+                // one that did not move.
+                for (id, _) in &keys {
+                    in_flight_sweeps.invalidate(id);
+                }
+
+                // Keyed by the id in each outcome, not by position. `BatchOutcomes` carries the
+                // allocation it belongs to, so nothing here has to assume the pool returned one
+                // result per key in the order given — an assumption that, when this took a bare
+                // `&[K]`, silently attributed sweep outcomes to the wrong allocations.
+                let mut swept = 0u64;
+                for outcome in outcomes {
+                    match outcome {
+                        Ok((id, _receipt)) => {
+                            swept += 1;
+                            if let Some(ref store) = recovery_store
+                                && let Err(error) = store.remove(&id)
+                            {
+                                tracing::error!(%error, ?id, "failed to remove the swept entry from the recovery store");
+                            }
+                        }
+                        // Keeps its persisted key, so the next start replays it.
+                        Err(error) => {
+                            let error: StrategyError = error.into();
+                            tracing::error!(%error, "withdrawal within the batch failed");
+                        }
+                    }
+                }
+                // Only the items that actually moved funds are counted; the rest keep their
+                // persisted key for a later retry. `attempted` is reported separately from
+                // `count` so keys dropped above are visible rather than looking like failures.
+                tracing::info!(count, attempted, swept, "batch withdrawal flushed");
+                #[cfg(all(feature = "telemetry", not(test)))]
+                METRIC_PIX_SWEEPS.increment_by(swept);
+            }
+            Err(error) => {
+                for (id, _) in &keys {
+                    in_flight_sweeps.invalidate(id);
+                }
+                tracing::error!(%error, count, attempted, "batch withdrawal flush failed");
+            }
+        }
+    }
+}
+
 /// Rebuild the pool's keypair from the 32 bytes the recovery store persists.
 ///
 /// The store predates the typed pool and holds a bare [`PixDepositSecret`], which is the same
@@ -1214,6 +1346,17 @@ where
     K::from_secret(secret.0.as_ref()).map_err(StrategyError::other)
 }
 
+/// Re-attempt the sweep for every persisted recovery entry.
+///
+/// Entries are swept sequentially. An entry whose deposit address is still empty fails
+/// with [`StrategyError::CriteriaNotSatisfied`] and is deliberately left in the store, so
+/// a deposit that lands later is picked up by a subsequent start rather than lost.
+///
+/// This is a free function rather than a method so that [`StrategyTrait::run`] can spawn it:
+/// each sweep carries the pool's own retry budget, and running the whole store inline would
+/// stop the strategy consuming PIX events for as long as that takes. `in_flight_sweeps` is a
+/// [`Cache`], whose clones share state, so the guard still excludes a concurrent sweep of the
+/// same id from the event loop.
 async fn replay_pending_recoveries<D, K>(
     pool: D,
     store: PixRecoveryStore,
@@ -1351,6 +1494,11 @@ where
     /// exits — an interrupted replay loses nothing, because an entry is removed from the store
     /// only after its funds have moved.
     async fn run(&mut self) -> Result<()> {
+        // From here on there is an event loop to keep responsive, so no flush may be awaited on
+        // it — including the one a zero buffer period triggers from inside a handler. See
+        // `detach_flushes`.
+        self.detach_flushes = true;
+
         let mut event_stream = self
             .node
             .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Pix]))
@@ -1401,14 +1549,18 @@ where
                         }
                     }
                     _ = &mut sleep => {
-                        // At least one deadline elapsed — flush ready buffers.
+                        // At least one deadline elapsed — hand off the ready buffers. Detached
+                        // rather than awaited: the pool call carries its own retry budget, and
+                        // waiting for it here is waiting with the event stream unread. The
+                        // buffers are still drained synchronously, so the next iteration sees
+                        // them empty and nothing is flushed twice.
                         let now = tokio::time::Instant::now();
                         if deposit_flush_at.is_some_and(|d| d <= now) {
-                            self.flush_deposits().await;
+                            self.detach_flush_deposits();
                             deposit_flush_at = None;
                         }
                         if withdrawal_flush_at.is_some_and(|d| d <= now) {
-                            self.flush_withdrawals().await;
+                            self.detach_flush_withdrawals();
                             withdrawal_flush_at = None;
                         }
                     }
@@ -1431,7 +1583,8 @@ where
             }
         }
 
-        // Flush any remaining buffered items.
+        // Flush any remaining buffered items. Awaited, not detached: the loop is over, so there is
+        // nothing left to keep responsive, and a task spawned here would race `run` returning.
         self.flush_deposits().await;
         self.flush_withdrawals().await;
 
@@ -3385,6 +3538,103 @@ mod tests {
 
         running.abort();
         landed.context("the deposit was not served while the recovery replay was still running")?;
+        Ok(())
+    }
+
+    /// Regression: a sweep in progress must not stall event consumption.
+    ///
+    /// The sibling of `test_startup_replay_does_not_block_event_consumption`, for the flush path
+    /// rather than the replay one. `run` used to await `flush_withdrawals` directly on its
+    /// `select!`, so a sweep held the loop for its whole retry budget and no PIX event was
+    /// dispatched meanwhile. Downstream that is fatal rather than slow: hoprnet's Exit gives a
+    /// deposit pool three seconds to answer `DepositDataRequest` and closes the Session with
+    /// `MissingDepositData` when it does not. Spawning the `DepositDataRequest` arm — which this
+    /// module already does — buys nothing if the loop never reaches it.
+    ///
+    /// The recovered key's address stays empty, so its sweep burns the full five-attempt budget:
+    /// tens of seconds, against the ten this is willing to wait.
+    #[test_log::test(tokio::test)]
+    async fn test_sweep_does_not_block_event_consumption() -> anyhow::Result<()> {
+        use crate::{strategy::Strategy as _, testing::PixNode};
+
+        let da: Address = [0x44u8; 20].into();
+        let quota = 20u64;
+        let expected = HoprBalance::new_base(quota);
+
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+            .with_balances([(da, HoprBalance::zero())])
+            // Never funded, so every sweep attempt fails and the budget is spent in full.
+            .with_balances([(ra, HoprBalance::zero())])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let client = cc.client();
+        let cc = Arc::new(cc);
+        let node = Arc::new(PixNode::new(
+            Arc::clone(&cc),
+            NodeOnchainIdentity {
+                node_address: *BOB,
+                safe_address: *BOB,
+                module_address: MODULE_ADDRESS.into(),
+            },
+        ));
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 5),
+            client,
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
+        };
+        let mut s = PixStrategyInner::new(pool, Arc::clone(&node), cfg, *BOB, None);
+
+        let running = tokio::spawn(async move { s.run().await });
+
+        // Start the doomed sweep first, then ask for a deposit while it is still retrying.
+        node.inject_pix(PixEvent::PrivateKeyRecovered(hopr_api::node::PixPrivateKeyRecovered {
+            id: pix_id(1),
+            secret: hopr_api::chain::PixDepositSecret(rk.into()),
+        }));
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+        let id = pix_id(2);
+        node.inject_pix(PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+            id,
+            address: da.into(),
+            quota,
+            deposit_data: pool_deposit_data(id),
+        }));
+
+        let landed = timeout(StdDuration::from_secs(10), async {
+            loop {
+                if hopr_balance(&*cc, da).await.is_ok_and(|b| b == expected) {
+                    return;
+                }
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        running.abort();
+        landed.context("the deposit was not served while a sweep was still retrying")?;
         Ok(())
     }
 
