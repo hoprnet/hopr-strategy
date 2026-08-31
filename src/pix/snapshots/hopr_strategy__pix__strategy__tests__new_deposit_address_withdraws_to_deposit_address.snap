@@ -10,17 +10,17 @@ accounts:
     packet_key: d6affd9ecd20b4fa1ea3fe65162604f01bc8fb859bb8a079b9e70be10eba15a6
     safe_address: 93534e8ca82510a346dd329115ce7aefd4d35583
   1:
-    chain_key: bea83ba0fcee21da44a30c893f466e6bf0c29bbb
-    keyid: 1
-    multi_addresses: []
-    packet_key: c443eb7d2eb0c95b3fe8ade2a75b7ea008087b5fe22843557273688d1e4d4f22
-    safe_address: 259bed99d230648d7c8a116af59abdd15c9f4f1e
-  2:
     chain_key: b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234
-    keyid: 2
+    keyid: 1
     multi_addresses: []
     packet_key: 8994396d4907dc5e18e209cf958f001afe8f04d7dc1b3a4fd0f9086ee8c610b7
     safe_address: 0f944bc36fdcf97fff6807174eeb839ecd6035bd
+  9:
+    chain_key: bea83ba0fcee21da44a30c893f466e6bf0c29bbb
+    keyid: 9
+    multi_addresses: []
+    packet_key: c443eb7d2eb0c95b3fe8ade2a75b7ea008087b5fe22843557273688d1e4d4f22
+    safe_address: bea83ba0fcee21da44a30c893f466e6bf0c29bbb
 native_balances:
   18f8ae833c85c51fbeba29cef9fbfb53b3bad950:
     __typename: NativeBalance
@@ -28,18 +28,15 @@ native_balances:
   93534e8ca82510a346dd329115ce7aefd4d35583:
     __typename: NativeBalance
     balance: 0 xDai
-  bea83ba0fcee21da44a30c893f466e6bf0c29bbb:
-    __typename: NativeBalance
-    balance: 0.999999999999999999 xDai
-  259bed99d230648d7c8a116af59abdd15c9f4f1e:
-    __typename: NativeBalance
-    balance: 0 xDai
   b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234:
     __typename: NativeBalance
     balance: 1 xDai
   0f944bc36fdcf97fff6807174eeb839ecd6035bd:
     __typename: NativeBalance
     balance: 0 xDai
+  bea83ba0fcee21da44a30c893f466e6bf0c29bbb:
+    __typename: NativeBalance
+    balance: 0.999999999999999999 xDai
 token_balances:
   18f8ae833c85c51fbeba29cef9fbfb53b3bad950:
     __typename: HoprBalance
@@ -47,18 +44,15 @@ token_balances:
   93534e8ca82510a346dd329115ce7aefd4d35583:
     __typename: HoprBalance
     balance: 1000 wxHOPR
-  bea83ba0fcee21da44a30c893f466e6bf0c29bbb:
-    __typename: HoprBalance
-    balance: 980 wxHOPR
-  259bed99d230648d7c8a116af59abdd15c9f4f1e:
-    __typename: HoprBalance
-    balance: 1000 wxHOPR
   b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234:
     __typename: HoprBalance
     balance: 0 wxHOPR
   0f944bc36fdcf97fff6807174eeb839ecd6035bd:
     __typename: HoprBalance
     balance: 1000 wxHOPR
+  bea83ba0fcee21da44a30c893f466e6bf0c29bbb:
+    __typename: HoprBalance
+    balance: 980 wxHOPR
   "4242424242424242424242424242424242424242":
     __typename: HoprBalance
     balance: 20 wxHOPR
@@ -66,10 +60,10 @@ safe_allowances:
   93534e8ca82510a346dd329115ce7aefd4d35583:
     __typename: SafeHoprAllowance
     allowance: 10000000000000 wxHOPR
-  259bed99d230648d7c8a116af59abdd15c9f4f1e:
+  0f944bc36fdcf97fff6807174eeb839ecd6035bd:
     __typename: SafeHoprAllowance
     allowance: 10000000000000 wxHOPR
-  0f944bc36fdcf97fff6807174eeb839ecd6035bd:
+  bea83ba0fcee21da44a30c893f466e6bf0c29bbb:
     __typename: SafeHoprAllowance
     allowance: 10000000000000 wxHOPR
 deployed_safes:
@@ -81,20 +75,20 @@ deployed_safes:
     module_address: c2ac223dbf64edf995c70c5a3d5599c3fb6d6291
     registered_nodes: []
     threshold: "1"
-  259bed99d230648d7c8a116af59abdd15c9f4f1e:
-    address: 259bed99d230648d7c8a116af59abdd15c9f4f1e
-    chain_key: bea83ba0fcee21da44a30c893f466e6bf0c29bbb
-    owners:
-      - bea83ba0fcee21da44a30c893f466e6bf0c29bbb
-    module_address: ff263744a4621e2cac0f4882cc623bee3c9aef8d
-    registered_nodes: []
-    threshold: "1"
   0f944bc36fdcf97fff6807174eeb839ecd6035bd:
     address: 0f944bc36fdcf97fff6807174eeb839ecd6035bd
     chain_key: b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234
     owners:
       - b6021e0860dd9d96c9ff0a73e2e5ba3a466ba234
     module_address: 1613d5898cae268775bb85aa0b7e6e7fbc9dcd47
+    registered_nodes: []
+    threshold: "1"
+  bea83ba0fcee21da44a30c893f466e6bf0c29bbb:
+    address: bea83ba0fcee21da44a30c893f466e6bf0c29bbb
+    chain_key: bea83ba0fcee21da44a30c893f466e6bf0c29bbb
+    owners:
+      - bea83ba0fcee21da44a30c893f466e6bf0c29bbb
+    module_address: ff263744a4621e2cac0f4882cc623bee3c9aef8d
     registered_nodes: []
     threshold: "1"
 safe_redeem_stats: {}

@@ -1091,6 +1091,16 @@ impl<M: BlokliTestStateMutator + Clone + Send + Sync + 'static> TestChainConnect
         self.faults.clone()
     }
 
+    /// A handle to the same in-process chain this connector talks to.
+    ///
+    /// `BlokliTestClient` shares its state when cloned, so the returned handle sees and mutates
+    /// exactly the state this connector does. Needed by anything that builds a *second* connector
+    /// over the same chain — a component signing as an EOA rather than through the node's Safe,
+    /// say — which otherwise has no way to reach it.
+    pub fn client(&self) -> BlokliTestClient<M> {
+        (*self.client).clone()
+    }
+
     /// Loads initial state via finite queries and spawns a background task for live event forwarding.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         // Fetch chain info to initialize the payload generator and cache ticket values.

@@ -11,8 +11,8 @@ futures  = { workspace = true }
 hopr-api = { workspace = true, features = ["node", "serde"] }
 # `strategy-pix-test` rather than bare `strategy-pix`: the latter is the pool-less engine,
 # and `tests/pix.rs` drives a concrete pool — `build_non_anonymous` and
-# `secp256k1::NonAnonymousDepositPoolConfig` exist only once that pool's feature is on. Only
-# secp256k1 is enabled because it is the only implemented pool; `strategy-pix-curvy` is a stub
+# `plain::NonAnonymousDepositPoolConfig` exist only once that pool's feature is on. Only the
+# `plain` pool is enabled because it is the only implemented one; `strategy-pix-curvy` is a stub
 # whose methods panic, so there is nothing for it to drive yet. The two features are additive, so
 # adding it here later needs no restructuring — only tests worth writing.
 hopr-strategy = { workspace = true, features = [

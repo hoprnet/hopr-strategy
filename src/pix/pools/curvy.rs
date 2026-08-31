@@ -1,7 +1,7 @@
 //! ## Baby JubJub [`DepositPool`] implementation — **stub**
 //!
 //! [`CurvyDepositPool`] is the counterpart to
-//! `secp256k1::NonAnonymousDepositPool` for the
+//! `plain::NonAnonymousDepositPool` for the
 //! Baby JubJub instantiation of `HoprPixSpec`, where a deposit address is a curve point rather
 //! than an Ethereum account.
 use std::{sync::Arc, time::Duration};
@@ -26,7 +26,7 @@ use crate::{errors::StrategyError, pix::ByteDepositData};
 /// settles to.
 ///
 /// The upstream [`BjjKeypair`] directly, for the reason given under *Why no newtype* above. The
-/// `pix::secp256k1` module exports the same two names for its own pool, so the
+/// `pix::pools::plain` module exports the same two names for its own pool, so the
 /// two coexist and the choice is made by which one is imported.
 pub type PoolKeypair = BjjKeypair;
 
@@ -40,7 +40,7 @@ pub type PoolConfig = CurvyDepositPoolConfig;
 /// The deposit address this pool settles to — [`BjjPublicKey`], via [`PoolKeypair`].
 ///
 /// A projection rather than `BjjPublicKey` directly, for the reason given on
-/// `secp256k1::DepositAddress`: it derives the
+/// `plain::DepositAddress`: it derives the
 /// [`DepositAddressOf`](crate::pix::DepositAddressOf) impl below from the keypair instead of
 /// restating it, so the impl cannot claim an address type this pool does not settle to.
 pub type DepositAddress = <PoolKeypair as hopr_api::types::crypto::prelude::Keypair>::Public;
