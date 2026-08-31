@@ -1,12 +1,28 @@
-//! ## Non-anonymous [`DepositPool`] implementation — secp256k1 deposit addresses
+//! ## Non-anonymous [`DepositPool`] implementation — plain on-chain settlement
 //!
 //! A [`DepositPool`] that uses plain Ethereum transactions from the node's own account
 //! to fund deposit addresses.  All operations are fully visible on-chain.
 //!
-//! The node account is the payer throughout — for both the wxHOPR deposit and the xDai gas
-//! top-up — because the Safe payload generator wraps channel and ticket calls in the Safe
-//! module but emits a plain, node-signed transfer for `transfer`. Recovered deposits are
-//! nevertheless swept *to* the Safe; see [`crate::pix::strategy`].
+//! The module is named for *how* it settles rather than for the curve it settles on, matching its
+//! sibling [`curvy`](super::curvy): the deposit addresses happen to be secp256k1 `Address`es, but
+//! what distinguishes this pool is that every movement is an ordinary, linkable transfer.
+//!
+//! Three movements, three payers — which is the thing to keep straight when reading this module:
+//!
+//! | movement | signed by | paid by |
+//! |---|---|---|
+//! | wxHOPR deposit to a stealth address | node key | the **Safe** |
+//! | xDai gas top-up of a stealth address | node key | the **node account** |
+//! | sweep of a recovered stealth address | that address's key | the **stealth address** |
+//!
+//! The split follows from `SafePayloadGenerator::transfer`, which since hopr-types 4.0.1 wraps
+//! every transfer in the Safe module's `execTransactionFromModule`. A deposit goes through
+//! [`ChainWriteAccountOperations::withdraw`] and so spends the Safe, which is where the float
+//! lives. The other two cannot use that path — a Safe holds no xDai to top up gas with, and a
+//! stealth address is not a party to the node's Safe at all — so both sign directly with the key
+//! that owns the funds.
+//!
+//! Recovered deposits are nevertheless swept *to* the Safe; see [`crate::pix::strategy`].
 //!
 //! **DO NOT USE IN PRODUCTION.**
 //!
@@ -34,6 +50,11 @@ use hopr_api::{
         primitive::prelude::{Address, GeneralError, HoprBalance, XDaiBalance},
     },
 };
+use hopr_chain_connector::{
+    BlockchainConnectorConfig, HoprBlockchainBasicConnector,
+    blokli_client::{BlokliClient, Url},
+    create_trustful_safeless_hopr_blokli_connector,
+};
 use serde_with::{DisplayFromStr, serde_as};
 use subtle::{Choice, ConstantTimeEq};
 use validator::Validate;
@@ -49,7 +70,7 @@ use crate::{errors::StrategyError, pix::ByteDepositData};
 ///
 /// Named separately from [`EthDepositKey`] so a consumer can assert the pool/curve invariant
 /// `<HoprPixSpec as PixSpec>::DepositAddress == PoolKeypair::Public` against a stable path. The
-/// `pix::curvy` module exports the same two names for its own pool, so the two
+/// `pix::pools::curvy` module exports the same two names for its own pool, so the two
 /// coexist and the choice is made by which one is imported.
 pub type PoolKeypair = EthDepositKey;
 
@@ -123,7 +144,7 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
 ///   checked rather than assumed.
 ///
 /// Both are reported rather than ignored, and before any funds move: swallowing either would
-/// reproduce exactly the failure the `pix::curvy` docs describe, a deposit that quietly drops what
+/// reproduce exactly the failure the `pix::pools::curvy` docs describe, a deposit that quietly drops what
 /// the peer sent. The strategy makes the same id comparison on the wire form in its
 /// `NewDepositAddress` arm; this one covers every other way into the pool, including callers that
 /// do not go through the strategy at all.
@@ -223,6 +244,14 @@ impl Keypair for EthDepositKey {
 // Config
 // ---------------------------------------------------------------------------
 
+/// A placeholder an operator is expected to replace; nothing useful is reachable there.
+///
+/// It exists because [`Default`] has to produce *something*, and every other field in this config
+/// names its default through a function.
+fn default_blokli_url() -> Url {
+    "http://localhost:8080/".parse().expect("valid static URL")
+}
+
 fn default_gas_xdai() -> XDaiBalance {
     "0.01 xdai".parse().expect("valid static xDai amount")
 }
@@ -262,7 +291,7 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// ```
 /// use std::time::Duration;
 ///
-/// use hopr_strategy::pix::secp256k1::NonAnonymousDepositPoolConfig;
+/// use hopr_strategy::pix::pools::plain::NonAnonymousDepositPoolConfig;
 ///
 /// // Override one budget and inherit the documented defaults for the rest.
 /// let cfg = NonAnonymousDepositPoolConfig {
@@ -275,33 +304,50 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(60));
 /// assert_eq!(cfg.gas_xdai_per_sweep, "0.01 xdai".parse().unwrap());
 /// assert_eq!(cfg.min_node_xdai_reserve, "0.01 xdai".parse().unwrap());
-/// assert!(cfg.min_node_hopr_reserve.is_zero());
+/// assert!(cfg.min_safe_hopr_reserve.is_zero());
 /// ```
 ///
-/// Both floors guard the *node's own account*, which is the payer for a deposit and for a sweep's
-/// gas alike. Raise them where that account is funded for something other than PIX — the wxHOPR
-/// floor defaults to zero precisely because it usually is not:
+/// The two floors guard **different accounts**, because a deposit and a sweep's gas are paid by
+/// different ones. A deposit goes out through [`ChainWriteAccountOperations::withdraw`], which the
+/// node's `SafePayloadGenerator` wraps in the Safe module, so the *Safe* pays — hence
+/// [`Self::min_safe_hopr_reserve`]. A sweep's gas top-up is signed by the node's own key, so the
+/// *node account* pays — hence [`Self::min_node_xdai_reserve`]. Raise either where that account is
+/// funded for something other than PIX; the wxHOPR floor defaults to zero precisely because the
+/// Safe's balance usually *is* the deposit float:
 ///
 /// ```
 /// use hopr_api::types::primitive::prelude::HoprBalance;
-/// use hopr_strategy::pix::secp256k1::NonAnonymousDepositPoolConfig;
+/// use hopr_strategy::pix::pools::plain::NonAnonymousDepositPoolConfig;
 ///
 /// let cfg = NonAnonymousDepositPoolConfig {
-///     // Keep enough xDai back to pay gas for the node's own transactions...
+///     // Keep enough xDai back for the node's own transactions...
 ///     min_node_xdai_reserve: "0.5 xdai".parse()?,
-///     // ...and leave 200 wxHOPR that PIX deposits will not draw on.
-///     min_node_hopr_reserve: HoprBalance::new_base(200),
+///     // ...and leave 200 wxHOPR in the Safe that PIX deposits will not draw on.
+///     min_safe_hopr_reserve: HoprBalance::new_base(200),
 ///     ..Default::default()
 /// };
 ///
 /// assert_eq!(cfg.min_node_xdai_reserve, "0.5 xdai".parse()?);
-/// assert_eq!(cfg.min_node_hopr_reserve, HoprBalance::new_base(200));
+/// assert_eq!(cfg.min_safe_hopr_reserve, HoprBalance::new_base(200));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct NonAnonymousDepositPoolConfig {
+    /// Blokli endpoint the pool builds its own EOA-signing connectors against.
+    /// Default: `http://localhost:8080/`, a placeholder an operator must replace.
+    ///
+    /// Two of this pool's three movements cannot go through the node's connector, because that one
+    /// signs through the Safe module — see the module docs. The pool therefore builds short-lived
+    /// [`BasicPayloadGenerator`](hopr_chain_connector::BasicPayloadGenerator) connectors of its
+    /// own, and this is where they connect. Contract addresses are read from the endpoint rather
+    /// than configured, so nothing else is needed here.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_blokli_url")]
+    #[default(default_blokli_url())]
+    pub blokli_url: Url,
+
     /// How long to keep polling a stealth address for the expected deposit before
     /// giving up.  Default: 60 seconds.
     #[default(default_max_deposit_tracking_time())]
@@ -329,6 +375,12 @@ pub struct NonAnonymousDepositPoolConfig {
     /// then no more recoverable than they were before, and the rest of the node is
     /// stuck too.
     ///
+    /// The node rather than the Safe, and deliberately so: a Safe holds wxHOPR and no xDai on a
+    /// normal deployment, so a top-up drawn from it would be refused every time and recovered
+    /// deposits would stay stranded. `fund_sweep_gas` therefore signs with the node key directly
+    /// rather than going through [`ChainWriteAccountOperations::withdraw`], which would route
+    /// through the Safe module.
+    ///
     /// The default matches one sweep's gas budget, so the node always keeps back at
     /// least what it just handed out. Zero opts out, leaving only the plain
     /// affordability check.
@@ -350,20 +402,23 @@ pub struct NonAnonymousDepositPoolConfig {
     #[serde(default = "default_node_xdai_reserve")]
     pub min_node_xdai_reserve: XDaiBalance,
 
-    /// wxHOPR the node's account must still hold after funding a deposit.  Default: 0.
+    /// wxHOPR the **Safe** must still hold after funding a deposit.  Default: 0.
     ///
-    /// Unlike [`Self::min_node_xdai_reserve`] this defaults to zero, because the node's wxHOPR
+    /// The Safe rather than the node account, because that is what a deposit actually spends:
+    /// `withdraw` settles through the Safe module. See `deposit_once`.
+    ///
+    /// Unlike [`Self::min_node_xdai_reserve`] this defaults to zero, because the Safe's wxHOPR
     /// *is* the deposit float — nothing else in this strategy spends it, so drawing it down is
-    /// the intended behaviour rather than a hazard. Set it where the same account is funded for
-    /// something else too.
+    /// the intended behaviour rather than a hazard. Set it where the Safe is funded for
+    /// something else too, such as channel stakes.
     ///
-    /// The affordability check it participates in runs either way: a deposit the node cannot
+    /// The affordability check it participates in runs either way: a deposit the Safe cannot
     /// cover is refused with [`StrategyError::CriteriaNotSatisfied`] instead of being submitted
     /// and reverted.
     #[default(HoprBalance::zero())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "HoprBalance::zero")]
-    pub min_node_hopr_reserve: HoprBalance,
+    pub min_safe_hopr_reserve: HoprBalance,
 
     /// Attempts *in addition to* the first for a deposit transfer.  Default: 3.
     /// Zero means a single attempt with no backoff.
@@ -433,20 +488,21 @@ impl Drop for DepositTrackerSlot {
 /// use std::sync::Arc;
 ///
 /// use hopr_api::{
+///     ChainKeypair,
 ///     chain::DepositPool,
 ///     node::{HasChainApi, PixAddressId},
 ///     types::primitive::prelude::{Address, HoprBalance},
 /// };
-/// use hopr_strategy::pix::secp256k1::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+/// use hopr_strategy::pix::pools::plain::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
 ///
 /// // `dst` is an `Address` — the pool settles to `EthDepositKey::Public`, not to the
 /// // curve-agnostic `PixDepositAddress` the events carry. `id` names the allocation the
 /// // deposit belongs to; it comes from the `PixEvent` that asked for the deposit.
-/// async fn deposit<N>(node: Arc<N>, id: PixAddressId, dst: Address) -> anyhow::Result<()>
+/// async fn deposit<N>(node: Arc<N>, node_key: ChainKeypair, id: PixAddressId, dst: Address) -> anyhow::Result<()>
 /// where
 ///     N: HasChainApi + Send + Sync + 'static,
 /// {
-///     let pool = NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default());
+///     let pool = NonAnonymousDepositPool::new(node, node_key, NonAnonymousDepositPoolConfig::default());
 ///
 ///     // The payload is the pool's own to make, so it is asked for rather than assembled here.
 ///     // This pool carries no side-channel data, so what comes back is empty but for `id`.
@@ -458,30 +514,58 @@ impl Drop for DepositTrackerSlot {
 ///     Ok(())
 /// }
 /// ```
-pub struct NonAnonymousDepositPool<N: HasChainApi> {
+pub struct NonAnonymousDepositPool<N: HasChainApi, C = BlokliClient> {
     node: Arc<N>,
+    /// The node's own key, used to sign gas top-ups directly rather than through the Safe module.
+    /// See [`fund_sweep_gas`].
+    node_key: ChainKeypair,
+    /// Blokli client the pool's own EOA-signing connectors are built on. Defaults to one created
+    /// from [`NonAnonymousDepositPoolConfig::blokli_url`]; tests substitute an in-process one.
+    client: C,
     cfg: NonAnonymousDepositPoolConfig,
     active_deposit_trackers: Arc<AtomicUsize>,
 }
 
 impl<N: HasChainApi> NonAnonymousDepositPool<N> {
-    /// Creates a pool that funds deposit addresses from `node`'s own account.
+    /// Creates a pool that deposits from the node's Safe and signs gas top-ups with `node_key`.
+    ///
+    /// `node_key` must be the node's own chain key: it signs the gas top-ups, which cannot go
+    /// through [`ChainWriteAccountOperations::withdraw`] because that spends the Safe. See the
+    /// module docs for the three payers.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use std::sync::Arc;
     ///
-    /// use hopr_api::node::HasChainApi;
-    /// use hopr_strategy::pix::secp256k1::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    /// use hopr_api::{ChainKeypair, node::HasChainApi};
+    /// use hopr_strategy::pix::pools::plain::{NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
     ///
-    /// fn build<N: HasChainApi>(node: Arc<N>) -> NonAnonymousDepositPool<N> {
-    ///     NonAnonymousDepositPool::new(node, NonAnonymousDepositPoolConfig::default())
+    /// fn build<N: HasChainApi>(node: Arc<N>, node_key: ChainKeypair) -> NonAnonymousDepositPool<N> {
+    ///     NonAnonymousDepositPool::new(node, node_key, NonAnonymousDepositPoolConfig::default())
     /// }
     /// ```
-    pub fn new(node: Arc<N>, cfg: NonAnonymousDepositPoolConfig) -> Self {
+    pub fn new(node: Arc<N>, node_key: ChainKeypair, cfg: NonAnonymousDepositPoolConfig) -> Self {
+        let client = hopr_chain_connector::create_blokli_client(hopr_chain_connector::HoprBlokliClientConfig::new(
+            cfg.blokli_url.clone(),
+        ));
+        Self::with_client(node, node_key, cfg, client)
+    }
+}
+
+impl<N: HasChainApi, C> NonAnonymousDepositPool<N, C> {
+    /// Creates a pool against an already-built blokli client, bypassing
+    /// [`NonAnonymousDepositPoolConfig::blokli_url`].
+    ///
+    /// The pool's own connectors are what make the gas top-up and the sweep work, so they have to
+    /// be on the tested path rather than stubbed. Tests hand in the in-process
+    /// `BlokliTestClient` here; production goes through [`Self::new`], and the two then run
+    /// exactly the same code.
+    pub fn with_client(node: Arc<N>, node_key: ChainKeypair, cfg: NonAnonymousDepositPoolConfig, client: C) -> Self {
         Self {
             node,
+            node_key,
+            client,
             cfg,
             active_deposit_trackers: Arc::new(AtomicUsize::new(0)),
         }
@@ -502,6 +586,36 @@ fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
         .with_jitter()
 }
 
+/// A connector that spends `key`'s own balance, built for one transfer and dropped after it.
+///
+/// The node's connector cannot do this. It carries a `SafePayloadGenerator`, whose `transfer`
+/// wraps the call in the Safe module's `execTransactionFromModule` — so it always spends the Safe,
+/// whoever signs. `withdraw_from_signer` does not help either: it swaps the *signature* but keeps
+/// that payload, producing a module call the signer has no authority over. A
+/// `BasicPayloadGenerator` emits the plain transfer this needs.
+///
+/// Built per call rather than cached. These are rare operations — a gas top-up and a sweep, both
+/// only for recovered addresses — and a cache would have to hold a live subscription per key and
+/// decide when to evict it. `withdraw` no longer requires the connector to be connected (since
+/// hopr-chain-connector 0.26.0), so construction here is cheap: it is one `query_chain_info` call
+/// to learn the contract addresses.
+///
+/// *Trustful*: the contract addresses come from the endpoint rather than from configuration, which
+/// is what lets this work against a test emulator unchanged.
+async fn eoa_connector<C>(client: C, key: &ChainKeypair) -> Result<HoprBlockchainBasicConnector<C>, StrategyError>
+where
+    C: hopr_chain_connector::blokli_client::BlokliSubscriptionClient
+        + hopr_chain_connector::blokli_client::BlokliQueryClient
+        + hopr_chain_connector::blokli_client::BlokliTransactionClient
+        + Send
+        + Sync
+        + 'static,
+{
+    create_trustful_safeless_hopr_blokli_connector(key, BlockchainConnectorConfig::default(), client)
+        .await
+        .map_err(StrategyError::other)
+}
+
 /// A single deposit attempt.  Called inside a retry loop (takes `Arc` to avoid borrow issues).
 ///
 /// The transfer is not idempotent, so the destination balance is re-read before every
@@ -511,7 +625,18 @@ fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
 /// A failed balance read is propagated instead of being ignored — a retry after an
 /// unreadable balance is exactly the case this guard exists for.
 ///
-/// The payer's balance is checked before transferring, so a deposit the node cannot cover is
+/// The payer here is the **Safe**, not the node's own account.
+/// [`ChainWriteAccountOperations::withdraw`] builds its transaction with the node's payload
+/// generator, and `SafePayloadGenerator::transfer` wraps every transfer — wxHOPR and xDai alike —
+/// in the Safe module's `execTransactionFromModule`. The node key signs and pays the gas; the
+/// tokens come out of the Safe. That is also where the wxHOPR float lives on a normal deployment,
+/// so it is the right account to spend, and [`Self::min_safe_hopr_reserve`] is what guards it.
+///
+/// It has not always been so: in hopr-types 3.x `SafePayloadGenerator::transfer` emitted a plain,
+/// node-signed transfer, and this gate correctly read the node's account. hopr-types 4.0.1 routed
+/// it through the module, which moved the payer without moving the check.
+///
+/// The payer's balance is checked before transferring, so a deposit the Safe cannot cover is
 /// refused rather than submitted and reverted — an operator then sees the reason instead of an
 /// opaque transaction failure. The check is per-deposit and the balance read is not atomic with
 /// the transfer, so a *batch* fanned out through
@@ -536,19 +661,20 @@ async fn deposit_once(
         return Ok(());
     }
 
-    let payer = node.identity().node_address;
+    // The Safe, because `withdraw` settles through the Safe module — see this function's docs.
+    let payer = node.identity().safe_address;
     let payer_hopr: HoprBalance = node.chain_api().balance(payer).await.map_err(StrategyError::other)?;
 
     // Saturating addition, so an absurd reserve refuses the deposit rather than wrapping.
-    let required = amount + cfg.min_node_hopr_reserve;
+    let required = amount + cfg.min_safe_hopr_reserve;
 
     if payer_hopr < required {
         tracing::warn!(
-            node = %payer,
+            safe = %payer,
             %amount,
-            reserve = %cfg.min_node_hopr_reserve,
+            reserve = %cfg.min_safe_hopr_reserve,
             available = %payer_hopr,
-            "insufficient wxHOPR in the node account to fund the deposit"
+            "insufficient wxHOPR in the Safe to fund the deposit"
         );
         return Err(StrategyError::CriteriaNotSatisfied);
     }
@@ -565,21 +691,36 @@ async fn deposit_once(
 /// Ensure the recovered stealth address has enough xDai for gas.
 ///
 /// The top-up is paid by the **node's own account**, not by the Safe, and the pre-flight balance
-/// check reads that same account. [`ChainWriteAccountOperations::withdraw`] is documented as
-/// withdrawing "from the Safe or node account (depends on the used `PayloadGenerator`)", but for a
-/// *native* transfer no generator in `hopr-types` routes through the Safe: `transfer` returns a
-/// plain value transfer rather than wrapping the call in the Safe module's
-/// `execTransactionFromModule`, and the connector signs it with the node key. Reading the Safe
-/// here would refuse every top-up on a normal deployment, where the Safe holds wxHOPR and no xDai
-/// at all.
+/// check reads that same account.
+///
+/// That is a constraint rather than a preference. A Safe holds wxHOPR and no xDai on a normal
+/// deployment, so a top-up drawn from it would be refused every time and every recovered deposit
+/// that could not already pay its own way would stay stranded. The node account is the one that
+/// actually holds gas.
+///
+/// [`ChainWriteAccountOperations::withdraw`] cannot deliver that: since hopr-types 4.0.1,
+/// `SafePayloadGenerator::transfer` wraps *both* currencies in the Safe module's
+/// `execTransactionFromModule`, so it always spends the Safe. (In 3.x it emitted a plain
+/// node-signed transfer, which is why this function used to be able to use it.) The transfer is
+/// therefore signed by the node key directly.
 ///
 /// [`NonAnonymousDepositPoolConfig::min_node_xdai_reserve`] is what the node keeps back, so
 /// funding a sweep cannot leave it without gas for its own transactions.
-async fn fund_sweep_gas(
+async fn fund_sweep_gas<C>(
     node: &impl HasChainApi,
+    client: C,
+    node_key: &ChainKeypair,
     cfg: &NonAnonymousDepositPoolConfig,
     recovered_address: Address,
-) -> Result<(), StrategyError> {
+) -> Result<(), StrategyError>
+where
+    C: hopr_chain_connector::blokli_client::BlokliSubscriptionClient
+        + hopr_chain_connector::blokli_client::BlokliQueryClient
+        + hopr_chain_connector::blokli_client::BlokliTransactionClient
+        + Send
+        + Sync
+        + 'static,
+{
     if cfg.gas_xdai_per_sweep.is_zero() {
         return Ok(());
     }
@@ -620,7 +761,10 @@ async fn fund_sweep_gas(
         return Err(StrategyError::CriteriaNotSatisfied);
     }
 
-    node.chain_api()
+    // Signed by the node key on its own behalf, so the xDai leaves the account the gate just
+    // checked. Going through `node.chain_api().withdraw` here would spend the Safe instead.
+    eoa_connector(client, node_key)
+        .await?
         .withdraw(deficit, &recovered_address)
         .and_then(identity)
         .await
@@ -634,16 +778,37 @@ async fn fund_sweep_gas(
 /// Sweep the full balance from a recovered stealth address into the destination.
 /// Called inside a retry closure (takes `Arc` to avoid borrow issues).
 ///
+/// The transfer is signed by `chain_key` — the recovered address's own key — through a connector
+/// built for it, so the funds move out of that address directly.
+///
+/// It cannot go through [`ChainWriteAccountOperations::withdraw_from_signer`], which is what this
+/// used to do. That method swaps the signature but keeps the node's `SafePayloadGenerator` payload,
+/// so it produces an `execTransactionFromModule` call on the node's Safe signed by a stealth EOA:
+/// an address that is not a party to that Safe and cannot drive its module. On-chain it reverts,
+/// and had it not, it would have moved the Safe's funds rather than the deposit. See
+/// [`eoa_connector`].
+///
 /// An empty address is reported as [`StrategyError::CriteriaNotSatisfied`], **not** as a
 /// zero-value success. A recovered key whose deposit has not landed yet must stay
 /// pending: reporting success would let the caller drop the key (and with it the only
 /// means of ever moving those funds) while the deposit is still in flight.
-async fn sweep_single(
+async fn sweep_single<C>(
     node: Arc<impl HasChainApi>,
+    client: C,
+    node_key: &ChainKeypair,
     cfg: &NonAnonymousDepositPoolConfig,
     chain_key: &ChainKeypair,
     dst: Address,
-) -> Result<HoprBalance, StrategyError> {
+) -> Result<HoprBalance, StrategyError>
+where
+    C: hopr_chain_connector::blokli_client::BlokliSubscriptionClient
+        + hopr_chain_connector::blokli_client::BlokliQueryClient
+        + hopr_chain_connector::blokli_client::BlokliTransactionClient
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     let recovered_address = chain_key.public().to_address();
 
     let balance: HoprBalance = node
@@ -660,12 +825,12 @@ async fn sweep_single(
         return Err(StrategyError::CriteriaNotSatisfied);
     }
 
-    fund_sweep_gas(&*node, cfg, recovered_address).await?;
+    fund_sweep_gas(&*node, client.clone(), node_key, cfg, recovered_address).await?;
 
-    node.chain_api()
-        .withdraw_from_signer(chain_key, balance, &dst)
-        .await
-        .map_err(StrategyError::other)?
+    eoa_connector(client, chain_key)
+        .await?
+        .withdraw(balance, &dst)
+        .and_then(identity)
         .await
         .map_err(StrategyError::other)?;
 
@@ -677,9 +842,16 @@ async fn sweep_single(
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
-impl<N> DepositPool<EthDepositKey> for NonAnonymousDepositPool<N>
+impl<N, C> DepositPool<EthDepositKey> for NonAnonymousDepositPool<N, C>
 where
     N: HasChainApi + Send + Sync + 'static,
+    C: hopr_chain_connector::blokli_client::BlokliSubscriptionClient
+        + hopr_chain_connector::blokli_client::BlokliQueryClient
+        + hopr_chain_connector::blokli_client::BlokliTransactionClient
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     type Error = StrategyError;
     /// [`ByteDepositData`] carrying [`DEPOSIT_MARKER_PAYLOAD`], filed under the allocation id.
@@ -732,7 +904,7 @@ where
         check_deposit_payload(id, &additional_data)?;
 
         let dest_addr = *dst;
-        // `cfg` as well as `node`: `deposit_once` reads `min_node_hopr_reserve` from it.
+        // `cfg` as well as `node`: `deposit_once` reads `min_safe_hopr_reserve` from it.
         let (node, cfg) = (&self.node, &self.cfg);
         let id = *id;
 
@@ -844,9 +1016,10 @@ where
         _amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
         let (node, cfg, chain_key) = (&self.node, &self.cfg, key.chain_key());
+        let (client, node_key) = (&self.client, &self.node_key);
         let id = *id;
 
-        (move || sweep_single(Arc::clone(node), cfg, chain_key, dst))
+        (move || sweep_single(Arc::clone(node), client.clone(), node_key, cfg, chain_key, dst))
             .retry(retry_policy(cfg.max_sweep_retries))
             .sleep(backon::FuturesTimerSleeper)
             .notify(move |error, dur| {
@@ -920,12 +1093,13 @@ mod tests {
         },
     };
 
-    use super::{EthDepositKey, NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    use super::{DEPOSIT_MARKER_PAYLOAD, EthDepositKey, NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
     use crate::{
         errors::StrategyError,
-        pix::EmptyDepositData,
+        pix::ByteDepositData,
         testing::{
-            BlokliTestStateBuilder, FullStateEmulator, PixNode, TestChainConnector, create_test_blokli_connector,
+            BlokliTestClient, BlokliTestStateBuilder, FullStateEmulator, PixNode, TestChainConnector,
+            create_test_blokli_connector,
         },
     };
 
@@ -979,18 +1153,23 @@ mod tests {
     struct Balances {
         node_xdai: XDaiBalance,
         node_hopr: HoprBalance,
+        safe_hopr: HoprBalance,
         safe_xdai: XDaiBalance,
         deposit_hopr: HoprBalance,
         deposit_xdai: XDaiBalance,
     }
 
     impl Default for Balances {
-        /// The shape a real deployment has: the node holds the gas and the float, the Safe holds
-        /// wxHOPR and no xDai, and a stealth address holding a deposit cannot pay to move it.
+        /// The shape a real deployment has: the Safe holds the wxHOPR float and no xDai, the node
+        /// holds the gas, and a stealth address holding a deposit cannot pay to move it.
+        ///
+        /// `node_hopr` is non-zero only so that a test drawing on the Safe can assert the node was
+        /// *not* drawn on instead; nothing in the pool spends it.
         fn default() -> Self {
             Self {
                 node_xdai: XDaiBalance::new_base(1),
                 node_hopr: HoprBalance::new_base(1000),
+                safe_hopr: safe_hopr(),
                 safe_xdai: XDaiBalance::zero(),
                 deposit_hopr: deposited(),
                 deposit_xdai: XDaiBalance::zero(),
@@ -1002,7 +1181,7 @@ mod tests {
 
     struct Fixture {
         cc: Connector,
-        pool: NonAnonymousDepositPool<PixNode<Connector>>,
+        pool: NonAnonymousDepositPool<PixNode<Connector>, BlokliTestClient<FullStateEmulator>>,
         node_addr: Address,
         safe_addr: Address,
         deposit_addr: Address,
@@ -1025,10 +1204,19 @@ mod tests {
         }
 
         /// Deposits into the fresh destination, which is what the Entry side does.
+        ///
+        /// The payload is the marker rather than an empty one: these tests are about the balance
+        /// gates, so the deposit data has to be what the pool accepts or `check_deposit_payload`
+        /// refuses first and the gate under test never runs.
         async fn deposit(&self, amount: HoprBalance) -> Result<(), StrategyError> {
             let id = an_id();
             self.pool
-                .deposit_funds_to(&id, &self.dest_addr, amount, EmptyDepositData::for_id(id))
+                .deposit_funds_to(
+                    &id,
+                    &self.dest_addr,
+                    amount,
+                    ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD),
+                )
                 .await
         }
     }
@@ -1051,11 +1239,11 @@ mod tests {
                     safe_address: Some(safe_addr),
                     key_id: 0u32.into(),
                 },
-                safe_hopr(),
+                balances.safe_hopr,
                 balances.node_xdai,
             )])
             // `with_accounts` puts the wxHOPR on the Safe and zeroes both of the node's balances,
-            // so the node's own float has to be credited after the fact. It also zeroes the
+            // so the node's own wxHOPR has to be credited after the fact. It also zeroes the
             // Safe's xDai, which mirrors a real deployment; a test overrides it to prove the gas
             // top-up ignores it.
             .with_balances([(node_addr, balances.node_hopr)])
@@ -1068,6 +1256,10 @@ mod tests {
             .with_balances([(dest_addr, XDaiBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
 
+        // The same in-process chain, reached two ways: `cc` is the node's Safe-signing connector,
+        // and the clone goes to the pool so its own EOA-signing connectors settle against exactly
+        // the same state. Cloning shares the state rather than copying it.
+        let sim_for_pool = sim.clone();
         let cc = Arc::new(create_test_blokli_connector(&node_kp, sim, MODULE_ADDRESS.into()).await?);
         let node = Arc::new(PixNode::new(
             Arc::clone(&cc),
@@ -1079,13 +1271,57 @@ mod tests {
         ));
 
         Ok(Fixture {
-            pool: NonAnonymousDepositPool::new(node, cfg),
+            pool: NonAnonymousDepositPool::with_client(node, node_kp.clone(), cfg, sim_for_pool),
             cc,
             node_addr,
             safe_addr,
             deposit_addr,
             dest_addr,
         })
+    }
+
+    /// The regression test for the defect this pool was rewritten to fix.
+    ///
+    /// The sweep used to go through `withdraw_from_signer`, which keeps the node's
+    /// `SafePayloadGenerator` payload and only swaps the signature — producing an
+    /// `execTransactionFromModule` call on the node's Safe signed by a stealth EOA that has no
+    /// authority over it. On-chain that reverts; had it not, it would have moved the Safe's funds
+    /// instead of the deposit.
+    ///
+    /// Three things pinned together, because the wrong one passing is how this hid before:
+    /// the deposit address is emptied, the Safe receives exactly that amount, and the Safe is not
+    /// *also* debited along the way. The last is what a module-routed sweep would violate.
+    ///
+    /// The gas top-up is disabled so the only movement asserted here is the sweep itself.
+    #[test_log::test(tokio::test)]
+    async fn sweep_debits_the_deposit_address_and_credits_the_safe() -> anyhow::Result<()> {
+        let f = fixture(
+            Balances {
+                // The top-up is off, so the address has to be able to sign for itself.
+                deposit_xdai: XDaiBalance::new_base(1),
+                ..Default::default()
+            },
+            NonAnonymousDepositPoolConfig {
+                gas_xdai_per_sweep: XDaiBalance::zero(),
+                ..cfg()
+            },
+        )
+        .await?;
+
+        let safe_before = f.hopr(f.safe_addr).await?;
+
+        f.sweep().await?;
+
+        assert!(
+            f.hopr(f.deposit_addr).await?.is_zero(),
+            "the deposit address must be swept dry"
+        );
+        assert_eq!(
+            f.hopr(f.safe_addr).await?,
+            safe_before + deposited(),
+            "the Safe must receive exactly the deposit, having funded none of it"
+        );
+        Ok(())
     }
 
     /// The regression test for the gate/payer mismatch.
@@ -1203,10 +1439,10 @@ mod tests {
     /// The pool used to transfer blind: nothing read the payer's balance, so running the float
     /// dry surfaced as an opaque transaction failure with no indication of the cause.
     #[test_log::test(tokio::test)]
-    async fn deposit_is_refused_when_the_node_cannot_cover_it() -> anyhow::Result<()> {
+    async fn deposit_is_refused_when_the_safe_cannot_cover_it() -> anyhow::Result<()> {
         let f = fixture(
             Balances {
-                node_hopr: HoprBalance::new_base(10),
+                safe_hopr: HoprBalance::new_base(10),
                 ..Default::default()
             },
             cfg(),
@@ -1221,19 +1457,19 @@ mod tests {
             "a refused deposit must not move anything"
         );
         assert_eq!(
-            f.hopr(f.node_addr).await?,
+            f.hopr(f.safe_addr).await?,
             HoprBalance::new_base(10),
             "and must not spend anything either"
         );
         Ok(())
     }
 
-    /// `min_node_hopr_reserve` holds back a floor the deposits may not eat into, for an operator
-    /// funding the node's account for something other than the PIX float.
+    /// `min_safe_hopr_reserve` holds back a floor the deposits may not eat into, for an operator
+    /// whose Safe is funded for something beyond the PIX float — channel stakes, say.
     #[test_log::test(tokio::test)]
-    async fn deposit_stops_at_the_node_hopr_reserve() -> anyhow::Result<()> {
+    async fn deposit_stops_at_the_safe_hopr_reserve() -> anyhow::Result<()> {
         let balances = || Balances {
-            node_hopr: HoprBalance::new_base(30),
+            safe_hopr: HoprBalance::new_base(30),
             ..Default::default()
         };
         let amount = HoprBalance::new_base(25);
@@ -1241,7 +1477,7 @@ mod tests {
         let refused = fixture(
             balances(),
             NonAnonymousDepositPoolConfig {
-                min_node_hopr_reserve: HoprBalance::new_base(10),
+                min_safe_hopr_reserve: HoprBalance::new_base(10),
                 ..cfg()
             },
         )
@@ -1261,7 +1497,12 @@ mod tests {
         assert_eq!(
             allowed.hopr(allowed.dest_addr).await?,
             amount,
-            "with no reserve configured the same node funds the deposit"
+            "with no reserve configured the same Safe funds the deposit"
+        );
+        assert_eq!(
+            allowed.hopr(allowed.node_addr).await?,
+            HoprBalance::new_base(1000),
+            "the node's own wxHOPR is never what a deposit spends"
         );
         Ok(())
     }
@@ -1278,7 +1519,7 @@ mod tests {
             NonAnonymousDepositPoolConfig::default().min_node_xdai_reserve
         );
         assert_eq!(parsed.min_node_xdai_reserve, "0.01 xdai".parse()?);
-        assert!(parsed.min_node_hopr_reserve.is_zero());
+        assert!(parsed.min_safe_hopr_reserve.is_zero());
         Ok(())
     }
 }

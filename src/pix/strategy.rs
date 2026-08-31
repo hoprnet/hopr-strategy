@@ -10,7 +10,7 @@
 //! * `N` — The node type that emits PIX events via [`ActionableEventSource`].
 //!
 //! One builder per bundled pool, each taking that pool's own config: `build_non_anonymous` for
-//! `secp256k1::NonAnonymousDepositPool` and `build_curvy` for `curvy::CurvyDepositPool`. Each
+//! `plain::NonAnonymousDepositPool` and `build_curvy` for `curvy::CurvyDepositPool`. Each
 //! exists whenever its own `strategy-pix-*` feature does, and both may exist at once, so the pool
 //! is named at the call site rather than inferred from the feature graph. For a custom pool,
 //! construct it first and pass it to [`PixStrategy::build_with_pool`].
@@ -221,7 +221,7 @@ pub struct PixStrategyConfig {
     /// the window rolls forward.
     ///
     /// The ledger behind it is in memory, so a restart forgives the window. It bounds a burst,
-    /// not lifetime spend; `secp256k1::NonAnonymousDepositPoolConfig::min_node_hopr_reserve`
+    /// not lifetime spend; `plain::NonAnonymousDepositPoolConfig::min_safe_hopr_reserve`
     /// is the balance floor that survives restarts.
     #[default(default_max_spend_per_window())]
     #[serde_as(as = "DisplayFromStr")]
@@ -289,8 +289,9 @@ impl PixStrategy {
         Self { cfg }
     }
 
-    /// Build with the [`NonAnonymousDepositPool`](crate::pix::secp256k1::NonAnonymousDepositPool),
-    /// settling to secp256k1 (`Address`) deposit addresses.
+    /// Build with the
+    /// [`NonAnonymousDepositPool`](crate::pix::pools::plain::NonAnonymousDepositPool), settling
+    /// to secp256k1 (`Address`) deposit addresses.
     ///
     /// `A` is the deposit-address type the node's PIX spec produces, and the `PoolKeypair:
     /// Keypair<Public = A>` bound makes naming it the whole compatibility check. Pass
@@ -316,17 +317,19 @@ impl PixStrategy {
     /// use std::sync::Arc;
     ///
     /// use hopr_api::{
+    ///     ChainKeypair,
     ///     node::{ActionableEventSource, HasChainApi},
     ///     types::primitive::prelude::Address,
     /// };
     /// use hopr_strategy::pix::strategy::{PixStrategy, PixStrategyConfig};
     ///
     /// # fn main() -> anyhow::Result<()> {
-    /// # fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>)
+    /// # fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>, node_key: ChainKeypair)
     /// #     -> hopr_strategy::errors::Result<()> {
     /// // In `hoprd` this is `<HoprPixSpec as PixSpec>::DepositAddress`, not a literal `Address`.
-    /// let _strategy =
-    ///     PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(node, Default::default())?;
+    /// // `node_key` signs the sweep-gas top-ups, which cannot go through the node's Safe.
+    /// let _strategy = PixStrategy::new(PixStrategyConfig::default())
+    ///     .build_non_anonymous::<_, Address>(node, node_key, Default::default())?;
     /// # Ok(()) }
     /// # Ok(())
     /// # }
@@ -338,47 +341,87 @@ impl PixStrategy {
     /// use std::sync::Arc;
     ///
     /// use hopr_api::{
+    ///     ChainKeypair,
     ///     node::{ActionableEventSource, HasChainApi},
     ///     types::crypto::prelude::BjjPublicKey,
     /// };
     /// use hopr_strategy::pix::strategy::{PixStrategy, PixStrategyConfig};
     ///
-    /// fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>) {
+    /// fn build<N: HasChainApi + ActionableEventSource + Send + Sync + 'static>(node: Arc<N>, node_key: ChainKeypair) {
     ///     // `NonAnonymousDepositPool` settles to `Address`, so this pairing is rejected here
     ///     // rather than failing on every event at runtime.
     ///     let _ = PixStrategy::new(PixStrategyConfig::default())
-    ///         .build_non_anonymous::<_, BjjPublicKey>(node, Default::default());
+    ///         .build_non_anonymous::<_, BjjPublicKey>(node, node_key, Default::default());
     /// }
     /// ```
     #[cfg(feature = "strategy-pix-test")]
     pub fn build_non_anonymous<N, A>(
         self,
         node: Arc<N>,
-        pool_cfg: crate::pix::secp256k1::PoolConfig,
+        node_key: hopr_api::ChainKeypair,
+        pool_cfg: crate::pix::pools::plain::PoolConfig,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
-        A: crate::pix::DepositAddressOf<crate::pix::secp256k1::PoolKeypair>,
+        A: crate::pix::DepositAddressOf<crate::pix::pools::plain::PoolKeypair>,
     {
         // Each builder validates the config it owns: the pool's here, the strategy's inside
         // `build_with_pool`. Checked before anything is constructed, so a build that is going to
         // fail does not first open a recovery store on disk.
         StrategyError::validate_config(&pool_cfg)?;
 
+        let client = hopr_chain_connector::create_blokli_client(hopr_chain_connector::HoprBlokliClientConfig::new(
+            pool_cfg.blokli_url.clone(),
+        ));
+        self.build_non_anonymous_with_client::<N, A, _>(node, node_key, pool_cfg, client)
+    }
+
+    /// [`build_non_anonymous`](Self::build_non_anonymous) against an already-built blokli client.
+    ///
+    /// The pool builds EOA-signing connectors of its own for the gas top-up and the sweep, and
+    /// those connect to [`PoolConfig::blokli_url`](crate::pix::pools::plain::PoolConfig). An
+    /// in-process test chain has no URL, so this hands the client over directly. Everything after
+    /// that point is the code the real builder runs, which is why
+    /// [`build_non_anonymous`](Self::build_non_anonymous) delegates here rather than duplicating
+    /// it. Also useful to a consumer that already holds a client and would rather not have a
+    /// second one opened on its behalf.
+    #[cfg(feature = "strategy-pix-test")]
+    pub fn build_non_anonymous_with_client<N, A, C>(
+        self,
+        node: Arc<N>,
+        node_key: hopr_api::ChainKeypair,
+        pool_cfg: crate::pix::pools::plain::PoolConfig,
+        client: C,
+    ) -> Result<Box<dyn StrategyTrait + Send>>
+    where
+        N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
+        A: crate::pix::DepositAddressOf<crate::pix::pools::plain::PoolKeypair>,
+        C: hopr_chain_connector::blokli_client::BlokliSubscriptionClient
+            + hopr_chain_connector::blokli_client::BlokliQueryClient
+            + hopr_chain_connector::blokli_client::BlokliTransactionClient
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        StrategyError::validate_config(&pool_cfg)?;
+
         // `Arc` rather than the bare pool: `build_with_pool` needs a cloneable `D`, and
         // `DepositPool` is auto-implemented for `Arc<D>`.
-        let pool = Arc::new(crate::pix::secp256k1::NonAnonymousDepositPool::new(
+        let pool = Arc::new(crate::pix::pools::plain::NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            node_key,
             pool_cfg,
+            client,
         ));
         let safe_address = node.identity().safe_address;
 
         // The key is named rather than inferred: it is the choice this builder exists to make.
-        self.build_with_pool::<_, _, crate::pix::secp256k1::PoolKeypair>(pool, node, safe_address)
+        self.build_with_pool::<_, _, crate::pix::pools::plain::PoolKeypair>(pool, node, safe_address)
     }
 
-    /// Build with the [`CurvyDepositPool`](crate::pix::curvy::CurvyDepositPool), settling to Baby
-    /// JubJub (`BjjPublicKey`) deposit addresses.
+    /// Build with the [`CurvyDepositPool`](crate::pix::pools::curvy::CurvyDepositPool), settling to
+    /// Baby JubJub (`BjjPublicKey`) deposit addresses.
     ///
     /// `A` is the deposit-address type the node's PIX spec produces; see
     /// `build_non_anonymous` for why naming it is the compatibility
@@ -387,7 +430,7 @@ impl PixStrategy {
     /// enabling only this feature already agrees.
     ///
     /// Note that this pool is a **stub**: building succeeds and the first deposit panics. See
-    /// [`crate::pix::curvy`].
+    /// [`crate::pix::pools::curvy`].
     ///
     /// # Examples
     ///
@@ -413,19 +456,22 @@ impl PixStrategy {
     pub fn build_curvy<N, A>(
         self,
         node: Arc<N>,
-        pool_cfg: crate::pix::curvy::PoolConfig,
+        pool_cfg: crate::pix::pools::curvy::PoolConfig,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
-        A: crate::pix::DepositAddressOf<crate::pix::curvy::PoolKeypair>,
+        A: crate::pix::DepositAddressOf<crate::pix::pools::curvy::PoolKeypair>,
     {
         // See `build_non_anonymous`: the pool config is this builder's to validate.
         StrategyError::validate_config(&pool_cfg)?;
 
-        let pool = Arc::new(crate::pix::curvy::CurvyDepositPool::new(Arc::clone(&node), pool_cfg));
+        let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
+            Arc::clone(&node),
+            pool_cfg,
+        ));
         let safe_address = node.identity().safe_address;
 
-        self.build_with_pool::<_, _, crate::pix::curvy::PoolKeypair>(pool, node, safe_address)
+        self.build_with_pool::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
@@ -1424,9 +1470,12 @@ mod tests {
             PixDepositAddressReceived, PixDepositData, PixDepositDataRequest, PixEvent,
         },
         types::{
-            crypto::{keypairs::Keypair, prelude::ChainKeypair},
+            crypto::{
+                keypairs::Keypair,
+                prelude::{ChainKeypair, OffchainKeypair},
+            },
             crypto_random::Randomizable,
-            internal::prelude::HoprPseudonym,
+            internal::prelude::{AccountEntry, AccountType, HoprPseudonym},
             primitive::prelude::{Address, HoprBalance, XDaiBalance},
         },
     };
@@ -1437,10 +1486,10 @@ mod tests {
         errors::StrategyError,
         pix::{
             ByteDepositData,
+            pools::plain::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPool},
             recovery_store::PixRecoveryStore,
-            secp256k1::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPool},
         },
-        testing::{BlokliTestStateBuilder, TestChainConnector},
+        testing::{BlokliTestClient, BlokliTestStateBuilder, FullStateEmulator, TestChainConnector},
     };
 
     /// Owned exclusively by `test_build_with_recovery_path_opens_store`. Tests share one
@@ -1474,7 +1523,7 @@ mod tests {
     /// The wire payload `NonAnonymousDepositPool` generates and accepts, filed under `id`.
     ///
     /// Every test here drives that pool, so this is what an event has to carry for the deposit to
-    /// be settled rather than refused — see `secp256k1::DEPOSIT_MARKER_PAYLOAD`.
+    /// be settled rather than refused — see `plain::DEPOSIT_MARKER_PAYLOAD`.
     ///
     /// `id` has to be the same value the event carries, so callers bind it to a local first rather
     /// than calling `pix_id` twice — [`pix_id`] is random per call.
@@ -1483,6 +1532,47 @@ mod tests {
             id,
             data: DEPOSIT_MARKER_PAYLOAD.into(),
         }
+    }
+
+    /// Registers the node account with **itself** as its Safe, and credits that account.
+    ///
+    /// [`ChainNode::identity`] reports `safe_address == node_address`, while
+    /// `with_generated_accounts` derives a *distinct* Safe per account. Left to disagree, a deposit
+    /// would be gated on one account's balance and settled out of another's — which is exactly the
+    /// class of defect this module's payer handling exists to prevent, so the two are made to
+    /// agree rather than papered over in the assertions.
+    ///
+    /// Tests that genuinely need the node and its Safe to be different accounts live in
+    /// `pix::pools::plain`, whose fixture keeps them apart on purpose.
+    fn with_self_safed_node(
+        builder: BlokliTestStateBuilder,
+        node: Address,
+        key_id: u32,
+        balance: HoprBalance,
+    ) -> BlokliTestStateBuilder {
+        // Derived from the address rather than random: these fixtures feed snapshot assertions,
+        // and a fresh packet key each run would never match twice.
+        let packet_key =
+            OffchainKeypair::from_secret(hopr_api::types::crypto::types::Hash::create(&[node.as_ref()]).as_ref())
+                .expect("offchain keypair creation cannot fail");
+
+        builder
+            .with_accounts([(
+                AccountEntry {
+                    public_key: *packet_key.public(),
+                    chain_addr: node,
+                    entry_type: AccountType::NotAnnounced,
+                    safe_address: Some(node),
+                    key_id: key_id.into(),
+                },
+                balance,
+                XDaiBalance::new_base(1),
+            )])
+            // `with_accounts` credits the Safe and zeroes the node's own token balance, then
+            // zeroes the Safe's xDai. Both writes land on this one account, so the float and the
+            // gas have to be put back afterwards.
+            .with_balances([(node, balance)])
+            .with_balances([(node, XDaiBalance::new_base(1))])
     }
 
     struct ChainNode<C>(C);
@@ -1563,7 +1653,7 @@ mod tests {
     /// Every test using this helper asserts on the outcome of a single attempt, so retrying
     /// would only add real backoff sleeps to the suite. Tests that are *about* retrying use
     /// [`pool_cfg_with_retries`].
-    fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::secp256k1::NonAnonymousDepositPoolConfig {
+    fn pool_cfg(t: StdDuration, g: XDaiBalance) -> crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
         pool_cfg_with_retries(t, g, 0, 0)
     }
 
@@ -1572,8 +1662,8 @@ mod tests {
         g: XDaiBalance,
         max_deposit_retries: usize,
         max_sweep_retries: usize,
-    ) -> crate::pix::secp256k1::NonAnonymousDepositPoolConfig {
-        crate::pix::secp256k1::NonAnonymousDepositPoolConfig {
+    ) -> crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+        crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
             max_deposit_tracking_time: t,
             gas_xdai_per_sweep: g,
             max_deposit_retries,
@@ -1606,11 +1696,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -1641,14 +1734,13 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_new_deposit_address_withdraws_to_deposit_address() -> anyhow::Result<()> {
         let da: Address = [0x42u8; 20].into();
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
             // `deposit_funds_to` reads the destination balance before transferring, and the
             // stub chain has no entry for an address that was never funded.
             .with_balances([(da, HoprBalance::zero())])
@@ -1656,11 +1748,14 @@ mod tests {
         let snap = sim.snapshot();
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -1700,11 +1795,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(10),
@@ -1747,25 +1845,27 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_new_deposit_address_does_not_settle_unreadable_deposit_data() -> anyhow::Result<()> {
         let dest_addr = Address::from([0x42u8; 20]);
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
             // `deposit_funds_to` reads the destination balance before transferring, and the
             // stub chain has no entry for an address that was never funded.
             .with_balances([(dest_addr, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -1842,10 +1942,13 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let node = Arc::new(ChainNode(Arc::new(cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -1903,10 +2006,13 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let node = Arc::new(ChainNode(Arc::new(cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -1961,10 +2067,13 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let node = Arc::new(ChainNode(Arc::new(cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -2003,11 +2112,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -2054,12 +2166,15 @@ mod tests {
         let snap = sim.snapshot();
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         register_test_safe(&connector, *BOB).await?;
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -2118,7 +2233,11 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
             ..Default::default()
         })
-        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default())?;
+        .build_non_anonymous::<_, Address>(
+            Arc::new(ChainNode(Arc::new(cc))),
+            BOB_KP.clone(),
+            Default::default(),
+        )?;
         assert_eq!(s.to_string(), "pix");
         fn assert_send<T: Send>(_: &T) {}
         assert_send(&s);
@@ -2139,16 +2258,19 @@ mod tests {
     ) -> anyhow::Result<(
         SpendTestConnector,
         Arc<SpendTestNode>,
-        Arc<NonAnonymousDepositPool<SpendTestNode>>,
+        Arc<NonAnonymousDepositPool<SpendTestNode, BlokliTestClient<FullStateEmulator>>>,
     )> {
-        let mut builder = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
+        let mut builder = with_self_safed_node(
+            BlokliTestStateBuilder::default().with_generated_accounts(
+                &[&*ALICE, &*CHRIS],
                 false,
                 XDaiBalance::new_base(1),
                 HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))]);
+            ),
+            *BOB,
+            9,
+            HoprBalance::new_base(1000),
+        );
         for destination in destinations {
             builder = builder.with_balances([(*destination, HoprBalance::zero())]);
         }
@@ -2160,11 +2282,14 @@ mod tests {
             MODULE_ADDRESS.into(),
         );
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         Ok((cc, node, pool))
     }
@@ -2194,7 +2319,7 @@ mod tests {
             id,
             address: address.into(),
             quota,
-            deposit_data: empty_deposit_data(id),
+            deposit_data: pool_deposit_data(id),
         })
     }
 
@@ -2340,7 +2465,7 @@ mod tests {
                 id,
                 address: mismatched.into(),
                 quota: 50,
-                deposit_data: empty_deposit_data(pix_id(2)),
+                deposit_data: pool_deposit_data(pix_id(2)),
             }))
             .await;
         assert!(
@@ -2366,7 +2491,7 @@ mod tests {
         let (_cc, node, _pool) = entry_side(&[]).await?;
 
         let result = PixStrategy::new(spend_cfg(HoprBalance::new_base(50), StdDuration::ZERO))
-            .build_non_anonymous::<_, Address>(node, Default::default());
+            .build_non_anonymous::<_, Address>(node, BOB_KP.clone(), Default::default());
 
         assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
         Ok(())
@@ -2385,7 +2510,8 @@ mod tests {
 
         let result = PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(
             node,
-            crate::pix::secp256k1::PoolConfig {
+            BOB_KP.clone(),
+            crate::pix::pools::plain::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
                 ..Default::default()
             },
@@ -2406,7 +2532,8 @@ mod tests {
 
         PixStrategy::new(PixStrategyConfig::default()).build_non_anonymous::<_, Address>(
             node,
-            crate::pix::secp256k1::PoolConfig {
+            BOB_KP.clone(),
+            crate::pix::pools::plain::PoolConfig {
                 max_deposit_retries: 0,
                 max_sweep_retries: 0,
                 ..Default::default()
@@ -2427,7 +2554,7 @@ mod tests {
 
         let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
             node,
-            crate::pix::curvy::PoolConfig {
+            crate::pix::pools::curvy::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
             },
         );
@@ -2439,25 +2566,27 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_new_deposit_address_dedup_skips_duplicate() -> anyhow::Result<()> {
         let da: Address = [0x42u8; 20].into();
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
             // `deposit_funds_to` reads the destination balance before transferring, and the
             // stub chain has no entry for an address that was never funded.
             .with_balances([(da, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -2514,7 +2643,11 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
             ..Default::default()
         })
-        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default())?;
+        .build_non_anonymous::<_, Address>(
+            Arc::new(ChainNode(Arc::new(cc))),
+            BOB_KP.clone(),
+            Default::default(),
+        )?;
         assert!(db.exists());
         // SAFETY: as above.
         unsafe { std::env::remove_var(BUILD_PASSWORD_ENV) };
@@ -2543,12 +2676,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         register_test_safe(&connector, *BOB).await?;
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -2599,14 +2735,20 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let node = Arc::new(ChainNode(Arc::new(cc)));
-        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
+        );
 
         let started = std::time::Instant::now();
         let result = pool
             .withdraw_deposit(
                 &pix_id(1),
-                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 *BOB,
                 None,
             )
@@ -2645,11 +2787,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(
+        let pool = NonAnonymousDepositPool::with_client(
             node,
+            BOB_KP.clone(),
             pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 3),
+            client,
         );
 
         // The deposit lands after the first attempt has already failed.
@@ -2663,7 +2808,7 @@ mod tests {
         let result = pool
             .withdraw_deposit(
                 &pix_id(1),
-                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 *CHRIS,
                 None,
             )
@@ -2709,9 +2854,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
+        );
 
         let safe_before = hopr_balance(&*cc, *BOB).await?;
         let dst_before = hopr_balance(&*cc, *CHRIS).await?;
@@ -2719,7 +2870,7 @@ mod tests {
         let dst_id = pix_id(2);
         pool.pool_transfer(
             &pix_id(1),
-            &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+            &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
             &dst_id,
             *CHRIS,
             ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -2769,14 +2920,20 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let node = Arc::new(ChainNode(Arc::new(cc)));
-        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
+        );
 
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
                 &pix_id(1),
-                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -2810,14 +2967,13 @@ mod tests {
         let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
         let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
 
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
             // `deposit_funds_to` reads the destination balance before transferring, and the
             // stub chain has no entry for an address that was never funded.
             .with_balances([(dest_addr, HoprBalance::zero())])
@@ -2827,9 +2983,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
+        );
 
         let dst_before = hopr_balance(&*cc, *CHRIS).await?;
 
@@ -2853,7 +3015,7 @@ mod tests {
         let transferred = pool
             .pool_transfer(
                 &id,
-                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, [0xde, 0xad, 0xbe, 0xef]),
@@ -2911,14 +3073,13 @@ mod tests {
         let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
         let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
 
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
             .with_balances([(dest_addr, HoprBalance::zero())])
             // A funded deposit address with gas of its own to pay for the transfer.
             .with_balances([(ra, deposit)])
@@ -2926,9 +3087,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(node, pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
+        );
 
         let dst_before = hopr_balance(&*cc, *CHRIS).await?;
 
@@ -2955,7 +3122,7 @@ mod tests {
         let transferred = pool
             .pool_transfer(
                 &id,
-                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 &dst_id,
                 *CHRIS,
                 misfiled,
@@ -3005,11 +3172,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(
+        let pool = NonAnonymousDepositPool::with_client(
             node,
+            BOB_KP.clone(),
             pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 3),
+            client,
         );
 
         let funder = Arc::clone(&cc);
@@ -3023,7 +3193,7 @@ mod tests {
         let result = pool
             .pool_transfer(
                 &pix_id(1),
-                &crate::pix::secp256k1::EthDepositKey::from_secret(&rk)?,
+                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -3078,11 +3248,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(
+        let pool = NonAnonymousDepositPool::with_client(
             node,
+            BOB_KP.clone(),
             pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 3),
+            client,
         );
 
         let funder = Arc::clone(&cc);
@@ -3103,7 +3276,7 @@ mod tests {
             .map(|(i, rk)| {
                 (
                     pix_id(i as u32 + 1),
-                    crate::pix::secp256k1::EthDepositKey::from_secret(rk).expect("valid test secret"),
+                    crate::pix::pools::plain::EthDepositKey::from_secret(rk).expect("valid test secret"),
                 )
             })
             .collect();
@@ -3162,6 +3335,7 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(PixNode::new(
             Arc::clone(&cc),
@@ -3173,9 +3347,11 @@ mod tests {
         ));
         // The default sweep budget, so the replay stays busy far longer than the assertion
         // below is willing to wait.
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 0, 5),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -3238,12 +3414,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         register_test_safe(&connector, *BOB).await?;
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -3298,7 +3477,11 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
             ..Default::default()
         })
-        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default());
+        .build_non_anonymous::<_, Address>(
+            Arc::new(ChainNode(Arc::new(cc))),
+            BOB_KP.clone(),
+            Default::default(),
+        );
         // The message must name the field that is missing, not just report a failed criterion.
         let error = r
             .err()
@@ -3334,7 +3517,11 @@ mod tests {
             withdrawal_buffer_period: StdDuration::ZERO,
             ..Default::default()
         })
-        .build_non_anonymous::<_, Address>(Arc::new(ChainNode(Arc::new(cc))), Default::default());
+        .build_non_anonymous::<_, Address>(
+            Arc::new(ChainNode(Arc::new(cc))),
+            BOB_KP.clone(),
+            Default::default(),
+        );
         assert!(r.is_err());
         Ok(())
     }
@@ -3350,25 +3537,27 @@ mod tests {
         let da1: Address = [0x42u8; 20].into();
         let da2: Address = [0x43u8; 20].into();
         let start_balance = HoprBalance::new_base(1000);
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                start_balance,
-            )
-            .with_balances([(*BOB, start_balance)])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            start_balance,
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, start_balance)
             // `deposit_funds_to` reads the destination balance before transferring, and the
             // stub chain has no entry for an address that was never funded.
             .with_balances([(da1, HoprBalance::zero()), (da2, HoprBalance::zero())])
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         cc.connect().await?;
+        let client = cc.client();
         let cc = Arc::new(cc);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -3435,12 +3624,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         register_test_safe(&connector, *BOB).await?;
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),
@@ -3505,12 +3697,15 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         register_test_safe(&connector, *BOB).await?;
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
 
         let dir = tempfile::tempdir()?;
@@ -3572,23 +3767,25 @@ mod tests {
         let amount = HoprBalance::new_base(40);
         let seed = HoprBalance::new_base(1);
 
-        let sim = BlokliTestStateBuilder::default()
-            .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS],
-                false,
-                XDaiBalance::new_base(1),
-                HoprBalance::new_base(1000),
-            )
-            .with_balances([(*BOB, HoprBalance::new_base(1000))])
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
             // Deliberately no entry for `dst`: the first read fails.
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = NonAnonymousDepositPool::new(
+        let pool = NonAnonymousDepositPool::with_client(
             node,
+            BOB_KP.clone(),
             pool_cfg_with_retries(StdDuration::from_secs(60), XDaiBalance::zero(), 5, 0),
+            client,
         );
 
         let funder = Arc::clone(&cc);
@@ -3632,9 +3829,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let node = Arc::new(ChainNode(Arc::new(connector)));
-        let pool =
-            NonAnonymousDepositPool::new(Arc::new(node), pool_cfg(StdDuration::from_secs(1), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            Arc::new(node),
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(1), XDaiBalance::zero()),
+            client,
+        );
 
         let fut = pool.notify_deposit(pix_id(1), dst, HoprBalance::new_base(10))?;
         let result = fut.await;
@@ -3668,9 +3870,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let node = Arc::new(ChainNode(Arc::new(connector)));
-        let pool =
-            NonAnonymousDepositPool::new(Arc::new(node), pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()));
+        let pool = NonAnonymousDepositPool::with_client(
+            Arc::new(node),
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
+        );
 
         let id = pix_id(1);
         let wire: PixDepositData = pool.generate_deposit_data(&id).await?.try_into()?;
@@ -3699,11 +3906,14 @@ mod tests {
             .build_dynamic_client(MODULE_ADDRESS.into());
         let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
         connector.connect().await?;
+        let client = connector.client();
         let cc = Arc::new(connector);
         let node = Arc::new(ChainNode(Arc::clone(&cc)));
-        let pool = Arc::new(NonAnonymousDepositPool::new(
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
             Arc::clone(&node),
+            BOB_KP.clone(),
             pool_cfg(StdDuration::from_secs(60), XDaiBalance::zero()),
+            client,
         ));
         let cfg = PixStrategyConfig {
             price_per_byte: HoprBalance::new_base(1),

@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "3.0.0"
+version      = "4.0.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -35,15 +35,6 @@ strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
 strategy-closure-finalizer = []
 # The PIX strategy engine, without a deposit pool.
-#
-# `DepositPool` is generic over its keypair, and `K::Public` is the deposit address the pool can
-# settle to. That has to match the address type `HoprPixSpec` produces, which is chosen by a
-# feature on `hopr-crypto-packet` — an entirely separate crate. Enabling this alone gives the
-# generic engine and `PixStrategy::build_with_pool`, for a consumer bringing its own pool.
-#
-# Consumers that want a bundled pool also enable one of the two pairings below. Those two are
-# additive, not exclusive: each lives in its own module with its own builder, so enabling both is
-# well-defined and is what `--all-features` does. Which pool runs is decided at the call site.
 strategy-pix = [
   "dep:backon",
   "dep:chacha20poly1305",
@@ -55,15 +46,8 @@ strategy-pix = [
 # `NonAnonymousDepositPool`, keyed on `EthDepositKey` (Ethereum deposit addresses).
 #
 # **For testing and development only.** The pool settles with plain, fully visible on-chain
-# transfers, so every deposit and sweep is linkable — it offers no anonymity at all. The feature is
-# named for that intent rather than for the curve it settles on, so it cannot be reached for in
-# production by mistake. The module stays `pix::secp256k1`, after the address scheme, and the
-# `hopr-lib/pix-secp256k1` pairing below is unchanged.
-#
-# Pair with `hopr-crypto-packet/pix-secp256k1` — reached through `hopr-lib/pix-secp256k1` — or
-# the pool cannot spend the addresses the events carry. Cargo cannot express "these two must
-# agree" across crates, so the consumer states both and `hoprd::strategy` asserts the result.
-strategy-pix-test = ["strategy-pix"]
+# transfers, so every deposit and sweep is linkable — it offers no anonymity at all.
+strategy-pix-test = ["strategy-pix", "dep:hopr-chain-connector"]
 # `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses).
 #
 # Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
@@ -97,6 +81,7 @@ hopr-api = { workspace = true, features = [
   "types-chain",
   "types-internal",
 ] }
+hopr-chain-connector = { workspace = true, optional = true }
 hopr-utils = { workspace = true, default-features = false }
 moka = { workspace = true, features = ["sync"] }
 multiaddr = { workspace = true }
@@ -156,7 +141,7 @@ anyhow              = "1.0.104"
 async-broadcast     = "0.7.2"
 async-trait         = "0.1.92"
 backon              = { version = "1.6.0", default-features = false }
-blokli-client       = "0.32.1"
+blokli-client       = "0.33.1"
 bytesize            = { version = "2.7.0", features = ["serde"] }
 chacha20poly1305    = "0.11.0"
 chrono              = { version = "0.4.45", default-features = false }
@@ -166,8 +151,9 @@ futures-concurrency = "7.7.1"
 futures-time        = "3.1.0"
 hex-literal         = "1.1.0"
 hopr-api            = "4.1.0"
+hopr-chain-connector = "0.26.0"
 hopr-strategy       = { path = "." }
-hopr-utils          = { package = "hopr-utilities", version = "0.12.0", default-features = false }
+hopr-utils          = { package = "hopr-utilities", version = "0.13.0", default-features = false }
 humantime-serde     = "1.1.1"
 insta               = "1.48.0"
 lazy_static         = "1.5.0"

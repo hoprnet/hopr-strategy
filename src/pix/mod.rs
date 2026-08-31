@@ -53,8 +53,8 @@
 // reason in `strategy.rs` for the two builders. Please leave them unlinked.
 //! | feature | module | pool | `K::Public` | pair with |
 //! |---|---|---|---|---|
-//! | `strategy-pix-test` | `pix::secp256k1` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
-//! | `strategy-pix-curvy` | `pix::curvy` | `CurvyDepositPool` (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
+//! | `strategy-pix-test` | `pix::pools::plain` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
+//! | `strategy-pix-curvy` | `pix::pools::curvy` | `CurvyDepositPool` (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
 //!
 //! Both features may be enabled at once, and enabling both is what `--all-features` does. Nothing
 //! is selected *by* the feature graph: each module exports its own `PoolKeypair` / `PoolConfig`
@@ -91,11 +91,8 @@
 //! consumer supplying its own via
 //! [`PixStrategy::build_with_pool`](strategy::PixStrategy::build_with_pool).
 
-#[cfg(feature = "strategy-pix-curvy")]
-pub mod curvy;
+pub mod pools;
 pub mod recovery_store;
-#[cfg(feature = "strategy-pix-test")]
-pub mod secp256k1;
 pub mod strategy;
 
 use hopr_api::node::{PixAddressId, PixDepositData};
@@ -105,7 +102,7 @@ use crate::errors::StrategyError;
 /// An example [`PoolDepositData`](hopr_api::chain::DepositPool::PoolDepositData): the allocation id
 /// plus an uninterpreted byte string.
 ///
-/// **Not a production type.** It is the payload of `secp256k1::NonAnonymousDepositPool` — itself a
+/// **Not a production type.** It is the payload of `pools::plain::NonAnonymousDepositPool` — itself a
 /// development-and-testing pool — and it exists mainly to show what the associated type has to look
 /// like. A real pool should define its own, naming the note, commitment or blinding factor it
 /// actually carries, so that the wire form is parsed and validated once, at the boundary, into
@@ -122,11 +119,11 @@ use crate::errors::StrategyError;
 ///
 /// What any bytes *mean* is the receiving pool's business, so no meaning is imposed here: a pool
 /// that requires a particular payload checks for it itself, where the payload reaches it — see
-/// `secp256k1::DEPOSIT_MARKER_PAYLOAD` for what that looks like. A check on this type would instead
+/// `pools::plain::DEPOSIT_MARKER_PAYLOAD` for what that looks like. A check on this type would instead
 /// apply to every pool using it.
 ///
 /// Defined here rather than in either pool module because both use it and each is behind its own
-/// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::secp256k1`.
+/// feature: a `strategy-pix-curvy`-only build cannot reach into `pix::pools::plain`.
 ///
 /// # Examples
 ///
@@ -219,7 +216,7 @@ impl ByteDepositData {
 
     /// The payload carrying `data`, for the allocation named by `id`.
     ///
-    /// Used by `secp256k1::NonAnonymousDepositPool` to carry its marker. A pool with a real payload
+    /// Used by `pools::plain::NonAnonymousDepositPool` to carry its marker. A pool with a real payload
     /// is better served by a type that names it than by an uninterpreted byte string — see the type
     /// documentation.
     ///
@@ -294,7 +291,7 @@ impl TryFrom<PixDepositData> for ByteDepositData {
         // Total on purpose: whether a given payload is acceptable depends on which pool is
         // receiving it, and this conversion is shared by every pool. A pool that only reads one
         // shape of payload rejects the others where it is handed them — see
-        // `secp256k1::check_deposit_payload`.
+        // `pools::plain::check_deposit_payload`.
         Ok(Self(data.id, data.data))
     }
 }

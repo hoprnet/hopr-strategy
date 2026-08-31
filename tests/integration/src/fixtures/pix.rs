@@ -10,6 +10,7 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use hopr_api::{
+    ChainKeypair,
     chain::{AccountSelector, ChainReadAccountOperations, ChainValues, PixDepositSecret},
     node::{DepositDataCreated, NodeOnchainIdentity, PixAddressId, PixDepositData, PixEvent},
     types::{
@@ -18,7 +19,7 @@ use hopr_api::{
     },
 };
 use hopr_strategy::{
-    pix::secp256k1::DEPOSIT_MARKER_PAYLOAD,
+    pix::pools::plain::DEPOSIT_MARKER_PAYLOAD,
     testing::{BlokliTestStateBuilder, PixNode, create_test_blokli_connector, register_test_safe},
 };
 
@@ -88,6 +89,9 @@ pub struct PixScenario {
     /// Node adapter to hand to `PixStrategy::build_non_anonymous`.
     pub node: Arc<PixNode<Arc<NodeConnector>>>,
     pub node_addr: Address,
+    /// The node's own chain key. `build_non_anonymous` needs it so the pool can sign sweep-gas
+    /// top-ups directly: those cannot go through the node's connector, which settles via the Safe.
+    pub node_key: ChainKeypair,
     /// The node's generated Safe — the destination `build_non_anonymous` picks up
     /// from `identity()` and sweeps recovered deposits into.
     pub safe_addr: Address,
@@ -212,6 +216,7 @@ impl IntegrationFixture {
             connector,
             node: pix_node,
             node_addr: node.address,
+            node_key: node.keypair.clone(),
             safe_addr,
         })
     }
