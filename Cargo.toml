@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "4.1.0"
+version      = "5.0.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -55,10 +55,9 @@ strategy-pix-test = ["dep:hopr-chain-connector", "strategy-pix"]
 # Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
 # feature and nothing else already agrees.
 #
-# Pulls in the Curvy SDK (`curvy-sdk`, git-only for now, which is why this crate cannot be
-# published to crates.io while the feature exists — see the README), the Curvy stealth-address
-# and note primitives (`curvy-core`), and `blokli-client`'s `curvy` query surface for note
-# discovery.
+# Pulls in the Curvy SDK (`curvy-sdk`), the Curvy stealth-address and note primitives
+# (`curvy-core`), and `blokli-client`'s `curvy` query surface for note discovery. The SDK needs
+# the Curvy proving artifacts on disk at runtime (`CURVY_ZK_KEYS_DIR`) — see the README.
 strategy-pix-curvy = [
   "blokli-client/curvy",
   "dep:babyjubjub-ec",
@@ -159,19 +158,8 @@ tokio = { workspace = true, features = [
 ] }
 
 [workspace]
-exclude  = ["vendor"]
 members  = ["tests/integration"]
 resolver = "3"
-
-# The published `curvy-prover`/`curvy-witness` 0.1.0-rc.3 pin `thiserror = "=2.0.19"`, while
-# `hopr-api` 4.x and `hopr-chain-connector` 0.26 require `^2.0.20`; Cargo resolves one 2.x, so
-# the two cannot coexist. `vendor/` carries byte-identical copies of both crates with only that
-# pin relaxed, patched in here. See `vendor/README.md` — and note that every root workspace that
-# consumes this crate has to repeat these two lines, because Cargo only honours `[patch]` from
-# the root. Remove both once upstream releases with a compatible requirement.
-[patch.crates-io]
-curvy-prover  = { path = "vendor/curvy-prover" }
-curvy-witness = { path = "vendor/curvy-witness" }
 
 [workspace.dependencies]
 anyhow           = "1.0.104"
@@ -184,11 +172,11 @@ bytesize         = { version = "2.7.0", features = ["serde"] }
 chacha20poly1305 = "0.11.0"
 chrono           = { version = "0.4.45", default-features = false }
 const-hex        = "1.19.1"
-# The Curvy SDK is git-only: `curvy-core` (and its prover/witness crates) are on crates.io, the
-# SDK workspace is not yet. The rev is the one the Curvy team integrated PIX against.
-curvy-chain-blokli   = { git = "https://github.com/0xCurvy/rs-sdk", rev = "7040bbb6c0bb8803dab282498be1f05db2710e47" }
-curvy-core           = "=0.1.0-rc.3"
-curvy-sdk            = { git = "https://github.com/0xCurvy/rs-sdk", rev = "7040bbb6c0bb8803dab282498be1f05db2710e47" }
+# The Curvy crates are pre-release and change API between release candidates; `curvy-sdk` pins
+# `curvy-core` exactly, so these three must name the same candidate and move together.
+curvy-chain-blokli   = "=0.1.0-rc.6"
+curvy-core           = "=0.1.0-rc.6"
+curvy-sdk            = "=0.1.0-rc.6"
 dashmap              = "6.2.1"
 futures              = "0.3.34"
 futures-concurrency  = "7.7.1"

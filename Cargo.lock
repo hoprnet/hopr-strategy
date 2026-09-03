@@ -1298,7 +1298,6 @@ dependencies = [
  "fnv",
  "merlin",
  "num-bigint 0.4.8",
- "rayon",
  "sha2 0.10.9",
 ]
 
@@ -1352,7 +1351,6 @@ dependencies = [
  "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
- "rayon",
  "zeroize",
 ]
 
@@ -1537,7 +1535,6 @@ dependencies = [
  "ark-serialize 0.6.0",
  "ark-snark",
  "ark-std 0.6.0",
- "rayon",
 ]
 
 [[package]]
@@ -1601,7 +1598,6 @@ dependencies = [
  "ark-std 0.6.0",
  "foldhash 0.1.5",
  "indexmap 2.14.1",
- "rayon",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2707,8 +2703,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-abi"
-version = "0.1.0"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=7040bbb6c0bb8803dab282498be1f05db2710e47#7040bbb6c0bb8803dab282498be1f05db2710e47"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9f0a862683111082f4278c86ea2417469804b12ccbb622af7cb424ee94823c"
 dependencies = [
  "alloy 1.8.3",
  "anyhow",
@@ -2719,8 +2716,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-chain-api"
-version = "0.1.0"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=7040bbb6c0bb8803dab282498be1f05db2710e47#7040bbb6c0bb8803dab282498be1f05db2710e47"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b97733db48a4a6fcba34d62b71068498be7e384a186d1bae3282e7c17932af62"
 dependencies = [
  "async-trait",
  "curvy-types",
@@ -2729,8 +2727,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-chain-blokli"
-version = "0.1.0"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=7040bbb6c0bb8803dab282498be1f05db2710e47#7040bbb6c0bb8803dab282498be1f05db2710e47"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d3e5d94fbccca1a78bcc03b2363f1bd461a4d3f8482bbb1ec81f35b35365809"
 dependencies = [
  "async-trait",
  "curvy-chain-api",
@@ -2742,9 +2741,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-core"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad039edd8eb265c92104aaff6758113893e198c384e0301881f127155bd9ce03"
+checksum = "6c3fc4ddb515fb093c886aaffb0b03eb88d0c2d17d362c3aa03d0baefbf95f12"
 dependencies = [
  "aes",
  "ark-bn254 0.6.0",
@@ -2764,7 +2763,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-prover"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97569b2c10f4d08e669cf37c614bd37cce5c8ff19221bb4b2fec88c49a91f4ee"
 dependencies = [
  "ark-bn254 0.6.0",
  "ark-ec 0.6.0",
@@ -2785,8 +2786,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-sdk"
-version = "0.1.0"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=7040bbb6c0bb8803dab282498be1f05db2710e47#7040bbb6c0bb8803dab282498be1f05db2710e47"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "237c62ab15146b9856b06a1b334f9b351eb6c79b2e349dccac1b8171d8b6ae5c"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -2805,15 +2807,18 @@ dependencies = [
 
 [[package]]
 name = "curvy-types"
-version = "0.1.0"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=7040bbb6c0bb8803dab282498be1f05db2710e47#7040bbb6c0bb8803dab282498be1f05db2710e47"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f4e9e00fb71c10500e7e7902c99f13a05f41ebec4387f4be8a03db194078552"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "curvy-witness"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d10e9c22247f273c3dfb9fc6d56fb7b601c7396f9707faa7104973123d802968"
 dependencies = [
  "ark-bn254 0.6.0",
  "ark-ff 0.6.0",
@@ -2826,8 +2831,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-witnesscalc"
-version = "0.1.0"
-source = "git+https://github.com/0xCurvy/rs-sdk?rev=7040bbb6c0bb8803dab282498be1f05db2710e47#7040bbb6c0bb8803dab282498be1f05db2710e47"
+version = "0.1.0-rc.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8168a834c73d1dadb64b8d9a4ca93e77efb14b08085a28048a639c735c50151b"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -4090,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "4.1.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-broadcast",

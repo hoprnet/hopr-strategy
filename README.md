@@ -37,10 +37,9 @@ to the builder makes a mismatched pairing a compile error instead of a per-event
 `strategy-pix-curvy` settles anonymously through the [Curvy](https://curvy.box) shielded pool: deposits are allocations inside the pool,
 discoverable only by a per-SSA scan identity the Exit mints, and recovered deposits are withdrawn from it to the Safe. At runtime it needs a
 Blokli endpoint that exposes the Curvy deployment, the Curvy operator's EVM key in the environment (`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by
-default), the Curvy Groth16 proving keys (`CURVY_ZK_KEYS_DIR`), and a state file that survives restarts; see the `pix::pools::curvy` module
-documentation. It pulls the Curvy SDK in as a **git dependency**, which is why this crate cannot be published to crates.io while that is the
-case, and two of the SDK's crates are vendored under `vendor/` with one dependency pin relaxed — see [`vendor/README.md`](vendor/README.md),
-including the `[patch.crates-io]` lines every consumer has to repeat.
+default), the Curvy Groth16 proving artifacts (`CURVY_ZK_KEYS_DIR`: the five zkeys and five witness graphs published with each
+[`rs-sdk` release](https://github.com/0xCurvy/rs-sdk/releases), digest-checked on load), and a state file that survives restarts; see the
+`pix::pools::curvy` module documentation.
 
 Enabling `strategy-pix` alone gives the engine without a pool, for a consumer supplying its own.
 

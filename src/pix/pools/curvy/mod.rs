@@ -30,10 +30,11 @@
 //! * The **Curvy operator key**, from the environment variable named by [`CurvyDepositPoolConfig::operator_key_env`].
 //!   It must hold the PortalFactory operator role and gas: it deploys and shields portals, commits notes, and submits
 //!   allocations and withdrawals. It is the only EVM key the pool holds.
-//! * The Curvy **proving keys**: every allocation, commitment and withdrawal is a Groth16 proof made in-process, and
-//!   the SDK loads the zkeys from `CURVY_ZK_KEYS_DIR` (flat, one file per circuit, digest-checked; or one
-//!   `CURVY_*_ZKEY` per circuit). They are published with the SDK's releases. Without them the first deposit fails with
-//!   "proving key location is not configured".
+//! * The Curvy **proving artifacts**: every allocation, commitment and withdrawal is a Groth16 proof made in-process,
+//!   and the SDK loads each circuit's zkey and witness graph from `CURVY_ZK_KEYS_DIR` (flat, one zkey and one
+//!   `*.signet.zst` graph per circuit, digest-checked; a `CURVY_*_ZKEY` / `CURVY_*_GRAPH` pair per circuit overrides
+//!   the directory). All ten files ship with each SDK release. Without them the first deposit fails with "location is
+//!   not configured".
 //! * A **Safe with wxHOPR** (Entry): the shield is funded from it through the node's own chain API, like the plain
 //!   pool's deposits. The amount is [`CurvyDepositPoolConfig::initial_funding`], overridable through
 //!   [`INITIAL_FUNDING_ENV`], and it is shielded **lazily** — on the first deposit, not at startup — so a node that
