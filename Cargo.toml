@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "4.0.0"
+version      = "5.0.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -22,6 +22,7 @@ runtime-tokio = ["hopr-utils/runtime-tokio"]
 telemetry     = ["hopr-api/types-telemetry"]
 ## Exposes `crate::testing` node adapters to downstream test crates.
 testing = [
+  "blokli-client/testing",
   "dep:async-broadcast",
   "dep:blokli-client",
   "dep:serde_json",
@@ -48,14 +49,28 @@ strategy-pix = [
 # **For testing and development only.** The pool settles with plain, fully visible on-chain
 # transfers, so every deposit and sweep is linkable — it offers no anonymity at all.
 strategy-pix-test = ["dep:hopr-chain-connector", "strategy-pix"]
-# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses).
+# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses): settlement through
+# the Curvy shielded pool, with per-SSA stealth scan identities for private note discovery.
 #
 # Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
 # feature and nothing else already agrees.
 #
-# NOTE: the pool itself is a stub whose methods panic. The feature wiring is final; the
-# implementation is not.
-strategy-pix-curvy = ["strategy-pix"]
+# Pulls in the Curvy SDK (`curvy-sdk`), the Curvy stealth-address and note primitives
+# (`curvy-core`), and `blokli-client`'s `curvy` query surface for note discovery. The SDK needs
+# the Curvy proving artifacts on disk at runtime (`CURVY_ZK_KEYS_DIR`) — see the README.
+strategy-pix-curvy = [
+  "blokli-client/curvy",
+  "dep:babyjubjub-ec",
+  "dep:blokli-client",
+  "dep:const-hex",
+  "dep:curvy-chain-blokli",
+  "dep:curvy-core",
+  "dep:curvy-sdk",
+  "dep:serde_json",
+  "dep:zeroize",
+  "hopr-api/types-curvy",
+  "strategy-pix",
+]
 
 [dependencies]
 anyhow              = { workspace = true }
@@ -87,9 +102,11 @@ moka = { workspace = true, features = ["sync"] }
 multiaddr = { workspace = true }
 parking_lot = { workspace = true }
 
-# Optional deps enabled by the `testing` feature
+# Optional deps enabled by the `testing` feature. `blokli-client` is shared with
+# `strategy-pix-curvy`, which is why its `testing` feature is enabled from the feature list
+# rather than here — a production curvy build must not inherit the test emulator.
 async-broadcast = { workspace = true, optional = true }
-blokli-client = { workspace = true, optional = true, features = ["testing"] }
+blokli-client = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
   "macros",
@@ -106,6 +123,14 @@ chacha20poly1305 = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
+
+# Curvy deposit pool — enabled via the `strategy-pix-curvy` feature.
+babyjubjub-ec      = { workspace = true, optional = true }
+const-hex          = { workspace = true, optional = true }
+curvy-chain-blokli = { workspace = true, optional = true }
+curvy-core         = { workspace = true, optional = true }
+curvy-sdk          = { workspace = true, optional = true }
+zeroize            = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-broadcast = { workspace = true }
@@ -137,14 +162,21 @@ members  = ["tests/integration"]
 resolver = "3"
 
 [workspace.dependencies]
-anyhow               = "1.0.104"
-async-broadcast      = "0.7.2"
-async-trait          = "0.1.92"
-backon               = { version = "1.6.0", default-features = false }
-blokli-client        = "0.33.1"
-bytesize             = { version = "2.7.0", features = ["serde"] }
-chacha20poly1305     = "0.11.0"
-chrono               = { version = "0.4.45", default-features = false }
+anyhow           = "1.0.104"
+async-broadcast  = "0.7.2"
+async-trait      = "0.1.92"
+babyjubjub-ec    = { version = "0.4.0", features = ["arithmetic"] }
+backon           = { version = "1.6.0", default-features = false }
+blokli-client    = "0.33.1"
+bytesize         = { version = "2.7.0", features = ["serde"] }
+chacha20poly1305 = "0.11.0"
+chrono           = { version = "0.4.45", default-features = false }
+const-hex        = "1.19.1"
+# The Curvy crates are pre-release and change API between release candidates; `curvy-sdk` pins
+# `curvy-core` exactly, so these three must name the same candidate and move together.
+curvy-chain-blokli   = "=0.1.0-rc.6"
+curvy-core           = "=0.1.0-rc.6"
+curvy-sdk            = "=0.1.0-rc.6"
 dashmap              = "6.2.1"
 futures              = "0.3.34"
 futures-concurrency  = "7.7.1"
@@ -176,6 +208,7 @@ thiserror            = "2.0.20"
 tokio                = "1.53.1"
 tracing              = "0.1.44"
 validator            = "0.21.0"
+zeroize              = "1.8.1"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

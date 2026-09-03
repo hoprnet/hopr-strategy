@@ -93,7 +93,9 @@ lazy_static::lazy_static! {
             "hopr_strategy_pix_sweeps_total",
             "Count of recovered SSA deposits swept into the Exit's Safe",
         ).unwrap();
-    static ref METRIC_PIX_LAST_SWEEP: hopr_api::types::telemetry::SimpleGauge =
+    // `pub(crate)`: the strategy discards the pool's receipt, so the swept amount is only known
+    // to a pool that reads it back from its own settlement — the curvy pool sets this itself.
+    pub(crate) static ref METRIC_PIX_LAST_SWEEP: hopr_api::types::telemetry::SimpleGauge =
         hopr_api::types::telemetry::SimpleGauge::new(
             "hopr_strategy_pix_last_sweep_hopr",
             "wxHOPR moved by the most recent SSA sweep, in base units",
@@ -471,8 +473,11 @@ impl PixStrategy {
     /// `<HoprPixSpec as PixSpec>::DepositAddress`; `hopr-lib/pix-bjj` is the default, so a consumer
     /// enabling only this feature already agrees.
     ///
-    /// Note that this pool is a **stub**: building succeeds and the first deposit panics. See
-    /// [`crate::pix::pools::curvy`].
+    /// The pool needs two things the config cannot carry: the Curvy operator key, read from the
+    /// environment variable named by `pool_cfg.operator_key_env`, and a Blokli endpoint that
+    /// exposes the Curvy deployment (`pool_cfg.blokli_url`). The key is checked here, so a build
+    /// that would fail at the first deposit fails at startup instead. See
+    /// [`crate::pix::pools::curvy`] for the rest of the runtime requirements.
     ///
     /// # Examples
     ///
@@ -507,10 +512,12 @@ impl PixStrategy {
         // See `build_non_anonymous`: the pool config is this builder's to validate.
         StrategyError::validate_config(&pool_cfg)?;
 
+        // `Arc` for the same reason as in `build_non_anonymous`; the pool itself is deliberately
+        // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
         let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
             Arc::clone(&node),
             pool_cfg,
-        ));
+        )?);
         let safe_address = node.identity().safe_address;
 
         self.build_with_pool::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address)
@@ -1644,9 +1651,10 @@ where
 
 // Gated on the secp pairing rather than plain `test`: every case here drives a real
 // `NonAnonymousDepositPool` against a stub chain, so they exercise the pool as much as the
-// strategy. The bjj pairing has no equivalent yet because its pool is a stub — when
-// `CurvyDepositPool` is implemented, the engine-level cases here are the ones worth
-// generalising over `PoolKeypair` rather than duplicating.
+// strategy. The bjj pairing has no equivalent here because `CurvyDepositPool` settles in a Curvy
+// deployment the stub chain does not model; it is tested in its own module over a scripted note
+// index. The engine-level cases here are the ones worth generalising over `PoolKeypair` if that
+// ever changes, rather than duplicating.
 #[cfg(all(test, feature = "strategy-pix-test"))]
 mod tests {
     use std::{num::NonZeroU32, sync::Arc, time::Duration as StdDuration};
@@ -2761,8 +2769,8 @@ mod tests {
         Ok(())
     }
 
-    /// The curvy builder validates its own pool config on the same footing, even though the pool
-    /// behind it is still a stub.
+    /// The curvy builder validates its own pool config on the same footing — and before it looks
+    /// for the operator key or opens the state file, which is why this needs neither.
     #[cfg(feature = "strategy-pix-curvy")]
     #[test_log::test(tokio::test)]
     async fn test_build_curvy_rejects_an_invalid_pool_config() -> anyhow::Result<()> {
@@ -2774,6 +2782,7 @@ mod tests {
             node,
             crate::pix::pools::curvy::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
+                ..Default::default()
             },
         );
 
