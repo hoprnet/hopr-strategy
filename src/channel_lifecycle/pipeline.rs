@@ -46,6 +46,25 @@ use crate::strategy::StrategyState;
 /// stream on every tick.
 const PEER_ADDR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// Outcome of one call to [`ChannelLifecycleStrategyInner::try_open_channel`]. Kept
+/// distinct from a plain `Option<HoprBalance>` so the redirect-to-fund path can report
+/// "wanted to spend, but the safe can't afford it" back to the caller — the caller owns
+/// the tick's `state` variable and is the only thing that publishes it, so this can't be
+/// a direct `self.set_state(...)` call here without racing that single publication (see
+/// the CodeRabbit-flagged regression this type fixes).
+#[derive(Debug, PartialEq, Eq)]
+enum OpenAttempt {
+    /// A tx was dispatched (open or redirected top-up); this much wxHOPR was committed
+    /// against the caller's `safe_remaining` budget.
+    Spent(HoprBalance),
+    /// Nothing needed doing (already at target stake, pending closure) or dispatch was
+    /// throttled (lease already held, action budget exhausted).
+    Skipped,
+    /// The on-chain re-read found the channel needs a top-up, redirecting from a plain
+    /// open — but the safe cannot afford that top-up.
+    Underfunded,
+}
+
 impl<N> ChannelLifecycleStrategyInner<N>
 where
     N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
@@ -358,9 +377,9 @@ where
         })
     }
 
-    /// Spawn an open transaction for a new channel to `dest`.  Returns the
-    /// committed amount if a chain action was submitted (either a fresh open or
-    /// an immediate top-up), or `None` if no action was taken.
+    /// Spawn an open transaction for a new channel to `dest`. Returns an
+    /// [`OpenAttempt`] describing what happened — including, distinctly from "nothing to
+    /// do", the case where the redirect below wanted to spend but couldn't afford to.
     ///
     /// `funding` carries the wxHOPR amounts already resolved from the capacity
     /// config for this tick.  `amount` is `funding.initial_balance` (passed by
@@ -379,7 +398,7 @@ where
         amount: HoprBalance,
         funding: &ResolvedFunding,
         safe_remaining: HoprBalance,
-    ) -> Option<HoprBalance> {
+    ) -> OpenAttempt {
         // The snapshot `all_channels` in `pipeline_inner` can be stale (race
         // between chain events and the snapshot pass), so re-read before
         // spending a tx slot.
@@ -389,7 +408,7 @@ where
                 ChannelStatus::Open => {
                     if existing.balance >= funding.lower_balance_threshold {
                         debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open at desired stake, skipping");
-                        return None;
+                        return OpenAttempt::Skipped;
                     }
                     let topup = funding.topup_balance;
                     if safe_remaining < topup {
@@ -397,15 +416,18 @@ where
                             %dest, %safe_remaining, %topup,
                             "channel-lifecycle: open pass redirected to fund, but safe cannot afford the top-up"
                         );
-                        self.set_state(StrategyState::Degraded);
-                        return None;
+                        return OpenAttempt::Underfunded;
                     }
                     debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open below threshold, funding immediately");
-                    return self.try_fund_channel(&existing, topup).then_some(topup);
+                    return if self.try_fund_channel(&existing, topup) {
+                        OpenAttempt::Spent(topup)
+                    } else {
+                        OpenAttempt::Skipped
+                    };
                 }
                 ChannelStatus::PendingToClose(_) => {
                     debug!(%dest, "channel-lifecycle: channel pending closure, deferring open");
-                    return None;
+                    return OpenAttempt::Skipped;
                 }
                 _ => {} // Closed — fall through to open
             },
@@ -416,7 +438,7 @@ where
         }
 
         let chain = chain.clone();
-        self.spawn_leased(&self.open_in_flight, dest, move || async move {
+        let dispatched = self.spawn_leased(&self.open_in_flight, dest, move || async move {
             debug!(%dest, %amount, "channel-lifecycle: opening channel");
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_CHANNEL_OPENS.increment();
@@ -429,8 +451,12 @@ where
                 }
                 Err(e) => warn!(%dest, %e, "channel-lifecycle: failed to submit open tx"),
             }
-        })
-        .then_some(amount)
+        });
+        if dispatched {
+            OpenAttempt::Spent(amount)
+        } else {
+            OpenAttempt::Skipped
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -954,8 +980,10 @@ where
                 state = StrategyState::Degraded;
                 break;
             }
-            if let Some(committed) = self.try_open_channel(*addr, funding.initial_balance, &funding, safe_remaining) {
-                safe_remaining -= committed;
+            match self.try_open_channel(*addr, funding.initial_balance, &funding, safe_remaining) {
+                OpenAttempt::Spent(committed) => safe_remaining -= committed,
+                OpenAttempt::Underfunded => state = StrategyState::Degraded,
+                OpenAttempt::Skipped => {}
             }
         }
 
@@ -1248,10 +1276,11 @@ mod tests {
         },
     };
 
+    use super::super::{ChannelLifecycleStrategyInner, config::ResolvedFunding, *};
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
-    // Private items (ChannelLifecycleStrategyInner) are accessible from descendant modules.
-    use super::super::ChannelLifecycleStrategyInner;
-    use super::super::{config::ResolvedFunding, *};
+    // Private items (ChannelLifecycleStrategyInner, OpenAttempt) are accessible from
+    // descendant modules.
+    use super::OpenAttempt;
     use crate::{
         errors::StrategyError,
         strategy::{Strategy as _, StrategyState},
@@ -2362,9 +2391,10 @@ mod tests {
         let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, HoprBalance::new_base(1000));
 
         // No open tx should have been submitted; no fund tx either.
-        assert!(
-            result.is_none(),
-            "try_open_channel should return None for already-open-at-stake"
+        assert_eq!(
+            result,
+            OpenAttempt::Skipped,
+            "try_open_channel should skip an already-open-at-stake channel"
         );
         assert!(inner.open_in_flight.is_empty(), "open_in_flight must be cleared");
         assert!(inner.fund_in_flight.is_empty(), "fund_in_flight must be empty");
@@ -2428,9 +2458,10 @@ mod tests {
         let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, HoprBalance::new_base(1000));
 
         // The PendingToClose guard must fire: no tx, in-flight marker cleared.
-        assert!(
-            result.is_none(),
-            "try_open_channel must return None when channel is PendingToClose"
+        assert_eq!(
+            result,
+            OpenAttempt::Skipped,
+            "try_open_channel must skip a channel that is PendingToClose"
         );
         assert!(inner.open_in_flight.is_empty(), "open_in_flight must be cleared");
         assert!(inner.fund_in_flight.is_empty(), "fund_in_flight must be empty");
@@ -2502,11 +2533,11 @@ mod tests {
             HoprBalance::new_base(1000),
         );
 
-        // Should return Some(topup_balance) (fund tx submitted) and clear open_in_flight.
+        // Should spend topup_balance (fund tx submitted) and clear open_in_flight.
         assert_eq!(
             result,
-            Some(topup_balance),
-            "try_open_channel should return Some(topup_balance) when delegating to fund"
+            OpenAttempt::Spent(topup_balance),
+            "try_open_channel should spend topup_balance when delegating to fund"
         );
         assert!(inner.open_in_flight.is_empty(), "open_in_flight must be cleared");
 
@@ -2534,6 +2565,22 @@ mod tests {
     /// before calling. A `safe_remaining` that covers `initial_balance` but not
     /// `topup_balance` must NOT dispatch the unaffordable fund tx — `try_open_channel`
     /// must gate on the cost it actually selects, not the cost the caller assumed.
+    ///
+    /// Direct-call only: this checks `try_open_channel`'s own return value, not the
+    /// tick's externally observable `state()`. A follow-up CodeRabbit pass flagged that
+    /// `try_open_channel` used to call `self.set_state(Degraded)` directly, which the
+    /// open pass's own single, once-per-tick `self.set_state(state)` publication could
+    /// silently overwrite back to `Running` — two writers racing one value. The fix
+    /// (this `OpenAttempt::Underfunded` variant, folded into the open pass's `state`
+    /// alongside every other gate) removes the second writer entirely: `try_open_channel`
+    /// no longer touches the atomic at all, so there is nothing left to race. A
+    /// full-`run_pipeline` reproduction of the original bug was intentionally not added:
+    /// this redirect path is only reachable when a peer's channel snapshot
+    /// (`all_channels`, taken once at the top of the tick) has gone stale relative to
+    /// `try_open_channel`'s live re-read — a genuine concurrent-mutation race the test
+    /// harness has no deterministic hook for (`ChainOp` has no fault for
+    /// `channel_by_parties`). Forcing it would mean a timing-dependent, flaky test for a
+    /// bug class the structural fix already makes impossible by construction.
     #[tokio::test]
     async fn open_pass_does_not_redirect_to_an_unaffordable_topup() -> anyhow::Result<()> {
         let lower_threshold = HoprBalance::from(3_u32);
@@ -2573,17 +2620,13 @@ mod tests {
         let resolved = make_resolved(lower_threshold, topup_balance, initial_balance);
         let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, safe_remaining);
 
-        assert!(
-            result.is_none(),
+        assert_eq!(
+            result,
+            OpenAttempt::Underfunded,
             "must not dispatch a fund tx costing more than safe_remaining"
         );
         assert!(inner.open_in_flight.is_empty(), "open_in_flight must be cleared");
         assert!(inner.fund_in_flight.is_empty(), "fund_in_flight must not be held");
-        assert_eq!(
-            inner.state(),
-            StrategyState::Degraded,
-            "the strategy discovered it cannot afford the redirected top-up"
-        );
 
         let channels: Vec<ChannelEntry> = connector
             .stream_channels(ChannelSelector::default().with_source(*BOB))
@@ -2634,8 +2677,8 @@ mod tests {
         let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, HoprBalance::new_base(1000));
         assert_eq!(
             result,
-            Some(initial_balance),
-            "try_open_channel should return Some(initial_balance) for a fresh channel"
+            OpenAttempt::Spent(initial_balance),
+            "try_open_channel should spend initial_balance for a fresh channel"
         );
 
         // Wait for the open tx to confirm.

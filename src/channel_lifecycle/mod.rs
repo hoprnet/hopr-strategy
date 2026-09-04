@@ -125,7 +125,7 @@ lazy_static::lazy_static! {
     static ref METRIC_REQUIRED_SAFE_BALANCE: hopr_api::types::telemetry::SimpleGauge =
         hopr_api::types::telemetry::SimpleGauge::new(
             "hopr_strategy_channel_lifecycle_required_safe_balance_hopr",
-            "wxHOPR the safe must hold to satisfy the demand of the last tick, in base units",
+            "wxHOPR the safe must hold to satisfy the demand of the most recent successful tick, in base units (may be stale if a required chain read fails)",
         ).unwrap();
 
     // ── Diversity / anonymity ─────────────────────────────────────────────────
