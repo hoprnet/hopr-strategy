@@ -16,6 +16,12 @@ use crate::errors::Result;
 
 /// Externally observable operational state of a running [`Strategy`].
 ///
+/// Shared across every strategy in this crate — implementing [`Strategy::state`] is
+/// optional, and any strategy can report a real state through it, though today only
+/// `channel_lifecycle` does. Deliberately strategy-agnostic: what makes a given
+/// strategy `Degraded` or `Failed`, and whether it recovers on its own, is up to that
+/// strategy to define and document at its own implementation.
+///
 /// Implementations that track no health signal of their own do not need to implement
 /// [`Strategy::state`] at all — the trait's default reports `Running`, so "nothing to
 /// say" reads as healthy rather than as a status an operator has to interpret.
@@ -28,25 +34,39 @@ use crate::errors::Result;
 ///
 /// assert_eq!(StrategyState::default(), StrategyState::Running);
 /// assert!(StrategyState::Running < StrategyState::Degraded);
-/// assert!(StrategyState::Degraded < StrategyState::Inactive);
+/// assert!(StrategyState::Degraded < StrategyState::Failed);
 /// assert_eq!(
 ///     StrategyState::Running.max(StrategyState::Degraded),
 ///     StrategyState::Degraded
 /// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(u8)]
 pub enum StrategyState {
-    /// Every pass this strategy evaluated either had nothing to do or completed what it
-    /// needed to.
+    /// Operating normally: everything the strategy currently needs to do, it can do.
     #[default]
-    Running,
-    /// At least one pass evaluated fine but could not afford to do what it needed —
-    /// e.g. a safe balance short of one funding or opening transaction. The strategy
-    /// keeps running and recovers on its own once funds arrive.
-    Degraded,
-    /// Could not evaluate any pass this tick: a required chain read (the channel list,
-    /// ticket economics, or the safe balance) failed.
-    Inactive,
+    Running = 0,
+    /// Can still do some of what it needs to, but not all of it.
+    Degraded = 1,
+    /// Cannot currently do any of what it needs to.
+    Failed = 2,
+}
+
+impl StrategyState {
+    /// Reconstructs a state from the discriminant `as u8` produces on this fieldless,
+    /// `#[repr(u8)]` enum. Exists so a strategy can store this small `Copy` value in an
+    /// atomic instead of behind a lock — see `channel_lifecycle`'s
+    /// `ChannelLifecycleStrategyInner::state` field for the pattern.
+    ///
+    /// `value` should be a discriminant this enum actually produced (0, 1, or 2); any
+    /// other input maps to `Failed`, the safe-direction fallback, rather than panicking.
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Running,
+            1 => Self::Degraded,
+            _ => Self::Failed,
+        }
+    }
 }
 
 /// A strategy that runs until cancelled or a fatal error occurs.
@@ -291,11 +311,12 @@ mod tests {
         assert_eq!(external.state(), StrategyState::Running);
     }
 
-    /// Increasing order of severity: comparing two observations always keeps the worse
-    /// one, which is how a tick would combine several passes' outcomes if it needed to.
+    /// Increasing order of severity: comparing two observations always keeps the
+    /// worse one, so a strategy combining several internal outcomes into one
+    /// reported state can do so with a plain `max`.
     #[test]
     fn state_ordering_is_by_severity() {
         assert!(StrategyState::Running < StrategyState::Degraded);
-        assert!(StrategyState::Degraded < StrategyState::Inactive);
+        assert!(StrategyState::Degraded < StrategyState::Failed);
     }
 }

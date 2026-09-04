@@ -78,10 +78,6 @@ where
             .await?;
 
         let Some(safe) = safe else {
-            // The fund/open passes already gate on what they are about to spend
-            // (see `pipeline_inner`), so this branch is only an informational
-            // signal — keep it at `debug!` to avoid log spam in misconfigured
-            // environments.
             debug!(%me, "channel-lifecycle: safe not registered");
             return Some(HoprBalance::zero());
         };
@@ -472,7 +468,7 @@ where
             .await
         else {
             debug!("channel-lifecycle: tick skipped: channel list unavailable");
-            self.set_state(StrategyState::Inactive);
+            self.set_state(StrategyState::Failed);
             return Ok(());
         };
 
@@ -580,9 +576,11 @@ where
         let mut safe_remaining = safe_balance.unwrap_or_else(HoprBalance::zero);
 
         // This tick's externally observable state (see `crate::strategy::StrategyState`).
-        // Reassigned, never combined via a severity max: `Inactive` is only reachable
-        // in the `else` arm below (chain inputs unavailable) and `Degraded` only inside
-        // the `Some`/`Some` arm, so the two can never both apply within one tick.
+        // `Degraded` means a pass evaluated fine but a per-pass affordability gate
+        // failed; `Failed` means chain inputs were unavailable, so no pass could even
+        // be evaluated. Reassigned, never combined via a severity max: `Failed` is
+        // only reachable in the `else` arm below and `Degraded` only inside the
+        // `Some`/`Some` arm, so the two can never both apply within one tick.
         let mut state = StrategyState::Running;
 
         // ── 2. Fund pass ─────────────────────────────────────────────────────
@@ -646,7 +644,7 @@ where
                 }
             }
         } else {
-            state = StrategyState::Inactive;
+            state = StrategyState::Failed;
             debug!(
                 economics_known = funding.is_some(),
                 safe_known = safe_balance.is_some(),
@@ -1809,10 +1807,10 @@ mod tests {
     }
 
     /// A tick that cannot even evaluate the gates — because a required chain read
-    /// failed — must report `Inactive`, distinct from `Degraded` (which means the
+    /// failed — must report `Failed`, distinct from `Degraded` (which means the
     /// tick evaluated fine but a pass was short of funds).
     #[tokio::test]
-    async fn state_is_inactive_when_chain_inputs_are_unavailable() -> anyhow::Result<()> {
+    async fn state_is_failed_when_chain_inputs_are_unavailable() -> anyhow::Result<()> {
         let module_address: Address = [1; Address::SIZE].into();
 
         let blokli_sim = BlokliTestStateBuilder::default()
@@ -1844,7 +1842,7 @@ mod tests {
 
         assert_eq!(
             inner.state(),
-            StrategyState::Inactive,
+            StrategyState::Failed,
             "ticket economics could not be read this tick"
         );
 
@@ -2044,7 +2042,7 @@ mod tests {
                 peer_ticket_activity: Arc::new(DashMap::new()),
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
-                state: Arc::new(Mutex::new(StrategyState::Running)),
+                state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
             }
         }
 
@@ -2168,7 +2166,7 @@ mod tests {
                 peer_ticket_activity: Arc::new(DashMap::new()),
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
-                state: Arc::new(Mutex::new(StrategyState::Running)),
+                state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -2192,7 +2190,7 @@ mod tests {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(Mutex::new(None)),
             last_resolved_funding: Arc::new(Mutex::new(None)),
-            state: Arc::new(Mutex::new(StrategyState::Running)),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -2265,7 +2263,7 @@ mod tests {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-            state: Arc::new(parking_lot::Mutex::new(StrategyState::Running)),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
         }
     }
 
