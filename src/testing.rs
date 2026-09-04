@@ -227,7 +227,14 @@ impl<C: PacketTransport, G, V> PacketTransport for LifecycleNode<C, G, V> {
     }
 }
 
-/// A network view that reports no peers and `Red` health.
+/// A network view that reports no discovered peers and `Red` health.
+///
+/// `is_connected` answers `true` for any peer asked about, unlike the empty
+/// `discovered_peers`/`connected_peers` sets: it is the one query the close
+/// pass treats as a live signal (disconnection is itself a close trigger), so
+/// an inert view — meant to neutralise the passes that consult it — must give
+/// the answer that does not trigger closing, not the literal "reports no
+/// peers" answer that would.
 pub struct EmptyNetworkView;
 
 impl hopr_api::network::NetworkView for EmptyNetworkView {
@@ -248,7 +255,7 @@ impl hopr_api::network::NetworkView for EmptyNetworkView {
     }
 
     fn is_connected(&self, _peer: &PeerId) -> bool {
-        false
+        true
     }
 
     fn health(&self) -> hopr_api::network::Health {

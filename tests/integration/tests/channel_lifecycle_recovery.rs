@@ -213,6 +213,59 @@ async fn observes_before_closing_on_startup(fixture: IntegrationFixture) -> Resu
     Ok(())
 }
 
+/// Connectivity is itself a close trigger, independent of `DefaultSelector`'s
+/// quality/staleness rules: a channel to a disconnected peer cannot be used to
+/// construct SURBs, so it must not survive purely because its stored quality
+/// score still looks fine (or was never measured).
+///
+/// Seeds one `Open` channel to a disconnected peer whose quality score is high
+/// enough, and recent enough, that the selector alone would never rank it —
+/// `should_close` returns `false` on both the quality and staleness rules. With
+/// the startup guard fully disabled (past shielding from the first tick), the
+/// only thing that can close this channel is the disconnection itself.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn force_closes_disconnected_channel_regardless_of_quality(fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [source, peer] = fixture.claim_accounts::<2>();
+    let peer_addr = peer.address;
+
+    let channels = vec![SeededChannel {
+        peer,
+        connected: false,
+        edge_score: 1.0,
+        balance: "5 wxHOPR".parse()?,
+    }];
+    let scenario = fixture.unhealthy_channels_scenario(&source, &channels, &[]).await?;
+
+    let mut cfg = recovery_config(Duration::from_millis(100));
+    cfg.restart.startup_observation_period = Duration::ZERO;
+    cfg.restart.startup_close_grace_period = Duration::ZERO;
+    cfg.population.target_open_channels = 0;
+
+    let node = Arc::new(LifecycleNode::with_views(
+        scenario.connector.clone(),
+        scenario.graph.clone(),
+        scenario.network.clone(),
+    ));
+    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
+
+    await_channel_where(
+        &scenario.connector,
+        scenario.source_addr,
+        peer_addr,
+        timeouts.action,
+        "disconnected channel force-closed despite fine quality",
+        |c| c.status != ChannelStatus::Open,
+    )
+    .await?;
+
+    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
 /// A node holding one unusable channel recovers to a healthy, funded one within
 /// a bounded time, whether the channel is unusable through poor quality or
 /// through being drained — the two branches of `DefaultSelector::should_close`

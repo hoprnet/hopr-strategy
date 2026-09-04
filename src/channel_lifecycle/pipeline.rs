@@ -775,7 +775,33 @@ where
                 "channel-lifecycle: close pass"
             );
 
-            for channel_id in &closes_ranked {
+            // A channel to a disconnected peer cannot be used to construct
+            // SURBs, so connectivity is itself a close trigger — not merely a
+            // signal the selector's quality/staleness rules might happen to
+            // pick up. Computed for every open channel, not only ranked ones,
+            // so a disconnected peer with an otherwise-fine (or unmeasured)
+            // quality score doesn't linger. An unresolvable peer counts as
+            // connected, so a cold or failed account read shields rather than
+            // forces a close.
+            let disconnected: HashSet<ChannelId> = open_channels
+                .iter()
+                .filter(|ch| {
+                    !addr_to_peer_id
+                        .get(&ch.destination)
+                        .is_none_or(|peer_id| self.node.network_view().is_connected(peer_id))
+                })
+                .map(|ch| *ch.get_id())
+                .collect();
+
+            let mut candidates = closes_ranked.clone();
+            let unranked_disconnected: Vec<ChannelId> = disconnected
+                .iter()
+                .filter(|id| !candidates.contains(id))
+                .copied()
+                .collect();
+            candidates.extend(unranked_disconnected);
+
+            for channel_id in &candidates {
                 if close_count >= self.cfg.closure.close_max_concurrent {
                     break;
                 }
@@ -787,12 +813,11 @@ where
                     if self.close_in_flight.is_held(ch.get_id()) || self.fund_in_flight.is_held(ch.get_id()) {
                         continue;
                     }
-                    // An unresolvable peer counts as connected, so a cold or
-                    // failed account read shields rather than retires.
-                    let connected = addr_to_peer_id
-                        .get(&ch.destination)
-                        .is_none_or(|peer_id| self.node.network_view().is_connected(peer_id));
-                    if startup_phase == StartupPhase::ShieldingConnected && connected {
+                    // Shielding protects a connected peer's channel from the
+                    // selector's own quality/staleness verdict; it never
+                    // protects a disconnected one — that's what "shielding
+                    // connected peers" means.
+                    if startup_phase == StartupPhase::ShieldingConnected && !disconnected.contains(channel_id) {
                         debug!(
                             dest = %ch.destination,
                             "channel-lifecycle: close deferred: peer connected within startup grace"
@@ -1298,8 +1323,11 @@ mod tests {
             HashSet::new()
         }
 
+        // An inert stub, meant to neutralise the passes that consult it — see
+        // `EmptyNetworkView` in `src/testing.rs` for why this answers `true`
+        // rather than the literal "reports no peers" `false`.
         fn is_connected(&self, _peer: &PeerId) -> bool {
-            false
+            true
         }
 
         fn health(&self) -> hopr_api::network::Health {
