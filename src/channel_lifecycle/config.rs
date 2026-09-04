@@ -249,7 +249,7 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// data volumes, plus the [`CapacitySizingMode`] that controls how those volumes
 /// are converted to wxHOPR stakes at runtime.
 ///
-/// All four capacity fields share the same sizing mode.  [`FundingConfig::resolve`]
+/// All three capacity fields share the same sizing mode.  [`FundingConfig::resolve`]
 /// converts them to [`ResolvedFunding`] balances once per tick using the live
 /// ticket price (and, for `Expected`/`Probabilistic` modes, the live winning
 /// probability).
@@ -260,7 +260,6 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// initial_capacity: 1 GiB
 /// topup_capacity: 1 GiB
 /// lower_capacity_threshold: 256 MiB
-/// min_safe_capacity_required: 1 GiB
 /// sizing_mode: deterministic
 /// ```
 ///
@@ -297,16 +296,6 @@ pub struct FundingConfig {
     #[default(ByteSize::mib(256))]
     pub lower_capacity_threshold: ByteSize,
 
-    /// Minimum safe balance (expressed as data capacity) required before the
-    /// strategy opens or funds any channel.  Default: 1 GiB.
-    #[default(ByteSize::gib(1))]
-    pub min_safe_capacity_required: ByteSize,
-
-    /// When `true` the fund and open passes are skipped entirely if the safe
-    /// balance is below `min_safe_capacity_required`.  Default: true.
-    #[default = true]
-    pub stop_when_unfunded: bool,
-
     /// How each capacity field is converted to a wxHOPR stake.
     /// Default: `Deterministic` (mean drain, floored at one winning ticket).
     ///
@@ -329,8 +318,11 @@ pub struct FundingConfig {
 /// because it *is* the strategy's own calculation.
 ///
 /// Each field resolves its own capacity independently; no ordering is implied. Under
-/// [`FundingConfig::default`] the top-up, initial and min-safe capacities are all 1 GiB
-/// and resolve equal, with only the lower threshold (256 MiB) below them.
+/// [`FundingConfig::default`] the top-up and initial capacities are both 1 GiB and
+/// resolve equal, with only the lower threshold (256 MiB) below them.
+///
+/// There is no resolved minimum safe balance: what a safe must hold is a property of
+/// live channel state, not of config — see [`Self::required_safe_balance`].
 ///
 /// ```no_run
 /// # use hopr_strategy::channel_lifecycle::FundingConfig;
@@ -348,8 +340,52 @@ pub struct ResolvedFunding {
     pub topup_balance: HoprBalance,
     /// Channel balance below which a top-up is triggered.
     pub lower_balance_threshold: HoprBalance,
-    /// Minimum safe balance required before opening or funding any channel.
-    pub min_safe_balance_required: HoprBalance,
+}
+
+impl ResolvedFunding {
+    /// wxHOPR the safe must hold for the demand this tick observed to be met in full.
+    ///
+    /// ```text
+    /// required = topup_balance × channels_needing_topup + initial_balance × open_deficit
+    /// ```
+    ///
+    /// `channels_needing_topup` is the count of open channels that need a top-up right
+    /// now (or would before a funding transaction could confirm) and have no
+    /// funding/closing transaction already in flight for them.
+    ///
+    /// `open_deficit` is measured against [`PopulationConfig::min_open_channels`] — the
+    /// floor below which the node stops being a useful relay — **not**
+    /// `PopulationConfig::target_open_channels`, which is an ambition funded from
+    /// surplus rather than a requirement. A safe sized to the target would report a
+    /// figure the node does not need.
+    ///
+    /// Zero when nothing is outstanding: every term here is something the strategy
+    /// would spend this tick if it could afford to. There is no standing minimum — a
+    /// node at its population floor whose channels are all healthy needs nothing.
+    ///
+    /// Saturating throughout ([`HoprBalance`]'s arithmetic saturates at `U256::MAX`
+    /// rather than wrapping), so an absurd count reads as "unaffordable" rather than
+    /// wrapping to something small.
+    ///
+    /// ```
+    /// # use hopr_strategy::channel_lifecycle::ResolvedFunding;
+    /// # use hopr_api::types::primitive::prelude::HoprBalance;
+    /// let resolved = ResolvedFunding {
+    ///     initial_balance: HoprBalance::new_base(100),
+    ///     topup_balance: HoprBalance::new_base(10),
+    ///     lower_balance_threshold: HoprBalance::new_base(5),
+    /// };
+    ///
+    /// // Nothing outstanding: no standing minimum.
+    /// assert_eq!(resolved.required_safe_balance(0, 0), HoprBalance::zero());
+    ///
+    /// // Two channels need a top-up, and the node is one channel short of its floor.
+    /// let required = resolved.required_safe_balance(2, 1);
+    /// assert_eq!(required, HoprBalance::new_base(10) * 2 + HoprBalance::new_base(100));
+    /// ```
+    pub fn required_safe_balance(&self, channels_needing_topup: usize, open_deficit: usize) -> HoprBalance {
+        self.topup_balance * channels_needing_topup + self.initial_balance * open_deficit
+    }
 }
 
 /// Convert a data `capacity` to a wxHOPR channel stake using the live ticket
@@ -505,17 +541,18 @@ impl FundingConfig {
     ///
     /// Build funding recommendations from here, not from a reimplementation: a copy
     /// compiles fine after the formula changes here, then reports figures the strategy
-    /// disagrees with.  Since [`FundingConfig::min_safe_capacity_required`] gates opening
-    /// when `stop_when_unfunded` is set, reporting below this leaves a node unable to
-    /// open a single channel.
+    /// disagrees with. For "how much must the safe hold", there is no configured answer
+    /// to read — combine these balances with live channel state through
+    /// [`ResolvedFunding::required_safe_balance`].
     ///
     /// ```no_run
     /// # use hopr_strategy::channel_lifecycle::FundingConfig;
     /// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
     /// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
     /// let resolved = funding.resolve::<C>(price, win_prob);
-    /// // Fund the safe to at least this before expecting any channel to open.
-    /// let required = resolved.min_safe_balance_required;
+    /// // Fund the safe to at least this: one top-up for each of two needy channels,
+    /// // and one opening stake to climb back to the population floor.
+    /// let required = resolved.required_safe_balance(2, 1);
     /// # let _ = required;
     /// # }
     /// ```
@@ -527,13 +564,6 @@ impl FundingConfig {
             topup_balance: capacity_to_balance::<C>(self.topup_capacity, price, win_prob, hops, mode),
             lower_balance_threshold: capacity_to_balance::<C>(
                 self.lower_capacity_threshold,
-                price,
-                win_prob,
-                hops,
-                mode,
-            ),
-            min_safe_balance_required: capacity_to_balance::<C>(
-                self.min_safe_capacity_required,
                 price,
                 win_prob,
                 hops,
@@ -1003,12 +1033,11 @@ mod config_tests {
     /// The floor is applied independently to every FundingConfig field, so even
     /// with 1-byte capacities every resolved balance covers one winning ticket.
     #[test]
-    fn floor_applies_to_all_four_fields() {
+    fn floor_applies_to_all_three_fields() {
         let cfg = FundingConfig {
             initial_capacity: ByteSize::b(1),
             topup_capacity: ByteSize::b(1),
             lower_capacity_threshold: ByteSize::b(1),
-            min_safe_capacity_required: ByteSize::b(1),
             ..FundingConfig::default()
         };
         let floor = floor_wei(JURA_TP, 3, JURA_P);
@@ -1017,7 +1046,6 @@ mod config_tests {
             ("initial", r.initial_balance),
             ("topup", r.topup_balance),
             ("lower_threshold", r.lower_balance_threshold),
-            ("min_safe", r.min_safe_balance_required),
         ] {
             assert_close(bal.amount().low_u128(), floor, name);
         }
@@ -1212,7 +1240,6 @@ mod config_tests {
                     ("initial", det.initial_balance, pr.initial_balance),
                     ("topup", det.topup_balance, pr.topup_balance),
                     ("lower", det.lower_balance_threshold, pr.lower_balance_threshold),
-                    ("min_safe", det.min_safe_balance_required, pr.min_safe_balance_required),
                 ] {
                     let dw = d.amount().low_u128();
                     let qw = q.amount().low_u128();
@@ -1279,7 +1306,7 @@ mod config_tests {
         let floor = floor_wei(JURA_TP, 3, JURA_P); // 7.5e18
         assert_close(floor, 7_500_000_000_000_000_000, "jura 1-ticket floor");
 
-        // initial / topup / min_safe = 1 GiB → mean drain ≈ 31.09 wxHOPR = 4.15
+        // initial / topup = 1 GiB → mean drain ≈ 31.09 wxHOPR = 4.15
         // tickets, rounded up to 5 × 7.5 = 37.5 wxHOPR.
         let n_gib = packets(ByteSize::gib(1).as_u64()); // 1_036_431
         assert_close(mean_wei(n_gib, 3, JURA_TP), 31_092_930_000_000_000_000, "jura mean");
@@ -1337,7 +1364,7 @@ mod config_tests {
     // ── FundingConfig::resolve, defaults, validation, serde ──────────────────
 
     #[test]
-    fn resolve_maps_all_four_fields() {
+    fn resolve_maps_all_three_fields() {
         let cfg = FundingConfig::default();
         let price = balance_from_wei(PRICE_WEI);
         let p = 0.5_f64;
@@ -1346,7 +1373,54 @@ mod config_tests {
         assert_eq!(r.initial_balance, cap(cfg.initial_capacity));
         assert_eq!(r.topup_balance, cap(cfg.topup_capacity));
         assert_eq!(r.lower_balance_threshold, cap(cfg.lower_capacity_threshold));
-        assert_eq!(r.min_safe_balance_required, cap(cfg.min_safe_capacity_required));
+    }
+
+    // ── ResolvedFunding::required_safe_balance ────────────────────────────────
+
+    /// No standing minimum: a node with nothing to do must be told it needs nothing.
+    #[test]
+    fn required_safe_balance_is_zero_when_the_node_wants_nothing() {
+        let r = FundingConfig::default().resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert_eq!(r.required_safe_balance(0, 0), HoprBalance::zero());
+    }
+
+    /// Each term is scaled by the balance it would actually spend: top-ups by
+    /// `topup_balance`, opens by `initial_balance`. Uses distinct capacities so a term
+    /// scaled by the wrong balance would be visible.
+    #[rstest]
+    #[case(1, 0)]
+    #[case(0, 1)]
+    #[case(3, 2)]
+    #[case(7, 5)]
+    fn required_safe_balance_sums_one_topup_per_needy_channel_and_one_stake_per_missing_channel(
+        #[case] topups: usize,
+        #[case] opens: usize,
+    ) {
+        let cfg = FundingConfig {
+            initial_capacity: ByteSize::gib(2),
+            topup_capacity: ByteSize::gib(1),
+            ..FundingConfig::default()
+        };
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert_ne!(
+            r.initial_balance, r.topup_balance,
+            "test setup: the two terms must differ"
+        );
+
+        // Repeated addition rather than the multiplication under test, so this isn't
+        // just a restatement of `required_safe_balance`'s own formula.
+        let expected: HoprBalance = std::iter::repeat_n(r.topup_balance, topups)
+            .chain(std::iter::repeat_n(r.initial_balance, opens))
+            .fold(HoprBalance::zero(), |acc, b| acc + b);
+        assert_eq!(r.required_safe_balance(topups, opens), expected);
+    }
+
+    /// Monotone in both arguments: more demand is never less money.
+    #[test]
+    fn required_safe_balance_grows_with_demand() {
+        let r = FundingConfig::default().resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert!(r.required_safe_balance(1, 0) > r.required_safe_balance(0, 0));
+        assert!(r.required_safe_balance(1, 1) > r.required_safe_balance(1, 0));
     }
 
     #[test]
@@ -1421,14 +1495,38 @@ mod config_tests {
         );
     }
 
+    /// The safe floor is no longer configured: it is computed from live channel state by
+    /// [`ResolvedFunding::required_safe_balance`]. A config naming it must be rejected
+    /// rather than silently ignored — a quietly dropped key would leave an operator
+    /// believing a floor they set is still in force.
+    #[test]
+    fn min_safe_capacity_required_is_no_longer_accepted_in_config() {
+        let err = serde_json::from_str::<FundingConfig>(r#"{"min_safe_capacity_required":1}"#)
+            .expect_err("min_safe_capacity_required must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("min_safe_capacity_required"),
+            "error should name the offending key, got: {err}"
+        );
+    }
+
+    /// The fund and open passes now gate on exactly what each spends, so there is no
+    /// all-or-nothing switch left for this flag to control.
+    #[test]
+    fn stop_when_unfunded_is_no_longer_accepted_in_config() {
+        let err = serde_json::from_str::<FundingConfig>(r#"{"stop_when_unfunded":false}"#)
+            .expect_err("stop_when_unfunded must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("stop_when_unfunded"),
+            "error should name the offending key, got: {err}"
+        );
+    }
+
     #[test]
     fn funding_config_serde_roundtrip_probabilistic() -> anyhow::Result<()> {
         let cfg = FundingConfig {
             initial_capacity: ByteSize::gib(5),
             topup_capacity: ByteSize::mib(512),
             lower_capacity_threshold: ByteSize::mib(128),
-            min_safe_capacity_required: ByteSize::gib(2),
-            stop_when_unfunded: false,
             sizing_mode: prob(0.9999),
         };
         let json = serde_json::to_string(&cfg).context("serialize")?;

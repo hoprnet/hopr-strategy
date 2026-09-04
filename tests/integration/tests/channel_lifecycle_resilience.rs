@@ -82,7 +82,6 @@ fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
     cfg.population.target_open_channels = 1;
     cfg.funding.lower_capacity_threshold = ByteSize::b(PACKET * 4); // 12 wxHOPR
     cfg.funding.topup_capacity = ByteSize::b(1); // 1 packet → 3 wxHOPR per top-up
-    cfg.funding.min_safe_capacity_required = ByteSize::b(0);
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
     cfg.concurrency.action_lease_timeout = lease;
@@ -94,8 +93,8 @@ fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
 ///
 /// The stake sits below `close_when_drained_below`, so the close pass selects it
 /// on the first tick with no probing history, and the finalize pass follows once
-/// the notice period is up (`max_closure_overdue = 0`).  Funding is off — an
-/// unaffordable safe floor — so the fund pass cannot take the slot first.
+/// the notice period is up (`max_closure_overdue = 0`).  Funding is off — no
+/// top-up is affordable — so the fund pass cannot take the slot first.
 fn retire_channel_config(lease: Duration) -> ChannelLifecycleConfig {
     let mut cfg = ChannelLifecycleConfig {
         tick_interval: TICK,
@@ -107,8 +106,7 @@ fn retire_channel_config(lease: Duration) -> ChannelLifecycleConfig {
     cfg.population.target_open_channels = 0;
     cfg.restart.startup_close_grace_period = Duration::ZERO;
     cfg.closure.close_when_drained_below = "2 wxHOPR".parse().expect("valid balance");
-    cfg.funding.stop_when_unfunded = true;
-    cfg.funding.min_safe_capacity_required = ByteSize::b(u64::MAX);
+    cfg.funding.topup_capacity = ByteSize::b(u64::MAX);
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = true;
     cfg.finalizer.max_closure_overdue = Duration::ZERO;

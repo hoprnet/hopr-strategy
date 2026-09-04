@@ -118,6 +118,16 @@ lazy_static::lazy_static! {
             "Count of initiated channel closure finalizations",
         ).unwrap();
 
+    /// wxHOPR the safe must hold to satisfy the demand the last tick observed. Zero
+    /// when the population is at its floor and no channel needs a top-up. Not updated
+    /// on a tick whose chain reads fail — stale is the safe direction; a false zero
+    /// would read as "needs nothing".
+    static ref METRIC_REQUIRED_SAFE_BALANCE: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_required_safe_balance_hopr",
+            "wxHOPR the safe must hold to satisfy the demand of the most recent successful tick, in base units (may be stale if a required chain read fails)",
+        ).unwrap();
+
     // ── Diversity / anonymity ─────────────────────────────────────────────────
     /// Shannon-entropy-based effective number of distinct (latency, subnet) cells.
     static ref METRIC_EFFECTIVE_BUCKETS: hopr_api::types::telemetry::SimpleGauge =
@@ -405,4 +415,23 @@ struct ChannelLifecycleStrategyInner<N> {
     /// event-driven funding handler so it reuses per-tick values instead of
     /// issuing fresh chain RPC calls on every balance-decrease event.
     last_resolved_funding: Arc<Mutex<Option<ResolvedFunding>>>,
+    /// This strategy's externally observable state, recomputed fresh every tick.
+    /// `AtomicStrategyState` (from `#[atomic_enum]`) is a lock-free wrapper — no mutex
+    /// needed for a value with no invariant tying it to any other field.
+    state: Arc<crate::strategy::AtomicStrategyState>,
+    /// Monotonically increasing tick number, one per `run_pipeline` call. Carried as a
+    /// `tracing` span field so every log line one tick emits can be correlated, even
+    /// though ticks never overlap (`run_pipeline` is only ever awaited sequentially).
+    tick_counter: AtomicU64,
+}
+
+impl<N> ChannelLifecycleStrategyInner<N> {
+    /// Records this tick's observed state. Logs only on a genuine transition — a
+    /// persistently degraded node must not re-log every `tick_interval`.
+    fn set_state(&self, next: crate::strategy::StrategyState) {
+        let prev = self.state.swap(next, Ordering::Relaxed);
+        if prev != next {
+            tracing::info!(from = %prev, to = %next, "channel-lifecycle: strategy state changed");
+        }
+    }
 }
