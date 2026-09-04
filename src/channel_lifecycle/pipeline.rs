@@ -48,10 +48,8 @@ const PEER_ADDR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Outcome of one call to [`ChannelLifecycleStrategyInner::try_open_channel`]. Kept
 /// distinct from a plain `Option<HoprBalance>` so the redirect-to-fund path can report
-/// "wanted to spend, but the safe can't afford it" back to the caller — the caller owns
-/// the tick's `state` variable and is the only thing that publishes it, so this can't be
-/// a direct `self.set_state(...)` call here without racing that single publication (see
-/// the CodeRabbit-flagged regression this type fixes).
+/// "wanted to spend, but the safe can't afford it" back to the caller as data, instead
+/// of writing to the shared state directly (see [`StatePublisher`] for why that matters).
 #[derive(Debug, PartialEq, Eq)]
 enum OpenAttempt {
     /// A tx was dispatched (open or redirected top-up); this much wxHOPR was committed
@@ -63,6 +61,37 @@ enum OpenAttempt {
     /// The on-chain re-read found the channel needs a top-up, redirecting from a plain
     /// open — but the safe cannot afford that top-up.
     Underfunded,
+}
+
+/// Publishes one tick's accumulated [`StrategyState`] exactly once, when this guard
+/// drops — whichever of `pipeline_inner`'s several exit points fires. A `self.set_state`
+/// call site duplicated (or, as happened before, omitted) at each early return is a
+/// mistake waiting to happen; a guard that publishes on drop is structural instead of
+/// conventional — there is nothing left in `pipeline_inner` for a future early return to
+/// forget.
+struct StatePublisher<'a, N> {
+    strategy: &'a ChannelLifecycleStrategyInner<N>,
+    state: StrategyState,
+}
+
+impl<'a, N> StatePublisher<'a, N> {
+    /// Starts a tick optimistically: `Running` until something says otherwise.
+    fn new(strategy: &'a ChannelLifecycleStrategyInner<N>) -> Self {
+        Self {
+            strategy,
+            state: StrategyState::Running,
+        }
+    }
+
+    fn set(&mut self, next: StrategyState) {
+        self.state = next;
+    }
+}
+
+impl<N> Drop for StatePublisher<'_, N> {
+    fn drop(&mut self) {
+        self.strategy.set_state(self.state);
+    }
 }
 
 impl<N> ChannelLifecycleStrategyInner<N>
@@ -280,9 +309,10 @@ where
             debug!("channel-lifecycle: action lease already held, skipping dispatch");
             return false;
         };
-        if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
+        let in_flight = self.total_in_flight();
+        if in_flight > self.cfg.concurrency.max_concurrent_actions {
             debug!(
-                in_flight = self.total_in_flight(),
+                in_flight,
                 budget = self.cfg.concurrency.max_concurrent_actions,
                 "channel-lifecycle: action budget exhausted, skipping dispatch"
             );
@@ -482,6 +512,10 @@ where
         let chain = self.node.chain_api();
         let me = *chain.me();
 
+        // Publishes this tick's externally observable state on drop, from wherever
+        // this function returns — see `StatePublisher`.
+        let mut state = StatePublisher::new(self);
+
         // ── 1. Snapshot ──────────────────────────────────────────────────────
         // Reclaim slots of operations that never reported back, so this tick's
         // budget and per-channel checks see only genuinely pending work.
@@ -509,7 +543,7 @@ where
             .await
         else {
             debug!("channel-lifecycle: tick skipped: channel list unavailable");
-            self.set_state(StrategyState::Failed);
+            state.set(StrategyState::Failed);
             return Ok(());
         };
 
@@ -616,13 +650,12 @@ where
         // safe balance is unknown, which keeps both passes from spending.
         let mut safe_remaining = safe_balance.unwrap_or_else(HoprBalance::zero);
 
-        // This tick's externally observable state (see `crate::strategy::StrategyState`).
-        // `Degraded` means a pass evaluated fine but a per-pass affordability gate
-        // failed; `Failed` means chain inputs were unavailable, so no pass could even
-        // be evaluated. Reassigned, never combined via a severity max: `Failed` is
-        // only reachable in the `else` arm below and `Degraded` only inside the
-        // `Some`/`Some` arm, so the two can never both apply within one tick.
-        let mut state = StrategyState::Running;
+        // `state` (declared above): `Degraded` means a pass evaluated fine but a
+        // per-pass affordability gate failed; `Failed` means chain inputs were
+        // unavailable, so no pass could even be evaluated. Reassigned below, never
+        // combined via a severity max: `Failed` is only reachable in the `else` arm
+        // below and `Degraded` only inside the `Some`/`Some` arm, so the two can never
+        // both apply within one tick.
 
         // ── 2. Fund pass ─────────────────────────────────────────────────────
         if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
@@ -676,7 +709,7 @@ where
                             topup = %funding.topup_balance,
                             "channel-lifecycle: fund pass stopped: safe cannot afford another top-up"
                         );
-                        state = StrategyState::Degraded;
+                        state.set(StrategyState::Degraded);
                         break;
                     }
                     if self.try_fund_channel(ch, funding.topup_balance) {
@@ -685,7 +718,7 @@ where
                 }
             }
         } else {
-            state = StrategyState::Failed;
+            state.set(StrategyState::Failed);
             debug!(
                 economics_known = funding.is_some(),
                 safe_known = safe_balance.is_some(),
@@ -897,13 +930,12 @@ where
         if self.cfg.finalizer.enabled {
             let overdue = self.cfg.finalizer.max_closure_overdue;
             let mut finalize_count = self.finalize_in_flight.held_count();
-            let pending_count = all_channels
-                .iter()
-                .filter(|ch| matches!(ch.status, ChannelStatus::PendingToClose(_)))
-                .count();
             debug!(
                 in_flight = finalize_count,
-                pending = pending_count,
+                pending = all_channels
+                    .iter()
+                    .filter(|ch| matches!(ch.status, ChannelStatus::PendingToClose(_)))
+                    .count(),
                 "channel-lifecycle: finalize pass"
             );
 
@@ -943,25 +975,21 @@ where
         );
 
         if deficit == 0 {
-            self.set_state(state);
             return Ok(());
         }
 
         let Some(funding) = funding else {
             debug!("channel-lifecycle: open pass skipped: ticket economics unavailable");
-            self.set_state(state);
             return Ok(());
         };
 
         if safe_balance.is_none() {
             debug!("channel-lifecycle: open pass skipped: safe balance unknown");
-            self.set_state(state);
             return Ok(());
         }
 
         if funding.initial_balance.is_zero() {
             debug!("channel-lifecycle: open pass skipped: resolved initial balance is zero");
-            self.set_state(state);
             return Ok(());
         }
 
@@ -977,17 +1005,16 @@ where
                     initial = %funding.initial_balance,
                     "channel-lifecycle: open pass stopped: safe cannot afford an opening stake"
                 );
-                state = StrategyState::Degraded;
+                state.set(StrategyState::Degraded);
                 break;
             }
             match self.try_open_channel(*addr, funding.initial_balance, &funding, safe_remaining) {
                 OpenAttempt::Spent(committed) => safe_remaining -= committed,
-                OpenAttempt::Underfunded => state = StrategyState::Degraded,
+                OpenAttempt::Underfunded => state.set(StrategyState::Degraded),
                 OpenAttempt::Skipped => {}
             }
         }
 
-        self.set_state(state);
         Ok(())
     }
 
