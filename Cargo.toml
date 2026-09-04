@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "5.0.0"
+version      = "4.0.1"
 
 [lib]
 crate-type = ["rlib"]
@@ -141,7 +141,9 @@ hex-literal          = "1.1.0"
 hopr-api             = "4.1.0"
 hopr-chain-connector = "0.26.0"
 hopr-strategy        = { path = "." }
-hopr-utils           = { package = "hopr-utilities", version = "0.14.0", default-features = false }
+# TEMPORARY: pinned to the hopr-utilities PR branch until hoprnet/hopr-utilities#24 merges and
+# publishes 0.14.0 to crates.io. Revert to a plain `version = "0.14.0"` once that lands.
+hopr-utils           = { package = "hopr-utilities", git = "https://github.com/hoprnet/hopr-utilities.git", rev = "287d1b40ccb6856b4f06b36b29856b1b0147de2d", version = "0.14.0", default-features = false }
 humantime-serde      = "1.1.1"
 insta                = "1.48.0"
 lazy_static          = "1.5.0"
