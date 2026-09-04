@@ -38,9 +38,13 @@ pub struct PopulationConfig {
     pub target_open_channels: usize,
 
     /// How long a peer is ineligible for a new channel after its previous
-    /// channel was closed.  Default: 30 minutes.
+    /// channel was closed.  Counted from `ChannelClosed` — after closure is
+    /// already fully confirmed on-chain, so this never races the closure
+    /// itself.  Sized at roughly one on-chain closure cycle so a reopen never
+    /// looks premature relative to how long retiring the old channel took,
+    /// without padding on top of that.  Default: 15 minutes.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub peer_reopen_cooldown: Duration,
 }
 
@@ -636,9 +640,11 @@ pub struct FinalizerConfig {
     pub enabled: bool,
 
     /// Extra time to wait beyond the on-chain notice period before finalizing.
-    /// Provides a buffer for slow-block periods.  Default: 30 min.
+    /// Provides a buffer for slow-block periods, stacked on top of the notice
+    /// period itself.  Sized at roughly one on-chain closure cycle, matching
+    /// `PopulationConfig::peer_reopen_cooldown`.  Default: 15 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub max_closure_overdue: Duration,
 
     /// Maximum simultaneous finalization transactions initiated per pass.
@@ -1673,7 +1679,7 @@ mod config_tests {
         assert_eq!(cfg.population.target_open_channels, 8, "sibling in the same section");
         assert_eq!(
             cfg.population.peer_reopen_cooldown,
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(15 * 60),
             "sibling of a different type"
         );
         assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");
