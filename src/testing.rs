@@ -54,9 +54,16 @@ use hopr_api::{
 
 /// Implements the (identical across adapters) `HasChainApi` surface for a node
 /// newtype, given an expression yielding a `&C` reference to its chain field.
+///
+/// The second form takes the adapter's extra type parameters (beyond the chain
+/// `C`), so an adapter carrying injectable views is covered for every choice of
+/// them rather than only for their defaults.
 macro_rules! impl_has_chain_api {
     ($ty:ident, |$node:ident| $chain:expr) => {
-        impl<C> HasChainApi for $ty<C>
+        impl_has_chain_api!($ty, <>, |$node| $chain);
+    };
+    ($ty:ident, <$($extra:ident),*>, |$node:ident| $chain:expr) => {
+        impl<C, $($extra),*> HasChainApi for $ty<C, $($extra),*>
         where
             C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
         {
@@ -118,26 +125,43 @@ where
     }
 }
 
-/// Chain-only node augmented with inert network and graph views, as required by
-/// the channel-lifecycle strategy. The views are empty: population/proactive
-/// passes that consult them are expected to be neutralised in the test config.
-pub struct LifecycleNode<C> {
+/// Chain-only node augmented with the network and graph views the
+/// channel-lifecycle strategy requires.
+///
+/// Defaults to inert views, in which case population/proactive passes that
+/// consult them are expected to be neutralised in the test config. Use
+/// [`LifecycleNode::with_views`] to drive those passes instead, supplying
+/// [`TestGraph`] and [`TestNetworkView`].
+pub struct LifecycleNode<C, G = EmptyGraph, V = EmptyNetworkView> {
     chain: C,
-    graph: EmptyGraph,
+    graph: G,
+    network: V,
 }
 
 impl<C> LifecycleNode<C> {
+    /// Wraps `chain` with inert views that report no peers and no edges.
     pub fn new(chain: C) -> Self {
         Self {
             chain,
             graph: EmptyGraph,
+            network: EmptyNetworkView,
         }
     }
 }
 
-impl_has_chain_api!(LifecycleNode, |node| &node.chain);
+impl<C, G, V> LifecycleNode<C, G, V> {
+    /// Wraps `chain` with programmable `graph` and `network` views.
+    ///
+    /// Required by any test exercising the open pass or a quality-driven close:
+    /// both read peer state exclusively through these two views.
+    pub fn with_views(chain: C, graph: G, network: V) -> Self {
+        Self { chain, graph, network }
+    }
+}
 
-impl<C> ActionableEventSource for LifecycleNode<C>
+impl_has_chain_api!(LifecycleNode, <G, V>, |node| &node.chain);
+
+impl<C, G, V> ActionableEventSource for LifecycleNode<C, G, V>
 where
     C: ChainEvents + Send + Sync + 'static,
 {
@@ -154,15 +178,15 @@ where
     }
 }
 
-impl<C> HasNetworkView for LifecycleNode<C>
+impl<C, G, V> HasNetworkView for LifecycleNode<C, G, V>
 where
     C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
+    V: hopr_api::network::NetworkView + Send + Sync + 'static,
 {
-    type NetworkView = EmptyNetworkView;
+    type NetworkView = V;
 
     fn network_view(&self) -> &Self::NetworkView {
-        static VIEW: EmptyNetworkView = EmptyNetworkView;
-        &VIEW
+        &self.network
     }
 
     fn status(&self) -> ComponentStatus {
@@ -170,11 +194,17 @@ where
     }
 }
 
-impl<C> HasGraphView for LifecycleNode<C>
+impl<C, G, V> HasGraphView for LifecycleNode<C, G, V>
 where
     C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
+    G: hopr_api::graph::NetworkGraphView<NodeId = OffchainPublicKey>
+        + hopr_api::graph::NetworkGraphConnectivity<NodeId = OffchainPublicKey>
+        + hopr_api::graph::NetworkGraphTraverse<NodeId = OffchainPublicKey>
+        + Send
+        + Sync
+        + 'static,
 {
-    type Graph = EmptyGraph;
+    type Graph = G;
 
     fn graph(&self) -> &Self::Graph {
         &self.graph
@@ -191,7 +221,7 @@ impl<C: PacketTransport> PacketTransport for ChainNode<C> {
     }
 }
 
-impl<C: PacketTransport> PacketTransport for LifecycleNode<C> {
+impl<C: PacketTransport, G, V> PacketTransport for LifecycleNode<C, G, V> {
     fn packet_payload_size() -> usize {
         C::packet_payload_size()
     }
@@ -379,6 +409,241 @@ impl hopr_api::graph::traits::EdgeProtocolObservable for EmptyMeasurement {
     fn balance(&self) -> Option<hopr_api::graph::traits::Balance> {
         None
     }
+}
+
+// ─── Programmable network and graph views ────────────────────────────────────
+
+/// Off-chain key `BlokliTestStateBuilder::with_generated_accounts` derives for `addr`.
+///
+/// Peer state reaches a strategy keyed by off-chain key or `PeerId`, while tests
+/// address peers by chain address; this is the bridge between the two.
+pub fn test_offchain_key(addr: &Address) -> OffchainPublicKey {
+    let pseudo_secret = Hash::create(&[addr.as_ref()]);
+    *OffchainKeypair::from_secret(pseudo_secret.as_ref())
+        .expect("hash output is a valid off-chain secret")
+        .public()
+}
+
+/// `PeerId` of the account `addr`, matching [`test_offchain_key`].
+pub fn test_peer_id(addr: &Address) -> PeerId {
+    PeerId::from(&test_offchain_key(addr))
+}
+
+/// A network view whose connected peer set is settable while a strategy runs.
+///
+/// The open pass draws its candidates from `connected_peers`, and connectivity
+/// also decides whether a channel is shielded during the startup observation
+/// window — neither is expressible with [`EmptyNetworkView`], which reports no
+/// peers at all.
+#[derive(Clone, Default)]
+pub struct TestNetworkView {
+    connected: Arc<dashmap::DashSet<PeerId>>,
+}
+
+impl TestNetworkView {
+    /// An empty view: every peer counts as disconnected.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks `addr` as currently connected.
+    pub fn connect(&self, addr: &Address) {
+        self.connected.insert(test_peer_id(addr));
+    }
+
+    /// Marks `addr` as no longer connected.
+    pub fn disconnect(&self, addr: &Address) {
+        self.connected.remove(&test_peer_id(addr));
+    }
+}
+
+impl hopr_api::network::NetworkView for TestNetworkView {
+    fn listening_as(&self) -> HashSet<hopr_api::Multiaddr> {
+        HashSet::new()
+    }
+
+    /// Always `None`, so every peer lands in `SubnetBucket::Unknown`.
+    ///
+    /// Only the multi-objective selector buckets by subnet; tests needing that
+    /// diversity axis have to extend this view.
+    fn multiaddress_of(&self, _peer: &PeerId) -> Option<HashSet<hopr_api::Multiaddr>> {
+        None
+    }
+
+    fn discovered_peers(&self) -> HashSet<PeerId> {
+        self.connected_peers()
+    }
+
+    fn connected_peers(&self) -> HashSet<PeerId> {
+        self.connected.iter().map(|peer| *peer).collect()
+    }
+
+    fn is_connected(&self, peer: &PeerId) -> bool {
+        self.connected.contains(peer)
+    }
+
+    /// Reports `Green`: a view with a settable peer set models a network that
+    /// has finished bootstrapping.
+    fn health(&self) -> hopr_api::network::Health {
+        hopr_api::network::Health::Green
+    }
+
+    fn subscribe_network_events(
+        &self,
+    ) -> impl futures::Stream<Item = hopr_api::network::NetworkEvent> + Send + 'static {
+        futures::stream::pending()
+    }
+}
+
+/// A network graph whose per-peer edge observations are settable while a
+/// strategy runs.
+///
+/// Quality-driven closes and the open pass's eligibility gate both read
+/// `edge(identity, peer).score()`, which [`EmptyGraph`] leaves unset.
+#[derive(Clone)]
+pub struct TestGraph {
+    identity: OffchainPublicKey,
+    edges: Arc<dashmap::DashMap<(OffchainPublicKey, OffchainPublicKey), TestEdge>>,
+}
+
+impl TestGraph {
+    /// A graph rooted at `node_addr`, the address of the node under test.
+    ///
+    /// The root must match, or edges recorded here are invisible to the
+    /// strategy: it only ever queries edges outgoing from its own identity.
+    pub fn new(node_addr: &Address) -> Self {
+        Self {
+            identity: test_offchain_key(node_addr),
+            edges: Arc::new(dashmap::DashMap::new()),
+        }
+    }
+
+    /// Records an observation of the edge to `addr`, replacing any previous one.
+    ///
+    /// `last_update` is the *age* of the observation and must be non-zero for a
+    /// quality-driven close: `Duration::ZERO` reads as "never probed", which
+    /// suppresses closure entirely.
+    pub fn set_edge(&self, addr: &Address, score: f64, last_update: Duration) {
+        self.edges.insert(
+            (self.identity, test_offchain_key(addr)),
+            TestEdge { score, last_update },
+        );
+    }
+}
+
+/// A single programmable edge observation of [`TestGraph`].
+#[derive(Clone)]
+pub struct TestEdge {
+    score: f64,
+    last_update: Duration,
+}
+
+impl hopr_api::graph::NetworkGraphView for TestGraph {
+    type NodeId = OffchainPublicKey;
+    type Observed = TestEdge;
+
+    fn ticket_face_value(&self) -> Option<hopr_api::graph::traits::Balance> {
+        None
+    }
+
+    fn path_slot(&self, _key: &Self::NodeId) -> Option<u64> {
+        None
+    }
+
+    fn node_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn contains_node(&self, key: &Self::NodeId) -> bool {
+        self.edges.iter().any(|entry| entry.key().1 == *key)
+    }
+
+    fn nodes(&self) -> BoxStream<'static, Self::NodeId> {
+        let nodes: Vec<_> = self.edges.iter().map(|entry| entry.key().1).collect();
+        futures::stream::iter(nodes).boxed()
+    }
+
+    fn edge(&self, src: &Self::NodeId, dest: &Self::NodeId) -> Option<Self::Observed> {
+        self.edges.get(&(*src, *dest)).map(|entry| entry.clone())
+    }
+
+    fn identity(&self) -> &Self::NodeId {
+        &self.identity
+    }
+}
+
+impl hopr_api::graph::NetworkGraphConnectivity for TestGraph {
+    type NodeId = OffchainPublicKey;
+    type Observed = TestEdge;
+
+    fn connected_edges(&self) -> Vec<(Self::NodeId, Self::NodeId, Self::Observed)> {
+        Vec::new()
+    }
+
+    fn reachable_edges(&self) -> Vec<(Self::NodeId, Self::NodeId, Self::Observed)> {
+        Vec::new()
+    }
+}
+
+/// Traversal is unimplemented: the channel-lifecycle strategy reads individual
+/// edges and never plans paths, so every method yields nothing.
+impl hopr_api::graph::NetworkGraphTraverse for TestGraph {
+    type NodeId = OffchainPublicKey;
+    type Observed = TestEdge;
+
+    fn simple_paths<V: hopr_api::graph::ValueFn<Weight = Self::Observed>>(
+        &self,
+        _source: &Self::NodeId,
+        _destination: &Self::NodeId,
+        _length: usize,
+        _take_count: Option<usize>,
+        _value_fn: V,
+    ) -> Vec<(Vec<Self::NodeId>, [u64; 5], V::Value)> {
+        Vec::new()
+    }
+
+    fn simple_paths_from<V: hopr_api::graph::ValueFn<Weight = Self::Observed>>(
+        &self,
+        _source: &Self::NodeId,
+        _length: usize,
+        _take_count: Option<usize>,
+        _value_fn: V,
+    ) -> Vec<(Vec<Self::NodeId>, [u64; 5], V::Value)> {
+        Vec::new()
+    }
+
+    fn simple_loopback_to_self(
+        &self,
+        _length: usize,
+        _take_count: Option<usize>,
+    ) -> Vec<(Vec<Self::NodeId>, [u64; 5])> {
+        Vec::new()
+    }
+}
+
+impl hopr_api::graph::EdgeObservableRead for TestEdge {
+    type ImmediateMeasurement = EmptyMeasurement;
+    type IntermediateMeasurement = EmptyMeasurement;
+
+    fn last_update(&self) -> Duration {
+        self.last_update
+    }
+
+    fn immediate_qos(&self) -> Option<&Self::ImmediateMeasurement> {
+        None
+    }
+
+    fn intermediate_qos(&self) -> Option<&Self::IntermediateMeasurement> {
+        None
+    }
+
+    fn score(&self) -> Option<f64> {
+        Some(self.score)
+    }
+}
+
+impl hopr_api::graph::traits::EdgeObservableWrite for TestEdge {
+    fn record(&mut self, _measurement: hopr_api::graph::traits::EdgeWeightType) {}
 }
 
 // ─── Test chain connector ────────────────────────────────────────────────────

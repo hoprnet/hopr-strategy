@@ -32,7 +32,7 @@ use tracing::{debug, warn};
 
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
-    config::ResolvedFunding,
+    config::{ResolvedFunding, StartupPhase},
     selector::{
         BucketCell, BucketView, CloseCandidate, LatencyBucket, OpenCandidate, PeerEdgeInfo, SelectorContext, SignalSet,
         StakeView, SubnetBucket,
@@ -762,12 +762,16 @@ where
         let opens_ranked = self.selector.select_opens(&selector_ctx).await;
 
         // ── 3. Close pass ─────────────────────────────────────────────────────
-        if self.start_epoch.elapsed() >= self.cfg.restart.startup_close_grace_period {
+        // Startup is staged (see `RestartGuardConfig`): observe everything, then
+        // retire only unconnected peers, then apply the usual rules.
+        let startup_phase = self.cfg.restart.phase_at(self.start_epoch.elapsed());
+        if startup_phase != StartupPhase::Observing {
             let mut close_count = self.close_in_flight.held_count();
             debug!(
                 in_flight = close_count,
                 open = open_count,
                 min = self.cfg.population.min_open_channels,
+                phase = ?startup_phase,
                 "channel-lifecycle: close pass"
             );
 
@@ -781,6 +785,18 @@ where
                 }
                 if let Some(ch) = channel_by_id.get(channel_id) {
                     if self.close_in_flight.is_held(ch.get_id()) || self.fund_in_flight.is_held(ch.get_id()) {
+                        continue;
+                    }
+                    // An unresolvable peer counts as connected, so a cold or
+                    // failed account read shields rather than retires.
+                    let connected = addr_to_peer_id
+                        .get(&ch.destination)
+                        .is_none_or(|peer_id| self.node.network_view().is_connected(peer_id));
+                    if startup_phase == StartupPhase::ShieldingConnected && connected {
+                        debug!(
+                            dest = %ch.destination,
+                            "channel-lifecycle: close deferred: peer connected within startup grace"
+                        );
                         continue;
                     }
                     if self.try_close_channel(ch) {
@@ -1580,6 +1596,7 @@ mod tests {
                 ..Default::default()
             },
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             ..Default::default()
@@ -1615,15 +1632,16 @@ mod tests {
     fn restart_grace_should_block_close_pass() {
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::from_secs(60),
                 startup_close_grace_period: Duration::from_secs(3600),
             },
             ..Default::default()
         };
-        let start_epoch = Instant::now();
-        let grace_elapsed = start_epoch.elapsed() >= cfg.restart.startup_close_grace_period;
-        assert!(
-            !grace_elapsed,
-            "close pass should be suppressed during startup grace period"
+        let phase = cfg.restart.phase_at(Duration::ZERO);
+        assert_eq!(
+            phase,
+            crate::channel_lifecycle::config::StartupPhase::Observing,
+            "close pass should be suppressed during startup observation period"
         );
     }
 
@@ -1741,6 +1759,7 @@ mod tests {
     fn restart_grace_should_re_apply_on_new_instance() {
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::from_secs(10),
                 startup_close_grace_period: Duration::from_secs(60),
             },
             ..Default::default()
@@ -2334,6 +2353,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             funding: FundingConfig {
@@ -2545,6 +2565,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2624,6 +2645,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2824,6 +2846,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2973,6 +2996,7 @@ mod tests {
                 ..Default::default()
             },
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             ..Default::default()
