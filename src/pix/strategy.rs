@@ -2441,7 +2441,7 @@ mod tests {
 
     // ── Rolling spend limit ────────────────────────────────────────
 
-    type SpendTestConnector = Arc<TestChainConnector<crate::testing::FullStateEmulator>>;
+    type SpendTestConnector = Arc<TestChainConnector<BlokliTestClient<crate::testing::FullStateEmulator>>>;
     type SpendTestNode = ChainNode<SpendTestConnector>;
 
     /// A connected Entry-side node with each of `destinations` pre-created empty.

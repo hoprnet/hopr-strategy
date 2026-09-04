@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "4.0.0"
+version      = "5.0.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -21,14 +21,7 @@ default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
 telemetry     = ["hopr-api/types-telemetry"]
 ## Exposes `crate::testing` node adapters to downstream test crates.
-testing = [
-  "dep:async-broadcast",
-  "dep:blokli-client",
-  "dep:serde_json",
-  "dep:tokio",
-  "hopr-api/types-with-bindings",
-  "hopr-utils/testing-blokli",
-]
+testing = ["hopr-utils/testing-blokli"]
 ## Strategy features — each enables one strategy implementation.
 strategy-auto-funding      = []
 strategy-auto-redeeming    = []
@@ -87,10 +80,7 @@ moka = { workspace = true, features = ["sync"] }
 multiaddr = { workspace = true }
 parking_lot = { workspace = true }
 
-# Optional deps enabled by the `testing` feature
-async-broadcast = { workspace = true, optional = true }
-blokli-client = { workspace = true, optional = true, features = ["testing"] }
-serde_json = { workspace = true, optional = true }
+# Optional dep enabled by the `strategy-pix` feature.
 tokio = { workspace = true, optional = true, features = [
   "macros",
   "rt",
@@ -108,7 +98,6 @@ scrypt = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 
 [dev-dependencies]
-async-broadcast = { workspace = true }
 blokli-client = { workspace = true, features = ["testing"] }
 chrono = { workspace = true, default-features = false, features = [
   "clock",
@@ -138,7 +127,6 @@ resolver = "3"
 
 [workspace.dependencies]
 anyhow               = "1.0.104"
-async-broadcast      = "0.7.2"
 async-trait          = "0.1.92"
 backon               = { version = "1.6.0", default-features = false }
 blokli-client        = "0.33.1"
@@ -153,7 +141,7 @@ hex-literal          = "1.1.0"
 hopr-api             = "4.1.0"
 hopr-chain-connector = "0.26.0"
 hopr-strategy        = { path = "." }
-hopr-utils           = { package = "hopr-utilities", version = "0.13.0", default-features = false }
+hopr-utils           = { package = "hopr-utilities", version = "0.14.0", default-features = false }
 humantime-serde      = "1.1.1"
 insta                = "1.48.0"
 lazy_static          = "1.5.0"

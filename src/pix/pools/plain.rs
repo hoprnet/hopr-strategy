@@ -1254,7 +1254,7 @@ mod tests {
         }
     }
 
-    type Connector = Arc<TestChainConnector<FullStateEmulator>>;
+    type Connector = Arc<TestChainConnector<BlokliTestClient<FullStateEmulator>>>;
 
     struct Fixture {
         cc: Connector,
