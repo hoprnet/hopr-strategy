@@ -46,7 +46,6 @@ fn all_channels_underfunded(action_budget: usize) -> ChannelLifecycleConfig {
     };
     cfg.funding.lower_capacity_threshold = ByteSize::b(1); // 1 packet → 3 wxHOPR
     cfg.funding.topup_capacity = ByteSize::b(1);
-    cfg.funding.min_safe_capacity_required = ByteSize::b(0);
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
     cfg.concurrency.max_concurrent_actions = action_budget;
@@ -206,9 +205,9 @@ async fn strategy_should_respect_the_close_pass_cap_when_many_channels_are_closa
     cfg.restart.startup_close_grace_period = Duration::ZERO;
     cfg.closure.close_when_drained_below = "2 wxHOPR".parse().expect("valid balance");
     cfg.closure.close_max_concurrent = CLOSE_CAP;
-    // Funding off, so the fund pass cannot take slots the close pass needs.
-    cfg.funding.stop_when_unfunded = true;
-    cfg.funding.min_safe_capacity_required = ByteSize::b(u64::MAX);
+    // No single top-up is affordable, so the fund pass cannot take slots the
+    // close pass needs.
+    cfg.funding.topup_capacity = ByteSize::b(u64::MAX);
 
     let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
     let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;

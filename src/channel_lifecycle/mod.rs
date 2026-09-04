@@ -118,6 +118,16 @@ lazy_static::lazy_static! {
             "Count of initiated channel closure finalizations",
         ).unwrap();
 
+    /// wxHOPR the safe must hold to satisfy the demand the last tick observed. Zero
+    /// when the population is at its floor and no channel needs a top-up. Not updated
+    /// on a tick whose chain reads fail — stale is the safe direction; a false zero
+    /// would read as "needs nothing".
+    static ref METRIC_REQUIRED_SAFE_BALANCE: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_required_safe_balance_hopr",
+            "wxHOPR the safe must hold to satisfy the demand of the last tick, in base units",
+        ).unwrap();
+
     // ── Diversity / anonymity ─────────────────────────────────────────────────
     /// Shannon-entropy-based effective number of distinct (latency, subnet) cells.
     static ref METRIC_EFFECTIVE_BUCKETS: hopr_api::types::telemetry::SimpleGauge =
@@ -405,4 +415,18 @@ struct ChannelLifecycleStrategyInner<N> {
     /// event-driven funding handler so it reuses per-tick values instead of
     /// issuing fresh chain RPC calls on every balance-decrease event.
     last_resolved_funding: Arc<Mutex<Option<ResolvedFunding>>>,
+    /// This strategy's externally observable state, recomputed fresh every tick.
+    state: Arc<Mutex<crate::strategy::StrategyState>>,
+}
+
+impl<N> ChannelLifecycleStrategyInner<N> {
+    /// Records this tick's observed state. Logs only on a genuine transition — a
+    /// persistently degraded node must not re-log every `tick_interval`.
+    fn set_state(&self, next: crate::strategy::StrategyState) {
+        let mut current = self.state.lock();
+        if *current != next {
+            tracing::info!(from = ?*current, to = ?next, "channel-lifecycle: strategy state changed");
+            *current = next;
+        }
+    }
 }

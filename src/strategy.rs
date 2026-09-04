@@ -14,6 +14,26 @@ use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
 
 use crate::errors::Result;
 
+/// Externally observable operational state of a running [`Strategy`].
+///
+/// Implementations that track no health signal of their own do not need to implement
+/// [`Strategy::state`] at all — the trait's default reports `Running`, so "nothing to
+/// say" reads as healthy rather than as a status an operator has to interpret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum StrategyState {
+    /// Every pass this strategy evaluated either had nothing to do or completed what it
+    /// needed to.
+    #[default]
+    Running,
+    /// At least one pass evaluated fine but could not afford to do what it needed —
+    /// e.g. a safe balance short of one funding or opening transaction. The strategy
+    /// keeps running and recovers on its own once funds arrive.
+    Degraded,
+    /// Could not evaluate any pass this tick: a required chain read (the channel list,
+    /// ticket economics, or the safe balance) failed.
+    Inactive,
+}
+
 /// A strategy that runs until cancelled or a fatal error occurs.
 ///
 /// Each implementation subscribes to the node's event stream and/or creates internal
@@ -26,6 +46,15 @@ use crate::errors::Result;
 pub trait Strategy: Display + Send {
     /// Run the strategy. Returns only on cancellation or fatal error.
     async fn run(&mut self) -> Result<()>;
+
+    /// Current externally observable state.
+    ///
+    /// Default: always [`StrategyState::Running`] — a strategy with nothing to say
+    /// about its own health should look healthy from the outside, so implementing this
+    /// trait never obligates tracking one.
+    fn state(&self) -> StrategyState {
+        StrategyState::Running
+    }
 }
 
 /// Runs a group of sub-strategies concurrently, each in its own async task.
@@ -210,5 +239,21 @@ mod tests {
     fn test_multi_strategy_display_passive() {
         let ms = MultiStrategy::new(vec![]);
         assert_eq!(ms.to_string(), "multi_strategy(passive)");
+    }
+
+    /// A strategy that never overrides `state()` must still report `Running` — "nothing
+    /// to say" reads as healthy, not as an unimplemented status.
+    #[test]
+    fn state_defaults_to_running_when_unimplemented() {
+        let external = ExternalStrategy { ran: false };
+        assert_eq!(external.state(), StrategyState::Running);
+    }
+
+    /// Increasing order of severity: comparing two observations always keeps the worse
+    /// one, which is how a tick would combine several passes' outcomes if it needed to.
+    #[test]
+    fn state_ordering_is_by_severity() {
+        assert!(StrategyState::Running < StrategyState::Degraded);
+        assert!(StrategyState::Degraded < StrategyState::Inactive);
     }
 }
