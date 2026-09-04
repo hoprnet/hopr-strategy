@@ -6,7 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -258,9 +258,15 @@ where
         Fut: Future<Output = ()> + Send + 'static,
     {
         let Some(holder) = leases.acquire(key.clone(), self.cfg.concurrency.action_lease_timeout) else {
+            debug!("channel-lifecycle: action lease already held, skipping dispatch");
             return false;
         };
         if self.total_in_flight() > self.cfg.concurrency.max_concurrent_actions {
+            debug!(
+                in_flight = self.total_in_flight(),
+                budget = self.cfg.concurrency.max_concurrent_actions,
+                "channel-lifecycle: action budget exhausted, skipping dispatch"
+            );
             leases.release_owned(&key, holder);
             return false;
         }
@@ -431,6 +437,15 @@ where
     // Pipeline
     // ─────────────────────────────────────────────────────────────────────
 
+    /// `tick` is a fresh, monotonically increasing number per call — every `debug!`/
+    /// `warn!` this tick's pipeline emits inherits it as a span field, so log lines from
+    /// concurrent or closely spaced ticks (e.g. a tick-interval fire racing an
+    /// event-driven handler) can still be told apart.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self),
+        fields(tick = self.tick_counter.fetch_add(1, Ordering::Relaxed))
+    )]
     pub(super) async fn run_pipeline(&self) {
         if let Err(e) = self.pipeline_inner().await {
             warn!(%e, "channel-lifecycle: pipeline error");
@@ -813,15 +828,26 @@ where
                 in_flight = close_count,
                 open = open_count,
                 min = self.cfg.population.min_open_channels,
+                candidates = closes_ranked.len(),
                 "channel-lifecycle: close pass"
             );
 
             for channel_id in &closes_ranked {
                 if close_count >= self.cfg.closure.close_max_concurrent {
+                    debug!(
+                        close_count,
+                        cap = self.cfg.closure.close_max_concurrent,
+                        "channel-lifecycle: close pass stopped: concurrency cap reached"
+                    );
                     break;
                 }
                 let remaining_open = open_count.saturating_sub(close_count);
                 if remaining_open <= self.cfg.population.min_open_channels {
+                    debug!(
+                        remaining_open,
+                        min = self.cfg.population.min_open_channels,
+                        "channel-lifecycle: close pass stopped: population floor reached"
+                    );
                     break;
                 }
                 if let Some(ch) = channel_by_id.get(channel_id) {
@@ -833,15 +859,35 @@ where
                     }
                 }
             }
+        } else {
+            debug!(
+                elapsed = ?self.start_epoch.elapsed(),
+                grace = ?self.cfg.restart.startup_close_grace_period,
+                "channel-lifecycle: close pass skipped: startup grace period active"
+            );
         }
 
         // ── 4. Finalize pass ──────────────────────────────────────────────────
         if self.cfg.finalizer.enabled {
             let overdue = self.cfg.finalizer.max_closure_overdue;
             let mut finalize_count = self.finalize_in_flight.held_count();
+            let pending_count = all_channels
+                .iter()
+                .filter(|ch| matches!(ch.status, ChannelStatus::PendingToClose(_)))
+                .count();
+            debug!(
+                in_flight = finalize_count,
+                pending = pending_count,
+                "channel-lifecycle: finalize pass"
+            );
 
             for ch in &all_channels {
                 if finalize_count >= self.cfg.finalizer.finalize_max_concurrent {
+                    debug!(
+                        finalize_count,
+                        cap = self.cfg.finalizer.finalize_max_concurrent,
+                        "channel-lifecycle: finalize pass stopped: concurrency cap reached"
+                    );
                     break;
                 }
                 if self.finalize_in_flight.is_held(ch.get_id()) {
@@ -858,6 +904,8 @@ where
                     }
                 }
             }
+        } else {
+            debug!("channel-lifecycle: finalize pass skipped: finalizer disabled");
         }
 
         // ── 5. Open pass ──────────────────────────────────────────────────────
@@ -2043,6 +2091,7 @@ mod tests {
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
+                tick_counter: std::sync::atomic::AtomicU64::new(0),
             }
         }
 
@@ -2167,6 +2216,7 @@ mod tests {
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
+                tick_counter: std::sync::atomic::AtomicU64::new(0),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -2191,6 +2241,7 @@ mod tests {
             peer_addr_cache: Arc::new(Mutex::new(None)),
             last_resolved_funding: Arc::new(Mutex::new(None)),
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
+            tick_counter: std::sync::atomic::AtomicU64::new(0),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -2264,6 +2315,7 @@ mod tests {
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
+            tick_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

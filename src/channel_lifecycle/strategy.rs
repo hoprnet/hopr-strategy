@@ -118,6 +118,7 @@ impl ChannelLifecycleStrategy {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(
                 crate::strategy::StrategyState::Running,
             )),
+            tick_counter: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 }

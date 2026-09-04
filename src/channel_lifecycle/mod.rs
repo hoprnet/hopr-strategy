@@ -419,6 +419,10 @@ struct ChannelLifecycleStrategyInner<N> {
     /// `AtomicStrategyState` (from `#[atomic_enum]`) is a lock-free wrapper — no mutex
     /// needed for a value with no invariant tying it to any other field.
     state: Arc<crate::strategy::AtomicStrategyState>,
+    /// Monotonically increasing tick number, one per `run_pipeline` call. Carried as a
+    /// `tracing` span field so every log line one tick emits can be correlated, even
+    /// though ticks never overlap (`run_pipeline` is only ever awaited sequentially).
+    tick_counter: AtomicU64,
 }
 
 impl<N> ChannelLifecycleStrategyInner<N> {
