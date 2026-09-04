@@ -640,7 +640,15 @@ where
         let channel_by_id: HashMap<ChannelId, &ChannelEntry> =
             open_channels.iter().map(|ch| (*ch.get_id(), *ch)).collect();
 
-        let existing_dests: HashSet<Address> = all_channels.iter().map(|c| c.destination).collect();
+        // `all_channels` carries every state including `Closed` (the snapshot's
+        // `ChannelSelector` has no state filter). A `Closed` destination must
+        // NOT block reopening — only `Open`/`PendingToClose` represent an
+        // already-occupied (src, dst) slot on-chain.
+        let existing_dests: HashSet<Address> = all_channels
+            .iter()
+            .filter(|c| !matches!(c.status, ChannelStatus::Closed))
+            .map(|c| c.destination)
+            .collect();
         // No peer map means no candidate can be resolved to a chain address, so
         // the open pass has nothing to consider this tick.
         let connected = match peer_addr_map.as_ref() {
