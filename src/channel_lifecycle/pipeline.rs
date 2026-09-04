@@ -362,12 +362,22 @@ where
     ///
     /// `funding` carries the wxHOPR amounts already resolved from the capacity
     /// config for this tick.  `amount` is `funding.initial_balance` (passed by
-    /// the caller so this helper stays generic).
+    /// the caller so this helper stays generic).  `safe_remaining` is the
+    /// caller's current budget: the on-chain re-read below can redirect a plain
+    /// open into a top-up, whose cost (`funding.topup_balance`) may differ from
+    /// `amount` — gating on `amount` alone before calling this function is not
+    /// enough to guarantee the *actual* dispatch is affordable.
     ///
     /// Re-reads the channel before taking a slot so the strategy converges
     /// within this tick rather than the next.  `channel_by_parties` is served by
     /// the in-process cache, so this is a fast lookup in the common case.
-    fn try_open_channel(&self, dest: Address, amount: HoprBalance, funding: &ResolvedFunding) -> Option<HoprBalance> {
+    fn try_open_channel(
+        &self,
+        dest: Address,
+        amount: HoprBalance,
+        funding: &ResolvedFunding,
+        safe_remaining: HoprBalance,
+    ) -> Option<HoprBalance> {
         // The snapshot `all_channels` in `pipeline_inner` can be stale (race
         // between chain events and the snapshot pass), so re-read before
         // spending a tx slot.
@@ -379,8 +389,16 @@ where
                         debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open at desired stake, skipping");
                         return None;
                     }
-                    debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open below threshold, funding immediately");
                     let topup = funding.topup_balance;
+                    if safe_remaining < topup {
+                        warn!(
+                            %dest, %safe_remaining, %topup,
+                            "channel-lifecycle: open pass redirected to fund, but safe cannot afford the top-up"
+                        );
+                        self.set_state(StrategyState::Degraded);
+                        return None;
+                    }
+                    debug!(%dest, balance = %existing.balance, "channel-lifecycle: already open below threshold, funding immediately");
                     return self.try_fund_channel(&existing, topup).then_some(topup);
                 }
                 ChannelStatus::PendingToClose(_) => {
@@ -890,7 +908,7 @@ where
                 state = StrategyState::Degraded;
                 break;
             }
-            if let Some(committed) = self.try_open_channel(*addr, funding.initial_balance, &funding) {
+            if let Some(committed) = self.try_open_channel(*addr, funding.initial_balance, &funding, safe_remaining) {
                 safe_remaining -= committed;
             }
         }
@@ -2291,7 +2309,7 @@ mod tests {
             HoprBalance::from(8_u32), // topup (arbitrary, not used in this path)
             initial_balance,
         );
-        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved);
+        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, HoprBalance::new_base(1000));
 
         // No open tx should have been submitted; no fund tx either.
         assert!(
@@ -2357,7 +2375,7 @@ mod tests {
             HoprBalance::from(8_u32), // topup (unused in this path)
             initial_balance,
         );
-        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved);
+        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, HoprBalance::new_base(1000));
 
         // The PendingToClose guard must fire: no tx, in-flight marker cleared.
         assert!(
@@ -2427,7 +2445,12 @@ mod tests {
             topup_balance,
             HoprBalance::from(10_u32), // initial (arbitrary)
         );
-        let result = inner.try_open_channel(*ALICE, HoprBalance::from(10_u32), &resolved);
+        let result = inner.try_open_channel(
+            *ALICE,
+            HoprBalance::from(10_u32),
+            &resolved,
+            HoprBalance::new_base(1000),
+        );
 
         // Should return Some(topup_balance) (fund tx submitted) and clear open_in_flight.
         assert_eq!(
@@ -2450,6 +2473,78 @@ mod tests {
                 .iter()
                 .any(|c| c.destination == *ALICE && c.balance > HoprBalance::from(2_u32)),
             "on-chain balance must be increased after fund; got {channels:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Regression (CodeRabbit review on #53): the on-chain re-read can redirect a
+    /// plain open into a top-up, whose cost (`topup_balance`) can exceed the
+    /// `amount` (`initial_balance`) the caller checked affordability against
+    /// before calling. A `safe_remaining` that covers `initial_balance` but not
+    /// `topup_balance` must NOT dispatch the unaffordable fund tx — `try_open_channel`
+    /// must gate on the cost it actually selects, not the cost the caller assumed.
+    #[tokio::test]
+    async fn open_pass_does_not_redirect_to_an_unaffordable_topup() -> anyhow::Result<()> {
+        let lower_threshold = HoprBalance::from(3_u32);
+        // topup_balance deliberately exceeds initial_balance — the asymmetry the bug
+        // depends on. safe_remaining (5) covers initial_balance (2) but not
+        // topup_balance (10), the exact gap the fix must close.
+        let initial_balance = HoprBalance::from(2_u32);
+        let topup_balance = HoprBalance::from(10_u32);
+        let safe_remaining = HoprBalance::from(5_u32);
+
+        let existing_channel = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(2_u32) // balance 2 ≤ threshold 3 → underfunded, redirects to fund
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([existing_channel])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let cfg = ChannelLifecycleConfig::default();
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+
+        let resolved = make_resolved(lower_threshold, topup_balance, initial_balance);
+        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, safe_remaining);
+
+        assert!(
+            result.is_none(),
+            "must not dispatch a fund tx costing more than safe_remaining"
+        );
+        assert!(inner.open_in_flight.is_empty(), "open_in_flight must be cleared");
+        assert!(inner.fund_in_flight.is_empty(), "fund_in_flight must not be held");
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "the strategy discovered it cannot afford the redirected top-up"
+        );
+
+        let channels: Vec<ChannelEntry> = connector
+            .stream_channels(ChannelSelector::default().with_source(*BOB))
+            .context("failed to stream channels")?
+            .collect()
+            .await;
+        assert!(
+            channels
+                .iter()
+                .any(|c| c.destination == *ALICE && c.balance == HoprBalance::from(2_u32)),
+            "on-chain balance must be unchanged; got {channels:?}"
         );
 
         Ok(())
@@ -2486,7 +2581,7 @@ mod tests {
             HoprBalance::from(8_u32), // topup (arbitrary)
             initial_balance,
         );
-        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved);
+        let result = inner.try_open_channel(*ALICE, initial_balance, &resolved, HoprBalance::new_base(1000));
         assert_eq!(
             result,
             Some(initial_balance),
