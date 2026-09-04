@@ -3406,7 +3406,7 @@ dependencies = [
  "futures-concurrency",
  "futures-time",
  "hopr-api",
- "hopr-utilities",
+ "hopr-utilities 0.13.0",
  "moka",
  "parking_lot",
  "petgraph",
@@ -3422,10 +3422,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "anyhow",
- "async-broadcast",
  "async-trait",
  "backon",
  "blokli-client",
@@ -3439,7 +3438,7 @@ dependencies = [
  "hex-literal",
  "hopr-api",
  "hopr-chain-connector",
- "hopr-utilities",
+ "hopr-utilities 0.14.0",
  "humantime-serde",
  "insta",
  "lazy_static",
@@ -3546,15 +3545,34 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "752062e541c6d679acec0bf94af8099bca83a225d0ce8b933aaf464ad7396877"
 dependencies = [
+ "auto_impl",
+ "const-hex",
+ "futures",
+ "indexmap 2.14.1",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hopr-utilities"
+version = "0.14.0"
+source = "git+https://github.com/hoprnet/hopr-utilities.git?rev=287d1b40ccb6856b4f06b36b29856b1b0147de2d#287d1b40ccb6856b4f06b36b29856b1b0147de2d"
+dependencies = [
  "anyhow",
+ "async-broadcast",
+ "async-trait",
  "auto_impl",
  "blokli-client",
  "const-hex",
+ "dashmap",
  "futures",
+ "futures-time",
  "hopr-api",
  "hopr-types",
  "indexmap 2.14.1",
  "serde_json",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -7277,13 +7295,14 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wnaf"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab12e7090f27e2ffd9322651492942d50c2926094af30601e1964337db39daf1"
+checksum = "795ca18b3fdb5e62bf982199278341ddcf7ebf7d32e25e212ad05d496e95f6fa"
 dependencies = [
  "ff 0.14.0",
  "group 0.14.0",
  "hybrid-array",
+ "primefield",
 ]
 
 [[package]]
