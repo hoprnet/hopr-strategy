@@ -2042,7 +2042,7 @@ mod tests {
                 peer_ticket_activity: Arc::new(DashMap::new()),
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
-                state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
+                state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             }
         }
 
@@ -2166,7 +2166,7 @@ mod tests {
                 peer_ticket_activity: Arc::new(DashMap::new()),
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
-                state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
+                state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -2190,7 +2190,7 @@ mod tests {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(Mutex::new(None)),
             last_resolved_funding: Arc::new(Mutex::new(None)),
-            state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
+            state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -2263,7 +2263,7 @@ mod tests {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-            state: Arc::new(std::sync::atomic::AtomicU8::new(StrategyState::Running as u8)),
+            state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
         }
     }
 

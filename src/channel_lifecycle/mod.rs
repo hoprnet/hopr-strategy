@@ -77,7 +77,7 @@ use std::{
     hash::Hash,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -416,22 +416,18 @@ struct ChannelLifecycleStrategyInner<N> {
     /// issuing fresh chain RPC calls on every balance-decrease event.
     last_resolved_funding: Arc<Mutex<Option<ResolvedFunding>>>,
     /// This strategy's externally observable state, recomputed fresh every tick.
-    /// `StrategyState` is a small, `Copy`, `#[repr(u8)]` enum with no invariant tying
-    /// it to any other field, so a plain atomic is enough — no lock needed.
-    state: Arc<AtomicU8>,
+    /// `AtomicStrategyState` (from `#[atomic_enum]`) is a lock-free wrapper — no mutex
+    /// needed for a value with no invariant tying it to any other field.
+    state: Arc<crate::strategy::AtomicStrategyState>,
 }
 
 impl<N> ChannelLifecycleStrategyInner<N> {
     /// Records this tick's observed state. Logs only on a genuine transition — a
     /// persistently degraded node must not re-log every `tick_interval`.
     fn set_state(&self, next: crate::strategy::StrategyState) {
-        let prev = self.state.swap(next as u8, Ordering::Relaxed);
-        if prev != next as u8 {
-            tracing::info!(
-                from = ?crate::strategy::StrategyState::from_u8(prev),
-                to = ?next,
-                "channel-lifecycle: strategy state changed"
-            );
+        let prev = self.state.swap(next, Ordering::Relaxed);
+        if prev != next {
+            tracing::info!(from = %prev, to = %next, "channel-lifecycle: strategy state changed");
         }
     }
 }

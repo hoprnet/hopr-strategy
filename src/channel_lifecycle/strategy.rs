@@ -115,8 +115,8 @@ impl ChannelLifecycleStrategy {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-            state: Arc::new(std::sync::atomic::AtomicU8::new(
-                crate::strategy::StrategyState::Running as u8,
+            state: Arc::new(crate::strategy::AtomicStrategyState::new(
+                crate::strategy::StrategyState::Running,
             )),
         }))
     }
@@ -228,7 +228,7 @@ where
     }
 
     fn state(&self) -> crate::strategy::StrategyState {
-        crate::strategy::StrategyState::from_u8(self.state.load(std::sync::atomic::Ordering::Relaxed))
+        self.state.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

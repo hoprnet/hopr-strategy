@@ -40,7 +40,29 @@ use crate::errors::Result;
 ///     StrategyState::Degraded
 /// );
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+///
+/// `#[atomic_enum]` generates [`AtomicStrategyState`], a lock-free wrapper a strategy
+/// can store this small `Copy` value in instead of behind a mutex — see
+/// `channel_lifecycle`'s `ChannelLifecycleStrategyInner::state` field for the pattern.
+///
+/// `IntoPrimitive`/`TryFromPrimitive` separately give `From<StrategyState> for u8` and
+/// `TryFrom<u8> for StrategyState` for callers that need the raw discriminant — the
+/// latter rejecting any byte that isn't one of this enum's own discriminants, rather
+/// than silently mapping it to a variant. `strum::Display` renders each variant as its
+/// name:
+///
+/// ```
+/// use hopr_strategy::strategy::StrategyState;
+///
+/// assert_eq!(u8::from(StrategyState::Degraded), 1);
+/// assert_eq!(StrategyState::try_from(1), Ok(StrategyState::Degraded));
+/// assert!(StrategyState::try_from(99).is_err());
+/// assert_eq!(StrategyState::Degraded.to_string(), "Degraded");
+/// ```
+#[atomic_enum::atomic_enum]
+#[derive(
+    strum::Display, PartialEq, Eq, PartialOrd, Ord, Default, num_enum::IntoPrimitive, num_enum::TryFromPrimitive,
+)]
 #[repr(u8)]
 pub enum StrategyState {
     /// Operating normally: everything the strategy currently needs to do, it can do.
@@ -50,23 +72,6 @@ pub enum StrategyState {
     Degraded = 1,
     /// Cannot currently do any of what it needs to.
     Failed = 2,
-}
-
-impl StrategyState {
-    /// Reconstructs a state from the discriminant `as u8` produces on this fieldless,
-    /// `#[repr(u8)]` enum. Exists so a strategy can store this small `Copy` value in an
-    /// atomic instead of behind a lock — see `channel_lifecycle`'s
-    /// `ChannelLifecycleStrategyInner::state` field for the pattern.
-    ///
-    /// `value` should be a discriminant this enum actually produced (0, 1, or 2); any
-    /// other input maps to `Failed`, the safe-direction fallback, rather than panicking.
-    pub(crate) fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Running,
-            1 => Self::Degraded,
-            _ => Self::Failed,
-        }
-    }
 }
 
 /// A strategy that runs until cancelled or a fatal error occurs.
