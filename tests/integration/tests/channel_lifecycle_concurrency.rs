@@ -203,6 +203,7 @@ async fn strategy_should_respect_the_close_pass_cap_when_many_channels_are_closa
     let mut cfg = all_channels_underfunded(CLOSE_CAP * 4);
     cfg.population.min_open_channels = 0;
     cfg.population.target_open_channels = 0;
+    cfg.restart.startup_observation_period = Duration::ZERO;
     cfg.restart.startup_close_grace_period = Duration::ZERO;
     cfg.closure.close_when_drained_below = "2 wxHOPR".parse().expect("valid balance");
     cfg.closure.close_max_concurrent = CLOSE_CAP;

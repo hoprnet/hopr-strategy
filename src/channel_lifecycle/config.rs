@@ -38,9 +38,13 @@ pub struct PopulationConfig {
     pub target_open_channels: usize,
 
     /// How long a peer is ineligible for a new channel after its previous
-    /// channel was closed.  Default: 30 minutes.
+    /// channel was closed.  Counted from `ChannelClosed` — after closure is
+    /// already fully confirmed on-chain, so this never races the closure
+    /// itself.  Sized at roughly one on-chain closure cycle so a reopen never
+    /// looks premature relative to how long retiring the old channel took,
+    /// without padding on top of that.  Default: 15 minutes.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub peer_reopen_cooldown: Duration,
 }
 
@@ -230,6 +234,21 @@ fn default_success_probability() -> f64 {
 fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationError> {
     match duration.is_zero() {
         true => Err(validator::ValidationError::new("duration must be greater than zero")),
+        false => Ok(()),
+    }
+}
+
+/// Rejects an observation window longer than the grace window.
+///
+/// The observation window is the opening phase of the grace window, so
+/// exceeding it would leave the connectivity-aware middle phase unreachable and
+/// silently reduce the guard to blanket suppression. Rejected rather than
+/// clamped, so the misconfiguration surfaces instead of being absorbed.
+fn validate_restart_windows(cfg: &RestartGuardConfig) -> Result<(), validator::ValidationError> {
+    match cfg.startup_observation_period > cfg.startup_close_grace_period {
+        true => Err(validator::ValidationError::new(
+            "startup_observation_period must not exceed startup_close_grace_period",
+        )),
         false => Ok(()),
     }
 }
@@ -621,9 +640,11 @@ pub struct FinalizerConfig {
     pub enabled: bool,
 
     /// Extra time to wait beyond the on-chain notice period before finalizing.
-    /// Provides a buffer for slow-block periods.  Default: 30 min.
+    /// Provides a buffer for slow-block periods, stacked on top of the notice
+    /// period itself.  Sized at roughly one on-chain closure cycle, matching
+    /// `PopulationConfig::peer_reopen_cooldown`.  Default: 15 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub max_closure_overdue: Duration,
 
     /// Maximum simultaneous finalization transactions initiated per pass.
@@ -634,16 +655,76 @@ pub struct FinalizerConfig {
 
 /// Guards against mass-closing channels on restart (the graph is rebuilt from
 /// scratch and peers appear unseen until heartbeats arrive).
+///
+/// Startup is staged, so a node sheds dead weight quickly without churning
+/// channels whose quality data is merely still warming up:
+///
+/// | phase | channels eligible to close |
+/// | --- | --- |
+/// | before `startup_observation_period` | none — the strategy only observes |
+/// | before `startup_close_grace_period` | only those to peers that are not connected |
+/// | after `startup_close_grace_period`  | all, by the usual closure rules |
+///
+/// A channel to a peer whose connectivity cannot be resolved counts as
+/// connected, i.e. shielded: a failed account read must not read as "nothing is
+/// connected" and trigger the mass closure this guard exists to prevent.
+///
+/// ```yaml
+/// restart:
+///   startup_observation_period: 1m
+///   startup_close_grace_period: 5m
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[validate(schema(function = "validate_restart_windows"))]
 pub struct RestartGuardConfig {
-    /// The close pass is suppressed entirely for this long after startup.
-    /// Should exceed network bootstrap time + first heartbeat round.
-    /// Default: 10 min.
+    /// No channel is closed at all for this long after startup, whatever its
+    /// peer's connectivity.
+    ///
+    /// At startup no peer is connected yet, so without this window "close the
+    /// unconnected ones" would retire every channel at once. It must therefore
+    /// cover network bootstrap; only once it elapses does absent connectivity
+    /// become evidence of a dead peer rather than of a cold view.
+    /// Default: 1 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(10 * 60))]
+    #[default(Duration::from_secs(60))]
+    pub startup_observation_period: Duration,
+
+    /// Channels to *connected* peers are shielded from closure for this long
+    /// after startup, giving their quality data time to accumulate.
+    /// Should exceed network bootstrap time + first heartbeat round.
+    /// Default: 5 min.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5 * 60))]
     pub startup_close_grace_period: Duration,
+}
+
+/// Which startup stage the close pass is in; see [`RestartGuardConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupPhase {
+    /// The strategy only observes — no channel may close.
+    Observing,
+    /// Only channels to peers that are not connected may close.
+    ShieldingConnected,
+    /// The guard has expired; the usual closure rules apply.
+    Expired,
+}
+
+impl RestartGuardConfig {
+    /// Startup stage reached `elapsed` after this strategy instance started.
+    ///
+    /// Both windows at zero yields [`StartupPhase::Expired`] immediately, which
+    /// is how a test opts out of the guard entirely.
+    pub(crate) fn phase_at(&self, elapsed: Duration) -> StartupPhase {
+        if elapsed < self.startup_observation_period {
+            StartupPhase::Observing
+        } else if elapsed < self.startup_close_grace_period {
+            StartupPhase::ShieldingConnected
+        } else {
+            StartupPhase::Expired
+        }
+    }
 }
 
 /// Concurrency knobs for the per-channel evaluation loops, and the time bounds
@@ -1399,6 +1480,80 @@ mod config_tests {
         assert!(ConcurrencyConfig::default().validate().is_ok());
     }
 
+    /// Both bounds are exclusive, so each window covers `[start, bound)` and the
+    /// instant a window ends already belongs to the next phase.
+    #[rstest]
+    #[case::start_of_observation(Duration::ZERO, StartupPhase::Observing)]
+    #[case::within_observation(Duration::from_secs(59), StartupPhase::Observing)]
+    #[case::observation_boundary(Duration::from_secs(60), StartupPhase::ShieldingConnected)]
+    #[case::within_grace(Duration::from_secs(299), StartupPhase::ShieldingConnected)]
+    #[case::grace_boundary(Duration::from_secs(300), StartupPhase::Expired)]
+    #[case::long_after_grace(Duration::from_secs(3600), StartupPhase::Expired)]
+    fn restart_guard_should_stage_startup_by_elapsed_time(#[case] elapsed: Duration, #[case] expected: StartupPhase) {
+        assert_eq!(RestartGuardConfig::default().phase_at(elapsed), expected);
+    }
+
+    /// Zeroing both windows is how a test opts out of the guard, so it must land
+    /// in `Expired` from the very first tick rather than in `Observing`.
+    #[test]
+    fn restart_guard_should_expire_immediately_when_both_windows_are_zero() {
+        let restart = RestartGuardConfig {
+            startup_observation_period: Duration::ZERO,
+            startup_close_grace_period: Duration::ZERO,
+        };
+
+        assert_eq!(restart.phase_at(Duration::ZERO), StartupPhase::Expired);
+    }
+
+    /// An observation window longer than the grace window would leave the
+    /// connectivity-aware phase unreachable, quietly degrading the guard to
+    /// blanket suppression — so it is rejected rather than clamped.
+    ///
+    /// Checked through the top-level config too, so this also pins that
+    /// `#[validate(nested)]` still reaches `RestartGuardConfig`.
+    #[test]
+    fn restart_guard_should_reject_an_observation_window_exceeding_grace() {
+        use validator::Validate as _;
+
+        let restart = RestartGuardConfig {
+            startup_observation_period: Duration::from_secs(600),
+            startup_close_grace_period: Duration::from_secs(300),
+        };
+
+        assert!(
+            restart.validate().is_err(),
+            "an observation window past the grace window must be rejected"
+        );
+        assert!(
+            ChannelLifecycleConfig {
+                restart: restart.clone(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "and must be rejected through the top-level config too"
+        );
+
+        let equal = RestartGuardConfig {
+            startup_observation_period: Duration::from_secs(300),
+            ..restart
+        };
+        assert!(
+            equal.validate().is_ok(),
+            "equal windows are valid: they collapse the shielding phase without hiding a rule"
+        );
+    }
+
+    /// Startup latency is on the critical path of recovering a usable channel
+    /// set, so these two defaults are pinned against silent inflation.
+    #[test]
+    fn restart_guard_defaults_should_stay_within_five_minutes() {
+        let restart = RestartGuardConfig::default();
+
+        assert_eq!(restart.startup_observation_period, Duration::from_secs(60));
+        assert_eq!(restart.startup_close_grace_period, Duration::from_secs(5 * 60));
+    }
+
     /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the
     /// protocol's maximum path length cannot silently rescale every stake in the strategy.
     /// A ticket's face value is linear in this count, so a move from 3 to 4 would raise
@@ -1524,7 +1679,7 @@ mod config_tests {
         assert_eq!(cfg.population.target_open_channels, 8, "sibling in the same section");
         assert_eq!(
             cfg.population.peer_reopen_cooldown,
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(15 * 60),
             "sibling of a different type"
         );
         assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");

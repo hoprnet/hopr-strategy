@@ -105,6 +105,7 @@ fn retire_channel_config(lease: Duration) -> ChannelLifecycleConfig {
     // Nothing to keep open and nothing to open: only close and finalize run.
     cfg.population.min_open_channels = 0;
     cfg.population.target_open_channels = 0;
+    cfg.restart.startup_observation_period = Duration::ZERO;
     cfg.restart.startup_close_grace_period = Duration::ZERO;
     cfg.closure.close_when_drained_below = "2 wxHOPR".parse().expect("valid balance");
     cfg.funding.stop_when_unfunded = true;

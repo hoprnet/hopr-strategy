@@ -32,7 +32,7 @@ use tracing::{debug, warn};
 
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
-    config::ResolvedFunding,
+    config::{ResolvedFunding, StartupPhase},
     selector::{
         BucketCell, BucketView, CloseCandidate, LatencyBucket, OpenCandidate, PeerEdgeInfo, SelectorContext, SignalSet,
         StakeView, SubnetBucket,
@@ -640,7 +640,15 @@ where
         let channel_by_id: HashMap<ChannelId, &ChannelEntry> =
             open_channels.iter().map(|ch| (*ch.get_id(), *ch)).collect();
 
-        let existing_dests: HashSet<Address> = all_channels.iter().map(|c| c.destination).collect();
+        // `all_channels` carries every state including `Closed` (the snapshot's
+        // `ChannelSelector` has no state filter). A `Closed` destination must
+        // NOT block reopening — only `Open`/`PendingToClose` represent an
+        // already-occupied (src, dst) slot on-chain.
+        let existing_dests: HashSet<Address> = all_channels
+            .iter()
+            .filter(|c| !matches!(c.status, ChannelStatus::Closed))
+            .map(|c| c.destination)
+            .collect();
         // No peer map means no candidate can be resolved to a chain address, so
         // the open pass has nothing to consider this tick.
         let connected = match peer_addr_map.as_ref() {
@@ -762,16 +770,41 @@ where
         let opens_ranked = self.selector.select_opens(&selector_ctx).await;
 
         // ── 3. Close pass ─────────────────────────────────────────────────────
-        if self.start_epoch.elapsed() >= self.cfg.restart.startup_close_grace_period {
+        // Startup is staged (see `RestartGuardConfig`): observe everything, then
+        // retire only unconnected peers, then apply the usual rules.
+        let startup_phase = self.cfg.restart.phase_at(self.start_epoch.elapsed());
+        if startup_phase != StartupPhase::Observing {
             let mut close_count = self.close_in_flight.held_count();
             debug!(
                 in_flight = close_count,
                 open = open_count,
                 min = self.cfg.population.min_open_channels,
+                phase = ?startup_phase,
                 "channel-lifecycle: close pass"
             );
 
-            for channel_id in &closes_ranked {
+            // A channel to a disconnected peer cannot be used to construct
+            // SURBs, so connectivity is itself a close trigger — not merely a
+            // signal the selector's quality/staleness rules might happen to
+            // pick up. Computed for every open channel, not only ranked ones,
+            // so a disconnected peer with an otherwise-fine (or unmeasured)
+            // quality score doesn't linger. An unresolvable peer counts as
+            // connected, so a cold or failed account read shields rather than
+            // forces a close.
+            let disconnected: HashSet<ChannelId> = open_channels
+                .iter()
+                .filter(|ch| {
+                    addr_to_peer_id
+                        .get(&ch.destination)
+                        .is_some_and(|peer_id| !self.node.network_view().is_connected(peer_id))
+                })
+                .map(|ch| *ch.get_id())
+                .collect();
+
+            let ranked: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
+            let candidates = closes_ranked.iter().chain(disconnected.difference(&ranked));
+
+            for channel_id in candidates {
                 if close_count >= self.cfg.closure.close_max_concurrent {
                     break;
                 }
@@ -781,6 +814,17 @@ where
                 }
                 if let Some(ch) = channel_by_id.get(channel_id) {
                     if self.close_in_flight.is_held(ch.get_id()) || self.fund_in_flight.is_held(ch.get_id()) {
+                        continue;
+                    }
+                    // Shielding protects a connected peer's channel from the
+                    // selector's own quality/staleness verdict; it never
+                    // protects a disconnected one — that's what "shielding
+                    // connected peers" means.
+                    if startup_phase == StartupPhase::ShieldingConnected && !disconnected.contains(channel_id) {
+                        debug!(
+                            dest = %ch.destination,
+                            "channel-lifecycle: close deferred: peer connected within startup grace"
+                        );
                         continue;
                     }
                     if self.try_close_channel(ch) {
@@ -1282,8 +1326,11 @@ mod tests {
             HashSet::new()
         }
 
+        // An inert stub, meant to neutralise the passes that consult it — see
+        // `EmptyNetworkView` in `src/testing.rs` for why this answers `true`
+        // rather than the literal "reports no peers" `false`.
         fn is_connected(&self, _peer: &PeerId) -> bool {
-            false
+            true
         }
 
         fn health(&self) -> hopr_api::network::Health {
@@ -1580,6 +1627,7 @@ mod tests {
                 ..Default::default()
             },
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             ..Default::default()
@@ -1615,15 +1663,16 @@ mod tests {
     fn restart_grace_should_block_close_pass() {
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::from_secs(60),
                 startup_close_grace_period: Duration::from_secs(3600),
             },
             ..Default::default()
         };
-        let start_epoch = Instant::now();
-        let grace_elapsed = start_epoch.elapsed() >= cfg.restart.startup_close_grace_period;
-        assert!(
-            !grace_elapsed,
-            "close pass should be suppressed during startup grace period"
+        let phase = cfg.restart.phase_at(Duration::ZERO);
+        assert_eq!(
+            phase,
+            crate::channel_lifecycle::config::StartupPhase::Observing,
+            "close pass should be suppressed during startup observation period"
         );
     }
 
@@ -1741,6 +1790,7 @@ mod tests {
     fn restart_grace_should_re_apply_on_new_instance() {
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::from_secs(10),
                 startup_close_grace_period: Duration::from_secs(60),
             },
             ..Default::default()
@@ -2334,6 +2384,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             funding: FundingConfig {
@@ -2545,6 +2596,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2624,6 +2676,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2824,6 +2877,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2973,6 +3027,7 @@ mod tests {
                 ..Default::default()
             },
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             ..Default::default()
