@@ -794,22 +794,17 @@ where
             let disconnected: HashSet<ChannelId> = open_channels
                 .iter()
                 .filter(|ch| {
-                    !addr_to_peer_id
+                    addr_to_peer_id
                         .get(&ch.destination)
-                        .is_none_or(|peer_id| self.node.network_view().is_connected(peer_id))
+                        .is_some_and(|peer_id| !self.node.network_view().is_connected(peer_id))
                 })
                 .map(|ch| *ch.get_id())
                 .collect();
 
-            let mut candidates = closes_ranked.clone();
-            let unranked_disconnected: Vec<ChannelId> = disconnected
-                .iter()
-                .filter(|id| !candidates.contains(id))
-                .copied()
-                .collect();
-            candidates.extend(unranked_disconnected);
+            let ranked: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
+            let candidates = closes_ranked.iter().chain(disconnected.difference(&ranked));
 
-            for channel_id in &candidates {
+            for channel_id in candidates {
                 if close_count >= self.cfg.closure.close_max_concurrent {
                     break;
                 }

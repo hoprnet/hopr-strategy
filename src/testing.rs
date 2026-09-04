@@ -54,16 +54,9 @@ use hopr_api::{
 
 /// Implements the (identical across adapters) `HasChainApi` surface for a node
 /// newtype, given an expression yielding a `&C` reference to its chain field.
-///
-/// The second form takes the adapter's extra type parameters (beyond the chain
-/// `C`), so an adapter carrying injectable views is covered for every choice of
-/// them rather than only for their defaults.
 macro_rules! impl_has_chain_api {
     ($ty:ident, |$node:ident| $chain:expr) => {
-        impl_has_chain_api!($ty, <>, |$node| $chain);
-    };
-    ($ty:ident, <$($extra:ident),*>, |$node:ident| $chain:expr) => {
-        impl<C, $($extra),*> HasChainApi for $ty<C, $($extra),*>
+        impl<C> HasChainApi for $ty<C>
         where
             C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
         {
@@ -159,7 +152,38 @@ impl<C, G, V> LifecycleNode<C, G, V> {
     }
 }
 
-impl_has_chain_api!(LifecycleNode, <G, V>, |node| &node.chain);
+impl<C, G, V> HasChainApi for LifecycleNode<C, G, V>
+where
+    C: HoprChainApi + ComponentStatusReporter + Clone + Send + Sync + 'static,
+{
+    type ChainApi = C;
+    type ChainError = <C as HoprChainApi>::ChainError;
+
+    fn identity(&self) -> &NodeOnchainIdentity {
+        static IDENTITY: std::sync::OnceLock<NodeOnchainIdentity> = std::sync::OnceLock::new();
+        IDENTITY.get_or_init(NodeOnchainIdentity::default)
+    }
+
+    fn chain_api(&self) -> &C {
+        &self.chain
+    }
+
+    fn status(&self) -> ComponentStatus {
+        self.chain.component_status()
+    }
+
+    fn wait_for_on_chain_event<F>(
+        &self,
+        _predicate: F,
+        _context: String,
+        _timeout: Duration,
+    ) -> EventWaitResult<Self::ChainError, Self::ChainError>
+    where
+        F: Fn(&ChainEvent) -> bool + Send + Sync + 'static,
+    {
+        unimplemented!("tests do not call wait_for_on_chain_event")
+    }
+}
 
 impl<C, G, V> ActionableEventSource for LifecycleNode<C, G, V>
 where
