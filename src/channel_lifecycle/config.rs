@@ -662,6 +662,12 @@ pub struct FinalizerConfig {
 /// A channel to a peer whose connectivity cannot be resolved counts as
 /// connected, i.e. shielded: a failed account read must not read as "nothing is
 /// connected" and trigger the mass closure this guard exists to prevent.
+///
+/// ```yaml
+/// restart:
+///   startup_observation_period: 1m
+///   startup_close_grace_period: 5m
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
