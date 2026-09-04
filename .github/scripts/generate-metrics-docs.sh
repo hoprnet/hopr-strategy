@@ -42,6 +42,13 @@ extract_metrics() {
       next
     }
 
+    # ── a `static ref NAME: Type =` declaration line starts the *next* metric
+    # entry (its own ::new( call follows on a later line) — never extra detail
+    # for the current one.  Without this, a variable name that merely contains
+    # "BUCKETS" (e.g. METRIC_EFFECTIVE_BUCKETS) falls inside the -A8 trailing
+    # context of an unrelated, earlier metric and gets misread as its bucket detail.
+    /static[ \t]+ref[ \t]+[A-Za-z_]+[ \t]*:/ && !/::new\(/ { next }
+
     # ── group separator ──
     /^--$/ {
       if (name != "") {

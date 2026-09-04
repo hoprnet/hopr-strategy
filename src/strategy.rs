@@ -19,6 +19,21 @@ use crate::errors::Result;
 /// Implementations that track no health signal of their own do not need to implement
 /// [`Strategy::state`] at all — the trait's default reports `Running`, so "nothing to
 /// say" reads as healthy rather than as a status an operator has to interpret.
+///
+/// Declared in increasing order of severity, so comparing two observations keeps the
+/// worse one:
+///
+/// ```
+/// use hopr_strategy::strategy::StrategyState;
+///
+/// assert_eq!(StrategyState::default(), StrategyState::Running);
+/// assert!(StrategyState::Running < StrategyState::Degraded);
+/// assert!(StrategyState::Degraded < StrategyState::Inactive);
+/// assert_eq!(
+///     StrategyState::Running.max(StrategyState::Degraded),
+///     StrategyState::Degraded
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum StrategyState {
     /// Every pass this strategy evaluated either had nothing to do or completed what it
@@ -52,6 +67,33 @@ pub trait Strategy: Display + Send {
     /// Default: always [`StrategyState::Running`] — a strategy with nothing to say
     /// about its own health should look healthy from the outside, so implementing this
     /// trait never obligates tracking one.
+    ///
+    /// ```
+    /// use std::fmt::{Display, Formatter};
+    ///
+    /// use hopr_strategy::{
+    ///     errors::Result,
+    ///     strategy::{Strategy, StrategyState},
+    /// };
+    ///
+    /// struct PassiveStrategy;
+    ///
+    /// impl Display for PassiveStrategy {
+    ///     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    ///         write!(f, "passive")
+    ///     }
+    /// }
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Strategy for PassiveStrategy {
+    ///     async fn run(&mut self) -> Result<()> {
+    ///         Ok(())
+    ///     }
+    ///     // No `state` override — reports the trait's default.
+    /// }
+    ///
+    /// assert_eq!(PassiveStrategy.state(), StrategyState::Running);
+    /// ```
     fn state(&self) -> StrategyState {
         StrategyState::Running
     }

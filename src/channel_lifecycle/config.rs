@@ -366,6 +366,23 @@ impl ResolvedFunding {
     /// Saturating throughout ([`HoprBalance`]'s arithmetic saturates at `U256::MAX`
     /// rather than wrapping), so an absurd count reads as "unaffordable" rather than
     /// wrapping to something small.
+    ///
+    /// ```
+    /// # use hopr_strategy::channel_lifecycle::ResolvedFunding;
+    /// # use hopr_api::types::primitive::prelude::HoprBalance;
+    /// let resolved = ResolvedFunding {
+    ///     initial_balance: HoprBalance::new_base(100),
+    ///     topup_balance: HoprBalance::new_base(10),
+    ///     lower_balance_threshold: HoprBalance::new_base(5),
+    /// };
+    ///
+    /// // Nothing outstanding: no standing minimum.
+    /// assert_eq!(resolved.required_safe_balance(0, 0), HoprBalance::zero());
+    ///
+    /// // Two channels need a top-up, and the node is one channel short of its floor.
+    /// let required = resolved.required_safe_balance(2, 1);
+    /// assert_eq!(required, HoprBalance::new_base(10) * 2 + HoprBalance::new_base(100));
+    /// ```
     pub fn required_safe_balance(&self, channels_needing_topup: usize, open_deficit: usize) -> HoprBalance {
         self.topup_balance * channels_needing_topup + self.initial_balance * open_deficit
     }
