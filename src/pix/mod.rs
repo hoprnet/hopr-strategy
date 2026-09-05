@@ -54,7 +54,7 @@
 //! | feature | module | pool | `K::Public` | pair with |
 //! |---|---|---|---|---|
 //! | `strategy-pix-test` | `pix::pools::plain` | `NonAnonymousDepositPool` | `Address` | `hopr-lib/pix-secp256k1` |
-//! | `strategy-pix-curvy` | `pix::pools::curvy` | `CurvyDepositPool` (**stub**) | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
+//! | `strategy-pix-curvy` | `pix::pools::curvy` | `CurvyDepositPool` | `BjjPublicKey` | `hopr-lib/pix-bjj` (default) |
 //!
 //! Both features may be enabled at once, and enabling both is what `--all-features` does. Nothing
 //! is selected *by* the feature graph: each module exports its own `PoolKeypair` / `PoolConfig`
