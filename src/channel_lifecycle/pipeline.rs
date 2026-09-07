@@ -978,6 +978,16 @@ where
             return Ok(());
         }
 
+        // Distinct from "no eligible peers after filtering" (a legitimate, healthy
+        // `Running` outcome): the account-stream read itself failed, so open_candidates
+        // is empty regardless of who is actually connected — the open pass could not
+        // even attempt to fill a real deficit this tick.
+        if peer_addr_map.is_none() {
+            debug!("channel-lifecycle: open pass skipped: peer address map unavailable");
+            state.set(StrategyState::Failed);
+            return Ok(());
+        }
+
         let Some(funding) = funding else {
             debug!("channel-lifecycle: open pass skipped: ticket economics unavailable");
             return Ok(());
@@ -1311,7 +1321,7 @@ mod tests {
     use crate::{
         errors::StrategyError,
         strategy::{Strategy as _, StrategyState},
-        testing::{BlokliTestStateBuilder, create_test_blokli_connector},
+        testing::{BlokliTestStateBuilder, ChainOp, Fault, create_test_blokli_connector},
     };
 
     /// Lease duration for tests that seed in-flight slots directly.  Long
@@ -1948,6 +1958,46 @@ mod tests {
             inner.state(),
             StrategyState::Failed,
             "ticket economics could not be read this tick"
+        );
+
+        Ok(())
+    }
+
+    /// Regression (review on #53, `@jeandemeusy`): `peer_addr_map`'s account-stream read
+    /// failing only ever affected the local `open_candidates`/`opens_ranked` lists —
+    /// nothing propagated that failure into `state`. A tick that genuinely could not see
+    /// *any* opening candidate, because the chain read failed rather than because there
+    /// were no eligible peers, silently reported `Running` — indistinguishable from a
+    /// tick with nothing to do. With the default population config and no existing
+    /// channels, the open pass has a real deficit to fill; failing the account stream
+    /// must report `Failed`.
+    #[tokio::test]
+    async fn state_is_failed_when_the_account_stream_fails_and_channels_are_needed() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(&[&*BOB], false, XDaiBalance::new_base(1), HoprBalance::new_base(1000))
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        // Fail the account stream `peer_addr_map` depends on, after the setup above has
+        // already used it once to register the safe.
+        connector.faults().set(ChainOp::StreamAccounts, Fault::Fail);
+
+        // Default population (target 8, min 5) with zero existing channels: the open
+        // pass genuinely wants to open channels this tick, not merely "nothing to do".
+        let inner = fresh_inner_with_chain(ChannelLifecycleConfig::default(), Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.state(),
+            StrategyState::Failed,
+            "the account stream failed while channels were needed — a real chain-read failure, not merely \"no \
+             eligible peers\""
         );
 
         Ok(())
