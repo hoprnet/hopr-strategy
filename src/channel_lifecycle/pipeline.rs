@@ -659,9 +659,8 @@ where
         // `state` (declared above): `Degraded` means a pass evaluated fine but was
         // short of what it needed (an affordability gate, or missing peer data); `Failed`
         // means a required chain read was unavailable so a pass couldn't even be
-        // evaluated. The fund, close, and open passes each set this independently, and
-        // `StatePublisher::set` takes the max — a later `Degraded` from one pass can
-        // never downgrade an earlier `Failed` from another.
+        // evaluated. The fund, close, and open passes each set this independently — see
+        // `StatePublisher::set` for why that's safe.
 
         // ── 2. Fund pass ─────────────────────────────────────────────────────
         if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
@@ -1374,12 +1373,8 @@ mod tests {
     }
 
     /// Minimal node wrapper — same pattern as in auto_funding tests.
-    /// The second field is a shared stub graph; tests that need configurable
-    /// per-peer edges use `Arc::clone` of the graph to insert edges while the
-    /// strategy is running. The third is a stub network view; tests that need a
-    /// peer to appear connected clone it before construction and call `.connect(..)`
-    /// on their own handle — its internal `Arc` makes that visible to the running
-    /// strategy's copy too, the same sharing trick `StubGraph` uses.  Constructed via
+    /// The second field is a shared stub graph, the third a stub network view — see
+    /// their own doc comments for how tests configure them.  Constructed via
     /// `ChainNode::new` for the common case (empty graph, no connected peers),
     /// `ChainNode::with_graph` for a custom graph, or `ChainNode::with_graph_and_network`
     /// for both.
