@@ -3557,7 +3557,8 @@ dependencies = [
 [[package]]
 name = "hopr-utilities"
 version = "0.14.0"
-source = "git+https://github.com/hoprnet/hopr-utilities.git?rev=287d1b40ccb6856b4f06b36b29856b1b0147de2d#287d1b40ccb6856b4f06b36b29856b1b0147de2d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1a72f17ef546d06fdcc2804faada62bf16843552819909aeb0a23cc74fa265b"
 dependencies = [
  "anyhow",
  "async-broadcast",
