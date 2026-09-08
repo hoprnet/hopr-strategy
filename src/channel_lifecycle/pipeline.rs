@@ -83,8 +83,14 @@ impl<'a, N> StatePublisher<'a, N> {
         }
     }
 
+    /// Raises the tick's state to `next` if `next` is more severe than what's already
+    /// recorded, never downgrades. The close pass's own gate (peer address map missing)
+    /// is independent of the fund pass's (chain inputs missing) — without taking the
+    /// max, whichever pass runs later would silently overwrite the other's finding,
+    /// e.g. a genuine `Failed` from the fund pass downgraded to `Degraded` just because
+    /// the close pass happened to run afterward.
     fn set(&mut self, next: StrategyState) {
-        self.state = next;
+        self.state = self.state.max(next);
     }
 }
 
@@ -650,12 +656,12 @@ where
         // safe balance is unknown, which keeps both passes from spending.
         let mut safe_remaining = safe_balance.unwrap_or_else(HoprBalance::zero);
 
-        // `state` (declared above): `Degraded` means a pass evaluated fine but a
-        // per-pass affordability gate failed; `Failed` means chain inputs were
-        // unavailable, so no pass could even be evaluated. Reassigned below, never
-        // combined via a severity max: `Failed` is only reachable in the `else` arm
-        // below and `Degraded` only inside the `Some`/`Some` arm, so the two can never
-        // both apply within one tick.
+        // `state` (declared above): `Degraded` means a pass evaluated fine but was
+        // short of what it needed (an affordability gate, or missing peer data); `Failed`
+        // means a required chain read was unavailable so a pass couldn't even be
+        // evaluated. The fund, close, and open passes each set this independently, and
+        // `StatePublisher::set` takes the max — a later `Degraded` from one pass can
+        // never downgrade an earlier `Failed` from another.
 
         // ── 2. Fund pass ─────────────────────────────────────────────────────
         if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
@@ -882,6 +888,19 @@ where
 
         // ── 3. Close pass ─────────────────────────────────────────────────────
         if self.start_epoch.elapsed() >= self.cfg.restart.startup_close_grace_period {
+            // `should_close` returns `false` outright for a candidate with no resolved
+            // offchain key (see `DefaultSelector::should_close`), so a missing peer map
+            // silently limits this pass to balance-drained closes only — quality- and
+            // staleness-based closes are skipped without a trace. Only worth flagging
+            // when there was actually something to consider.
+            if peer_addr_map.is_none() && !close_candidates.is_empty() {
+                debug!(
+                    "channel-lifecycle: close pass degraded: peer address map unavailable, only balance-drained \
+                     closes possible"
+                );
+                state.set(StrategyState::Degraded);
+            }
+
             let mut close_count = self.close_in_flight.held_count();
             debug!(
                 in_flight = close_count,
@@ -978,10 +997,8 @@ where
             return Ok(());
         }
 
-        // Distinct from "no eligible peers after filtering" (a legitimate, healthy
-        // `Running` outcome): the account-stream read itself failed, so open_candidates
-        // is empty regardless of who is actually connected — the open pass could not
-        // even attempt to fill a real deficit this tick.
+        // Chain read failed (not "no eligible peers") — this tick can't attempt to
+        // fill a real deficit.
         if peer_addr_map.is_none() {
             debug!("channel-lifecycle: open pass skipped: peer address map unavailable");
             state.set(StrategyState::Failed);
@@ -1359,17 +1376,26 @@ mod tests {
     /// Minimal node wrapper — same pattern as in auto_funding tests.
     /// The second field is a shared stub graph; tests that need configurable
     /// per-peer edges use `Arc::clone` of the graph to insert edges while the
-    /// strategy is running.  Constructed via `ChainNode::new` for the common
-    /// case (empty graph) or `ChainNode::with_graph` for custom graphs.
-    struct ChainNode<C>(C, Arc<StubGraph>);
+    /// strategy is running. The third is a stub network view; tests that need a
+    /// peer to appear connected clone it before construction and call `.connect(..)`
+    /// on their own handle — its internal `Arc` makes that visible to the running
+    /// strategy's copy too, the same sharing trick `StubGraph` uses.  Constructed via
+    /// `ChainNode::new` for the common case (empty graph, no connected peers),
+    /// `ChainNode::with_graph` for a custom graph, or `ChainNode::with_graph_and_network`
+    /// for both.
+    struct ChainNode<C>(C, Arc<StubGraph>, StubNetworkView);
 
     impl<C> ChainNode<C> {
         fn new(chain: C) -> Self {
-            ChainNode(chain, Arc::new(StubGraph::default()))
+            ChainNode(chain, Arc::new(StubGraph::default()), StubNetworkView::default())
         }
 
         fn with_graph(chain: C, graph: Arc<StubGraph>) -> Self {
-            ChainNode(chain, graph)
+            ChainNode(chain, graph, StubNetworkView::default())
+        }
+
+        fn with_graph_and_network(chain: C, graph: Arc<StubGraph>, network: StubNetworkView) -> Self {
+            ChainNode(chain, graph, network)
         }
     }
 
@@ -1423,7 +1449,19 @@ mod tests {
         }
     }
 
-    struct StubNetworkView;
+    /// Programmable stub network view.  Empty by default (`connected_peers()` returns
+    /// nothing) — the same behavior the previous unit-struct always had.  Tests that
+    /// need a peer to appear connected use `connect`, mirroring `StubGraph::insert_edge`.
+    #[derive(Clone, Default)]
+    struct StubNetworkView {
+        connected: Arc<DashMap<PeerId, ()>>,
+    }
+
+    impl StubNetworkView {
+        fn connect(&self, peer: PeerId) {
+            self.connected.insert(peer, ());
+        }
+    }
 
     impl hopr_api::network::NetworkView for StubNetworkView {
         fn listening_as(&self) -> HashSet<hopr_api::Multiaddr> {
@@ -1439,11 +1477,11 @@ mod tests {
         }
 
         fn connected_peers(&self) -> HashSet<PeerId> {
-            HashSet::new()
+            self.connected.iter().map(|e| *e.key()).collect()
         }
 
-        fn is_connected(&self, _peer: &PeerId) -> bool {
-            false
+        fn is_connected(&self, peer: &PeerId) -> bool {
+            self.connected.contains_key(peer)
         }
 
         fn health(&self) -> hopr_api::network::Health {
@@ -1464,8 +1502,7 @@ mod tests {
         type NetworkView = StubNetworkView;
 
         fn network_view(&self) -> &Self::NetworkView {
-            static NV: StubNetworkView = StubNetworkView;
-            &NV
+            &self.2
         }
 
         fn status(&self) -> ComponentStatus {
@@ -1920,6 +1957,37 @@ mod tests {
         Ok(())
     }
 
+    /// The very first required read — the channel list, before ticket economics or
+    /// safe balance are even attempted — failing must report `Failed`. Distinct from
+    /// `state_is_failed_when_chain_inputs_are_unavailable` below, which exercises the
+    /// fund pass's own chain-input check instead.
+    #[tokio::test]
+    async fn state_is_failed_when_the_channel_list_is_unavailable() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(&[&*BOB], false, XDaiBalance::new_base(1), HoprBalance::new_base(1000))
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        connector.faults().set(ChainOp::StreamChannels, Fault::Fail);
+
+        let inner = fresh_inner_with_chain(ChannelLifecycleConfig::default(), Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.state(),
+            StrategyState::Failed,
+            "the channel list could not be read this tick"
+        );
+
+        Ok(())
+    }
+
     /// A tick that cannot even evaluate the gates — because a required chain read
     /// failed — must report `Failed`, distinct from `Degraded` (which means the
     /// tick evaluated fine but a pass was short of funds).
@@ -1963,14 +2031,8 @@ mod tests {
         Ok(())
     }
 
-    /// Regression (review on #53, `@jeandemeusy`): `peer_addr_map`'s account-stream read
-    /// failing only ever affected the local `open_candidates`/`opens_ranked` lists —
-    /// nothing propagated that failure into `state`. A tick that genuinely could not see
-    /// *any* opening candidate, because the chain read failed rather than because there
-    /// were no eligible peers, silently reported `Running` — indistinguishable from a
-    /// tick with nothing to do. With the default population config and no existing
-    /// channels, the open pass has a real deficit to fill; failing the account stream
-    /// must report `Failed`.
+    /// `peer_addr_map`'s account-stream read failing must report `Failed`, not silently
+    /// fall through to `Running`, once the open pass has a real deficit to fill.
     #[tokio::test]
     async fn state_is_failed_when_the_account_stream_fails_and_channels_are_needed() -> anyhow::Result<()> {
         let module_address: Address = [1; Address::SIZE].into();
@@ -1996,8 +2058,150 @@ mod tests {
         assert_eq!(
             inner.state(),
             StrategyState::Failed,
-            "the account stream failed while channels were needed — a real chain-read failure, not merely \"no \
-             eligible peers\""
+            "account stream failed while channels were needed"
+        );
+
+        Ok(())
+    }
+
+    /// The close pass depends on `peer_addr_map` too: `DefaultSelector::should_close`
+    /// returns `false` outright for a candidate with no resolved offchain key, so a
+    /// missing peer map silently limits the pass to balance-drained closes only. A tick
+    /// with a healthy (non-drained) open channel and a failed account stream must report
+    /// `Degraded` — the pass ran, but could not fully evaluate its one candidate.
+    #[tokio::test]
+    async fn state_is_degraded_when_the_close_pass_cannot_resolve_peer_data() -> anyhow::Result<()> {
+        let ch = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(125_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let module_address: Address = [1; Address::SIZE].into();
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([ch])
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        connector.faults().set(ChainOp::StreamAccounts, Fault::Fail);
+
+        let cfg = ChannelLifecycleConfig {
+            restart: RestartGuardConfig {
+                startup_close_grace_period: Duration::ZERO,
+            },
+            population: PopulationConfig {
+                min_open_channels: 0,
+                // Matches the one existing channel — no open-pass deficit to confound
+                // this test with the account-stream Failed path added above.
+                target_open_channels: 1,
+                ..Default::default()
+            },
+            // A zero topup makes the fund pass a no-op (rather than a genuinely
+            // unaffordable one), isolating the close pass's own Degraded signal —
+            // without this, the default topup capacity resolves far above the
+            // channel's balance and the fund pass's own affordability gate fires
+            // first, for an unrelated reason.
+            funding: FundingConfig {
+                topup_capacity: ByteSize::b(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "the close pass could not resolve peer data for its one candidate"
+        );
+
+        Ok(())
+    }
+
+    /// The open pass's own per-candidate affordability gate (`safe_remaining <
+    /// funding.initial_balance`) is only reachable once a real, connected, eligible peer
+    /// makes it into `opens_ranked` — `StubNetworkView::connect` (added alongside this
+    /// test) is what finally makes that reachable through the full pipeline.
+    #[tokio::test]
+    async fn state_is_degraded_when_the_open_pass_cannot_afford_a_new_channel() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                // `public`: ALICE's account must be announced, or peer_addr_map's
+                // `with_public_only(true)` filter excludes her from the candidate list
+                // regardless of what StubNetworkView reports as connected.
+                true,
+                XDaiBalance::new_base(1),
+                // Far short of the default initial capacity's resolved wxHOPR cost.
+                HoprBalance::new_base(1),
+            )
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let alice_pk = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*ALICE).as_ref()]);
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(pseudo.as_ref())
+                .expect("alice offchain key")
+                .public()
+        };
+        let my_key = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[1u8; 32])
+                .expect("my key")
+                .public()
+        };
+
+        let network = StubNetworkView::default();
+        network.connect(PeerId::from(&alice_pk));
+
+        let graph = Arc::new(StubGraph::default());
+        // High score clears the default composite eligibility threshold (0.5).
+        graph.insert_edge(
+            my_key,
+            alice_pk,
+            StubEdge {
+                last_update: Duration::from_secs(1),
+                score: 1.0,
+            },
+        );
+
+        let cfg = ChannelLifecycleConfig {
+            population: PopulationConfig {
+                min_open_channels: 0,
+                target_open_channels: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain_graph_and_network(cfg, Arc::clone(&connector), graph, network);
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "safe is short of the opening stake for the one eligible, connected peer"
         );
 
         Ok(())
@@ -2406,9 +2610,18 @@ mod tests {
         connector: Arc<C>,
         graph: Arc<StubGraph>,
     ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
+        fresh_inner_with_chain_graph_and_network(cfg, connector, graph, StubNetworkView::default())
+    }
+
+    fn fresh_inner_with_chain_graph_and_network<C>(
+        cfg: ChannelLifecycleConfig,
+        connector: Arc<C>,
+        graph: Arc<StubGraph>,
+        network: StubNetworkView,
+    ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
         ChannelLifecycleStrategyInner {
             cfg,
-            node: Arc::new(ChainNode::with_graph(connector, graph)),
+            node: Arc::new(ChainNode::with_graph_and_network(connector, graph, network)),
             selector: Arc::new(selector::DefaultSelector),
             open_in_flight: Default::default(),
             fund_in_flight: Default::default(),
