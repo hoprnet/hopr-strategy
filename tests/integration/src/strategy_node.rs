@@ -13,7 +13,7 @@ use hopr_api::types::{
 };
 use hopr_strategy::testing::{BlokliTestClient, FullStateEmulator, TestChainConnector, create_test_blokli_connector};
 
-pub type NodeConnector = TestChainConnector<FullStateEmulator>;
+pub type NodeConnector = TestChainConnector<BlokliTestClient<FullStateEmulator>>;
 
 pub fn node_chain_keypair(secret: &[u8]) -> anyhow::Result<ChainKeypair> {
     ChainKeypair::from_secret(secret).map_err(|e| anyhow::anyhow!("invalid node secret: {e}"))

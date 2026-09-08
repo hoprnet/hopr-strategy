@@ -523,7 +523,7 @@ mod tests {
             .build_static_client();
     }
 
-    type TestConnector = Arc<TestChainConnector<StaticState>>;
+    type TestConnector = Arc<TestChainConnector<BlokliTestClient<StaticState>>>;
 
     fn generate_random_ack_ticket(index: u64, worth_packets: u32) -> anyhow::Result<RedeemableTicket> {
         let hk1 = HalfKey::random();
