@@ -2,8 +2,7 @@
 
 use std::collections::HashSet;
 
-use hopr_api::Multiaddr;
-use multiaddr::Protocol;
+use hopr_api::{Multiaddr, types::primitive::multiaddr::Protocol};
 
 /// Network-locality bucket derived from a peer's advertised multiaddresses.
 /// Used as the locality dimension in the anonymity bucket grid.
