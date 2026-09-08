@@ -1,3 +1,5 @@
+# HOPR Strategy Metrics
+
 | Name                                                         | Type          | Description                                                                                                                                     | Detail        |
 | ------------------------------------------------------------ | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
 | `hopr_strategy_auto_funding_failure_count`                   | SimpleCounter | Count of failed automatic funding attempts                                                                                                      |               |

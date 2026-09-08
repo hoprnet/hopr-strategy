@@ -124,6 +124,10 @@ if [[ ${1:-} == "--generate" ]]; then
     ((${#c4} > widths[3])) && widths[3]=${#c4}
   done
 
+  # Top-level heading: markdownlint (MD041) requires the first line of a
+  # markdown file to be a heading.
+  printf "# HOPR Strategy Metrics\n\n"
+
   # Print header
   printf "| %-${widths[0]}s | %-${widths[1]}s | %-${widths[2]}s | %-${widths[3]}s |\n" \
     "${headers[0]}" "${headers[1]}" "${headers[2]}" "${headers[3]}"
