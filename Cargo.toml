@@ -77,7 +77,6 @@ hopr-api = { workspace = true, features = [
 hopr-chain-connector = { workspace = true, optional = true }
 hopr-utils = { workspace = true, default-features = false }
 moka = { workspace = true, features = ["sync"] }
-multiaddr = { workspace = true }
 parking_lot = { workspace = true }
 
 # Optional dep enabled by the `strategy-pix` feature.
@@ -147,7 +146,6 @@ insta                = "1.48.0"
 lazy_static          = "1.5.0"
 mockall              = "0.15.0"
 moka                 = "0.12.16"
-multiaddr            = "0.19.0"
 parking_lot          = "0.12.5"
 redb                 = "4.2.0"
 rstest               = "0.27.0"
