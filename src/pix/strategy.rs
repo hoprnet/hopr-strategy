@@ -473,10 +473,16 @@ impl PixStrategy {
     /// `<HoprPixSpec as PixSpec>::DepositAddress`; `hopr-lib/pix-bjj` is the default, so a consumer
     /// enabling only this feature already agrees.
     ///
-    /// The pool needs two things the config cannot carry: the Curvy operator key, read from the
-    /// environment variable named by `pool_cfg.operator_key_env`, and a Blokli endpoint that
-    /// exposes the Curvy deployment (`pool_cfg.blokli_url`). The key is checked here, so a build
-    /// that would fail at the first deposit fails at startup instead. See
+    /// `node_key` is the node's own chain keypair, and must be the node's: under the default
+    /// `shielding: direct` the pool spends the float by driving the node's Safe through its
+    /// permission module, whose `execTransactionFromModule` accepts no other signer. It is used
+    /// for nothing else, and no key is derived from or stored alongside it.
+    ///
+    /// The pool needs one more thing the config cannot carry: a Blokli endpoint that exposes the
+    /// Curvy deployment (`pool_cfg.blokli_url`). Under `submission: operator` it additionally
+    /// needs the Curvy operator key, read from the environment variable named by
+    /// `pool_cfg.operator_key_env` and checked here, so a build that would fail at the first
+    /// deposit fails at startup instead. A relayed node needs no such key. See
     /// [`crate::pix::pools::curvy`] for the rest of the runtime requirements.
     ///
     /// # Examples
@@ -496,13 +502,14 @@ impl PixStrategy {
     ///     // `CurvyDepositPool` settles to `BjjPublicKey`, so this pairing is rejected here
     ///     // rather than failing on every event at runtime.
     ///     let _ = PixStrategy::new(PixStrategyConfig::default())
-    ///         .build_curvy::<_, Address>(node, Default::default());
+    ///         .build_curvy::<_, Address>(node, hopr_api::ChainKeypair::random(), Default::default());
     /// }
     /// ```
     #[cfg(feature = "strategy-pix-curvy")]
     pub fn build_curvy<N, A>(
         self,
         node: Arc<N>,
+        node_key: hopr_api::ChainKeypair,
         pool_cfg: crate::pix::pools::curvy::PoolConfig,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
@@ -518,6 +525,7 @@ impl PixStrategy {
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
         let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
             Arc::clone(&node),
+            node_key,
             pool_cfg,
         )?);
         let safe_address = node.identity().safe_address;
@@ -2771,8 +2779,12 @@ mod tests {
         Ok(())
     }
 
-    /// The curvy builder validates its own pool config on the same footing — and before it looks
-    /// for the operator key or opens the state file, which is why this needs neither.
+    /// The curvy pool validates its config before it looks for the operator key or opens the
+    /// state file, which is why this needs neither.
+    ///
+    /// Validation happens inside `CurvyDepositPool::new` rather than in the builder — the
+    /// environment overrides have to be applied first — so this also pins that the builder still
+    /// surfaces it.
     #[cfg(feature = "strategy-pix-curvy")]
     #[test_log::test(tokio::test)]
     async fn test_build_curvy_rejects_an_invalid_pool_config() -> anyhow::Result<()> {
@@ -2782,6 +2794,7 @@ mod tests {
 
         let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
             node,
+            hopr_api::ChainKeypair::random(),
             crate::pix::pools::curvy::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
                 ..Default::default()

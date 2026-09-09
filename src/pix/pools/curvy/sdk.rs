@@ -47,7 +47,8 @@ use curvy_core::{
     stealth,
 };
 use curvy_sdk::{
-    Account, CurvyClient, Identity, OwnedNote, PreparedDeposit, Route, ScanRecipient, TxLedger, ViewerIdentity,
+    Account, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route, ScanRecipient, TxLedger,
+    ViewerIdentity,
 };
 use futures::future::BoxFuture;
 use hopr_api::{
@@ -81,6 +82,19 @@ const MAX_ALLOCATION_INPUTS: usize = 2;
 ///
 /// Built by the pool over the node's chain API — see the module docs for why the Safe pays.
 pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+/// Performs a direct shield on behalf of the account that holds the float.
+///
+/// Takes the `directShield` calldata plus the addresses the bundled approval needs, and is
+/// responsible for making the call originate from the fund-holding account — the node's Safe.
+/// A callback rather than a method so the pool keeps no chain key of its own and the SDK bridge
+/// stays ignorant of how the Safe is driven.
+///
+/// Arguments: the `directShield` calldata, the token, the vault to approve, the aggregator to
+/// call, and the gross amount to approve.
+pub type DirectShielder = Arc<
+    dyn Fn(Vec<u8>, Address, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync,
+>;
 
 /// Curvy chain operations that require SDK knowledge.
 ///
@@ -266,6 +280,18 @@ enum StoredShieldStage {
     Funded,
 }
 
+/// A direct shield in flight.
+///
+/// Fewer stages than [`StoredShield`]: nothing is funded ahead of time, so there is no
+/// funded-but-not-shielded window to resume from. The record exists so that a crash between
+/// submitting and observing the note does not shield twice — the note id is checked against the
+/// chain before a resubmission.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredDirectShield {
+    note: StoredNote,
+    gross: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredShield {
     note: StoredNote,
@@ -359,6 +385,8 @@ struct SdkState {
     ambiguous_emitted: Vec<StoredNote>,
     #[serde(default)]
     shield_in_flight: Option<StoredShield>,
+    #[serde(default)]
+    direct_shield_in_flight: Option<StoredDirectShield>,
     #[serde(default)]
     allocations: Vec<StoredAllocation>,
     #[serde(default)]
@@ -513,6 +541,8 @@ pub struct RsSdkCurvyAdapter<C> {
     blokli_url: String,
     config: RsSdkCurvyAdapterConfig,
     funder: PortalFunder,
+    /// Present only for [`CurvyShielding::Direct`]; the portal path never uses it.
+    shielder: Option<DirectShielder>,
     store: RedbCurvySdkStore,
     state: parking_lot::Mutex<SdkState>,
     spender: Account,
@@ -531,6 +561,7 @@ where
         blokli_url: impl Into<String>,
         config: RsSdkCurvyAdapterConfig,
         funder: PortalFunder,
+        shielder: Option<DirectShielder>,
         state: &RedbCurvyDepositState,
     ) -> Result<Self, RsSdkCurvyAdapterError> {
         let store = RedbCurvySdkStore::new(state)?;
@@ -555,6 +586,7 @@ where
             blokli_url,
             config,
             funder,
+            shielder,
             store,
             state: parking_lot::Mutex::new(persisted),
             spender,
@@ -581,6 +613,93 @@ where
             .await
     }
 
+    /// Shields without an entry portal, paid by whatever account the [`DirectShielder`] drives —
+    /// the node's Safe.
+    ///
+    /// Must be called with the chain lock held.
+    ///
+    /// The note is journalled **before** submission, and a journalled note is checked against the
+    /// chain before it would be shielded again: the shielder cannot report an ambiguous outcome
+    /// the way the SDK's own submission path can, so a crash between submitting and recording
+    /// success is indistinguishable from a crash before submitting, and only the chain can say
+    /// which happened.
+    async fn direct_shield(&self, gross: u128) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        let Some(shielder) = self.shielder.clone() else {
+            return Err(RsSdkCurvyAdapterError::InvalidValue(
+                "direct shielding was selected but the pool was built without a shielder".to_owned(),
+            ));
+        };
+        let (client, endpoints) = self.client().await?;
+
+        // Resume an in-flight shield rather than preparing a second one: the note is
+        // deterministic in its inputs, but a fresh `prepare_direct_shield` would seal a new one.
+        let in_flight = self.state.lock().direct_shield_in_flight.clone();
+        let prepared = match in_flight {
+            Some(stored) if stored.gross == gross.to_string() => {
+                let note = OwnedNote::try_from(&stored.note)?;
+                PreparedDirectShield::from_recovery_parts(note, gross)
+            }
+            Some(_) => return Err(RsSdkCurvyAdapterError::ShieldInProgress),
+            None => {
+                let prepared = client
+                    .prepare_direct_shield(&self.spender, gross, self.config.token)
+                    .await?;
+                let mut state = self.state.lock();
+                state.direct_shield_in_flight = Some(StoredDirectShield {
+                    note: StoredNote::from(&prepared.note),
+                    gross: gross.to_string(),
+                });
+                self.store.save(&state)?;
+                prepared
+            }
+        };
+
+        // A note the aggregator already knows was shielded by an earlier attempt whose outcome we
+        // lost. Shielding again would spend the float twice.
+        let observed = client.note_status(&prepared.note.note_id()).await?;
+        if !matches!(observed, 1 | 2) {
+            let token: Address = endpoints
+                .token_address
+                .parse()
+                .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("token address: {error}")))?;
+            let vault: Address = endpoints
+                .vault
+                .parse()
+                .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("vault address: {error}")))?;
+            let aggregator: Address = endpoints
+                .aggregator
+                .parse()
+                .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("aggregator address: {error}")))?;
+            let calldata = prepared.calldata()?;
+            tracing::info!(%gross, %vault, "shielding the Curvy funding note directly from the Safe");
+            shielder(calldata, token, vault, aggregator, gross)
+                .await
+                .map_err(RsSdkCurvyAdapterError::Funding)?;
+        }
+
+        {
+            let mut state = self.state.lock();
+            let stored = StoredNote::from(&prepared.note);
+            let prepared_id = note_id(&prepared.note);
+            let already_funding = state
+                .funding
+                .iter()
+                .map(OwnedNote::try_from)
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|note| note_id(note) == prepared_id);
+            if !already_funding {
+                state.funding.push(stored.clone());
+            }
+            if observed != 2 && !state.pending.iter().any(|note| note == &stored) {
+                state.pending.push(stored);
+            }
+            state.direct_shield_in_flight = None;
+            self.store.save(&state)?;
+        }
+        self.recover_pending().await
+    }
+
     /// Shields initial private-pool funding if no durable funding already exists.
     async fn shield(&self, gross: u128, recovery_address: &str) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
@@ -588,10 +707,13 @@ where
         self.recover_pending().await?;
         let already_funded = {
             let state = self.state.lock();
-            !state.funding.is_empty() && state.shield_in_flight.is_none()
+            !state.funding.is_empty() && state.shield_in_flight.is_none() && state.direct_shield_in_flight.is_none()
         };
         if already_funded {
             return Ok(Vec::new());
+        }
+        if self.config.shielding == CurvyShielding::Direct {
+            return self.direct_shield(gross).await;
         }
         let mut shield = if let Some(shield) = self.state.lock().shield_in_flight.clone() {
             if shield.gross != gross.to_string() || shield.recovery != recovery_address {

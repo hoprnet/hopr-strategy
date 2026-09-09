@@ -63,6 +63,7 @@ strategy-pix-curvy = [
   "dep:babyjubjub-ec",
   "dep:blokli-client",
   "dep:const-hex",
+  "dep:curvy-abi",
   "dep:curvy-chain-blokli",
   "dep:curvy-core",
   "dep:curvy-sdk",
@@ -127,6 +128,7 @@ subtle = { workspace = true, optional = true }
 # Curvy deposit pool — enabled via the `strategy-pix-curvy` feature.
 babyjubjub-ec      = { workspace = true, optional = true }
 const-hex          = { workspace = true, optional = true }
+curvy-abi          = { workspace = true, optional = true }
 curvy-chain-blokli = { workspace = true, optional = true }
 curvy-core         = { workspace = true, optional = true }
 curvy-sdk          = { workspace = true, optional = true }
@@ -174,6 +176,7 @@ chrono           = { version = "0.4.45", default-features = false }
 const-hex        = "1.19.1"
 # The Curvy crates are pre-release and change API between release candidates; `curvy-sdk` pins
 # `curvy-core` exactly, so these three must name the same candidate and move together.
+curvy-abi            = "=0.1.0-rc.6"
 curvy-chain-blokli   = "=0.1.0-rc.6"
 curvy-core           = "=0.1.0-rc.6"
 curvy-sdk            = "=0.1.0-rc.6"
@@ -209,6 +212,26 @@ tokio                = "1.53.1"
 tracing              = "0.1.44"
 validator            = "0.21.0"
 zeroize              = "1.8.1"
+
+# TEMPORARY, and must not survive review in this form.
+#
+# Direct shielding needs `curvy-sdk` changes that are not published yet: `directShield` calldata,
+# the portal-free fee math, and `PreparedDirectShield`. Until those ship as 0.1.0-rc.7 this points
+# at a local checkout, which builds nowhere but this machine.
+#
+# Replace with a git rev of the rs-sdk branch before pushing — the way `hoprd` pins this crate —
+# and delete the section entirely once rc.7 is on crates.io.
+# All of them, not just `curvy-sdk`: these crates share types (`curvy-chain-api`'s traits, most
+# visibly), so patching one and leaving its siblings on crates.io puts two versions of the same
+# trait in the graph and nothing implements the one that matters.
+[patch.crates-io]
+curvy-abi = { path = "../rs-sdk/curvy-abi" }
+curvy-chain-api = { path = "../rs-sdk/curvy-chain-api" }
+curvy-chain-blokli = { path = "../rs-sdk/curvy-chain-blokli" }
+curvy-chain-rpc = { path = "../rs-sdk/curvy-chain-rpc" }
+curvy-sdk = { path = "../rs-sdk/curvy-sdk" }
+curvy-types = { path = "../rs-sdk/curvy-types" }
+curvy-witnesscalc = { path = "../rs-sdk/curvy-witnesscalc" }
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]

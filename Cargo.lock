@@ -2704,8 +2704,6 @@ dependencies = [
 [[package]]
 name = "curvy-abi"
 version = "0.1.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a9f0a862683111082f4278c86ea2417469804b12ccbb622af7cb424ee94823c"
 dependencies = [
  "alloy 1.8.3",
  "anyhow",
@@ -2717,8 +2715,6 @@ dependencies = [
 [[package]]
 name = "curvy-chain-api"
 version = "0.1.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97733db48a4a6fcba34d62b71068498be7e384a186d1bae3282e7c17932af62"
 dependencies = [
  "async-trait",
  "curvy-types",
@@ -2728,8 +2724,6 @@ dependencies = [
 [[package]]
 name = "curvy-chain-blokli"
 version = "0.1.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d3e5d94fbccca1a78bcc03b2363f1bd461a4d3f8482bbb1ec81f35b35365809"
 dependencies = [
  "async-trait",
  "curvy-chain-api",
@@ -2787,8 +2781,6 @@ dependencies = [
 [[package]]
 name = "curvy-sdk"
 version = "0.1.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "237c62ab15146b9856b06a1b334f9b351eb6c79b2e349dccac1b8171d8b6ae5c"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -2808,8 +2800,6 @@ dependencies = [
 [[package]]
 name = "curvy-types"
 version = "0.1.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f4e9e00fb71c10500e7e7902c99f13a05f41ebec4387f4be8a03db194078552"
 dependencies = [
  "serde",
 ]
@@ -2832,8 +2822,6 @@ dependencies = [
 [[package]]
 name = "curvy-witnesscalc"
 version = "0.1.0-rc.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8168a834c73d1dadb64b8d9a4ca93e77efb14b08085a28048a639c735c50151b"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -4108,6 +4096,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "const-hex",
+ "curvy-abi",
  "curvy-chain-blokli",
  "curvy-core",
  "curvy-sdk",
@@ -8209,3 +8198,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "curvy-chain-rpc"
+version = "0.1.0-rc.6"

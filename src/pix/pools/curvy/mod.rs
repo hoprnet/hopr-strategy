@@ -85,7 +85,7 @@ use hopr_api::{
 };
 pub use lifecycle::{BlokliIndex, CurvyIndexSource};
 pub use sdk::{
-    CurvyChainEndpoints, CurvySdkAdapter, PortalFunder, RsSdkCurvyAdapter, RsSdkCurvyAdapterConfig,
+    CurvyChainEndpoints, CurvySdkAdapter, DirectShielder, PortalFunder, RsSdkCurvyAdapter, RsSdkCurvyAdapterConfig,
     RsSdkCurvyAdapterError,
 };
 use serde_with::{DisplayFromStr, serde_as};
@@ -512,6 +512,50 @@ impl From<CurvyDepositPoolError> for StrategyError {
     }
 }
 
+/// A [`DirectShielder`] that makes the node's **Safe** approve the vault and call
+/// `directShield`, in one transaction, through the Safe's permission module.
+///
+/// This is what keeps a direct deposit non-custodial: the vault pulls from whoever calls
+/// `directShield`, so that caller must be the account holding the float. Routing the float
+/// through an EOA first would work equally well on chain and would put the node's whole PIX
+/// budget behind a hot key.
+///
+/// Signed with the node's own chain key, which is what the module's `nodeOnly` check requires —
+/// no new key material. See [`module::SafeModuleSubmitter`] for the nonce it shares with the
+/// node's connector, and why that is safe.
+fn safe_direct_shielder<C>(
+    client: Arc<C>,
+    chain_key: hopr_api::ChainKeypair,
+    module_address: Address,
+    multisend: Address,
+) -> DirectShielder
+where
+    C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliTransactionClient + Send + Sync + 'static,
+{
+    let submitter = Arc::new(module::SafeModuleSubmitter::new(client, chain_key, module_address));
+    Arc::new(
+        move |calldata: Vec<u8>, token: Address, vault: Address, aggregator: Address, gross: u128| {
+            let submitter = Arc::clone(&submitter);
+            Box::pin(async move {
+                let bundle =
+                    module::encode_safe_direct_shield(&multisend, &token, &vault, &aggregator, gross, calldata);
+                submitter
+                    .submit(bundle, SAFE_DIRECT_SHIELD_GAS)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }) as BoxFuture<'static, Result<(), String>>
+        },
+    )
+}
+
+/// Gas for the bundled approval and shield.
+///
+/// The shield is a Groth16-free call — the proving happens off chain — but it deploys nothing and
+/// writes one pending note, so this is generous rather than measured. An over-estimate costs
+/// nothing but the block's unused gas.
+const SAFE_DIRECT_SHIELD_GAS: u64 = 1_500_000;
+
 /// A [`PortalFunder`] that pays from the node's Safe through its chain API.
 ///
 /// [`ChainWriteAccountOperations::withdraw`] settles through the Safe module, which is exactly
@@ -564,7 +608,11 @@ where
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
     /// state file cannot be opened, or an environment override does not parse.
-    pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig) -> Result<Self, StrategyError> {
+    pub fn new(
+        node: Arc<N>,
+        node_key: hopr_api::ChainKeypair,
+        mut cfg: CurvyDepositPoolConfig,
+    ) -> Result<Self, StrategyError> {
         // Environment overrides are applied before validation, so an override that contradicts
         // the file is caught here rather than at the first deposit.
         if let Ok(raw) = std::env::var(SHIELDING_ENV) {
@@ -615,6 +663,17 @@ where
                 cfg.relayer_url.clone(),
             ),
             safe_funder(node.chain_api().clone()),
+            match cfg.shielding {
+                // The node's own chain key, because the module's `nodeOnly` check accepts no
+                // other signer; nothing new is minted or stored here.
+                CurvyShielding::Direct => Some(safe_direct_shielder(
+                    Arc::clone(&blokli),
+                    node_key,
+                    node.identity().module_address,
+                    cfg.safe_multisend_address,
+                )),
+                CurvyShielding::Portal => None,
+            },
             &state,
         )
         .map_err(StrategyError::other)?;

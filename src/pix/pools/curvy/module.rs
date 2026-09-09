@@ -24,7 +24,15 @@
 //!   [`CurvyDepositPoolConfig::safe_multisend_address`](super::CurvyDepositPoolConfig::safe_multisend_address) is
 //!   configurable rather than compiled in.
 
-use hopr_api::types::primitive::prelude::Address;
+use std::sync::Arc;
+
+use blokli_client::api::{BlokliQueryClient, BlokliTransactionClient};
+use hopr_api::{
+    ChainKeypair,
+    types::{chain::payload::GasEstimation, crypto::prelude::Keypair, primitive::prelude::Address},
+};
+
+use crate::errors::StrategyError;
 
 /// `execTransactionFromModule(address,uint256,bytes,uint8)`.
 const EXEC_TRANSACTION_FROM_MODULE: [u8; 4] = [0x46, 0x87, 0x21, 0xa7];
@@ -132,6 +140,143 @@ pub fn encode_safe_direct_shield(
         (*aggregator, direct_shield_calldata),
     ]);
     encode_exec_from_module(multisend, &bundle, Operation::DelegateCall)
+}
+
+/// Signs and submits one `execTransactionFromModule` call with the node's own chain key.
+///
+/// A miniature transaction sequencer, and deliberately so. `hopr-chain-connector`'s real one —
+/// which owns nonce caching, gas estimation and confirmation — lives behind a private module, and
+/// `hopr-api` exposes no operation that would carry an arbitrary call through the Safe, so there
+/// is nothing to delegate to.
+///
+/// ### Sharing the node's nonce
+///
+/// `execTransactionFromModule` is `nodeOnly`, so this must be signed by the node's own chain
+/// key — the same key the node's connector uses for announcements, channel operations and ticket
+/// redemptions, through a nonce cache this code cannot see. Two independent nonce sources on one
+/// key can therefore pick the same value.
+///
+/// The mitigation is to **never raise the gas price**. A same-nonce transaction that does not
+/// outbid the pending one is rejected as underpriced rather than replacing it, so the worst case
+/// is that this shield fails and is retried — never that a node transaction is displaced. The
+/// retry below re-queries the nonce rather than incrementing a local guess, for the same reason.
+///
+/// The exposure is one transaction, once: the shield happens lazily on the first deposit and the
+/// pool is funded thereafter.
+pub struct SafeModuleSubmitter<C> {
+    client: Arc<C>,
+    chain_key: ChainKeypair,
+    module: Address,
+}
+
+/// How many times to re-query the nonce and resubmit before giving up.
+const NONCE_RETRIES: usize = 3;
+
+impl<C> SafeModuleSubmitter<C>
+where
+    C: BlokliQueryClient + BlokliTransactionClient + Send + Sync + 'static,
+{
+    pub fn new(client: Arc<C>, chain_key: ChainKeypair, module: Address) -> Self {
+        Self {
+            client,
+            chain_key,
+            module,
+        }
+    }
+
+    /// Submits `calldata` to the module and waits for one confirmation.
+    pub async fn submit(&self, calldata: Vec<u8>, gas_limit: u64) -> Result<String, StrategyError> {
+        let signer = self.chain_key.public().to_address();
+        let mut last_error = None;
+        for attempt in 0..NONCE_RETRIES {
+            let (chain_id, gas) = self.chain_parameters(gas_limit).await?;
+            let nonce = self
+                .client
+                .query_transaction_count(&signer.into())
+                .await
+                .map_err(|error| StrategyError::other(anyhow::anyhow!("querying the node's nonce: {error}")))?;
+
+            let signed = curvy_abi::sign_eip1559_call(curvy_abi::Eip1559Call {
+                signer_secret: self.chain_key.secret().as_ref(),
+                to: self.module.into(),
+                calldata: calldata.clone(),
+                value: 0,
+                nonce,
+                gas_limit: gas.gas_limit,
+                max_fee_per_gas: gas.max_fee_per_gas,
+                max_priority_fee_per_gas: gas.max_priority_fee_per_gas,
+                chain_id,
+            })
+            .map_err(|error| StrategyError::other(anyhow::anyhow!("signing the Safe module call: {error}")))?;
+
+            match self.client.submit_and_confirm_transaction(&signed.0, 1).await {
+                Ok(receipt) => return Ok(format!("{:?}", receipt)),
+                Err(error) => {
+                    let message = error.to_string();
+                    if !is_nonce_conflict(&message) {
+                        return Err(StrategyError::other(anyhow::anyhow!(
+                            "submitting the Safe module call: {message}"
+                        )));
+                    }
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        nonce,
+                        %message,
+                        "the node's own connector took this nonce first; re-querying"
+                    );
+                    last_error = Some(message);
+                }
+            }
+        }
+        Err(StrategyError::other(anyhow::anyhow!(
+            "the Safe module call lost the nonce race {NONCE_RETRIES} times, most recently: {}",
+            last_error.unwrap_or_else(|| "unknown".to_owned())
+        )))
+    }
+
+    /// Chain id and gas, taken from Blokli exactly as the node's own connector takes them so that
+    /// this transaction is priced like every other one the node sends — never above.
+    async fn chain_parameters(&self, gas_limit: u64) -> Result<(u64, GasEstimation), StrategyError> {
+        let info = self
+            .client
+            .query_chain_info()
+            .await
+            .map_err(|error| StrategyError::other(anyhow::anyhow!("querying chain info: {error}")))?;
+        let defaults = GasEstimation::default();
+        let max_fee_per_gas = info
+            .max_fee_per_gas
+            .as_deref()
+            .and_then(|raw| raw.parse::<u128>().ok())
+            .unwrap_or(defaults.max_fee_per_gas);
+        let max_priority_fee_per_gas = info
+            .max_priority_fee_per_gas
+            .as_deref()
+            .and_then(|raw| raw.parse::<u128>().ok())
+            .unwrap_or(defaults.max_priority_fee_per_gas)
+            .min(max_fee_per_gas);
+        let chain_id = u64::try_from(info.chain_id)
+            .map_err(|_| StrategyError::other(anyhow::anyhow!("Blokli reported a negative chain id")))?;
+        Ok((
+            chain_id,
+            GasEstimation {
+                gas_limit,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            },
+        ))
+    }
+}
+
+/// Whether a submission error is the nonce race described on [`SafeModuleSubmitter`], rather than
+/// a fault worth surfacing.
+///
+/// Matched on text because the underlying client reports it as an opaque message; a node's own
+/// transaction winning the nonce is normal and must not read as a shield failure.
+fn is_nonce_conflict(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    ["nonce too low", "already known", "replacement transaction underpriced"]
+        .iter()
+        .any(|marker| lowered.contains(marker))
 }
 
 #[cfg(test)]
