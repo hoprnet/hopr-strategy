@@ -344,7 +344,13 @@ pub struct CurvyDepositPoolConfig {
     pub max_deposit_tracking_time: Duration,
 
     /// The Curvy vault token id of wxHOPR. Default: 3, which is what Blokli's local Curvy
-    /// deployment registers it as; a production deployment may assign another id.
+    /// deployment registers it as.
+    ///
+    /// **A real deployment almost certainly needs another value.** Ids are assigned sequentially
+    /// by `CurvyVaultV2.registerToken`, starting at 2 because id 1 is the vault's pre-seeded
+    /// native currency — so on Gnosis, where wxHOPR is the first registered ERC-20, it is **2**.
+    /// Getting this wrong does not fail loudly: the pool would allocate against whatever token
+    /// that id names. Read it back with Blokli's `curvyVaultToken` before deploying.
     #[default(default_token())]
     #[serde(default = "default_token")]
     #[validate(range(min = 1))]
