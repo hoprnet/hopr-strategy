@@ -3462,10 +3462,11 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "4.0.1"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "atomic_enum",
  "backon",
  "blokli-client",
  "bytesize",
@@ -3484,6 +3485,7 @@ dependencies = [
  "lazy_static",
  "mockall",
  "moka",
+ "num_enum",
  "parking_lot",
  "redb",
  "rstest",
@@ -3493,6 +3495,7 @@ dependencies = [
  "serde_with",
  "smart-default",
  "statrs",
+ "strum",
  "subtle",
  "tempfile",
  "test-log",

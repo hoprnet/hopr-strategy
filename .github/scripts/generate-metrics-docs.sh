@@ -42,6 +42,13 @@ extract_metrics() {
       next
     }
 
+    # ── a `static ref NAME: Type =` declaration line starts the *next* metric
+    # entry (its own ::new( call follows on a later line) — never extra detail
+    # for the current one.  Without this, a variable name that merely contains
+    # "BUCKETS" (e.g. METRIC_EFFECTIVE_BUCKETS) falls inside the -A8 trailing
+    # context of an unrelated, earlier metric and gets misread as its bucket detail.
+    /static[ \t]+ref[ \t]+[A-Za-z_]+[ \t]*:/ && !/::new\(/ { next }
+
     # ── group separator ──
     /^--$/ {
       if (name != "") {
@@ -116,6 +123,10 @@ if [[ ${1:-} == "--generate" ]]; then
     ((${#c3} > widths[2])) && widths[2]=${#c3}
     ((${#c4} > widths[3])) && widths[3]=${#c4}
   done
+
+  # Top-level heading: markdownlint (MD041) requires the first line of a
+  # markdown file to be a heading.
+  printf "# HOPR Strategy Metrics\n\n"
 
   # Print header
   printf "| %-${widths[0]}s | %-${widths[1]}s | %-${widths[2]}s | %-${widths[3]}s |\n" \

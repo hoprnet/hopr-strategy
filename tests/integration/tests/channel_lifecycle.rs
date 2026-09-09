@@ -42,7 +42,6 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
     cfg.population.target_open_channels = 1;
     cfg.funding.lower_capacity_threshold = ByteSize::b(1); // ~3 wxHOPR; channel at 1 wxHOPR is below → tops up
     cfg.funding.topup_capacity = ByteSize::b(1); // adds ~3 wxHOPR
-    cfg.funding.min_safe_capacity_required = ByteSize::b(0); // no safe floor
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
 
@@ -65,17 +64,18 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
     Ok(())
 }
 
-/// Affordability gate: with `stop_when_unfunded = true` and a safe balance below
-/// `min_safe_balance_required`, the whole fund pass is skipped — an underfunded
-/// channel is left untouched.
+/// Affordability gate: the fund pass spends `topup_balance` and gates on exactly
+/// that. A safe holding 1 wxHOPR — one short of the 3 wxHOPR top-up — cannot pay
+/// for one, so the underfunded channel is left untouched. No configured floor is
+/// involved: this is the strategy discovering it cannot afford its own top-up.
 #[rstest]
 #[test_log::test(tokio::test)]
-async fn skips_funding_when_safe_below_required(fixture: IntegrationFixture) -> Result<()> {
+async fn skips_funding_when_the_safe_cannot_afford_a_topup(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, destination] = fixture.claim_accounts::<2>();
 
-    // Fund each safe with barely more than the channel stake so the remaining
-    // balance sits below `min_safe_balance_required`.
+    // Fund each safe with barely more than the channel stake, so the remaining
+    // balance (2 - 1 = 1 wxHOPR) sits one short of the 3 wxHOPR top-up below.
     let scenario = fixture
         .open_channel_scenario(
             &source,
@@ -98,10 +98,7 @@ async fn skips_funding_when_safe_below_required(fixture: IntegrationFixture) -> 
     cfg.population.min_open_channels = 1;
     cfg.population.target_open_channels = 1;
     cfg.funding.lower_capacity_threshold = ByteSize::b(1); // ~3 wxHOPR
-    cfg.funding.topup_capacity = ByteSize::b(1); // ~3 wxHOPR
-    // Require far more capacity than the safe can afford, and stop when unfunded.
-    cfg.funding.min_safe_capacity_required = ByteSize::b(u64::MAX);
-    cfg.funding.stop_when_unfunded = true;
+    cfg.funding.topup_capacity = ByteSize::b(1); // ~3 wxHOPR; unaffordable at a 1 wxHOPR remaining safe balance
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
 

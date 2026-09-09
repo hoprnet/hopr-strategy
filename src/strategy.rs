@@ -14,6 +14,66 @@ use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
 
 use crate::errors::Result;
 
+/// Externally observable operational state of a running [`Strategy`].
+///
+/// Shared across every strategy in this crate — implementing [`Strategy::state`] is
+/// optional, and any strategy can report a real state through it, though today only
+/// `channel_lifecycle` does. Deliberately strategy-agnostic: what makes a given
+/// strategy `Degraded` or `Failed`, and whether it recovers on its own, is up to that
+/// strategy to define and document at its own implementation.
+///
+/// Implementations that track no health signal of their own do not need to implement
+/// [`Strategy::state`] at all — the trait's default reports `Running`, so "nothing to
+/// say" reads as healthy rather than as a status an operator has to interpret.
+///
+/// Declared in increasing order of severity, so comparing two observations keeps the
+/// worse one:
+///
+/// ```
+/// use hopr_strategy::strategy::StrategyState;
+///
+/// assert_eq!(StrategyState::default(), StrategyState::Running);
+/// assert!(StrategyState::Running < StrategyState::Degraded);
+/// assert!(StrategyState::Degraded < StrategyState::Failed);
+/// assert_eq!(
+///     StrategyState::Running.max(StrategyState::Degraded),
+///     StrategyState::Degraded
+/// );
+/// ```
+///
+/// `#[atomic_enum]` generates [`AtomicStrategyState`], a lock-free wrapper a strategy
+/// can store this small `Copy` value in instead of behind a mutex — see
+/// `channel_lifecycle`'s `ChannelLifecycleStrategyInner::state` field for the pattern.
+///
+/// `IntoPrimitive`/`TryFromPrimitive` separately give `From<StrategyState> for u8` and
+/// `TryFrom<u8> for StrategyState` for callers that need the raw discriminant — the
+/// latter rejecting any byte that isn't one of this enum's own discriminants, rather
+/// than silently mapping it to a variant. `strum::Display` renders each variant as its
+/// name:
+///
+/// ```
+/// use hopr_strategy::strategy::StrategyState;
+///
+/// assert_eq!(u8::from(StrategyState::Degraded), 1);
+/// assert_eq!(StrategyState::try_from(1), Ok(StrategyState::Degraded));
+/// assert!(StrategyState::try_from(99).is_err());
+/// assert_eq!(StrategyState::Degraded.to_string(), "Degraded");
+/// ```
+#[atomic_enum::atomic_enum]
+#[derive(
+    strum::Display, PartialEq, Eq, PartialOrd, Ord, Default, num_enum::IntoPrimitive, num_enum::TryFromPrimitive,
+)]
+#[repr(u8)]
+pub enum StrategyState {
+    /// Operating normally: everything the strategy currently needs to do, it can do.
+    #[default]
+    Running = 0,
+    /// Can still do some of what it needs to, but not all of it.
+    Degraded = 1,
+    /// Cannot currently do any of what it needs to.
+    Failed = 2,
+}
+
 /// A strategy that runs until cancelled or a fatal error occurs.
 ///
 /// Each implementation subscribes to the node's event stream and/or creates internal
@@ -26,6 +86,42 @@ use crate::errors::Result;
 pub trait Strategy: Display + Send {
     /// Run the strategy. Returns only on cancellation or fatal error.
     async fn run(&mut self) -> Result<()>;
+
+    /// Current externally observable state.
+    ///
+    /// Default: always [`StrategyState::Running`] — a strategy with nothing to say
+    /// about its own health should look healthy from the outside, so implementing this
+    /// trait never obligates tracking one.
+    ///
+    /// ```
+    /// use std::fmt::{Display, Formatter};
+    ///
+    /// use hopr_strategy::{
+    ///     errors::Result,
+    ///     strategy::{Strategy, StrategyState},
+    /// };
+    ///
+    /// struct PassiveStrategy;
+    ///
+    /// impl Display for PassiveStrategy {
+    ///     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    ///         write!(f, "passive")
+    ///     }
+    /// }
+    ///
+    /// #[async_trait::async_trait]
+    /// impl Strategy for PassiveStrategy {
+    ///     async fn run(&mut self) -> Result<()> {
+    ///         Ok(())
+    ///     }
+    ///     // No `state` override — reports the trait's default.
+    /// }
+    ///
+    /// assert_eq!(PassiveStrategy.state(), StrategyState::Running);
+    /// ```
+    fn state(&self) -> StrategyState {
+        StrategyState::Running
+    }
 }
 
 /// Runs a group of sub-strategies concurrently, each in its own async task.
@@ -210,5 +306,22 @@ mod tests {
     fn test_multi_strategy_display_passive() {
         let ms = MultiStrategy::new(vec![]);
         assert_eq!(ms.to_string(), "multi_strategy(passive)");
+    }
+
+    /// A strategy that never overrides `state()` must still report `Running` — "nothing
+    /// to say" reads as healthy, not as an unimplemented status.
+    #[test]
+    fn state_defaults_to_running_when_unimplemented() {
+        let external = ExternalStrategy { ran: false };
+        assert_eq!(external.state(), StrategyState::Running);
+    }
+
+    /// Increasing order of severity: comparing two observations always keeps the
+    /// worse one, so a strategy combining several internal outcomes into one
+    /// reported state can do so with a plain `max`.
+    #[test]
+    fn state_ordering_is_by_severity() {
+        assert!(StrategyState::Running < StrategyState::Degraded);
+        assert!(StrategyState::Degraded < StrategyState::Failed);
     }
 }
