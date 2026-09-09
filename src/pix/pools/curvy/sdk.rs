@@ -63,6 +63,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CommittedCurvyNote, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
+    relayer::RelayClient,
     detect::{bjj_point, scan_public_key_dec},
     state::{RedbCurvyDepositState, id_bytes},
 };
@@ -160,6 +161,8 @@ pub struct RsSdkCurvyAdapterConfig {
     pub submission: CurvySubmission,
     /// Base URL of the Curvy relayer, required under [`CurvySubmission::Relayer`].
     pub relayer_url: Option<Url>,
+    /// How long to wait for a relayed submission to reach the chain.
+    pub relay_timeout: std::time::Duration,
 }
 
 impl RsSdkCurvyAdapterConfig {
@@ -175,6 +178,7 @@ impl RsSdkCurvyAdapterConfig {
             shielding: CurvyShielding::Portal,
             submission: CurvySubmission::Operator,
             relayer_url: None,
+            relay_timeout: std::time::Duration::from_secs(120),
         }
     }
 
@@ -278,6 +282,15 @@ impl TryFrom<&StoredNote> for OwnedNote {
 enum StoredShieldStage {
     Prepared,
     Funded,
+}
+
+/// A relayer submission whose outcome is not yet known.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredRelayIntent {
+    intent: String,
+    action: String,
+    /// What the submission spends, so a resolved intent can be matched to its allocations.
+    spend_key: String,
 }
 
 /// A direct shield in flight.
@@ -387,6 +400,13 @@ struct SdkState {
     shield_in_flight: Option<StoredShield>,
     #[serde(default)]
     direct_shield_in_flight: Option<StoredDirectShield>,
+    /// Relayer submissions whose outcome we have not confirmed, keyed by our own intent id.
+    ///
+    /// Written *before* the submission is sent, which is what makes a lost response
+    /// recoverable: the relayer can be asked what became of an intent it may never have
+    /// received, where a `requestId` we never saw would tell us nothing.
+    #[serde(default)]
+    relay_intents: Vec<StoredRelayIntent>,
     #[serde(default)]
     allocations: Vec<StoredAllocation>,
     #[serde(default)]
@@ -427,6 +447,29 @@ impl RedbCurvySdkStore {
         write.commit().map_err(db_error)?;
         Ok(())
     }
+}
+
+fn relay_error(error: impl std::fmt::Display) -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(error.to_string()))
+}
+
+/// A random v4 UUID, which is the only shape the relayer accepts for an intent id.
+///
+/// Hand-rolled rather than pulling in a crate for one call site: this needs no parsing, no
+/// formatting variants and no ordering, only 122 random bits in the documented layout.
+fn uuid_v4() -> String {
+    let mut bytes = hopr_api::types::crypto_random::random_bytes::<16>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 fn db_error(error: impl std::fmt::Display) -> RsSdkCurvyAdapterError {
@@ -543,6 +586,8 @@ pub struct RsSdkCurvyAdapter<C> {
     funder: PortalFunder,
     /// Present only for [`CurvyShielding::Direct`]; the portal path never uses it.
     shielder: Option<DirectShielder>,
+    /// Present only for [`CurvySubmission::Relayer`].
+    relay: Option<Arc<RelayClient>>,
     store: RedbCurvySdkStore,
     state: parking_lot::Mutex<SdkState>,
     spender: Account,
@@ -562,6 +607,7 @@ where
         config: RsSdkCurvyAdapterConfig,
         funder: PortalFunder,
         shielder: Option<DirectShielder>,
+        relay: Option<Arc<RelayClient>>,
         state: &RedbCurvyDepositState,
     ) -> Result<Self, RsSdkCurvyAdapterError> {
         let store = RedbCurvySdkStore::new(state)?;
@@ -587,6 +633,7 @@ where
             config,
             funder,
             shielder,
+            relay,
             store,
             state: parking_lot::Mutex::new(persisted),
             spender,
@@ -856,6 +903,23 @@ where
     /// Commits every emitted note Blokli has not yet seen committed. Must be called with the
     /// chain lock held.
     async fn recover_pending(&self) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        // Committing is the deployment's job wherever a relayer runs: the relayer refuses
+        // `commitPendingNotes`, and the shared batch-prover alongside it commits every pending
+        // note anyway. Doing it here too would be a second party racing the same transaction.
+        // The pool does not depend on who commits — discovery waits for "committed and final"
+        // through Blokli either way — so this only stops us paying for it twice.
+        if self.config.submission == CurvySubmission::Relayer {
+            let mut state = self.state.lock();
+            if !state.pending.is_empty() {
+                tracing::debug!(
+                    notes = state.pending.len(),
+                    "leaving pending Curvy notes to the deployment's batch-prover"
+                );
+                state.pending.clear();
+                self.store.save(&state)?;
+            }
+            return Ok(Vec::new());
+        }
         let pending = self.state.lock().pending.clone();
         if pending.is_empty() {
             return Ok(Vec::new());
@@ -886,6 +950,142 @@ where
         Ok(ledger)
     }
 
+    /// The relayer operator's identity, as the recipient of an aggregation's gas-reimbursement
+    /// note, together with what that note must be worth.
+    ///
+    /// `Ok(None)` when the deployment runs no paymaster: aggregations are then accepted without a
+    /// fee note, and adding one would give the operator money for nothing.
+    async fn relay_fee_recipient(
+        relay: &RelayClient,
+        chain_id: u64,
+        token: u64,
+    ) -> Result<Option<(Identity, u128)>, RsSdkCurvyAdapterError> {
+        let Some(info) = relay.paymaster(chain_id).await.map_err(relay_error)? else {
+            return Ok(None);
+        };
+        // A fee note in a token the operator does not take is refused after we have paid to prove
+        // it, so it is worth catching here.
+        if let Some(accepted) = &info.accepted_vault_token_ids
+            && !accepted.iter().any(|id| id == &token.to_string())
+        {
+            return Err(RsSdkCurvyAdapterError::InvalidValue(format!(
+                "the Curvy relayer does not accept fee notes in vault token {token}; it takes {}",
+                accepted.join(", ")
+            )));
+        }
+        let amount = info.required_fee().map_err(|error| {
+            RsSdkCurvyAdapterError::InvalidValue(format!("pricing the relayer's fee note: {error}"))
+        })?;
+        // `"x.y"`, decimal — the same spelling `Identity` uses for its meta-keys and the relayer
+        // for its operator's owner key.
+        let (x, y) = info
+            .operator
+            .bjj_public_key
+            .split_once('.')
+            .ok_or_else(|| {
+                RsSdkCurvyAdapterError::InvalidValue(format!(
+                    "the relayer's operator key {:?} is not an `x.y` point",
+                    info.operator.bjj_public_key
+                ))
+            })?;
+        let coordinate = |value: &str, name: &str| {
+            Bn254Fr::try_from_dec(value)
+                .map(Bn254Fr::into_inner)
+                .map_err(|error| {
+                    RsSdkCurvyAdapterError::InvalidValue(format!("the relayer's operator key {name}: {error}"))
+                })
+        };
+        let identity = Identity {
+            big_k: info.operator.spend_public_key,
+            big_v: info.operator.view_public_key,
+            bjj_pub: (coordinate(x, "x")?, coordinate(y, "y")?),
+        };
+        Ok(Some((identity, amount)))
+    }
+
+    /// Records an intent before submitting under it, and clears it once the outcome is known.
+    fn journal_intent(&self, intent: &str, action: &str, spend_key: &str) -> Result<(), RsSdkCurvyAdapterError> {
+        let mut state = self.state.lock();
+        state.relay_intents.push(StoredRelayIntent {
+            intent: intent.to_owned(),
+            action: action.to_owned(),
+            spend_key: spend_key.to_owned(),
+        });
+        self.store.save(&state)
+    }
+
+    fn clear_intent(&self, intent: &str) -> Result<(), RsSdkCurvyAdapterError> {
+        let mut state = self.state.lock();
+        state.relay_intents.retain(|stored| stored.intent != intent);
+        self.store.save(&state)
+    }
+
+    /// Submits a proof through the relayer and waits for it to land.
+    ///
+    /// The intent id is ours and is journalled first, so a lost response is recoverable: the
+    /// relayer can be asked what became of that intent even though we never saw a `requestId`.
+    #[allow(clippy::too_many_arguments)]
+    async fn relay_submit(
+        &self,
+        relay: &RelayClient,
+        chain_id: u64,
+        action: curvy_abi::RelayAction,
+        max_inputs: usize,
+        proof: &curvy_abi::curvy_types::Groth16Proof,
+        public_signals: &[String],
+        request_key: &str,
+        spend_key: &str,
+    ) -> Result<(), RsSdkCurvyAdapterError> {
+        let intent = uuid_v4();
+        self.journal_intent(&intent, action.as_str(), spend_key)?;
+        let submitted = relay
+            .submit(
+                action,
+                chain_id,
+                max_inputs,
+                proof,
+                public_signals,
+                request_key,
+                spend_key,
+                &intent,
+            )
+            .await;
+        let submission = match submitted {
+            Ok(submission) => submission,
+            Err(error) => {
+                // The submission may still have arrived, so ask by intent before deciding.
+                match relay.by_intent(&intent, chain_id).await {
+                    Ok(Some(recovered)) => recovered,
+                    // Definitively never arrived: nothing was spent, so the intent is noise.
+                    Ok(None) => {
+                        self.clear_intent(&intent)?;
+                        return Err(relay_error(error));
+                    }
+                    // Could not tell. Leave the intent journalled for the next start to resolve.
+                    Err(_) => return Err(relay_error(error)),
+                }
+            }
+        };
+        let outcome = relay
+            .await_inclusion(submission, self.config.relay_timeout)
+            .await
+            .map_err(relay_error);
+        match outcome {
+            Ok(landed) => {
+                tracing::info!(
+                    tx = landed.transaction_hash.as_deref().unwrap_or("<unreported>"),
+                    action = action.as_str(),
+                    "the Curvy relayer submitted a PIX proof"
+                );
+                self.clear_intent(&intent)?;
+                Ok(())
+            }
+            // Deliberately keeps the intent: a timeout is not a refusal, and the submission may
+            // land after we stop watching.
+            Err(error) => Err(error),
+        }
+    }
+
     fn recipient(
         address: &BjjPublicKey,
         scan_key: CurvyScanPublicKey,
@@ -903,7 +1103,7 @@ where
         deposits: &[(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)],
     ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
-        let (client, _) = self.client().await?;
+        let (client, endpoints) = self.client().await?;
         if self.state.lock().ambiguous_allocation && !self.reconcile_ambiguous_allocation().await? {
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
@@ -985,17 +1185,54 @@ where
                 self.store.save(&state)?;
             }
             let funding_notes = funding.iter().map(|(_, note, _)| note.clone()).collect::<Vec<_>>();
+            // A relayed aggregation carries a gas-reimbursement note for the relayer's operator;
+            // a self-submitted one pays its own gas and carries none.
+            let relay_fee = match (self.config.submission, self.relay.as_ref()) {
+                (CurvySubmission::Relayer, Some(relay)) => {
+                    Self::relay_fee_recipient(relay, endpoints.chain_id, self.config.token).await?
+                }
+                (CurvySubmission::Relayer, None) => {
+                    return Err(RsSdkCurvyAdapterError::InvalidValue(
+                        "relayed submission was selected but the pool was built without a relayer".to_owned(),
+                    ));
+                }
+                (CurvySubmission::Operator, _) => None,
+            };
             let aggregated = client
-                .aggregate_pix_allocations(
+                .build_pix_aggregation(
                     &self.spender,
                     &funding_notes,
                     &allocations,
-                    None,
+                    relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
                     self.config.fee_recipient.as_ref(),
-                    &self.config.operator_private_key,
-                    self.config.route,
                 )
                 .await;
+            let aggregated = match aggregated {
+                Ok(request) => match (self.config.submission, self.relay.as_ref()) {
+                    (CurvySubmission::Relayer, Some(relay)) => {
+                        let outcome = self
+                            .relay_submit(
+                                relay,
+                                endpoints.chain_id,
+                                curvy_abi::RelayAction::Aggregation,
+                                request.max_inputs,
+                                &request.proof,
+                                &request.public_signals,
+                                &request.request_key,
+                                &request.spend_key,
+                            )
+                            .await;
+                        match outcome {
+                            Ok(()) => Ok(request.into_result_for_caller()),
+                            Err(error) => Err(anyhow::anyhow!("{error}")),
+                        }
+                    }
+                    _ => client
+                        .submit_pix_aggregation(request, &self.config.operator_private_key, self.config.route)
+                        .await,
+                },
+                Err(error) => Err(error),
+            };
             let result = match aggregated {
                 Ok(result) => result,
                 Err(error) => {
@@ -1124,22 +1361,45 @@ where
         destination: Address,
     ) -> Result<CurvyWithdrawalOutcome, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
-        let (client, _) = self.client().await?;
+        let (client, endpoints) = self.client().await?;
         let mut spent_note_ids = Vec::new();
         let mut withdrawn = 0_u128;
         for chunk in notes.chunks(MAX_WITHDRAWAL_INPUTS) {
             let spends = chunk.iter().map(|note| (secret, note)).collect::<Vec<_>>();
-            let (amount, ledger) = client
-                .withdraw_pix_multi_owner(
-                    &spends,
-                    &destination.to_string(),
-                    &self.config.operator_private_key,
-                    self.config.route,
-                )
-                .await?;
-            for entry in &ledger {
-                tracing::info!(tx = %entry.tx_hash, notes = chunk.len(), amount, "withdrew Curvy PIX notes");
-            }
+            let request = client.build_pix_withdrawal(&spends, &destination.to_string()).await?;
+            // No fee note here, unlike an aggregation: the vault reimburses the submitter's gas
+            // on chain, which is why the relayer does not price withdrawals at all.
+            let amount = match (self.config.submission, self.relay.as_ref()) {
+                (CurvySubmission::Relayer, Some(relay)) => {
+                    self.relay_submit(
+                        relay,
+                        endpoints.chain_id,
+                        curvy_abi::RelayAction::Withdrawal,
+                        request.max_inputs,
+                        &request.proof,
+                        &request.public_signals,
+                        &request.request_key,
+                        &request.spend_key,
+                    )
+                    .await?;
+                    tracing::info!(notes = chunk.len(), amount = request.delivered, "relayed a Curvy PIX withdrawal");
+                    request.delivered
+                }
+                (CurvySubmission::Relayer, None) => {
+                    return Err(RsSdkCurvyAdapterError::InvalidValue(
+                        "relayed submission was selected but the pool was built without a relayer".to_owned(),
+                    ));
+                }
+                (CurvySubmission::Operator, _) => {
+                    let (amount, ledger) = client
+                        .submit_pix_withdrawal(&request, &self.config.operator_private_key, self.config.route)
+                        .await?;
+                    for entry in &ledger {
+                        tracing::info!(tx = %entry.tx_hash, notes = chunk.len(), amount, "withdrew Curvy PIX notes");
+                    }
+                    amount
+                }
+            };
             withdrawn = withdrawn.saturating_add(amount);
             spent_note_ids.extend(chunk.iter().map(note_id));
         }
@@ -1236,6 +1496,49 @@ mod tests {
     use crate::pix::pools::curvy::{OwnedCurvyDeposit, detect::public_key_from_dec};
 
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
+
+    #[test]
+    fn an_intent_id_is_a_v4_uuid() {
+        let intent = uuid_v4();
+        // The relayer's schema is `z.string().uuid()`, so a malformed id is a 400 before the
+        // proof is even looked at.
+        assert_eq!(intent.len(), 36, "{intent}");
+        let parts = intent.split('-').collect::<Vec<_>>();
+        assert_eq!(
+            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "{intent}"
+        );
+        assert!(intent.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{intent}");
+        // Version 4 and the RFC 4122 variant, which a strict parser checks.
+        assert_eq!(parts[2].chars().next(), Some('4'), "{intent}");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "{intent}"
+        );
+    }
+
+    #[test]
+    fn intent_ids_do_not_repeat() {
+        // A repeated intent would make two distinct submissions look like one retry of the same.
+        let ids = (0..64).map(|_| uuid_v4()).collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 64);
+    }
+
+    #[test]
+    fn committing_is_the_deployments_job_only_when_a_relayer_runs() {
+        // The relayer refuses `commitPendingNotes` and its batch-prover does the work, so a
+        // relayed node must not also submit them; a self-submitting one has nobody else to do it.
+        let relayed = RsSdkCurvyAdapterConfig::new(String::new(), 3).with_modes(
+            CurvyShielding::Direct,
+            CurvySubmission::Relayer,
+            Some("https://api.curvy.box".parse().expect("valid URL")),
+        );
+        assert!(!relayed.commits_locally());
+
+        let self_submitted = RsSdkCurvyAdapterConfig::new("0xkey".to_owned(), 3);
+        assert!(self_submitted.commits_locally());
+    }
 
     #[test]
     fn the_zero_address_is_recognised_in_every_spelling() {

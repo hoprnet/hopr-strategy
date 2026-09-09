@@ -557,6 +557,12 @@ where
 /// nothing but the block's unused gas.
 const SAFE_DIRECT_SHIELD_GAS: u64 = 1_500_000;
 
+/// How long a single relayer HTTP request may take.
+///
+/// Separate from the deadline for a submission to reach the chain: this bounds one round trip,
+/// while the submission is queued and polled for much longer.
+const RELAYER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A [`PortalFunder`] that pays from the node's Safe through its chain API.
 ///
 /// [`ChainWriteAccountOperations::withdraw`] settles through the Safe module, which is exactly
@@ -674,6 +680,16 @@ where
                     cfg.safe_multisend_address,
                 )),
                 CurvyShielding::Portal => None,
+            },
+            match cfg.submission {
+                CurvySubmission::Relayer => {
+                    let url = cfg
+                        .relayer_url
+                        .clone()
+                        .expect("validated: `relayer_url` is required for relayed submission");
+                    Some(Arc::new(relayer::RelayClient::new(url, RELAYER_REQUEST_TIMEOUT)?))
+                }
+                CurvySubmission::Operator => None,
             },
             &state,
         )
