@@ -61,6 +61,7 @@
 mod detect;
 mod lifecycle;
 mod module;
+pub mod relayer;
 mod sdk;
 mod state;
 #[cfg(test)]

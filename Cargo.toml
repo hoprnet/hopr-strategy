@@ -65,6 +65,7 @@ strategy-pix-curvy = [
   "dep:const-hex",
   "dep:curvy-abi",
   "dep:curvy-chain-blokli",
+  "dep:reqwest",
   "dep:curvy-core",
   "dep:curvy-sdk",
   "dep:serde_json",
@@ -129,6 +130,12 @@ subtle = { workspace = true, optional = true }
 babyjubjub-ec      = { workspace = true, optional = true }
 const-hex          = { workspace = true, optional = true }
 curvy-abi          = { workspace = true, optional = true }
+# The relayer's HTTP surface. Already in the graph via `blokli-client` and `alloy`, so this
+# declares a dependency rather than adding one.
+reqwest = { workspace = true, optional = true, default-features = false, features = [
+  "json",
+  "rustls",
+] }
 curvy-chain-blokli = { workspace = true, optional = true }
 curvy-core         = { workspace = true, optional = true }
 curvy-sdk          = { workspace = true, optional = true }
@@ -197,6 +204,7 @@ moka                 = "0.12.16"
 multiaddr            = "0.18.2"
 parking_lot          = "0.12.5"
 redb                 = "4.2.0"
+reqwest              = { version = "0.13.4", default-features = false }
 rstest               = "0.26.1"
 scrypt               = "0.12.0"
 serde                = "1.0.229"
