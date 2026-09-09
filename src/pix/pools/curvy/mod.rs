@@ -60,6 +60,7 @@
 
 mod detect;
 mod lifecycle;
+mod module;
 mod sdk;
 mod state;
 #[cfg(test)]
@@ -238,6 +239,22 @@ fn default_operator_key_env() -> String {
     "HOPRD_CURVY_OPERATOR_PRIVATE_KEY".to_owned()
 }
 
+/// The Gnosis Safe MultiSend deployment the node's permission module accepts a `DelegateCall`
+/// to — the same address `hopr-types` builds its own Safe bundles against.
+///
+/// Deterministically deployed, hence identical across chains, but a value the module reads from
+/// its own storage rather than a constant of the protocol. Overridable for that reason: a
+/// deployment whose module names a different MultiSend would otherwise reject every bundle, and
+/// nothing available here can read `module.multisend()` back to check.
+const SAFE_MULTI_SEND_ADDRESS: [u8; 20] = [
+    0x38, 0x86, 0x9b, 0xf6, 0x6a, 0x61, 0xcf, 0x6b, 0xdb, 0x99, 0x6a, 0x6a, 0xe4, 0x0d, 0x58, 0x53, 0xfd, 0x43, 0xb5,
+    0x26,
+];
+
+fn default_safe_multisend_address() -> Address {
+    Address::from(SAFE_MULTI_SEND_ADDRESS)
+}
+
 /// Cross-field validation that `validator`'s derive cannot express: each mode needs a different
 /// piece of configuration, and a missing one is a startup error rather than a first-deposit one.
 fn validate_mode_requirements(cfg: &CurvyDepositPoolConfig) -> Result<(), validator::ValidationError> {
@@ -340,6 +357,16 @@ pub struct CurvyDepositPoolConfig {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     pub relayer_url: Option<Url>,
+
+    /// The Safe MultiSend the node's permission module delegate-calls for a bundled transaction.
+    ///
+    /// Only consulted for [`CurvyShielding::Direct`], which bundles the vault approval and the
+    /// shield into one transaction so that no allowance outlives the shield it was granted for.
+    /// Defaults to the canonical deployment; see [`SAFE_MULTI_SEND_ADDRESS`].
+    #[serde_as(as = "DisplayFromStr")]
+    #[default(default_safe_multisend_address())]
+    #[serde(default = "default_safe_multisend_address")]
+    pub safe_multisend_address: Address,
 }
 
 // ---------------------------------------------------------------------------
