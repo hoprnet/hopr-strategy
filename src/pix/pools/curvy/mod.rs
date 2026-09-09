@@ -139,6 +139,85 @@ impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
 /// to see leave the Safe.
 pub const INITIAL_FUNDING_ENV: &str = "HOPRD_CURVY_INITIAL_FUNDING";
 
+/// Environment variable that overrides [`CurvyDepositPoolConfig::shielding`].
+///
+/// Accepts `direct` or `portal`. Present for the same reason as [`SUBMISSION_ENV`]: the
+/// localcluster harness builds its PIX stanza from the *plain* pool's config type, so a
+/// Curvy-only YAML key is unreachable from there.
+pub const SHIELDING_ENV: &str = "HOPRD_CURVY_SHIELDING";
+
+/// Environment variable that overrides [`CurvyDepositPoolConfig::submission`].
+///
+/// Accepts `relayer` or `operator`.
+pub const SUBMISSION_ENV: &str = "HOPRD_CURVY_SUBMISSION";
+
+/// Environment variable that overrides [`CurvyDepositPoolConfig::relayer_url`].
+pub const RELAYER_URL_ENV: &str = "HOPRD_CURVY_RELAYER_URL";
+
+/// How the pool moves the node's float into the shielded vault.
+///
+/// Independent of [`CurvySubmission`]: the Curvy relayer never handles deposits, so a shield is a
+/// self-signed transaction whichever way proofs are submitted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CurvyShielding {
+    /// `CurvyAggregatorAlphaV2.directShield`, paid straight from the Safe. No portal is deployed,
+    /// so the deployment's `portalDeployment` gas-fee leg is not charged.
+    ///
+    /// The default, and the only option on a portal-less deployment — where `portalFactory` is
+    /// `address(0)` and `portalShield` is permanently unreachable.
+    #[default]
+    Direct,
+    /// The deterministic entry-portal flow: fund a CREATE2 portal address from the Safe, then
+    /// deploy and shield it. For deployments that still carry a portal factory.
+    Portal,
+}
+
+/// How the pool gets its Groth16 proofs on chain.
+///
+/// Also decides who commits pending notes: under [`CurvySubmission::Relayer`] the deployment's
+/// shared batch-prover does it, and this pool does not. Under [`CurvySubmission::Operator`] the
+/// pool commits with its own key, which is what the localcluster needs — it runs no off-chain
+/// Curvy infrastructure at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CurvySubmission {
+    /// Hand the proof to the Curvy off-chain relayer, which submits and pays gas, reimbursed by
+    /// an output note addressed to its operator. The node never appears as a transaction sender.
+    #[default]
+    Relayer,
+    /// Sign and submit every proof locally with the Curvy operator key.
+    Operator,
+}
+
+impl FromStr for CurvyShielding {
+    type Err = StrategyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct),
+            "portal" => Ok(Self::Portal),
+            other => Err(StrategyError::InvalidConfiguration(format!(
+                "Curvy shielding must be `direct` or `portal`, got `{other}`"
+            ))),
+        }
+    }
+}
+
+impl FromStr for CurvySubmission {
+    type Err = StrategyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "relayer" => Ok(Self::Relayer),
+            "operator" => Ok(Self::Operator),
+            other => Err(StrategyError::InvalidConfiguration(format!(
+                "Curvy submission must be `relayer` or `operator`, got `{other}`"
+            ))),
+        }
+    }
+}
+
 fn default_blokli_url() -> Url {
     "http://localhost:8080/".parse().expect("valid static URL")
 }
@@ -159,6 +238,17 @@ fn default_operator_key_env() -> String {
     "HOPRD_CURVY_OPERATOR_PRIVATE_KEY".to_owned()
 }
 
+/// Cross-field validation that `validator`'s derive cannot express: each mode needs a different
+/// piece of configuration, and a missing one is a startup error rather than a first-deposit one.
+fn validate_mode_requirements(cfg: &CurvyDepositPoolConfig) -> Result<(), validator::ValidationError> {
+    if cfg.submission == CurvySubmission::Relayer && cfg.relayer_url.is_none() {
+        return Err(validator::ValidationError::new(
+            "relayer_url is required when submission is `relayer`",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationError> {
     if duration.as_secs() < 1 {
         return Err(validator::ValidationError::new("must be at least 1 second"));
@@ -174,6 +264,7 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// `max_deposit_tracking_time`) mean the same thing in both.
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
+#[validate(schema(function = "validate_mode_requirements", skip_on_field_errors = false))]
 pub struct CurvyDepositPoolConfig {
     /// Blokli endpoint the pool discovers the Curvy deployment through, reads the note index
     /// from and submits its transactions to. Default: `http://localhost:8080/`, a placeholder an
@@ -224,6 +315,31 @@ pub struct CurvyDepositPoolConfig {
     #[default(default_operator_key_env())]
     #[serde(default = "default_operator_key_env")]
     pub operator_key_env: String,
+
+    /// How the float reaches the shielded vault. Default: [`CurvyShielding::Direct`] — no entry
+    /// portal. Overridden by [`SHIELDING_ENV`].
+    #[serde(default)]
+    pub shielding: CurvyShielding,
+
+    /// How proofs reach the chain. Default: [`CurvySubmission::Relayer`]. Overridden by
+    /// [`SUBMISSION_ENV`].
+    ///
+    /// [`CurvySubmission::Operator`] is what a deployment without Curvy's off-chain services
+    /// uses, the localcluster included; it is also what makes [`Self::operator_key_env`]
+    /// mandatory.
+    #[serde(default)]
+    pub submission: CurvySubmission,
+
+    /// Base URL of the Curvy relayer — `https://api.curvy.box` in production,
+    /// `https://api.curvy.dev` for staging. The service sits behind the gateway's `/relay`
+    /// prefix, which the client appends; give the host only.
+    ///
+    /// Required when [`Self::submission`] is [`CurvySubmission::Relayer`], and deliberately
+    /// without a default: silently pointing a misconfigured node at a production relayer is worse
+    /// than refusing to start. Overridden by [`RELAYER_URL_ENV`].
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(default)]
+    pub relayer_url: Option<Url>,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,13 +537,35 @@ where
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
     /// state file cannot be opened, or an environment override does not parse.
-    pub fn new(node: Arc<N>, cfg: CurvyDepositPoolConfig) -> Result<Self, StrategyError> {
-        let operator_key = std::env::var(&cfg.operator_key_env).map_err(|_| {
-            StrategyError::InvalidConfiguration(format!(
-                "environment variable {} must hold the Curvy operator's private key",
-                cfg.operator_key_env
-            ))
-        })?;
+    pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig) -> Result<Self, StrategyError> {
+        // Environment overrides are applied before validation, so an override that contradicts
+        // the file is caught here rather than at the first deposit.
+        if let Ok(raw) = std::env::var(SHIELDING_ENV) {
+            cfg.shielding = raw.parse()?;
+        }
+        if let Ok(raw) = std::env::var(SUBMISSION_ENV) {
+            cfg.submission = raw.parse()?;
+        }
+        if let Ok(raw) = std::env::var(RELAYER_URL_ENV) {
+            cfg.relayer_url = Some(Url::parse(&raw).map_err(|error| {
+                StrategyError::InvalidConfiguration(format!("{RELAYER_URL_ENV} must be a URL: {error}"))
+            })?);
+        }
+        StrategyError::validate_config(&cfg)?;
+
+        // The operator key signs proofs only when this node submits them itself. A relayed node
+        // needs no EVM key of its own: the relayer submits aggregations and withdrawals, the
+        // deployment's batch-prover commits, and the shield is paid by the Safe.
+        let operator_key = match cfg.submission {
+            CurvySubmission::Operator => std::env::var(&cfg.operator_key_env).map_err(|_| {
+                StrategyError::InvalidConfiguration(format!(
+                    "environment variable {} must hold the Curvy operator's private key when submission is \
+                     `operator`",
+                    cfg.operator_key_env
+                ))
+            })?,
+            CurvySubmission::Relayer => String::new(),
+        };
         let initial_funding = match std::env::var(INITIAL_FUNDING_ENV) {
             Ok(raw) => HoprBalance::from_str(&raw).map_err(|error| {
                 StrategyError::InvalidConfiguration(format!("{INITIAL_FUNDING_ENV} must be a wxHOPR amount: {error}"))
@@ -444,7 +582,11 @@ where
         let adapter = RsSdkCurvyAdapter::new(
             Arc::clone(&blokli),
             cfg.blokli_url.to_string(),
-            RsSdkCurvyAdapterConfig::new(operator_key, cfg.token),
+            RsSdkCurvyAdapterConfig::new(operator_key, cfg.token).with_modes(
+                cfg.shielding,
+                cfg.submission,
+                cfg.relayer_url.clone(),
+            ),
             safe_funder(node.chain_api().clone()),
             &state,
         )
@@ -454,6 +596,9 @@ where
             blokli = %cfg.blokli_url,
             %initial_funding,
             token = cfg.token,
+            shielding = ?cfg.shielding,
+            submission = ?cfg.submission,
+            relayer = cfg.relayer_url.as_ref().map(|url| url.to_string()),
             "Curvy PIX deposit pool ready"
         );
         let detector = RsCoreCurvyNoteDetector::for_token(cfg.token);

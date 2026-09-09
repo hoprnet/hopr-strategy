@@ -61,7 +61,7 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommittedCurvyNote, CurvyWithdrawalOutcome,
+    CommittedCurvyNote, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
     detect::{bjj_point, scan_public_key_dec},
     state::{RedbCurvyDepositState, id_bytes},
 };
@@ -123,25 +123,61 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
 
 /// Runtime configuration for the rs-sdk allocation and withdrawal bridge.
 pub struct RsSdkCurvyAdapterConfig {
-    /// Curvy relayer/operator EVM key: role-gated portal deployment and pending-note commitment,
-    /// and the submitter of allocation and withdrawal calls.
+    /// Curvy operator EVM key: role-gated portal deployment and pending-note commitment, and the
+    /// submitter of allocation and withdrawal calls.
+    ///
+    /// Empty under [`CurvySubmission::Relayer`], where none of those are this node's to sign —
+    /// see [`Self::submission`]. Every use is gated on the mode, so an empty key is never
+    /// presented to the SDK.
     pub operator_private_key: String,
     /// Token identifier used by all pool notes.
     pub token: u64,
-    /// Transaction route. Production should use [`Route::Blokli`].
+    /// Transaction route for locally-submitted calls. Production should use [`Route::Blokli`].
+    ///
+    /// Orthogonal to [`Self::submission`]: this picks *how* a self-submitted transaction reaches
+    /// the chain, while `submission` decides whether this node submits at all.
     pub route: Route,
     /// Fee collector identity required when the configured protocol fee is non-zero.
     pub fee_recipient: Option<Identity>,
+    /// How the float is moved into the vault. See [`CurvyShielding`].
+    pub shielding: CurvyShielding,
+    /// Who puts proofs on chain, and therefore who commits pending notes. See
+    /// [`CurvySubmission`].
+    pub submission: CurvySubmission,
+    /// Base URL of the Curvy relayer, required under [`CurvySubmission::Relayer`].
+    pub relayer_url: Option<Url>,
 }
 
 impl RsSdkCurvyAdapterConfig {
+    /// Self-submitting configuration: portal shielding, proofs signed with `operator_private_key`.
+    ///
+    /// This is what the localcluster runs, and what every caller got before the modes existed.
     pub fn new(operator_private_key: String, token: u64) -> Self {
         Self {
             operator_private_key,
             token,
             route: Route::Blokli,
             fee_recipient: None,
+            shielding: CurvyShielding::Portal,
+            submission: CurvySubmission::Operator,
+            relayer_url: None,
         }
+    }
+
+    /// Applies the pool's configured modes.
+    pub fn with_modes(mut self, shielding: CurvyShielding, submission: CurvySubmission, relayer_url: Option<Url>) -> Self {
+        self.shielding = shielding;
+        self.submission = submission;
+        self.relayer_url = relayer_url;
+        self
+    }
+
+    /// Whether this node commits its own pending notes.
+    ///
+    /// Only when it submits its own proofs. Under [`CurvySubmission::Relayer`] the deployment's
+    /// shared batch-prover commits, and the relayer refuses `commitPendingNotes` anyway.
+    pub fn commits_locally(&self) -> bool {
+        self.submission == CurvySubmission::Operator
     }
 }
 
@@ -373,7 +409,16 @@ fn db_error(error: impl std::fmt::Display) -> RsSdkCurvyAdapterError {
 #[derive(Clone, Debug)]
 pub struct CurvyChainEndpoints {
     pub aggregator: String,
-    pub portal_factory: String,
+    /// The entry-portal factory, absent on a portal-less deployment.
+    ///
+    /// `None` when Blokli does not name one, or names the zero address — which is exactly how a
+    /// direct-shield-only deployment is configured (`portalFactory` left at `address(0)`, making
+    /// `portalShield` permanently unreachable). Required only for
+    /// [`CurvyShielding::Portal`].
+    pub portal_factory: Option<String>,
+    /// The vault, which is the `approve` target of a direct shield: the aggregator forwards its
+    /// caller as `from` and the vault is what calls `safeTransferFrom`.
+    pub vault: String,
     pub token_address: String,
     pub chain_id: u64,
 }
@@ -394,12 +439,44 @@ impl CurvyChainEndpoints {
                 .cloned()
                 .ok_or_else(|| RsSdkCurvyAdapterError::Discovery(format!("no `{name}` contract in chain_info")))
         };
+        // A named-but-zero address is how a portal-less deployment states "no factory", so it
+        // is folded into the same `None` as an absent key rather than being carried as a
+        // plausible-looking address that every call to it would silently fail against.
+        let optional_contract = |name: &str| {
+            contracts
+                .get(name)
+                .filter(|address| !is_zero_address(address))
+                .cloned()
+        };
         Ok(Self {
             aggregator: contract("curvy_aggregator")?,
-            portal_factory: contract("curvy_portal_factory")?,
+            portal_factory: optional_contract("curvy_portal_factory"),
+            vault: contract("curvy_vault")?,
             token_address: contract("token")?,
             chain_id: u64::try_from(chain_info.chain_id)
                 .map_err(|_| RsSdkCurvyAdapterError::Discovery("negative chain id".to_owned()))?,
+        })
+    }
+}
+
+/// Whether a hex address string is the zero address, ignoring case and an optional `0x`.
+fn is_zero_address(address: &str) -> bool {
+    let trimmed = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+        .unwrap_or(address);
+    !trimmed.is_empty() && trimmed.chars().all(|c| c == '0')
+}
+
+impl CurvyChainEndpoints {
+    /// The portal factory, or a diagnostic naming the mode that needs it.
+    pub fn require_portal_factory(&self) -> Result<&str, RsSdkCurvyAdapterError> {
+        self.portal_factory.as_deref().ok_or_else(|| {
+            RsSdkCurvyAdapterError::Discovery(
+                "this Curvy deployment has no entry-portal factory, so `shielding: portal` cannot \
+                 work against it; use `shielding: direct`"
+                    .to_owned(),
+            )
         })
     }
 }
@@ -416,7 +493,13 @@ pub fn blokli_curvy_client(blokli_url: impl Into<String>, endpoints: &CurvyChain
         blokli.clone(),
         blokli,
         endpoints.aggregator.clone(),
-        endpoints.portal_factory.clone(),
+        // The SDK still wants a factory address. On a portal-less deployment there is none, and
+        // the zero address is the honest stand-in: every portal call would revert anyway, and
+        // `require_portal_factory` is what stops one being attempted.
+        endpoints
+            .portal_factory
+            .clone()
+            .unwrap_or_else(|| format!("0x{}", "0".repeat(40))),
         endpoints.chain_id,
     ))
 }
@@ -486,7 +569,8 @@ where
                 let endpoints = CurvyChainEndpoints::discover(self.blokli.as_ref()).await?;
                 tracing::info!(
                     aggregator = %endpoints.aggregator,
-                    portal_factory = %endpoints.portal_factory,
+                    portal_factory = endpoints.portal_factory.as_deref().unwrap_or("<none: direct-shield only>"),
+                    vault = %endpoints.vault,
                     token = %endpoints.token_address,
                     chain_id = endpoints.chain_id,
                     "discovered the Curvy deployment through Blokli"
@@ -1030,6 +1114,56 @@ mod tests {
     use crate::pix::pools::curvy::{OwnedCurvyDeposit, detect::public_key_from_dec};
 
     type Adapter = RsSdkCurvyAdapter<blokli_client::BlokliClient>;
+
+    #[test]
+    fn the_zero_address_is_recognised_in_every_spelling() {
+        for zero in [
+            "0x0000000000000000000000000000000000000000",
+            "0X0000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000",
+            "0x0",
+        ] {
+            assert!(is_zero_address(zero), "{zero} is the zero address");
+        }
+        for real in [
+            "0x0000000000000000000000000000000000000001",
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "",
+        ] {
+            assert!(!is_zero_address(real), "{real} is not the zero address");
+        }
+    }
+
+    #[test]
+    fn a_portal_less_deployment_refuses_portal_shielding_by_name() {
+        let endpoints = CurvyChainEndpoints {
+            aggregator: "0x01".to_owned(),
+            portal_factory: None,
+            vault: "0x02".to_owned(),
+            token_address: "0x03".to_owned(),
+            chain_id: 100,
+        };
+        let error = endpoints
+            .require_portal_factory()
+            .expect_err("a portal-less deployment cannot portal-shield");
+        let message = error.to_string();
+        // The message has to name the way out, not just the fact of failure: an operator seeing
+        // this has picked the wrong mode for their deployment.
+        assert!(message.contains("shielding: direct"), "{message}");
+    }
+
+    #[test]
+    fn a_portal_deployment_hands_back_its_factory() -> anyhow::Result<()> {
+        let endpoints = CurvyChainEndpoints {
+            aggregator: "0x01".to_owned(),
+            portal_factory: Some("0xfac".to_owned()),
+            vault: "0x02".to_owned(),
+            token_address: "0x03".to_owned(),
+            chain_id: 100,
+        };
+        assert_eq!(endpoints.require_portal_factory()?, "0xfac");
+        Ok(())
+    }
 
     #[test]
     fn sdk_note_conversion_preserves_the_complete_note() -> anyhow::Result<()> {

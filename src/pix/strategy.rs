@@ -509,8 +509,10 @@ impl PixStrategy {
         N: HasChainApi + ActionableEventSource + Send + Sync + 'static,
         A: crate::pix::DepositAddressOf<crate::pix::pools::curvy::PoolKeypair>,
     {
-        // See `build_non_anonymous`: the pool config is this builder's to validate.
-        StrategyError::validate_config(&pool_cfg)?;
+        // Unlike `build_non_anonymous`, validation is *not* done here: `CurvyDepositPool::new`
+        // applies the `HOPRD_CURVY_*` environment overrides first and validates the result. A
+        // config file that omits `relayer_url` because the deployment overrides `submission` to
+        // `operator` is legal, and validating the file as written would reject it.
 
         // `Arc` for the same reason as in `build_non_anonymous`; the pool itself is deliberately
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.

@@ -949,3 +949,82 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
     assert!(result.is_err());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Mode configuration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mode_defaults_are_direct_shielding_over_the_relayer() {
+    let cfg = CurvyDepositPoolConfig::default();
+    assert_eq!(cfg.shielding, CurvyShielding::Direct);
+    assert_eq!(cfg.submission, CurvySubmission::Relayer);
+    assert_eq!(cfg.relayer_url, None);
+}
+
+#[test]
+fn mode_values_parse_case_insensitively_and_reject_anything_else() -> anyhow::Result<()> {
+    assert_eq!("direct".parse::<CurvyShielding>()?, CurvyShielding::Direct);
+    assert_eq!("  PORTAL ".parse::<CurvyShielding>()?, CurvyShielding::Portal);
+    assert_eq!("Relayer".parse::<CurvySubmission>()?, CurvySubmission::Relayer);
+    assert_eq!("operator".parse::<CurvySubmission>()?, CurvySubmission::Operator);
+
+    assert!(matches!(
+        "portals".parse::<CurvyShielding>(),
+        Err(StrategyError::InvalidConfiguration(_))
+    ));
+    assert!(matches!(
+        "".parse::<CurvySubmission>(),
+        Err(StrategyError::InvalidConfiguration(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn relaying_requires_a_relayer_url_and_self_submission_does_not() -> anyhow::Result<()> {
+    // The default (relayed) config carries no URL, so it must not validate as written: an
+    // operator has to name the relayer before a node will start.
+    assert!(StrategyError::validate_config(&CurvyDepositPoolConfig::default()).is_err());
+
+    let relayed = CurvyDepositPoolConfig {
+        relayer_url: Some("https://api.curvy.box".parse()?),
+        ..Default::default()
+    };
+    StrategyError::validate_config(&relayed)?;
+
+    // What the localcluster runs: no off-chain infrastructure, so no URL is needed.
+    let self_submitted = CurvyDepositPoolConfig {
+        submission: CurvySubmission::Operator,
+        shielding: CurvyShielding::Portal,
+        ..Default::default()
+    };
+    StrategyError::validate_config(&self_submitted)?;
+    Ok(())
+}
+
+#[test]
+fn a_config_without_the_mode_keys_still_parses() -> anyhow::Result<()> {
+    // The localcluster harness emits the *plain* pool's stanza, which knows nothing about these
+    // keys; a Curvy node reading it must fall back to the defaults rather than refuse the file.
+    let cfg: CurvyDepositPoolConfig = serde_json::from_str(
+        r#"{"blokli_url":"http://127.0.0.1:8080/","max_deposit_tracking_time":"30s","gas_xdai_per_sweep":"1 xDai"}"#,
+    )?;
+    assert_eq!(cfg.shielding, CurvyShielding::Direct);
+    assert_eq!(cfg.submission, CurvySubmission::Relayer);
+    Ok(())
+}
+
+#[test]
+fn modes_round_trip_as_lowercase() -> anyhow::Result<()> {
+    let cfg = CurvyDepositPoolConfig {
+        shielding: CurvyShielding::Portal,
+        submission: CurvySubmission::Operator,
+        relayer_url: Some("https://api.curvy.dev/".parse()?),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_string(&cfg)?;
+    assert!(encoded.contains(r#""shielding":"portal""#), "{encoded}");
+    assert!(encoded.contains(r#""submission":"operator""#), "{encoded}");
+    assert_eq!(serde_json::from_str::<CurvyDepositPoolConfig>(&encoded)?, cfg);
+    Ok(())
+}
