@@ -721,7 +721,16 @@ where
             tracing::info!(%gross, %vault, "shielding the Curvy funding note directly from the Safe");
             shielder(calldata, token, vault, aggregator, gross)
                 .await
-                .map_err(RsSdkCurvyAdapterError::Funding)?;
+                // A revert here is most often the one setup step nothing performs automatically,
+                // so the error says which rather than leaving an operator to decode a receipt.
+                .map_err(|error| {
+                    RsSdkCurvyAdapterError::Funding(format!(
+                        "{error}\n\nA direct shield reverts until the node's Safe is allowed to call the Curvy \
+                         aggregator ({aggregator}). Grant it once per Safe with \
+                         `scripts/scope-curvy-aggregator.sh`, or check that the deployment has \
+                         `directShieldEnabled` set."
+                    ))
+                })?;
         }
 
         {

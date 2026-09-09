@@ -22,14 +22,55 @@
 //! | `DepositAddressReceived` | Exit | watches Blokli's note index with `v` until the allocation is committed and final |
 //! | `PrivateKeyRecovered` | Exit | withdraws the committed notes with the reconstructed key, to the Safe |
 //!
+//! ### Two independent choices
+//!
+//! How the float enters the pool and how proofs reach the chain are separate settings, because
+//! the Curvy relayer never handles deposits — a shield is a self-signed transaction either way.
+//!
+//! | | default | alternative |
+//! |---|---|---|
+//! | [`CurvyDepositPoolConfig::shielding`] | `direct` — the Safe calls `directShield`, no portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
+//! | [`CurvyDepositPoolConfig::submission`] | `relayer` — hand proofs to Curvy's off-chain relayer | `operator` — sign and submit them here |
+//!
+//! Both defaults describe a production deployment. The localcluster runs
+//! `submission: operator`, since it has no off-chain Curvy infrastructure at all.
+//!
+//! **A direct shield never takes the float out of the Safe.** The vault pulls with
+//! `safeTransferFrom(msg.sender_of_the_aggregator_call, ...)`, so the Safe itself calls
+//! `directShield`, through its permission module, in one transaction that also approves the
+//! vault. That needs a one-time grant per Safe — see *Setup* below — and the node's own chain key
+//! to sign the module call, which is why the builder takes one.
+//!
+//! **Under `submission: relayer` the pool commits nothing.** The relayer refuses
+//! `commitPendingNotes`, and the deployment's shared batch-prover commits every pending note
+//! anyway. Discovery is unaffected: it waits for *committed and final* through Blokli, and does
+//! not care who committed.
+//!
+//! ### Setup, once per Safe
+//!
+//! A direct shield reverts with `NonExistentKey()` until the node's Safe is allowed to call the
+//! Curvy aggregator. Nothing does this automatically:
+//!
+//! ```text
+//! ./scripts/scope-curvy-aggregator.sh --module 0xMODULE --aggregator 0xAGGREGATOR
+//! ```
+//!
+//! which prints the Safe transaction to execute. The grant is `ALLOW_ALL` on that one address —
+//! the module's selector whitelist is hardcoded and cannot express `directShield` any other way —
+//! so point it at an aggregator you have verified. See the script for what that permits.
+//!
 //! ### What it needs at runtime
 //!
 //! * A **Blokli endpoint** ([`CurvyDepositPoolConfig::blokli_url`]) whose `chain_info` names the Curvy deployment
-//!   (`curvy_aggregator`, `curvy_portal_factory`, `token`) and that indexes Curvy notes. Reads and submissions both go
-//!   through it.
-//! * The **Curvy operator key**, from the environment variable named by [`CurvyDepositPoolConfig::operator_key_env`].
-//!   It must hold the PortalFactory operator role and gas: it deploys and shields portals, commits notes, and submits
-//!   allocations and withdrawals. It is the only EVM key the pool holds.
+//!   (`curvy_aggregator`, `curvy_vault`, `token`, and `curvy_portal_factory` where one exists) and that indexes Curvy
+//!   notes. Reads go through it, and so do submissions under `submission: operator`.
+//! * A **relayer endpoint** ([`CurvyDepositPoolConfig::relayer_url`]) under `submission: relayer` —
+//!   `https://api.curvy.box` in production, `https://api.curvy.dev` for staging. No default: pointing a misconfigured
+//!   node at a production relayer is worse than refusing to start.
+//! * The **Curvy operator key**, from the environment variable named by
+//!   [`CurvyDepositPoolConfig::operator_key_env`] — **only under `submission: operator`**, where it signs and pays for
+//!   allocations, withdrawals and note commitments. A relayed node needs no EVM key of its own: the relayer submits,
+//!   the batch-prover commits, and the shield is signed by the node's existing chain key.
 //! * The Curvy **proving artifacts**: every allocation, commitment and withdrawal is a Groth16 proof made in-process,
 //!   and the SDK loads each circuit's zkey and witness graph from `CURVY_ZK_KEYS_DIR` (flat, one zkey and one
 //!   `*.signet.zst` graph per circuit, digest-checked; a `CURVY_*_ZKEY` / `CURVY_*_GRAPH` pair per circuit overrides
@@ -363,7 +404,9 @@ pub struct CurvyDepositPoolConfig {
     ///
     /// Only consulted for [`CurvyShielding::Direct`], which bundles the vault approval and the
     /// shield into one transaction so that no allowance outlives the shield it was granted for.
-    /// Defaults to the canonical deployment; see [`SAFE_MULTI_SEND_ADDRESS`].
+    /// Defaults to the canonical deterministic deployment,
+    /// `0x38869bf66a61cf6bdb996a6ae40d5853fd43b526` — the same one `hopr-types` builds its own
+    /// Safe bundles against.
     #[serde_as(as = "DisplayFromStr")]
     #[default(default_safe_multisend_address())]
     #[serde(default = "default_safe_multisend_address")]
