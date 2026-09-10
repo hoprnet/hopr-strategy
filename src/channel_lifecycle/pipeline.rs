@@ -747,9 +747,9 @@ where
             StakeView::empty()
         };
 
-        // Per-peer funded-outgoing-channel counts — only computed when the active
-        // selector requests FORWARDING.
-        let forwarding_view = if self.selector.required_signals().contains(SignalSet::FORWARDING) {
+        // Per-peer funded-outgoing-channel counts — computed only when sink
+        // demotion is enabled, and consumed by whichever selector is active.
+        let forwarding_view = if self.cfg.eligibility.demote_non_forwarding_peers {
             self.fetch_forwarding_view(chain, deadline, &open_candidates).await
         } else {
             ForwardingView::empty()

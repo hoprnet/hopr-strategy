@@ -40,9 +40,6 @@ pub use subnet::SubnetBucket;
 pub struct SignalSet(u8);
 
 impl SignalSet {
-    /// Pipeline should count each candidate's funded outgoing channels and
-    /// populate `ForwardingView`.
-    pub const FORWARDING: Self = Self(0b0010);
     /// Pipeline should fetch per-peer on-chain safe balance and populate `StakeView`.
     pub const STAKE: Self = Self(0b0001);
 
@@ -168,8 +165,31 @@ pub struct SelectorContext<'a> {
     /// Empty when the active selector did not request the `STAKE` signal.
     pub stake_view: StakeView,
     /// Per-peer funded-outgoing-channel counts, keyed by peer chain address.
-    /// Empty when the active selector did not request the `FORWARDING` signal.
+    /// Empty when `eligibility.demote_non_forwarding_peers` is off.
     pub forwarding_view: ForwardingView,
+}
+
+/// Splits `candidates` into `(forwarding-capable, ticket-sink)` tiers per the
+/// shared demotion policy, so every selector can rank capable-then-sink the same
+/// way.
+///
+/// A ticket sink — a peer sourcing fewer than
+/// [`minimum_peer_outgoing_channels`](crate::channel_lifecycle::config::EligibilityConfig::minimum_peer_outgoing_channels)
+/// funded outgoing channels — can only be a path's last hop, never an
+/// intermediate relay.  When demotion is disabled every candidate lands in the
+/// capable tier and the sink tier is empty, so callers need no special case.
+pub(super) fn partition_by_forwarding<'a>(
+    candidates: &'a [OpenCandidate],
+    forwarding_view: &ForwardingView,
+    eligibility: &crate::channel_lifecycle::config::EligibilityConfig,
+) -> (Vec<&'a OpenCandidate>, Vec<&'a OpenCandidate>) {
+    if !eligibility.demote_non_forwarding_peers {
+        return (candidates.iter().collect(), Vec::new());
+    }
+    let threshold = eligibility.minimum_peer_outgoing_channels.max(1) as u32;
+    candidates
+        .iter()
+        .partition(|c| forwarding_view.outgoing_channels(&c.addr) >= threshold)
 }
 
 /// Selects which peers to open channels with and which open channels to close.

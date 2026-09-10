@@ -202,14 +202,11 @@ impl MultiObjectiveSelector {
 #[async_trait]
 impl Selector for MultiObjectiveSelector {
     fn required_signals(&self) -> SignalSet {
-        let mut signals = SignalSet::default();
         if self.cfg.weights.stake > 0.0 {
-            signals = signals | SignalSet::STAKE;
+            SignalSet::STAKE
+        } else {
+            SignalSet::default()
         }
-        if self.cfg.demote_non_forwarding_peers {
-            signals = signals | SignalSet::FORWARDING;
-        }
-        signals
     }
 
     async fn select_closes(&self, ctx: &SelectorContext<'_>) -> Vec<ChannelId> {
@@ -305,14 +302,8 @@ impl Selector for MultiObjectiveSelector {
         // relay) can only be a path's last hop, so it is opened to only after
         // every capable peer — but it is never barred: when capable peers cannot
         // fill `limit`, the sink tier fills the rest.
-        let (capable, sinks): (Vec<&OpenCandidate>, Vec<&OpenCandidate>) = if self.cfg.demote_non_forwarding_peers {
-            let threshold = self.cfg.minimum_peer_outgoing_channels.max(1) as u32;
-            ctx.open_candidates
-                .iter()
-                .partition(|c| ctx.forwarding_view.outgoing_channels(&c.addr) >= threshold)
-        } else {
-            (ctx.open_candidates.iter().collect(), Vec::new())
-        };
+        let (capable, sinks) =
+            super::partition_by_forwarding(ctx.open_candidates, &ctx.forwarding_view, &ctx.cfg.eligibility);
 
         let mut result: Vec<(Address, OffchainPublicKey)> = Vec::new();
         let mut picked: HashSet<Address> = HashSet::new();
@@ -459,8 +450,6 @@ mod tests {
     fn required_signals_stake_zero() {
         let mut cfg = MultiObjectiveSelectorConfig::low_latency();
         cfg.weights.stake = 0.0;
-        // Isolate the STAKE bit from the independent FORWARDING signal.
-        cfg.demote_non_forwarding_peers = false;
         let sel = mk_selector(cfg);
         assert_eq!(sel.required_signals(), SignalSet::default());
     }
@@ -1031,13 +1020,15 @@ mod tests {
         ForwardingView::from_counts(pairs.iter().copied().collect())
     }
 
-    /// A base config that isolates the forwarding tiering from the fill-k sweep
-    /// (`k_floor = 0`) so a test asserts tier order alone.
+    /// A selector config that isolates the forwarding tiering from the fill-k
+    /// sweep (`k_floor = 0`) so a test asserts tier order alone.  Demotion itself
+    /// is a shared eligibility policy, enabled by default on
+    /// [`ChannelLifecycleConfig`].
     fn mo_demote() -> MultiObjectiveSelectorConfig {
         let mut mo = MultiObjectiveSelectorConfig::balanced();
         mo.k_floor = 0;
         mo.open_per_tick = 4;
-        mo // demote_non_forwarding_peers = true, minimum_peer_outgoing_channels = 1 (defaults)
+        mo
     }
 
     /// The load-bearing property: a ticket sink is a *last resort*, not a
@@ -1108,9 +1099,9 @@ mod tests {
         let mut mo = MultiObjectiveSelectorConfig::low_latency();
         mo.k_floor = 0;
         mo.open_per_tick = 4;
-        mo.demote_non_forwarding_peers = false;
         let sel = mk_selector(mo);
-        let lc_cfg = ChannelLifecycleConfig::default();
+        let mut lc_cfg = ChannelLifecycleConfig::default();
+        lc_cfg.eligibility.demote_non_forwarding_peers = false;
 
         let fast_sink = mk_candidate(addr(1), offchain_key(1), Some(10), 1.0, 1.0, 1);
         let slow_capable = mk_candidate(addr(2), offchain_key(2), Some(1000), 0.1, 0.0, 2);
@@ -1138,10 +1129,9 @@ mod tests {
     /// with exactly one outgoing channel is still a sink and is demoted.
     #[tokio::test]
     async fn minimum_peer_outgoing_channels_threshold() {
-        let mut mo = mo_demote();
-        mo.minimum_peer_outgoing_channels = 2;
-        let sel = mk_selector(mo);
-        let lc_cfg = ChannelLifecycleConfig::default();
+        let sel = mk_selector(mo_demote());
+        let mut lc_cfg = ChannelLifecycleConfig::default();
+        lc_cfg.eligibility.minimum_peer_outgoing_channels = 2;
 
         let one = mk_candidate(addr(1), offchain_key(1), Some(10), 1.0, 1.0, 1); // 1 outgoing → sink under threshold
         let two = mk_candidate(addr(2), offchain_key(2), Some(1000), 0.1, 0.0, 2); // 2 outgoing → capable
@@ -1164,19 +1154,5 @@ mod tests {
             vec![two.addr, one.addr],
             "a peer below minimum_peer_outgoing_channels is demoted like a zero-channel sink"
         );
-    }
-
-    #[test]
-    fn required_signals_forwarding_when_enabled() {
-        let mut mo = MultiObjectiveSelectorConfig::balanced();
-        mo.demote_non_forwarding_peers = true;
-        assert!(mk_selector(mo).required_signals().contains(SignalSet::FORWARDING));
-    }
-
-    #[test]
-    fn required_signals_no_forwarding_when_disabled() {
-        let mut mo = MultiObjectiveSelectorConfig::balanced();
-        mo.demote_non_forwarding_peers = false;
-        assert!(!mk_selector(mo).required_signals().contains(SignalSet::FORWARDING));
     }
 }
