@@ -15,7 +15,7 @@ use hopr_api::{
     PeerId,
     chain::{
         AccountSelector, ChainReadAccountOperations, ChainReadChannelOperations, ChainReadSafeOperations, ChainValues,
-        ChainWriteChannelOperations, ChannelSelector, SafeSelector,
+        ChainWriteChannelOperations, ChannelSelector, ChannelStatusDiscriminants, SafeSelector,
     },
     graph::{
         EdgeImmediateProtocolObservable as _, EdgeLinkObservable as _, EdgeObservableRead as _, NetworkGraphView as _,
@@ -34,8 +34,8 @@ use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
     config::ResolvedFunding,
     selector::{
-        BucketCell, BucketView, CloseCandidate, LatencyBucket, OpenCandidate, PeerEdgeInfo, SelectorContext, SignalSet,
-        StakeView, SubnetBucket,
+        BucketCell, BucketView, CloseCandidate, ForwardingView, LatencyBucket, OpenCandidate, PeerEdgeInfo,
+        SelectorContext, SignalSet, StakeView, SubnetBucket,
     },
 };
 
@@ -747,6 +747,14 @@ where
             StakeView::empty()
         };
 
+        // Per-peer funded-outgoing-channel counts — only computed when the active
+        // selector requests FORWARDING.
+        let forwarding_view = if self.selector.required_signals().contains(SignalSet::FORWARDING) {
+            self.fetch_forwarding_view(chain, deadline, &open_candidates).await
+        } else {
+            ForwardingView::empty()
+        };
+
         let selector_ctx = SelectorContext {
             cfg: &self.cfg,
             deficit,
@@ -755,6 +763,7 @@ where
             start_epoch_elapsed: self.start_epoch.elapsed(),
             bucket_view,
             stake_view,
+            forwarding_view,
         };
 
         self.emit_score_axis_metrics(&selector_ctx);
@@ -908,6 +917,58 @@ where
         });
 
         Some(map)
+    }
+
+    /// Counts each open candidate's funded outgoing channels — channels the peer
+    /// itself sources, in the `Open` state, to a distinct third party — and
+    /// returns them keyed by chain address.  Called only when the active selector
+    /// requests the `FORWARDING` signal.
+    ///
+    /// A single network-wide channel stream (served by the local indexer, the
+    /// same cost class as the tick's own-channel stream) is grouped by source; a
+    /// peer absent from the result has zero outgoing channels and is a ticket
+    /// sink.  Counts are restricted to candidate addresses to bound the returned
+    /// map.  When the stream is unavailable the view is empty, so no peer is
+    /// demoted for a chain read that simply did not answer.
+    async fn fetch_forwarding_view(
+        &self,
+        chain: &N::ChainApi,
+        deadline: Instant,
+        open_candidates: &[OpenCandidate],
+    ) -> ForwardingView {
+        let candidate_addrs: HashSet<Address> = open_candidates.iter().map(|c| c.addr).collect();
+        if candidate_addrs.is_empty() {
+            return ForwardingView::empty();
+        }
+
+        // source → set of distinct third-party destinations it funds an Open channel to.
+        let out_edges: Option<HashMap<Address, HashSet<Address>>> = self
+            .read("stream_channels (forwarding view)", deadline, async {
+                let mut edges: HashMap<Address, HashSet<Address>> = HashMap::new();
+                let selector = ChannelSelector::default().with_allowed_states(&[ChannelStatusDiscriminants::Open]);
+                let mut stream = chain.stream_channels(selector)?;
+                while let Some(ch) = stream.next().await {
+                    // Only candidate peers as source; the chain forbids self-loop
+                    // channels, so no `source == destination` guard is needed.
+                    if !candidate_addrs.contains(&ch.source) {
+                        continue;
+                    }
+                    edges.entry(ch.source).or_default().insert(ch.destination);
+                }
+                Ok::<_, <N::ChainApi as ChainReadChannelOperations>::Error>(edges)
+            })
+            .await;
+
+        match out_edges {
+            Some(edges) => {
+                let counts = edges
+                    .into_iter()
+                    .map(|(src, dests)| (src, dests.len() as u32))
+                    .collect();
+                ForwardingView::from_counts(counts)
+            }
+            None => ForwardingView::empty(),
+        }
     }
 
     /// Fetches on-chain safe balances for all candidate peers and returns
@@ -2008,6 +2069,74 @@ mod tests {
         }
     }
 
+    /// `fetch_forwarding_view` counts each candidate's own funded `Open` outgoing
+    /// channels to distinct third parties: a peer that sources channels is
+    /// forwarding-capable, a peer that sources none is a ticket sink (count 0).
+    #[tokio::test]
+    async fn fetch_forwarding_view_counts_outgoing_channels() -> anyhow::Result<()> {
+        // CHRIS sources two channels to distinct third parties; ALICE sources none.
+        let chris_alice = ChannelEntry::builder()
+            .between(*CHRIS, *ALICE)
+            .amount(5_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+        let chris_dave = ChannelEntry::builder()
+            .between(*CHRIS, *DAVE)
+            .amount(5_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([chris_alice, chris_dave])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let inner = fresh_inner_with_chain(ChannelLifecycleConfig::default(), Arc::clone(&connector));
+
+        let ok = *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[7u8; 32])
+            .expect("test key")
+            .public();
+        let cand = |a: Address| selector::OpenCandidate {
+            addr: a,
+            offchain_key: ok,
+            edge_info: selector::PeerEdgeInfo::default(),
+            ticket_score: 0.0,
+            subnet: selector::SubnetBucket::Unknown,
+        };
+        let candidates = vec![cand(*CHRIS), cand(*ALICE)];
+
+        let deadline = inner.read_deadline();
+        let view = inner
+            .fetch_forwarding_view(inner.node.chain_api(), deadline, &candidates)
+            .await;
+
+        assert_eq!(
+            view.outgoing_channels(&CHRIS),
+            2,
+            "CHRIS sources two distinct third-party channels"
+        );
+        assert_eq!(
+            view.outgoing_channels(&ALICE),
+            0,
+            "ALICE sources no channels — a ticket sink"
+        );
+        Ok(())
+    }
+
     /// try_open_channel: channel is already Open with stake >= lower_balance_threshold.
     /// Expected: no FundChannel tx submitted; open_in_flight empty after the call.
     #[tokio::test]
@@ -2425,6 +2554,7 @@ mod tests {
             start_epoch_elapsed: Duration::ZERO,
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
 
         let closes = selector::DefaultSelector.select_closes(&ctx).await;
@@ -2476,6 +2606,7 @@ mod tests {
             start_epoch_elapsed: Duration::ZERO,
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
         assert!(
             selector::DefaultSelector.select_closes(&ctx_no_data).await.is_empty(),
@@ -2501,6 +2632,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(10), // strategy running 10s > last_update 1s
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
         let closes = selector::DefaultSelector.select_closes(&ctx_with_data).await;
         assert_eq!(

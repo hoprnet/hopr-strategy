@@ -21,12 +21,14 @@ use crate::channel_lifecycle::ChannelLifecycleConfig;
 
 mod bucket;
 mod default;
+mod forwarding;
 mod multi_objective;
 mod stake;
 mod subnet;
 
 pub use bucket::{BucketCell, BucketView, LatencyBucket};
 pub use default::DefaultSelector;
+pub use forwarding::ForwardingView;
 pub use multi_objective::MultiObjectiveSelector;
 pub use stake::StakeView;
 pub use subnet::SubnetBucket;
@@ -38,6 +40,9 @@ pub use subnet::SubnetBucket;
 pub struct SignalSet(u8);
 
 impl SignalSet {
+    /// Pipeline should count each candidate's funded outgoing channels and
+    /// populate `ForwardingView`.
+    pub const FORWARDING: Self = Self(0b0010);
     /// Pipeline should fetch per-peer on-chain safe balance and populate `StakeView`.
     pub const STAKE: Self = Self(0b0001);
 
@@ -162,6 +167,9 @@ pub struct SelectorContext<'a> {
     /// Normalized on-chain safe-balance scores, keyed by peer chain address.
     /// Empty when the active selector did not request the `STAKE` signal.
     pub stake_view: StakeView,
+    /// Per-peer funded-outgoing-channel counts, keyed by peer chain address.
+    /// Empty when the active selector did not request the `FORWARDING` signal.
+    pub forwarding_view: ForwardingView,
 }
 
 /// Selects which peers to open channels with and which open channels to close.

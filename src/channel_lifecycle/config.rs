@@ -758,6 +758,23 @@ pub struct MultiObjectiveSelectorConfig {
     /// suppresses churn — once open, a channel stays open until quality is
     /// substantially worse than the open bar.
     pub hysteresis_gap: f64,
+    /// Prefer peers that fund their own outgoing channels.  When `true`, a
+    /// candidate with fewer than [`minimum_peer_outgoing_channels`] funded
+    /// outgoing channels is a *ticket sink*: it can only ever be a path's last
+    /// hop, never an intermediate relay, so it cannot carry the 2- and 3-hop
+    /// paths this node builds.  Such peers are ranked strictly below every
+    /// forwarding-capable candidate and are opened to only as a last resort when
+    /// no capable peer can fill an open slot — never barred.  Default: `true`.
+    ///
+    /// [`minimum_peer_outgoing_channels`]: Self::minimum_peer_outgoing_channels
+    pub demote_non_forwarding_peers: bool,
+    /// Funded outgoing channels a peer must source for it to count as
+    /// forwarding-capable rather than a ticket sink.  Only consulted when
+    /// [`demote_non_forwarding_peers`] is set.  Values below 1 are treated as 1
+    /// (a peer with zero outgoing channels is always a sink).  Default: 1.
+    ///
+    /// [`demote_non_forwarding_peers`]: Self::demote_non_forwarding_peers
+    pub minimum_peer_outgoing_channels: usize,
 }
 
 impl Default for MultiObjectiveSelectorConfig {
@@ -775,6 +792,8 @@ impl MultiObjectiveSelectorConfig {
             close_per_tick: 4,
             k_floor: 2,
             hysteresis_gap: 0.10,
+            demote_non_forwarding_peers: true,
+            minimum_peer_outgoing_channels: 1,
         }
     }
 
@@ -785,6 +804,8 @@ impl MultiObjectiveSelectorConfig {
             close_per_tick: 2,
             k_floor: 3,
             hysteresis_gap: 0.20,
+            demote_non_forwarding_peers: true,
+            minimum_peer_outgoing_channels: 1,
         }
     }
 
@@ -795,6 +816,8 @@ impl MultiObjectiveSelectorConfig {
             close_per_tick: 2,
             k_floor: 4,
             hysteresis_gap: 0.20,
+            demote_non_forwarding_peers: true,
+            minimum_peer_outgoing_channels: 1,
         }
     }
 
@@ -805,6 +828,8 @@ impl MultiObjectiveSelectorConfig {
             close_per_tick: 1,
             k_floor: 2,
             hysteresis_gap: 0.40,
+            demote_non_forwarding_peers: true,
+            minimum_peer_outgoing_channels: 1,
         }
     }
 
@@ -1614,8 +1639,26 @@ mod config_tests {
             .expect("custom profile must yield a config");
         assert_eq!(mo.open_per_tick, 5, "the overridden field");
         assert_eq!(mo.weights, SelectorWeights::default(), "weights default wholesale");
+        // A partial custom selector still defaults the forwarding-demotion knobs on.
+        assert!(mo.demote_non_forwarding_peers, "sink demotion defaults to enabled");
+        assert_eq!(
+            mo.minimum_peer_outgoing_channels, 1,
+            "capability threshold defaults to 1"
+        );
         // `selector` is outside the `Validate` tree, so `build()` checks this separately.
         mo.validate_trust_weights().map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn custom_selector_accepts_forwarding_overrides() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(
+            r#"{"selector":{"custom":{"demote_non_forwarding_peers":false,"minimum_peer_outgoing_channels":3}}}"#,
+        )
+        .context("custom selector with forwarding overrides")?;
+        let mo = cfg.selector.multi_objective_config().expect("custom profile");
+        assert!(!mo.demote_non_forwarding_peers);
+        assert_eq!(mo.minimum_peer_outgoing_channels, 3);
         Ok(())
     }
 
