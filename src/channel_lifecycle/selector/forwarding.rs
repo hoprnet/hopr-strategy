@@ -1,20 +1,19 @@
-//! Per-peer funded-outgoing-channel count, the "forwarding capability" signal.
+//! Per-peer funded-outgoing-channel count: the "forwarding capability" signal.
 //!
 //! A peer with no funded outgoing channels can only ever be the *last* hop of a
 //! path — it can never be an intermediate relay, so it cannot carry the 2- and
 //! 3-hop paths the strategy builds, nor route return traffic that earns us
-//! tickets.  The multi-objective selector uses this count to make such peers a
-//! last resort (see [`MultiObjectiveSelector`]), never to bar them.
-//!
-//! Populated only when the active selector requests the `FORWARDING` signal.
+//! tickets.  Every selector uses this count via
+//! [`partition_by_forwarding`](super::partition_by_forwarding) to make such
+//! peers a last resort, never to bar them.  Populated only when
+//! `eligibility.demote_non_forwarding_peers` is set.
 
 use std::collections::HashMap;
 
 use hopr_api::types::primitive::prelude::Address;
 
 /// Per-peer count of funded (`Open`) outgoing channels to distinct third
-/// parties, populated only when the active selector requests the `FORWARDING`
-/// signal.  Peers not present count `0`.
+/// parties.  Peers not present count `0`.
 pub struct ForwardingView {
     counts: HashMap<Address, u32>,
 }

@@ -739,21 +739,27 @@ where
         let bucket_view = BucketView::new(bucket_cells);
         self.emit_bucket_metrics(&bucket_view, &close_candidates);
 
-        // On-chain stake scores — only fetched when the active selector requests STAKE.
-        let stake_view = if self.selector.required_signals().contains(SignalSet::STAKE) {
-            self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
-                .await
-        } else {
-            StakeView::empty()
-        };
-
-        // Per-peer funded-outgoing-channel counts — computed only when sink
-        // demotion is enabled, and consumed by whichever selector is active.
-        let forwarding_view = if self.cfg.eligibility.demote_non_forwarding_peers {
-            self.fetch_forwarding_view(chain, deadline, &open_candidates).await
-        } else {
-            ForwardingView::empty()
-        };
+        // Two independent chain reads: stake scores (multi-objective STAKE
+        // signal) and funded-outgoing-channel counts (sink demotion, consumed by
+        // whichever selector is active).  Each is skipped when its consumer is off;
+        // when both run they overlap rather than serialize.
+        let (stake_view, forwarding_view) = futures::join!(
+            async {
+                if self.selector.required_signals().contains(SignalSet::STAKE) {
+                    self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
+                        .await
+                } else {
+                    StakeView::empty()
+                }
+            },
+            async {
+                if self.cfg.eligibility.demote_non_forwarding_peers {
+                    self.fetch_forwarding_view(chain, deadline, &open_candidates).await
+                } else {
+                    ForwardingView::empty()
+                }
+            },
+        );
 
         let selector_ctx = SelectorContext {
             cfg: &self.cfg,
@@ -920,16 +926,15 @@ where
     }
 
     /// Counts each open candidate's funded outgoing channels — channels the peer
-    /// itself sources, in the `Open` state, to a distinct third party — and
-    /// returns them keyed by chain address.  Called only when the active selector
-    /// requests the `FORWARDING` signal.
+    /// itself sources, in the `Open` state, to a third party other than this node
+    /// — keyed by chain address.  Computed only when sink demotion is enabled.
     ///
-    /// A single network-wide channel stream (served by the local indexer, the
-    /// same cost class as the tick's own-channel stream) is grouped by source; a
-    /// peer absent from the result has zero outgoing channels and is a ticket
-    /// sink.  Counts are restricted to candidate addresses to bound the returned
-    /// map.  When the stream is unavailable the view is empty, so no peer is
-    /// demoted for a chain read that simply did not answer.
+    /// One network-wide `Open`-channel stream (served by the local indexer) is
+    /// counted per source; a peer absent from the result has zero outgoing
+    /// channels and is a ticket sink.  Counts are restricted to candidate
+    /// addresses to bound the returned map.  When the stream is unavailable the
+    /// view is empty, so no peer is demoted for a chain read that simply did not
+    /// answer.
     async fn fetch_forwarding_view(
         &self,
         chain: &N::ChainApi,
@@ -942,11 +947,12 @@ where
         }
         let me = *chain.me();
 
-        // source → set of distinct third-party destinations it funds a usable
-        // onward Open channel to.
-        let out_edges: Option<HashMap<Address, HashSet<Address>>> = self
+        // Per candidate source, count its usable onward Open channels.  A channel
+        // is uniquely keyed by (source, destination), so each surviving edge is a
+        // distinct destination — no dedup needed.
+        let counts: Option<HashMap<Address, u32>> = self
             .read("stream_channels (forwarding view)", deadline, async {
-                let mut edges: HashMap<Address, HashSet<Address>> = HashMap::new();
+                let mut counts: HashMap<Address, u32> = HashMap::new();
                 let selector = ChannelSelector::default().with_allowed_states(&[ChannelStatusDiscriminants::Open]);
                 let mut stream = chain.stream_channels(selector)?;
                 while let Some(ch) = stream.next().await {
@@ -957,22 +963,15 @@ where
                     if !candidate_addrs.contains(&ch.source) || ch.balance.is_zero() || ch.destination == me {
                         continue;
                     }
-                    edges.entry(ch.source).or_default().insert(ch.destination);
+                    *counts.entry(ch.source).or_insert(0) += 1;
                 }
-                Ok::<_, <N::ChainApi as ChainReadChannelOperations>::Error>(edges)
+                Ok::<_, <N::ChainApi as ChainReadChannelOperations>::Error>(counts)
             })
             .await;
 
-        match out_edges {
-            Some(edges) => {
-                let counts = edges
-                    .into_iter()
-                    .map(|(src, dests)| (src, dests.len() as u32))
-                    .collect();
-                ForwardingView::from_counts(counts)
-            }
-            None => ForwardingView::empty(),
-        }
+        counts
+            .map(ForwardingView::from_counts)
+            .unwrap_or_else(ForwardingView::empty)
     }
 
     /// Fetches on-chain safe balances for all candidate peers and returns
