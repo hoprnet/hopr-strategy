@@ -1155,4 +1155,24 @@ mod tests {
             "a peer below minimum_peer_outgoing_channels is demoted like a zero-channel sink"
         );
     }
+
+    /// A `usize` threshold above `u32::MAX` must not wrap to 0 (which would mark
+    /// every peer capable and reverse the policy): even the maximum possible
+    /// channel count stays a sink.
+    #[test]
+    fn threshold_above_u32_max_is_not_truncated() {
+        let mut lc_cfg = ChannelLifecycleConfig::default();
+        lc_cfg.eligibility.minimum_peer_outgoing_channels = u32::MAX as usize + 1;
+
+        let cand = mk_candidate(addr(1), offchain_key(1), Some(50), 0.8, 0.5, 1);
+        let forwarding_view = fwd(&[(addr(1), u32::MAX)]); // the largest count representable
+
+        let (capable, sinks) =
+            super::super::partition_by_forwarding(std::slice::from_ref(&cand), &forwarding_view, &lc_cfg.eligibility);
+        assert!(
+            capable.is_empty(),
+            "count u32::MAX must not satisfy a threshold above u32::MAX"
+        );
+        assert_eq!(sinks.len(), 1);
+    }
 }

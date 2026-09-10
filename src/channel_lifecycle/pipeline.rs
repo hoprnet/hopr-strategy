@@ -940,17 +940,21 @@ where
         if candidate_addrs.is_empty() {
             return ForwardingView::empty();
         }
+        let me = *chain.me();
 
-        // source → set of distinct third-party destinations it funds an Open channel to.
+        // source → set of distinct third-party destinations it funds a usable
+        // onward Open channel to.
         let out_edges: Option<HashMap<Address, HashSet<Address>>> = self
             .read("stream_channels (forwarding view)", deadline, async {
                 let mut edges: HashMap<Address, HashSet<Address>> = HashMap::new();
                 let selector = ChannelSelector::default().with_allowed_states(&[ChannelStatusDiscriminants::Open]);
                 let mut stream = chain.stream_channels(selector)?;
                 while let Some(ch) = stream.next().await {
-                    // Only candidate peers as source; the chain forbids self-loop
-                    // channels, so no `source == destination` guard is needed.
-                    if !candidate_addrs.contains(&ch.source) {
+                    // Count only a candidate's *usable onward* edges: a drained
+                    // channel cannot relay, and a channel back to this node is not
+                    // an onward hop for a route this node builds.  (The chain
+                    // forbids self-loops, so no `source == destination` guard.)
+                    if !candidate_addrs.contains(&ch.source) || ch.balance.is_zero() || ch.destination == me {
                         continue;
                     }
                     edges.entry(ch.source).or_default().insert(ch.destination);
@@ -2070,34 +2074,44 @@ mod tests {
     }
 
     /// `fetch_forwarding_view` counts each candidate's own funded `Open` outgoing
-    /// channels to distinct third parties: a peer that sources channels is
-    /// forwarding-capable, a peer that sources none is a ticket sink (count 0).
+    /// channels to distinct third parties: a peer sourcing usable onward channels
+    /// is forwarding-capable, a peer sourcing none is a ticket sink (count 0).
+    /// Drained channels and channels back to this node are not usable onward
+    /// edges and must not count.
     #[tokio::test]
     async fn fetch_forwarding_view_counts_outgoing_channels() -> anyhow::Result<()> {
-        // CHRIS sources two channels to distinct third parties; ALICE sources none.
-        let chris_alice = ChannelEntry::builder()
-            .between(*CHRIS, *ALICE)
-            .amount(5_u32)
-            .ticket_index(0)
-            .status(ChannelStatus::Open)
-            .epoch(0)
-            .build()?;
-        let chris_dave = ChannelEntry::builder()
-            .between(*CHRIS, *DAVE)
-            .amount(5_u32)
-            .ticket_index(0)
-            .status(ChannelStatus::Open)
-            .epoch(0)
-            .build()?;
+        // `me` for the test connector is BOB (its chain key); a channel CHRIS -> BOB
+        // is not an onward hop for a route this node builds.
+        let drained_dest: Address = [9; Address::SIZE].into();
+
+        let mk = |src: Address, dst: Address, amount: u32| -> anyhow::Result<ChannelEntry> {
+            Ok(ChannelEntry::builder()
+                .between(src, dst)
+                .amount(amount)
+                .ticket_index(0)
+                .status(ChannelStatus::Open)
+                .epoch(0)
+                .build()?)
+        };
+
+        // CHRIS sources two usable onward channels (ALICE, DAVE) plus a drained
+        // one and one back to `me` (BOB) — the latter two must be excluded.
+        // ALICE sources none.
+        let channels = [
+            mk(*CHRIS, *ALICE, 5)?,
+            mk(*CHRIS, *DAVE, 5)?,
+            mk(*CHRIS, drained_dest, 0)?, // drained → cannot relay
+            mk(*CHRIS, *BOB, 5)?,         // back to this node → not an onward hop
+        ];
 
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE, &drained_dest],
                 false,
                 XDaiBalance::new_base(1),
                 HoprBalance::new_base(1000),
             )
-            .with_channels([chris_alice, chris_dave])
+            .with_channels(channels)
             .build_dynamic_client([1; Address::SIZE].into())
             .with_tx_simulation_delay(std::time::Duration::ZERO);
 
@@ -2127,7 +2141,7 @@ mod tests {
         assert_eq!(
             view.outgoing_channels(&CHRIS),
             2,
-            "CHRIS sources two distinct third-party channels"
+            "only the two funded onward channels count; drained and to-me are excluded"
         );
         assert_eq!(
             view.outgoing_channels(&ALICE),

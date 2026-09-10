@@ -186,10 +186,12 @@ pub(super) fn partition_by_forwarding<'a>(
     if !eligibility.demote_non_forwarding_peers {
         return (candidates.iter().collect(), Vec::new());
     }
-    let threshold = eligibility.minimum_peer_outgoing_channels.max(1) as u32;
+    // Compare in `usize`: a threshold above `u32::MAX` must not wrap to 0 and
+    // silently mark every peer forwarding-capable.
+    let threshold = eligibility.minimum_peer_outgoing_channels.max(1);
     candidates
         .iter()
-        .partition(|c| forwarding_view.outgoing_channels(&c.addr) >= threshold)
+        .partition(|c| forwarding_view.outgoing_channels(&c.addr) as usize >= threshold)
 }
 
 /// Selects which peers to open channels with and which open channels to close.
