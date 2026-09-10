@@ -101,6 +101,102 @@ impl MultiObjectiveSelector {
         };
         utility - penalty
     }
+
+    /// Runs the two-stage open selection (fill-k anonymity sweep, then utility
+    /// ranking) over one `tier` of candidates, appending picks to `result` up to
+    /// `limit`.
+    ///
+    /// `picked` and `fill_counts` are threaded in from the caller so that a later
+    /// tier neither re-picks a peer nor overfills an anonymity cell an earlier
+    /// tier already satisfied.  This lets [`select_opens`](Self::select_opens)
+    /// exhaust forwarding-capable peers before spilling into ticket sinks while
+    /// preserving every anonymity and utility invariant within each tier.
+    fn fill_opens(
+        &self,
+        tier: &[&OpenCandidate],
+        ctx: &SelectorContext<'_>,
+        limit: usize,
+        result: &mut Vec<(Address, OffchainPublicKey)>,
+        picked: &mut HashSet<Address>,
+        fill_counts: &mut HashMap<BucketCell, usize>,
+    ) {
+        if tier.is_empty() || result.len() >= limit {
+            return;
+        }
+        let k = self.cfg.k_floor;
+
+        // Score this tier by final score (utility − anonymity penalty) for fill-k ordering.
+        let mut scored: Vec<(&OpenCandidate, f64)> = tier
+            .iter()
+            .map(|&c| (c, Self::final_score_open(c, ctx, &self.cfg)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Stage 1 — Fill-k sweep: for each (latency, subnet) cell with count < k_floor,
+        // force-pick the highest-utility candidate that would land in that cell.
+        // Unknown-subnet candidates are excluded from the floor enforcement.
+        if k > 0 {
+            // Track cells we've already attempted to fill this sweep to avoid double-filling.
+            let mut attempted_cells: HashSet<BucketCell> = HashSet::new();
+
+            for (c, _score) in &scored {
+                if result.len() >= limit {
+                    break;
+                }
+                if matches!(c.subnet, SubnetBucket::Unknown) {
+                    continue;
+                }
+                let cell = BucketCell {
+                    latency: LatencyBucket::from_latency(c.edge_info.average_latency),
+                    subnet: c.subnet.clone(),
+                };
+                if attempted_cells.contains(&cell) {
+                    continue;
+                }
+                attempted_cells.insert(cell.clone());
+
+                let existing = ctx.bucket_view.cell_count(&cell);
+                let already_filling = fill_counts.get(&cell).copied().unwrap_or(0);
+                if existing + already_filling < k {
+                    // Pick the first (highest-utility) candidate in this underrepresented cell.
+                    if let Some((candidate, score)) = scored.iter().find(|(c2, _)| {
+                        !picked.contains(&c2.addr)
+                            && (BucketCell {
+                                latency: LatencyBucket::from_latency(c2.edge_info.average_latency),
+                                subnet: c2.subnet.clone(),
+                            }) == cell
+                    }) {
+                        debug!(
+                            addr = %candidate.addr,
+                            score,
+                            cell = ?cell,
+                            "channel-lifecycle: fill-k sweep open"
+                        );
+                        picked.insert(candidate.addr);
+                        *fill_counts.entry(cell).or_insert(0) += 1;
+                        result.push((candidate.addr, candidate.offchain_key));
+                    }
+                }
+            }
+        }
+
+        // Stage 2 — Utility ranking: fill remaining slots from highest final_score desc.
+        for (c, score) in &scored {
+            if result.len() >= limit {
+                break;
+            }
+            if picked.contains(&c.addr) {
+                continue;
+            }
+            debug!(
+                addr = %c.addr,
+                score,
+                "channel-lifecycle: multi-objective open candidate"
+            );
+            picked.insert(c.addr);
+            result.push((c.addr, c.offchain_key));
+        }
+    }
 }
 
 #[async_trait]
@@ -199,85 +295,25 @@ impl Selector for MultiObjectiveSelector {
     }
 
     async fn select_opens(&self, ctx: &SelectorContext<'_>) -> Vec<(Address, OffchainPublicKey)> {
-        let k = self.cfg.k_floor;
         let limit = self.cfg.open_per_tick.min(ctx.deficit);
 
-        // Score all candidates by final score (utility − anonymity penalty) for fill-k ordering.
-        let mut all_scored: Vec<(&OpenCandidate, f64)> = ctx
-            .open_candidates
-            .iter()
-            .map(|c| (c, Self::final_score_open(c, ctx, &self.cfg)))
-            .collect();
-        all_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Partition candidates into forwarding-capable peers and ticket sinks.
+        // A sink (too few funded outgoing channels to ever be an intermediate
+        // relay) can only be a path's last hop, so it is opened to only after
+        // every capable peer — but it is never barred: when capable peers cannot
+        // fill `limit`, the sink tier fills the rest.
+        let (capable, sinks) =
+            super::partition_by_forwarding(ctx.open_candidates, &ctx.forwarding_view, &ctx.cfg.eligibility);
 
         let mut result: Vec<(Address, OffchainPublicKey)> = Vec::new();
         let mut picked: HashSet<Address> = HashSet::new();
+        // Simulated per-cell fill counts, shared across tiers so the sink tier
+        // does not overfill an anonymity cell the capable tier already satisfied.
+        let mut fill_counts: HashMap<BucketCell, usize> = HashMap::new();
 
-        // Stage 1 — Fill-k sweep: for each (latency, subnet) cell with count < k_floor,
-        // force-pick the highest-utility candidate that would land in that cell.
-        // Unknown-subnet candidates are excluded from the floor enforcement.
-        if k > 0 {
-            // Track cells we've already attempted to fill this sweep to avoid double-filling.
-            let mut attempted_cells: HashSet<BucketCell> = HashSet::new();
-            // Simulate how many times each cell will be filled as we pick.
-            let mut fill_counts: HashMap<BucketCell, usize> = HashMap::new();
-
-            for (c, _score) in &all_scored {
-                if result.len() >= limit {
-                    break;
-                }
-                if matches!(c.subnet, SubnetBucket::Unknown) {
-                    continue;
-                }
-                let cell = BucketCell {
-                    latency: LatencyBucket::from_latency(c.edge_info.average_latency),
-                    subnet: c.subnet.clone(),
-                };
-                if attempted_cells.contains(&cell) {
-                    continue;
-                }
-                attempted_cells.insert(cell.clone());
-
-                let existing = ctx.bucket_view.cell_count(&cell);
-                let already_filling = fill_counts.get(&cell).copied().unwrap_or(0);
-                if existing + already_filling < k {
-                    // Pick the first (highest-utility) candidate in this underrepresented cell.
-                    if let Some((candidate, score)) = all_scored.iter().find(|(c2, _)| {
-                        !picked.contains(&c2.addr)
-                            && (BucketCell {
-                                latency: LatencyBucket::from_latency(c2.edge_info.average_latency),
-                                subnet: c2.subnet.clone(),
-                            }) == cell
-                    }) {
-                        debug!(
-                            addr = %candidate.addr,
-                            score,
-                            cell = ?cell,
-                            "channel-lifecycle: fill-k sweep open"
-                        );
-                        picked.insert(candidate.addr);
-                        *fill_counts.entry(cell).or_insert(0) += 1;
-                        result.push((candidate.addr, candidate.offchain_key));
-                    }
-                }
-            }
-        }
-
-        // Stage 2 — Utility ranking: fill remaining slots from highest final_score desc.
-        for (c, score) in &all_scored {
-            if result.len() >= limit {
-                break;
-            }
-            if picked.contains(&c.addr) {
-                continue;
-            }
-            debug!(
-                addr = %c.addr,
-                score,
-                "channel-lifecycle: multi-objective open candidate"
-            );
-            picked.insert(c.addr);
-            result.push((c.addr, c.offchain_key));
+        self.fill_opens(&capable, ctx, limit, &mut result, &mut picked, &mut fill_counts);
+        if result.len() < limit {
+            self.fill_opens(&sinks, ctx, limit, &mut result, &mut picked, &mut fill_counts);
         }
 
         result
@@ -297,7 +333,7 @@ mod tests {
     use crate::channel_lifecycle::{
         ChannelLifecycleConfig,
         config::MultiObjectiveSelectorConfig,
-        selector::{BucketView, PeerEdgeInfo, StakeView, SubnetBucket},
+        selector::{BucketView, ForwardingView, PeerEdgeInfo, StakeView, SubnetBucket},
     };
 
     fn mk_selector(cfg: MultiObjectiveSelectorConfig) -> MultiObjectiveSelector {
@@ -434,6 +470,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view: BucketView::default(),
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let opens = sel.select_opens(&ctx).await;
@@ -463,6 +500,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view: BucketView::default(),
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let opens = sel.select_opens(&ctx).await;
@@ -486,6 +524,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view: BucketView::default(),
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let opens = sel.select_opens(&ctx).await;
@@ -530,6 +569,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view,
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let opens = sel.select_opens(&ctx).await;
@@ -581,6 +621,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view,
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let opens = sel.select_opens(&ctx).await;
@@ -653,6 +694,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view,
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let closes = sel.select_closes(&ctx).await;
@@ -717,6 +759,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view,
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let closes = sel.select_closes(&ctx).await;
@@ -749,6 +792,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view: BucketView::default(),
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let opens = sel.select_opens(&ctx).await;
@@ -825,6 +869,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view,
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let closes = sel.select_closes(&ctx).await;
@@ -880,6 +925,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view: BucketView::default(),
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let closes = sel.select_closes(&ctx).await;
@@ -958,6 +1004,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(600),
             bucket_view,
             stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(),
         };
 
         let closes = sel.select_closes(&ctx).await;
@@ -965,5 +1012,167 @@ mod tests {
             closes.is_empty(),
             "channel with no graph observations must not be closed — it hasn't been measured yet"
         );
+    }
+
+    // ── Forwarding-capability tiering (ticket-sink demotion) ──────────────────
+
+    fn fwd(pairs: &[(Address, u32)]) -> ForwardingView {
+        ForwardingView::from_counts(pairs.iter().copied().collect())
+    }
+
+    /// A selector config that isolates the forwarding tiering from the fill-k
+    /// sweep (`k_floor = 0`) so a test asserts tier order alone.  Demotion itself
+    /// is a shared eligibility policy, enabled by default on
+    /// [`ChannelLifecycleConfig`].
+    fn mo_demote() -> MultiObjectiveSelectorConfig {
+        let mut mo = MultiObjectiveSelectorConfig::balanced();
+        mo.k_floor = 0;
+        mo.open_per_tick = 4;
+        mo
+    }
+
+    /// The load-bearing property: a ticket sink is a *last resort*, not a
+    /// weighted penalty.  A sink with the best possible latency/trust still ranks
+    /// below a forwarding-capable peer with the worst — capability wins over
+    /// score, because a sink can never be an intermediate hop.
+    #[tokio::test]
+    async fn sink_ranks_below_capable_even_when_faster() {
+        let sel = mk_selector(mo_demote());
+        let lc_cfg = ChannelLifecycleConfig::default();
+
+        let sink = mk_candidate(addr(1), offchain_key(1), Some(10), 1.0, 1.0, 1);
+        let capable = mk_candidate(addr(2), offchain_key(2), Some(1000), 0.1, 0.0, 2);
+        let forwarding_view = fwd(&[(addr(2), 1)]); // only the capable peer forwards
+
+        let ctx = SelectorContext {
+            cfg: &lc_cfg,
+            deficit: 4,
+            open_candidates: &[sink.clone(), capable.clone()],
+            close_candidates: &[],
+            start_epoch_elapsed: Duration::from_secs(600),
+            bucket_view: BucketView::default(),
+            stake_view: StakeView::empty(),
+            forwarding_view,
+        };
+
+        let opens = sel.select_opens(&ctx).await;
+        assert_eq!(
+            opens.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![capable.addr, sink.addr],
+            "a forwarding-capable peer must outrank a faster ticket sink"
+        );
+    }
+
+    /// Demotion never bars: when every candidate is a sink, they are still opened
+    /// to (the sink tier fills the slots the empty capable tier could not).
+    #[tokio::test]
+    async fn all_sinks_are_still_selected_not_barred() {
+        let sel = mk_selector(mo_demote());
+        let lc_cfg = ChannelLifecycleConfig::default();
+
+        let s1 = mk_candidate(addr(1), offchain_key(1), Some(50), 0.8, 0.5, 1);
+        let s2 = mk_candidate(addr(2), offchain_key(2), Some(60), 0.8, 0.5, 2);
+
+        let ctx = SelectorContext {
+            cfg: &lc_cfg,
+            deficit: 4,
+            open_candidates: &[s1.clone(), s2.clone()],
+            close_candidates: &[],
+            start_epoch_elapsed: Duration::from_secs(600),
+            bucket_view: BucketView::default(),
+            stake_view: StakeView::empty(),
+            forwarding_view: ForwardingView::empty(), // nobody forwards
+        };
+
+        let opens = sel.select_opens(&ctx).await;
+        assert_eq!(
+            opens.len(),
+            2,
+            "ticket sinks must still be opened to when they are the only candidates"
+        );
+    }
+
+    /// With demotion disabled the selector reproduces today's score-only ranking:
+    /// the faster peer wins even though the other one forwards.
+    #[tokio::test]
+    async fn demotion_disabled_ranks_by_score_only() {
+        let mut mo = MultiObjectiveSelectorConfig::low_latency();
+        mo.k_floor = 0;
+        mo.open_per_tick = 4;
+        let sel = mk_selector(mo);
+        let mut lc_cfg = ChannelLifecycleConfig::default();
+        lc_cfg.eligibility.demote_non_forwarding_peers = false;
+
+        let fast_sink = mk_candidate(addr(1), offchain_key(1), Some(10), 1.0, 1.0, 1);
+        let slow_capable = mk_candidate(addr(2), offchain_key(2), Some(1000), 0.1, 0.0, 2);
+        let forwarding_view = fwd(&[(addr(2), 5)]); // populated but ignored
+
+        let ctx = SelectorContext {
+            cfg: &lc_cfg,
+            deficit: 4,
+            open_candidates: &[fast_sink.clone(), slow_capable.clone()],
+            close_candidates: &[],
+            start_epoch_elapsed: Duration::from_secs(600),
+            bucket_view: BucketView::default(),
+            stake_view: StakeView::empty(),
+            forwarding_view,
+        };
+
+        let opens = sel.select_opens(&ctx).await;
+        assert_eq!(
+            opens[0].0, fast_sink.addr,
+            "with demotion disabled, the faster peer wins regardless of forwarding capability"
+        );
+    }
+
+    /// `minimum_peer_outgoing_channels` is the capability threshold: at 2, a peer
+    /// with exactly one outgoing channel is still a sink and is demoted.
+    #[tokio::test]
+    async fn minimum_peer_outgoing_channels_threshold() {
+        let sel = mk_selector(mo_demote());
+        let mut lc_cfg = ChannelLifecycleConfig::default();
+        lc_cfg.eligibility.minimum_peer_outgoing_channels = 2;
+
+        let one = mk_candidate(addr(1), offchain_key(1), Some(10), 1.0, 1.0, 1); // 1 outgoing → sink under threshold
+        let two = mk_candidate(addr(2), offchain_key(2), Some(1000), 0.1, 0.0, 2); // 2 outgoing → capable
+        let forwarding_view = fwd(&[(addr(1), 1), (addr(2), 2)]);
+
+        let ctx = SelectorContext {
+            cfg: &lc_cfg,
+            deficit: 4,
+            open_candidates: &[one.clone(), two.clone()],
+            close_candidates: &[],
+            start_epoch_elapsed: Duration::from_secs(600),
+            bucket_view: BucketView::default(),
+            stake_view: StakeView::empty(),
+            forwarding_view,
+        };
+
+        let opens = sel.select_opens(&ctx).await;
+        assert_eq!(
+            opens.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![two.addr, one.addr],
+            "a peer below minimum_peer_outgoing_channels is demoted like a zero-channel sink"
+        );
+    }
+
+    /// A `usize` threshold above `u32::MAX` must not wrap to 0 (which would mark
+    /// every peer capable and reverse the policy): even the maximum possible
+    /// channel count stays a sink.
+    #[test]
+    fn threshold_above_u32_max_is_not_truncated() {
+        let mut lc_cfg = ChannelLifecycleConfig::default();
+        lc_cfg.eligibility.minimum_peer_outgoing_channels = u32::MAX as usize + 1;
+
+        let cand = mk_candidate(addr(1), offchain_key(1), Some(50), 0.8, 0.5, 1);
+        let forwarding_view = fwd(&[(addr(1), u32::MAX)]); // the largest count representable
+
+        let (capable, sinks) =
+            super::super::partition_by_forwarding(std::slice::from_ref(&cand), &forwarding_view, &lc_cfg.eligibility);
+        assert!(
+            capable.is_empty(),
+            "count u32::MAX must not satisfy a threshold above u32::MAX"
+        );
+        assert_eq!(sinks.len(), 1);
     }
 }
