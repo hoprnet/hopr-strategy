@@ -297,13 +297,25 @@ fn default_safe_multisend_address() -> Address {
     Address::from(SAFE_MULTI_SEND_ADDRESS)
 }
 
-/// Cross-field validation that `validator`'s derive cannot express: each mode needs a different
-/// piece of configuration, and a missing one is a startup error rather than a first-deposit one.
-fn validate_mode_requirements(cfg: &CurvyDepositPoolConfig) -> Result<(), validator::ValidationError> {
+/// Cross-field validation: relayed submission needs somewhere to submit to.
+///
+/// Deliberately **not** a `#[validate(schema(...))]` on the config struct, and this is load-
+/// bearing rather than stylistic. `hoprd` validates its whole configuration as it parses the
+/// file, which happens before [`CurvyDepositPool::new`] applies the `HOPRD_CURVY_*` overrides —
+/// so a derive here rejects a file that an override was about to make valid. That is exactly the
+/// localcluster's shape: it cannot write `submission` into its YAML (the harness builds the PIX
+/// stanza from the *plain* pool's config type, which has no such field), so it sets
+/// `HOPRD_CURVY_SUBMISSION=operator` in the environment and omits `relayer_url` because nothing
+/// relayed runs there. As a derive, that configuration killed all four nodes at startup.
+///
+/// Called from `new` instead, once the overrides are in, so it judges the configuration the pool
+/// will actually run with rather than the one on disk.
+fn validate_mode_requirements(cfg: &CurvyDepositPoolConfig) -> Result<(), StrategyError> {
     if cfg.submission == CurvySubmission::Relayer && cfg.relayer_url.is_none() {
-        return Err(validator::ValidationError::new(
-            "relayer_url is required when submission is `relayer`",
-        ));
+        return Err(StrategyError::InvalidConfiguration(format!(
+            "`submission: relayer` needs `relayer_url`; set it, or select `submission: operator` \
+             (or {SUBMISSION_ENV}=operator) to sign and submit from this node"
+        )));
     }
     Ok(())
 }
@@ -323,7 +335,6 @@ fn validate_min_1sec(duration: &Duration) -> Result<(), validator::ValidationErr
 /// `max_deposit_tracking_time`) mean the same thing in both.
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, smart_default::SmartDefault, Validate)]
-#[validate(schema(function = "validate_mode_requirements", skip_on_field_errors = false))]
 pub struct CurvyDepositPoolConfig {
     /// Blokli endpoint the pool discovers the Curvy deployment through, reads the note index
     /// from and submits its transactions to. Default: `http://localhost:8080/`, a placeholder an
@@ -683,6 +694,8 @@ where
             })?);
         }
         StrategyError::validate_config(&cfg)?;
+        // After the overrides, so an env-selected mode is judged rather than the file's default.
+        validate_mode_requirements(&cfg)?;
 
         // The operator key signs proofs only when this node submits them itself. A relayed node
         // needs no EVM key of its own: the relayer submits aggregations and withdrawals, the

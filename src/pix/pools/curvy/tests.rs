@@ -982,15 +982,21 @@ fn mode_values_parse_case_insensitively_and_reject_anything_else() -> anyhow::Re
 
 #[test]
 fn relaying_requires_a_relayer_url_and_self_submission_does_not() -> anyhow::Result<()> {
-    // The default (relayed) config carries no URL, so it must not validate as written: an
-    // operator has to name the relayer before a node will start.
-    assert!(StrategyError::validate_config(&CurvyDepositPoolConfig::default()).is_err());
+    // The rule is unchanged; where it runs is. It is no longer a `#[validate(schema(...))]` on
+    // the config struct, because `hoprd` runs those as it parses the file — before the pool
+    // applies its `HOPRD_CURVY_*` overrides. See `validate_mode_requirements`.
+    let error = validate_mode_requirements(&CurvyDepositPoolConfig::default())
+        .expect_err("the default is relayed and carries no URL");
+    let message = error.to_string();
+    // The message has to name both ways out; it is what an operator sees at startup.
+    assert!(message.contains("relayer_url"), "{message}");
+    assert!(message.contains("HOPRD_CURVY_SUBMISSION=operator"), "{message}");
 
     let relayed = CurvyDepositPoolConfig {
         relayer_url: Some("https://api.curvy.box".parse()?),
         ..Default::default()
     };
-    StrategyError::validate_config(&relayed)?;
+    validate_mode_requirements(&relayed)?;
 
     // What the localcluster runs: no off-chain infrastructure, so no URL is needed.
     let self_submitted = CurvyDepositPoolConfig {
@@ -998,7 +1004,23 @@ fn relaying_requires_a_relayer_url_and_self_submission_does_not() -> anyhow::Res
         shielding: CurvyShielding::Portal,
         ..Default::default()
     };
-    StrategyError::validate_config(&self_submitted)?;
+    validate_mode_requirements(&self_submitted)?;
+    Ok(())
+}
+
+#[test]
+fn a_file_an_override_can_fix_still_parses_and_validates() -> anyhow::Result<()> {
+    // The localcluster's exact shape, and what killed all four nodes: no `submission` key (so it
+    // defaults to `relayer`) and no `relayer_url`, with the mode supplied by
+    // `HOPRD_CURVY_SUBMISSION` at startup. `hoprd` validates the file as it parses it, long
+    // before the pool applies its overrides, so deserialising plus `Validate` must NOT reject
+    // this. Enforcing the cross-field rule there is what made a valid deployment unstartable.
+    let cfg: CurvyDepositPoolConfig =
+        serde_json::from_str(r#"{"blokli_url":"http://127.0.0.1:8080/"}"#)?;
+    assert_eq!(cfg.submission, CurvySubmission::Relayer, "the default is unchanged");
+    assert!(cfg.relayer_url.is_none());
+    StrategyError::validate_config(&cfg)
+        .map_err(|error| anyhow::anyhow!("a file an override can fix must still validate: {error}"))?;
     Ok(())
 }
 
