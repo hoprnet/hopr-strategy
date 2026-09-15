@@ -12,9 +12,11 @@ hopr-api = { workspace = true, features = ["node", "serde"] }
 # `strategy-pix-test` rather than bare `strategy-pix`: the latter is the pool-less engine,
 # and `tests/pix.rs` drives a concrete pool — `build_non_anonymous` and
 # `plain::NonAnonymousDepositPoolConfig` exist only once that pool's feature is on. Only the
-# `plain` pool is enabled because it is the only implemented one; `strategy-pix-curvy` is a stub
-# whose methods panic, so there is nothing for it to drive yet. The two features are additive, so
-# adding it here later needs no restructuring — only tests worth writing.
+# `plain` pool is enabled here: it settles on the emulated chain these fixtures provide, whereas
+# the curvy pool settles in a Curvy deployment the emulator does not model. The curvy pool is
+# tested in-crate over a scripted note index and a fake SDK bridge (`pix::pools::curvy::tests`),
+# and end to end through hoprd's localcluster. The two features are additive, so adding it here
+# later needs no restructuring.
 hopr-strategy = { workspace = true, features = [
   "runtime-tokio",
   "strategy-auto-funding",

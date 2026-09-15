@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.97"
-version      = "4.0.1"
+version      = "5.0.0"
 
 [lib]
 crate-type = ["rlib"]
@@ -41,14 +41,32 @@ strategy-pix = [
 # **For testing and development only.** The pool settles with plain, fully visible on-chain
 # transfers, so every deposit and sweep is linkable — it offers no anonymity at all.
 strategy-pix-test = ["dep:hopr-chain-connector", "strategy-pix"]
-# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses).
+# `CurvyDepositPool`, keyed on `BjjKeypair` (Baby JubJub deposit addresses): settlement through
+# the Curvy shielded pool, with per-SSA stealth scan identities for private note discovery.
 #
 # Pair with `hopr-crypto-packet/pix-bjj`, which is the default, so a consumer enabling this
 # feature and nothing else already agrees.
 #
-# NOTE: the pool itself is a stub whose methods panic. The feature wiring is final; the
-# implementation is not.
-strategy-pix-curvy = ["strategy-pix"]
+# Pulls in the Curvy SDK (`curvy-sdk`), the Curvy stealth-address and note primitives
+# (`curvy-core`), and `blokli-client`'s `curvy` query surface for note discovery. The SDK needs
+# the Curvy proving artifacts on disk at runtime (`CURVY_ZK_KEYS_DIR`) — see the README.
+strategy-pix-curvy = [
+  "blokli-client/curvy",
+  "dep:babyjubjub-ec",
+  "dep:blokli-client",
+  "dep:const-hex",
+  "dep:curvy-abi",
+  "dep:curvy-chain-api",
+  "dep:curvy-chain-blokli",
+  "dep:curvy-core",
+  "dep:curvy-sdk",
+  "dep:curvy-types",
+  "dep:reqwest",
+  "dep:serde_json",
+  "dep:zeroize",
+  "hopr-api/types-curvy",
+  "strategy-pix",
+]
 
 [dependencies]
 anyhow              = { workspace = true }
@@ -79,7 +97,11 @@ hopr-utils = { workspace = true, default-features = false }
 moka = { workspace = true, features = ["sync"] }
 parking_lot = { workspace = true }
 
-# Optional dep enabled by the `strategy-pix` feature.
+# Optional deps enabled by the `strategy-pix-curvy` feature. `blokli-client`'s `testing`
+# feature is deliberately not enabled here — a production curvy build must not inherit the test
+# emulator; the crate's own tests get it through the dev-dependency below.
+blokli-client = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
   "macros",
   "rt",
@@ -95,6 +117,23 @@ chacha20poly1305 = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 scrypt = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
+
+# Curvy deposit pool — enabled via the `strategy-pix-curvy` feature.
+babyjubjub-ec = { workspace = true, optional = true }
+const-hex     = { workspace = true, optional = true }
+curvy-abi     = { workspace = true, optional = true }
+# The relayer's HTTP surface. Already in the graph via `blokli-client` and `alloy`, so this
+# declares a dependency rather than adding one.
+curvy-chain-api = { workspace = true, optional = true }
+curvy-chain-blokli = { workspace = true, optional = true }
+curvy-core = { workspace = true, optional = true }
+curvy-sdk = { workspace = true, optional = true }
+curvy-types = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, default-features = false, features = [
+  "json",
+  "rustls",
+] }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 blokli-client = { workspace = true, features = ["testing"] }
@@ -125,13 +164,24 @@ members  = ["tests/integration"]
 resolver = "3"
 
 [workspace.dependencies]
-anyhow               = "1.0.104"
-async-trait          = "0.1.92"
-backon               = { version = "1.6.0", default-features = false }
-blokli-client        = "0.33.1"
-bytesize             = { version = "2.7.0", features = ["serde"] }
-chacha20poly1305     = "0.11.0"
-chrono               = { version = "0.4.45", default-features = false }
+anyhow           = "1.0.104"
+async-trait      = "0.1.92"
+babyjubjub-ec    = { version = "0.4.0", features = ["arithmetic"] }
+backon           = { version = "1.6.0", default-features = false }
+blokli-client    = "0.33.1"
+bytesize         = { version = "2.7.0", features = ["serde"] }
+chacha20poly1305 = "0.11.0"
+chrono           = { version = "0.4.45", default-features = false }
+const-hex        = "1.19.1"
+# The Curvy crates are pre-release and change API between release candidates; `curvy-sdk` pins
+# `curvy-core` exactly (rc.6 is the last `curvy-core`), so the rs-sdk crates must name the same
+# candidate and move together.
+curvy-abi            = "=0.1.0-rc.7"
+curvy-chain-api      = "=0.1.0-rc.7"
+curvy-chain-blokli   = "=0.1.0-rc.7"
+curvy-core           = "=0.1.0-rc.6"
+curvy-sdk            = "=0.1.0-rc.7"
+curvy-types          = "=0.1.0-rc.7"
 dashmap              = "6.2.1"
 futures              = "0.3.34"
 futures-concurrency  = "7.7.1"
@@ -148,6 +198,7 @@ mockall              = "0.15.0"
 moka                 = "0.12.16"
 parking_lot          = "0.12.5"
 redb                 = "4.2.0"
+reqwest              = { version = "0.13.4", default-features = false }
 rstest               = "0.27.0"
 scrypt               = "0.12.0"
 serde                = "1.0.229"
@@ -162,6 +213,7 @@ thiserror            = "2.0.20"
 tokio                = "1.53.1"
 tracing              = "0.1.44"
 validator            = "0.21.0"
+zeroize              = "1.8.1"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
