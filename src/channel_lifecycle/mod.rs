@@ -353,12 +353,17 @@ mod action_leases {
     }
 }
 
-/// Per-channel observation snapshot used by the proactive funding estimate.
+/// Per-channel observation snapshot used by the proactive funding estimate and
+/// by the closure-cooldown reconciliation.
 #[derive(Clone)]
 struct ChannelObservation {
     balance: HoprBalance,
     ticket_index: u64,
     at: Instant,
+    /// Whether the channel was `Closed` when last observed. Lets the snapshot pass
+    /// start the reopen cooldown on the first tick a closure is seen, covering a
+    /// lost or delayed `Closed` event.
+    closed: bool,
 }
 
 /// Cached `peer_id → (offchain key, chain address)` map plus the timestamp at
@@ -405,4 +410,10 @@ struct ChannelLifecycleStrategyInner<N> {
     /// event-driven funding handler so it reuses per-tick values instead of
     /// issuing fresh chain RPC calls on every balance-decrease event.
     last_resolved_funding: Arc<Mutex<Option<ResolvedFunding>>>,
+    /// Consecutive ticks each channel's destination peer has been observed
+    /// disconnected.  Debounces the connectivity close trigger against a single
+    /// missed observation (see [`ClosureConfig::close_after_disconnected_ticks`]);
+    /// reset to zero on any tick the peer is connected, and pruned to live
+    /// channels each tick so it cannot grow without bound.
+    disconnect_streak: Arc<DashMap<Address, usize>>,
 }

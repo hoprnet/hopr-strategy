@@ -113,6 +113,10 @@ impl Selector for MultiObjectiveSelector {
         }
     }
 
+    fn max_closes_per_tick(&self) -> Option<usize> {
+        Some(self.cfg.close_per_tick)
+    }
+
     async fn select_closes(&self, ctx: &SelectorContext<'_>) -> Vec<ChannelId> {
         let k = self.cfg.k_floor;
 
