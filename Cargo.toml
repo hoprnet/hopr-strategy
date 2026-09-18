@@ -171,3 +171,6 @@ ignored = ["humantime-serde"]
 [patch.crates-io]
 hopr-types = { git = "https://github.com/hoprnet/hopr-types", branch = "lukas/extended-offchain-key" }
 hopr-api = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/extended-offchain-key" }
+# Only reached under `strategy-pix-test`, but kept on the branch so the whole train resolves to
+# one hopr-impls tree rather than a mix of branch and published crates.
+hopr-chain-connector = { git = "https://github.com/hoprnet/hopr-impls", branch = "lukas/extended-offchain-key" }
