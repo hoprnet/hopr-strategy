@@ -14,12 +14,18 @@ use validator::Validate;
 
 /// Paid downstream relay hops every channel stake is sized for.
 ///
-/// Fixed at the longest path the protocol can encode — not a tuning parameter.  A ticket's
-/// face value is `ticket_price × hops / win_prob`, and the issuing node cannot know how long
-/// a path a given packet will take, so sizing below the maximum under-funds the tickets a
-/// relayer must issue and the channel stalls mid-relay on any path that exceeds the guess.
-/// Sizing at the maximum over-funds shorter paths instead, which only leaves balance idle
-/// until the channel closes.
+/// Sourced from hopr-lib's published maximum intermediate hop count
+/// ([`RoutingOptions::MAX_INTERMEDIATE_HOPS`]) — the longest path the protocol can encode,
+/// not a tuning parameter, and currently `3`. hopr-lib publishes it as this routing constant
+/// rather than as a per-node chain value (the chain exposes ticket price and win probability,
+/// but no path-length), so it is read from there rather than the chain interface, and the
+/// value falls back to the protocol maximum whichever way it is obtained.
+///
+/// A ticket's face value is `ticket_price × hops / win_prob`, and the issuing node cannot know
+/// how long a path a given packet will take, so sizing below the maximum under-funds the
+/// tickets a relayer must issue and the channel stalls mid-relay on any path that exceeds the
+/// guess. Sizing at the maximum over-funds shorter paths instead, which only leaves balance
+/// idle until the channel closes.
 pub(crate) const ASSUMED_HOPS: u32 = RoutingOptions::MAX_INTERMEDIATE_HOPS as u32;
 
 /// Population thresholds: how many open channels to maintain.
