@@ -340,6 +340,12 @@ pub struct ResolvedFunding {
     pub topup_balance: HoprBalance,
     /// Channel balance below which a top-up is triggered.
     pub lower_balance_threshold: HoprBalance,
+    /// Face value of one winning ticket (`price × hops / win_prob`): the least a
+    /// channel must hold to issue its next ticket, and the quantum every stake is a
+    /// whole multiple of.  When the safe cannot afford a full [`Self::topup_balance`],
+    /// the fund pass tops up the largest whole number of these the safe can still
+    /// supply — anything below one funds no issuable ticket and is left unspent.
+    pub face_value: HoprBalance,
 }
 
 impl ResolvedFunding {
@@ -374,6 +380,7 @@ impl ResolvedFunding {
     ///     initial_balance: HoprBalance::new_base(100),
     ///     topup_balance: HoprBalance::new_base(10),
     ///     lower_balance_threshold: HoprBalance::new_base(5),
+    ///     face_value: HoprBalance::new_base(1),
     /// };
     ///
     /// // Nothing outstanding: no standing minimum.
@@ -456,6 +463,29 @@ fn whole_tickets(tickets: f64) -> f64 {
     }
 }
 
+/// wei value of one winning ticket, `price × hops / win_prob`, with `win_prob`
+/// clamped to `[f64::EPSILON, 1.0]` (NaN → EPSILON) so the ratio can neither
+/// diverge to `f64::INFINITY` nor go non-positive.  This is the one-ticket floor
+/// [`capacity_to_balance`] quantises every stake to; kept here as the single
+/// definition of the formula so callers cannot drift from it.
+fn winning_ticket_face_value_wei(price_wei: f64, win_prob: f64, hops: u32) -> f64 {
+    let p = if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    };
+    price_wei * hops as f64 / p
+}
+
+/// Face value of one winning ticket as a [`HoprBalance`] — the least a channel must
+/// hold to issue its next ticket, and the quantum every stake is a whole multiple
+/// of.  Rounds up to whole wei (the on-chain face value is integer wei), so a
+/// top-up sized in these units can never land a wei below an issuable ticket.
+pub(crate) fn winning_ticket_face_value(price: HoprBalance, win_prob: f64, hops: u32) -> HoprBalance {
+    let wei = winning_ticket_face_value_wei(price.amount().low_u128() as f64, win_prob, hops);
+    HoprBalance::from(U256::from(wei.ceil() as u128))
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
@@ -505,7 +535,7 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
     // A channel pays out in whole tickets of this face value, and it must always
     // be able to issue at least one or it cannot relay at all — so it is both the
     // floor and the quantum.
-    let face_value = price_f64 * h / p;
+    let face_value = winning_ticket_face_value_wei(price_f64, win_prob, hops);
 
     // Quantise up to a whole number of tickets.  A remainder below one face value
     // can never leave the channel, so it funds no further ticket and buys none of
@@ -569,6 +599,7 @@ impl FundingConfig {
                 hops,
                 mode,
             ),
+            face_value: winning_ticket_face_value(price, win_prob, hops),
         }
     }
 }
@@ -1373,6 +1404,38 @@ mod config_tests {
         assert_eq!(r.initial_balance, cap(cfg.initial_capacity));
         assert_eq!(r.topup_balance, cap(cfg.topup_capacity));
         assert_eq!(r.lower_balance_threshold, cap(cfg.lower_capacity_threshold));
+    }
+
+    // ── winning ticket face value ─────────────────────────────────────────────
+
+    /// The face value is `price × hops / win_prob`, in whole wei.
+    #[test]
+    fn winning_ticket_face_value_is_price_times_hops_over_win_prob() {
+        // 0.01 wxHOPR × 3 hops / 0.5 = 0.06 wxHOPR.
+        let f = winning_ticket_face_value(balance_from_wei(PRICE_WEI), 0.5, 3);
+        assert_eq!(f, balance_from_wei(PRICE_WEI * 3 * 2));
+    }
+
+    /// A non-positive or NaN win probability is clamped rather than diverging, and
+    /// yields a larger face value than a certain-win ticket — never zero, never a panic.
+    #[test]
+    fn winning_ticket_face_value_clamps_nonpositive_win_prob() {
+        let clamped = winning_ticket_face_value(balance_from_wei(PRICE_WEI), 0.0, 3);
+        let certain = winning_ticket_face_value(balance_from_wei(PRICE_WEI), 1.0, 3);
+        assert!(!certain.is_zero());
+        assert!(clamped > certain, "p→0 must inflate the face value, not collapse it");
+    }
+
+    /// `resolve` exposes exactly the standalone face value, so the fund pass and any
+    /// recommendation agree on the top-up quantum.
+    #[test]
+    fn resolve_exposes_the_winning_ticket_face_value() {
+        let r = FundingConfig::default().resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert_eq!(
+            r.face_value,
+            winning_ticket_face_value(balance_from_wei(PRICE_WEI), 0.5, ASSUMED_HOPS)
+        );
+        assert!(!r.face_value.is_zero());
     }
 
     // ── ResolvedFunding::required_safe_balance ────────────────────────────────

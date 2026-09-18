@@ -667,7 +667,7 @@ where
             // Needy, not-already-in-flight channels — collected before anything is
             // spent, so the demand figure below (and the loop after it) see every
             // candidate rather than only those the safe turned out to afford.
-            let fund_candidates: Vec<(&ChannelEntry, &'static str)> = open_channels
+            let mut fund_candidates: Vec<(&ChannelEntry, &'static str)> = open_channels
                 .iter()
                 .copied()
                 .filter(|ch| !self.fund_in_flight.is_held(ch.get_id()) && !self.close_in_flight.is_held(ch.get_id()))
@@ -688,6 +688,13 @@ where
                 })
                 .collect();
 
+            // Fund the neediest first. It only changes anything when the safe is too
+            // low to cover every candidate this tick — then the scarce balance rescues
+            // the channel closest to being unable to issue a ticket, rather than
+            // whichever happened to come first in the channel list.
+            fund_candidates
+                .sort_by(|(a, _), (b, _)| a.balance.partial_cmp(&b.balance).unwrap_or(std::cmp::Ordering::Equal));
+
             // What the safe must hold for this node to meet the demand it can see:
             // one top-up per needy channel, plus one opening stake per channel
             // missing from the population floor. Zero when nothing is outstanding.
@@ -703,22 +710,52 @@ where
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_REQUIRED_SAFE_BALANCE.set(required_safe.amount().low_u128() as f64);
 
-            if funding.topup_balance.is_zero() {
+            if funding.topup_balance.is_zero() || funding.face_value.is_zero() {
                 debug!("channel-lifecycle: fund pass skipped: resolved topup is zero");
             } else {
                 for (ch, reason) in fund_candidates {
-                    debug!(%ch, reason, safe_remaining = %safe_remaining, "channel-lifecycle: fund candidate");
-                    if safe_remaining < funding.topup_balance {
+                    // Fund a full top-up when the safe can afford one; otherwise the
+                    // largest whole number of winning-ticket face values it can still
+                    // supply, so a channel keeps issuing tickets instead of stranding
+                    // both it and the leftover safe balance. A remainder below one face
+                    // value funds no issuable ticket, so it is left unspent.
+                    let amount = if safe_remaining >= funding.topup_balance {
+                        funding.topup_balance
+                    } else {
+                        let remainder = safe_remaining.amount() % funding.face_value.amount();
+                        safe_remaining - HoprBalance::from(remainder)
+                    };
+
+                    if amount.is_zero() {
+                        // The neediest channel cannot be given even one ticket; no later
+                        // (less needy) candidate could either, so stop the pass.
                         warn!(
                             %safe_remaining,
-                            topup = %funding.topup_balance,
-                            "channel-lifecycle: fund pass stopped: safe cannot afford another top-up"
+                            face_value = %funding.face_value,
+                            "channel-lifecycle: fund pass stopped: safe cannot fund even one winning ticket"
                         );
                         state.set(StrategyState::Degraded);
                         break;
                     }
-                    if self.try_fund_channel(ch, funding.topup_balance) {
-                        safe_remaining -= funding.topup_balance;
+
+                    if amount < funding.topup_balance {
+                        // Partial top-up: the channel is kept alive, but the safe is
+                        // short of a full top-up, so demand is not met — still Degraded.
+                        warn!(
+                            %ch,
+                            reason,
+                            amount = %amount,
+                            topup = %funding.topup_balance,
+                            %safe_remaining,
+                            "channel-lifecycle: partial top-up: safe below a full top-up, funding whole winning tickets"
+                        );
+                        state.set(StrategyState::Degraded);
+                    } else {
+                        debug!(%ch, reason, safe_remaining = %safe_remaining, "channel-lifecycle: fund candidate");
+                    }
+
+                    if self.try_fund_channel(ch, amount) {
+                        safe_remaining -= amount;
                     }
                 }
             }
@@ -1351,6 +1388,11 @@ mod tests {
             lower_balance_threshold: lower,
             topup_balance: topup,
             initial_balance: initial,
+            // face_value == topup makes a top-up exactly one whole ticket, so the
+            // partial-funding path only ever funds the full amount or nothing —
+            // the all-or-nothing behaviour these pass-level unit tests were written
+            // against. Tests exercising partial funding set economics explicitly.
+            face_value: topup,
         }
     }
 
@@ -1860,6 +1902,78 @@ mod tests {
             inner.state(),
             StrategyState::Degraded,
             "safe is short of the one top-up it wants to make"
+        );
+
+        Ok(())
+    }
+
+    /// A safe that cannot afford a full top-up but holds at least one winning-ticket
+    /// face value must still fund the drained channel with the largest whole number
+    /// of face values it can supply — keeping the channel able to issue tickets
+    /// rather than stranding both it and the leftover safe balance. The strategy
+    /// still reports `Degraded`, because a partial top-up leaves demand unmet.
+    #[tokio::test]
+    async fn fund_pass_partially_tops_up_when_the_safe_cannot_afford_a_full_topup() -> anyhow::Result<()> {
+        let start_balance = HoprBalance::from(2_u32); // 2 wei, far below the 3 wxHOPR threshold
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(2_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                // Between one face value (3 wxHOPR) and a full top-up (6 wxHOPR):
+                // enough for exactly one whole winning ticket, not two.
+                HoprBalance::new_base(4),
+            )
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        // 1037 bytes = 2 packets at a 1036-byte payload → topup = 2 × 3 = 6 wxHOPR,
+        // while one face value (the fund quantum) stays 3 wxHOPR.
+        let cfg = ChannelLifecycleConfig {
+            funding: FundingConfig {
+                lower_capacity_threshold: ByteSize::b(1),
+                topup_capacity: ByteSize::b(1037),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+        inner.run_pipeline().await;
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "a partial top-up leaves demand unmet, so the strategy stays Degraded"
+        );
+
+        // `try_fund_channel` only *submits* the tx; let the spawned task run and the
+        // zero-delay simulator confirm before reading the channel back.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let channels: Vec<ChannelEntry> = connector
+            .stream_channels(ChannelSelector::default().with_source(*BOB))
+            .context("failed to stream channels for BOB")?
+            .collect()
+            .await;
+        let funded = channels.first().context("BOB channel missing after fund pass")?;
+        assert_eq!(
+            funded.balance,
+            start_balance + HoprBalance::new_base(3),
+            "channel must receive exactly one whole face value (3 wxHOPR), not a full 6 wxHOPR top-up; got {funded:?}"
         );
 
         Ok(())

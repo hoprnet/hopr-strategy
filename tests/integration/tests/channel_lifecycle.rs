@@ -64,6 +64,73 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
     Ok(())
 }
 
+/// Partial top-up: when the safe cannot afford a full `topup_balance` but still
+/// holds at least one winning-ticket face value, the fund pass tops the channel
+/// up with the largest whole number of face values the safe can supply, keeping it
+/// able to issue tickets rather than stranding both it and the leftover balance.
+///
+/// Economics (ticket price 1 wxHOPR, win_prob 1.0, hops 3): one face value is
+/// 3 wxHOPR. `topup_capacity = ByteSize::b(1037)` = 2 packets resolves to a full
+/// top-up of 6 wxHOPR. The safe is funded to leave 4 wxHOPR after the 1 wxHOPR
+/// channel stake — short of the 6 wxHOPR full top-up, but enough for exactly one
+/// 3 wxHOPR face value — so the channel must gain exactly 3 wxHOPR, not 6.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn partially_tops_up_when_the_safe_cannot_afford_a_full_topup(fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [source, destination] = fixture.claim_accounts::<2>();
+
+    // Safe funded with 5 wxHOPR; 1 wxHOPR goes into the channel stake, leaving 4
+    // wxHOPR — between one face value (3) and a full top-up (6).
+    let scenario = fixture
+        .open_channel_scenario(
+            &source,
+            &destination,
+            ScenarioOpts {
+                source_funding: "5 wxHOPR".parse()?,
+                destination_funding: "5 wxHOPR".parse()?,
+                ..ScenarioOpts::new("1 wxHOPR".parse()?)?
+            },
+        )
+        .await?;
+    let initial_balance = scenario.initial.balance;
+    let one_face_value: HoprBalance = "3 wxHOPR".parse()?;
+
+    let mut cfg = ChannelLifecycleConfig {
+        tick_interval: Duration::from_secs(3600),
+        jitter: Duration::ZERO,
+        ..Default::default()
+    };
+    cfg.population.min_open_channels = 1;
+    cfg.population.target_open_channels = 1;
+    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // ~3 wxHOPR; channel at 1 wxHOPR is below → tops up
+    cfg.funding.topup_capacity = ByteSize::b(1037); // 2 packets → full top-up of ~6 wxHOPR
+    cfg.proactive_funding.enabled = false;
+    cfg.finalizer.enabled = false;
+
+    let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
+    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
+
+    let funded = await_channel_where(
+        &scenario.connector,
+        scenario.source_addr,
+        scenario.destination_addr,
+        timeouts.action,
+        "channel partially funded to one face value by lifecycle strategy",
+        move |channel| channel.balance > initial_balance,
+    )
+    .await?;
+    assert_eq!(
+        funded.balance,
+        initial_balance + one_face_value,
+        "channel must gain exactly one 3 wxHOPR face value, not the full 6 wxHOPR top-up"
+    );
+    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
 /// Affordability gate: the fund pass spends `topup_balance` and gates on exactly
 /// that. A safe holding 1 wxHOPR — one short of the 3 wxHOPR top-up — cannot pay
 /// for one, so the underfunded channel is left untouched. No configured floor is
