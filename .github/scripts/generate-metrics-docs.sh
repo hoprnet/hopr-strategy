@@ -179,5 +179,7 @@ if ! diff -q <(echo "$expected" | normalize_table) <(normalize_table <"$METRICS_
   exit 1
 fi
 
-count=$(echo "$expected" | tail -n +3 | wc -l | tr -d ' ')
+# Skip the four non-data leading lines (top-level heading, blank, table header,
+# separator) so the count reflects metric rows only.
+count=$(echo "$expected" | tail -n +5 | wc -l | tr -d ' ')
 echo "OK: All $count metrics are in sync between code and METRICS.md."

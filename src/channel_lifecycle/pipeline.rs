@@ -15,7 +15,7 @@ use hopr_api::{
     PeerId,
     chain::{
         AccountSelector, ChainReadAccountOperations, ChainReadChannelOperations, ChainReadSafeOperations, ChainValues,
-        ChainWriteChannelOperations, ChannelSelector, SafeSelector,
+        ChainWriteChannelOperations, ChannelSelector, ChannelStatusDiscriminants, SafeSelector,
     },
     graph::{
         EdgeImmediateProtocolObservable as _, EdgeLinkObservable as _, EdgeObservableRead as _, NetworkGraphView as _,
@@ -32,10 +32,10 @@ use tracing::{debug, warn};
 
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
-    config::ResolvedFunding,
+    config::{ResolvedFunding, StartupPhase},
     selector::{
-        BucketCell, BucketView, CloseCandidate, LatencyBucket, OpenCandidate, PeerEdgeInfo, SelectorContext, SignalSet,
-        StakeView, SubnetBucket,
+        BucketCell, BucketView, CloseCandidate, ForwardingView, LatencyBucket, OpenCandidate, PeerEdgeInfo,
+        SelectorContext, SignalSet, StakeView, SubnetBucket,
     },
 };
 use crate::strategy::StrategyState;
@@ -563,21 +563,38 @@ where
 
         for ch in &all_channels {
             let id = *ch.get_id();
+            let is_closed = matches!(ch.status, ChannelStatus::Closed);
+
+            // Reconcile a closure the `Closed` event may have missed. `existing_dests`
+            // no longer blocks a `Closed` destination from reopening, but the reopen
+            // cooldown is otherwise only started by `on_channel_closed`; a lost or
+            // delayed event would let the peer be reopened immediately. The first tick
+            // a channel is observed `Closed`, start the cooldown for its destination
+            // if none is already active (an event-set cooldown, with the true close
+            // time, takes precedence). Keyed off the stored `closed` flag so it fires
+            // once per closure, not every tick the `Closed` entry lingers on-chain.
+            let was_closed = prev_observations.get(&id).is_some_and(|obs| obs.closed);
+            if is_closed && !was_closed && !self.is_on_cooldown(&ch.destination) {
+                // An event-set cooldown carries the true close time, so only fill the
+                // gap when none is already active.
+                self.start_reopen_cooldown(ch.destination);
+            }
+
             self.last_observed
                 .entry(id)
                 .and_modify(|obs| {
                     if obs.balance != ch.balance || obs.ticket_index != ch.ticket_index {
-                        *obs = ChannelObservation {
-                            balance: ch.balance,
-                            ticket_index: ch.ticket_index,
-                            at: Instant::now(),
-                        };
+                        obs.balance = ch.balance;
+                        obs.ticket_index = ch.ticket_index;
+                        obs.at = Instant::now();
                     }
+                    obs.closed = is_closed;
                 })
                 .or_insert_with(|| ChannelObservation {
                     balance: ch.balance,
                     ticket_index: ch.ticket_index,
                     at: Instant::now(),
+                    closed: is_closed,
                 });
         }
 
@@ -601,6 +618,15 @@ where
             (price, wp.map(|wp| wp.as_f64()))
         };
         let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
+
+        // The least an onward channel must hold to count as forwarding-capable: one
+        // winning-ticket face value at this tick's economics. Falls back to 1 wei
+        // (exclude only fully-drained edges) when economics are unavailable.
+        let min_onward_balance = ticket_price
+            .as_ref()
+            .zip(win_prob)
+            .map(|(price, wp)| super::config::winning_ticket_face_value(*price, wp, super::config::ASSUMED_HOPS))
+            .unwrap_or_else(|| HoprBalance::from(1_u32));
 
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
         // `None` when any required economic input is unavailable.
@@ -664,6 +690,32 @@ where
 
         // ── 2. Fund pass ─────────────────────────────────────────────────────
         if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
+            // Whether a channel drained into the close pass's balance-drained territory
+            // (`balance <= close_when_drained_below`) should still be topped up here, or
+            // left for the close pass to retire and reallocate:
+            //
+            // * balance above the drain threshold — not drain-close territory, always fundable.
+            // * operator set a positive drain floor — an explicit "retire, don't refund"; never rescue a channel
+            //   drained to it, regardless of the peer.
+            // * default floor (zero): refund a fully-drained channel only when its peer is still worth keeping —
+            //   connected, or with recent ticket activity — so a proven relay is kept alive; a drained channel to a
+            //   disconnected, inactive peer is left for the close pass to retire. Connectivity is resolved as in the
+            //   close pass: an unresolvable peer counts as connected (shielded).
+            let refundable = |ch: &ChannelEntry| -> bool {
+                if ch.balance > self.cfg.closure.close_when_drained_below {
+                    return true;
+                }
+                if !self.cfg.closure.close_when_drained_below.is_zero() {
+                    return false;
+                }
+                let connected = addr_to_key
+                    .get(&ch.destination)
+                    .map(|pk| self.node.network_view().is_connected(&PeerId::from(pk)))
+                    .unwrap_or(true);
+                let active = self.peer_ticket_activity.get(&ch.destination).is_some_and(|v| *v > 0);
+                connected || active
+            };
+
             // Needy, not-already-in-flight channels — collected before anything is
             // spent, so the demand figure below (and the loop after it) see every
             // candidate rather than only those the safe turned out to afford.
@@ -673,12 +725,7 @@ where
                 .filter(|ch| {
                     !self.fund_in_flight.is_held(ch.get_id())
                         && !self.close_in_flight.is_held(ch.get_id())
-                        // A channel already drained to the close threshold is destined
-                        // for retirement — topping it up (even partially) would rescue
-                        // it out from under the close pass and waste the stake. The
-                        // default threshold is zero, so this only excludes channels an
-                        // operator has explicitly configured to close on drain.
-                        && ch.balance > self.cfg.closure.close_when_drained_below
+                        && refundable(ch)
                 })
                 .filter_map(|ch| {
                     if ch.balance <= funding.lower_balance_threshold {
@@ -810,7 +857,15 @@ where
         let channel_by_id: HashMap<ChannelId, &ChannelEntry> =
             open_channels.iter().map(|ch| (*ch.get_id(), *ch)).collect();
 
-        let existing_dests: HashSet<Address> = all_channels.iter().map(|c| c.destination).collect();
+        // `all_channels` carries every state including `Closed` (the snapshot's
+        // `ChannelSelector` has no state filter). A `Closed` destination must
+        // NOT block reopening — only `Open`/`PendingToClose` represent an
+        // already-occupied (src, dst) slot on-chain.
+        let existing_dests: HashSet<Address> = all_channels
+            .iter()
+            .filter(|c| !matches!(c.status, ChannelStatus::Closed))
+            .map(|c| c.destination)
+            .collect();
         // No peer map means no candidate can be resolved to a chain address, so
         // the open pass has nothing to consider this tick.
         let connected = match peer_addr_map.as_ref() {
@@ -831,11 +886,7 @@ where
                 if self.open_in_flight.is_held(&chain_addr) {
                     return None;
                 }
-                if self
-                    .cooldown
-                    .get(&chain_addr)
-                    .is_some_and(|until| Instant::now() < *until)
-                {
+                if self.is_on_cooldown(&chain_addr) {
                     return None;
                 }
                 if self
@@ -909,13 +960,32 @@ where
         let bucket_view = BucketView::new(bucket_cells);
         self.emit_bucket_metrics(&bucket_view, &close_candidates);
 
-        // On-chain stake scores — only fetched when the active selector requests STAKE.
-        let stake_view = if self.selector.required_signals().contains(SignalSet::STAKE) {
-            self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
-                .await
-        } else {
-            StakeView::empty()
-        };
+        // Two independent chain reads: stake scores (multi-objective STAKE
+        // signal) and funded-outgoing-channel counts (sink demotion, consumed by
+        // whichever selector is active).  Each is skipped when its consumer is off;
+        // when both run they overlap rather than serialize.
+        let (stake_view, forwarding_view) = futures::join!(
+            async {
+                if self.selector.required_signals().contains(SignalSet::STAKE) {
+                    self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
+                        .await
+                } else {
+                    StakeView::empty()
+                }
+            },
+            async {
+                // Only consumed by the open pass's candidate ranking, so it is
+                // pointless when there is no open deficit to fill this tick — skip
+                // the network-wide channel scan entirely in that case, the common
+                // steady state once the population is at target.
+                if self.cfg.eligibility.demote_non_forwarding_peers && deficit > 0 {
+                    self.fetch_forwarding_view(chain, deadline, &open_candidates, min_onward_balance)
+                        .await
+                } else {
+                    ForwardingView::empty()
+                }
+            },
+        );
 
         let selector_ctx = SelectorContext {
             cfg: &self.cfg,
@@ -925,6 +995,7 @@ where
             start_epoch_elapsed: self.start_epoch.elapsed(),
             bucket_view,
             stake_view,
+            forwarding_view,
         };
 
         self.emit_score_axis_metrics(&selector_ctx);
@@ -932,7 +1003,10 @@ where
         let opens_ranked = self.selector.select_opens(&selector_ctx).await;
 
         // ── 3. Close pass ─────────────────────────────────────────────────────
-        if self.start_epoch.elapsed() >= self.cfg.restart.startup_close_grace_period {
+        // Startup is staged (see `RestartGuardConfig`): observe everything, then
+        // retire only unconnected peers, then apply the usual rules.
+        let startup_phase = self.cfg.restart.phase_at(self.start_epoch.elapsed());
+        if startup_phase != StartupPhase::Observing {
             // `should_close` returns `false` outright for a candidate with no resolved
             // offchain key (see `DefaultSelector::should_close`), so a missing peer map
             // silently limits this pass to balance-drained closes only — quality- and
@@ -952,16 +1026,72 @@ where
                 open = open_count,
                 min = self.cfg.population.min_open_channels,
                 candidates = closes_ranked.len(),
+                phase = ?startup_phase,
                 "channel-lifecycle: close pass"
             );
 
-            for channel_id in &closes_ranked {
+            // A channel to a disconnected peer cannot be used to construct
+            // SURBs, so connectivity is itself a close trigger — not merely a
+            // signal the selector's quality/staleness rules might happen to
+            // pick up. Computed for every open channel, not only ranked ones,
+            // so a disconnected peer with an otherwise-fine (or unmeasured)
+            // quality score doesn't linger. An unresolvable peer counts as
+            // connected, so a cold or failed account read shields rather than
+            // forces a close.
+            //
+            // `is_connected` is a point-in-time snapshot with no hysteresis of its
+            // own, so a single missed observation is debounced: a peer must be seen
+            // disconnected for `close_after_disconnected_ticks` consecutive ticks
+            // before its channel is retired, and any connected tick resets the count.
+            // The streak map is pruned to live channels each tick so it cannot grow
+            // without bound.
+            let debounce = self.cfg.closure.close_after_disconnected_ticks.max(1);
+            let live_dests: HashSet<Address> = open_channels.iter().map(|ch| ch.destination).collect();
+            self.disconnect_streak.retain(|dest, _| live_dests.contains(dest));
+            let disconnected: HashSet<ChannelId> = open_channels
+                .iter()
+                .filter(|ch| {
+                    // An unresolvable peer counts as connected (shielded), matching the
+                    // open pass — so only a resolvable, not-connected peer is disconnected.
+                    let disconnected_now = addr_to_peer_id
+                        .get(&ch.destination)
+                        .is_some_and(|peer_id| !self.node.network_view().is_connected(peer_id));
+                    if disconnected_now {
+                        // Advance the streak; retire only once it has persisted across
+                        // the whole debounce window.
+                        let mut streak = self.disconnect_streak.entry(ch.destination).or_insert(0);
+                        *streak += 1;
+                        *streak >= debounce
+                    } else {
+                        // Connected (or shielded) — reset the streak and keep the channel.
+                        self.disconnect_streak.remove(&ch.destination);
+                        false
+                    }
+                })
+                .map(|ch| *ch.get_id())
+                .collect();
+
+            let ranked: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
+            let candidates = closes_ranked.iter().chain(disconnected.difference(&ranked));
+
+            // The selector already capped its ranked list at its own per-tick
+            // budget; appending connectivity-triggered closes must not push the
+            // tick's total past it. Enforce that same cap over the combined set so
+            // an out-of-band close reason shares the budget rather than bypassing
+            // it (`close_max_concurrent` is a separate in-flight ceiling).
+            let per_tick_cap = self.selector.max_closes_per_tick();
+            let mut dispatched_this_tick = 0usize;
+
+            for channel_id in candidates {
                 if close_count >= self.cfg.closure.close_max_concurrent {
                     debug!(
                         close_count,
                         cap = self.cfg.closure.close_max_concurrent,
                         "channel-lifecycle: close pass stopped: concurrency cap reached"
                     );
+                    break;
+                }
+                if per_tick_cap.is_some_and(|cap| dispatched_this_tick >= cap) {
                     break;
                 }
                 let remaining_open = open_count.saturating_sub(close_count);
@@ -977,8 +1107,20 @@ where
                     if self.close_in_flight.is_held(ch.get_id()) || self.fund_in_flight.is_held(ch.get_id()) {
                         continue;
                     }
+                    // Shielding protects a connected peer's channel from the
+                    // selector's own quality/staleness verdict; it never
+                    // protects a disconnected one — that's what "shielding
+                    // connected peers" means.
+                    if startup_phase == StartupPhase::ShieldingConnected && !disconnected.contains(channel_id) {
+                        debug!(
+                            dest = %ch.destination,
+                            "channel-lifecycle: close deferred: peer connected within startup grace"
+                        );
+                        continue;
+                    }
                     if self.try_close_channel(ch) {
                         close_count += 1;
+                        dispatched_this_tick += 1;
                     }
                 }
             }
@@ -1134,6 +1276,58 @@ where
         });
 
         Some(map)
+    }
+
+    /// Counts each open candidate's funded outgoing channels — channels the peer
+    /// itself sources, in the `Open` state, to a third party other than this node
+    /// — keyed by chain address.  Computed only when sink demotion is enabled.
+    ///
+    /// One network-wide `Open`-channel stream (served by the local indexer) is
+    /// counted per source; a peer absent from the result has zero outgoing
+    /// channels and is a ticket sink.  Counts are restricted to candidate
+    /// addresses to bound the returned map.  When the stream is unavailable the
+    /// view is empty, so no peer is demoted for a chain read that simply did not
+    /// answer.
+    async fn fetch_forwarding_view(
+        &self,
+        chain: &N::ChainApi,
+        deadline: Instant,
+        open_candidates: &[OpenCandidate],
+        min_onward_balance: HoprBalance,
+    ) -> ForwardingView {
+        let candidate_addrs: HashSet<Address> = open_candidates.iter().map(|c| c.addr).collect();
+        if candidate_addrs.is_empty() {
+            return ForwardingView::empty();
+        }
+        let me = *chain.me();
+
+        // Per candidate source, count its usable onward Open channels.  A channel
+        // is uniquely keyed by (source, destination), so each surviving edge is a
+        // distinct destination — no dedup needed.
+        let counts: Option<HashMap<Address, u32>> = self
+            .read("stream_channels (forwarding view)", deadline, async {
+                let mut counts: HashMap<Address, u32> = HashMap::new();
+                let selector = ChannelSelector::default().with_allowed_states(&[ChannelStatusDiscriminants::Open]);
+                let mut stream = chain.stream_channels(selector)?;
+                while let Some(ch) = stream.next().await {
+                    // Count only a candidate's *usable onward* edges: an edge below
+                    // one winning-ticket face value cannot fund a hop (a dust ticket
+                    // sink is not forwarding-capable), and a channel back to this node
+                    // is not an onward hop for a route this node builds.  (The chain
+                    // forbids self-loops, so no `source == destination` guard.)
+                    if !candidate_addrs.contains(&ch.source) || ch.balance < min_onward_balance || ch.destination == me
+                    {
+                        continue;
+                    }
+                    *counts.entry(ch.source).or_insert(0) += 1;
+                }
+                Ok::<_, <N::ChainApi as ChainReadChannelOperations>::Error>(counts)
+            })
+            .await;
+
+        counts
+            .map(ForwardingView::from_counts)
+            .unwrap_or_else(ForwardingView::empty)
     }
 
     /// Fetches on-chain safe balances for all candidate peers and returns
@@ -1527,7 +1721,11 @@ mod tests {
         }
 
         fn is_connected(&self, peer: &PeerId) -> bool {
-            self.connected.contains_key(peer)
+            // Unconfigured (no peer marked connected) means "connectivity is not
+            // under test": report every peer connected, so the connectivity close
+            // trigger stays inert unless a test opts in via `connect`. Once any peer
+            // is marked, fall back to exact membership.
+            self.connected.is_empty() || self.connected.contains_key(peer)
         }
 
         fn health(&self) -> hopr_api::network::Health {
@@ -1821,6 +2019,7 @@ mod tests {
                 ..Default::default()
             },
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             ..Default::default()
@@ -2217,6 +2416,7 @@ mod tests {
 
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -2346,15 +2546,16 @@ mod tests {
     fn restart_grace_should_block_close_pass() {
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::from_secs(60),
                 startup_close_grace_period: Duration::from_secs(3600),
             },
             ..Default::default()
         };
-        let start_epoch = Instant::now();
-        let grace_elapsed = start_epoch.elapsed() >= cfg.restart.startup_close_grace_period;
-        assert!(
-            !grace_elapsed,
-            "close pass should be suppressed during startup grace period"
+        let phase = cfg.restart.phase_at(Duration::ZERO);
+        assert_eq!(
+            phase,
+            crate::channel_lifecycle::config::StartupPhase::Observing,
+            "close pass should be suppressed during startup observation period"
         );
     }
 
@@ -2472,6 +2673,7 @@ mod tests {
     fn restart_grace_should_re_apply_on_new_instance() {
         let cfg = ChannelLifecycleConfig {
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::from_secs(10),
                 startup_close_grace_period: Duration::from_secs(60),
             },
             ..Default::default()
@@ -2520,6 +2722,7 @@ mod tests {
                 last_resolved_funding: Arc::new(Mutex::new(None)),
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
+                disconnect_streak: Arc::new(DashMap::new()),
             }
         }
 
@@ -2645,6 +2848,7 @@ mod tests {
                 last_resolved_funding: Arc::new(Mutex::new(None)),
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
+                disconnect_streak: Arc::new(DashMap::new()),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -2670,6 +2874,7 @@ mod tests {
             last_resolved_funding: Arc::new(Mutex::new(None)),
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
+            disconnect_streak: Arc::new(DashMap::new()),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -2723,24 +2928,131 @@ mod tests {
         fresh_inner_with_chain_and_graph(cfg, connector, Arc::new(StubGraph::default()))
     }
 
-    fn fresh_inner_with_chain_and_graph<C>(
-        cfg: ChannelLifecycleConfig,
-        connector: Arc<C>,
-        graph: Arc<StubGraph>,
-    ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
-        fresh_inner_with_chain_graph_and_network(cfg, connector, graph, StubNetworkView::default())
+    /// Regression (review, @NumberFour8): excluding `Closed` channels from
+    /// `existing_dests` makes their destination immediately reopen-eligible, but the
+    /// reopen cooldown is otherwise only started by `on_channel_closed`. A lost or
+    /// delayed `Closed` event would then bypass the cooldown. The snapshot pass must
+    /// reconcile an observed on-chain closure into the cooldown itself.
+    #[tokio::test]
+    async fn observing_a_closed_channel_starts_the_reopen_cooldown_without_the_event() -> anyhow::Result<()> {
+        let closed = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(0_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Closed)
+            .epoch(1)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([closed])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.population.peer_reopen_cooldown = Duration::from_secs(900);
+
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+        // No `Closed` event was delivered, so nothing has started the cooldown yet.
+        assert!(inner.cooldown.get(&*ALICE).is_none());
+
+        inner.run_pipeline().await;
+
+        let until = inner
+            .cooldown
+            .get(&*ALICE)
+            .expect("observing the on-chain closure must start the reopen cooldown");
+        assert!(Instant::now() < *until, "reconciled cooldown must be active");
+        Ok(())
     }
 
-    fn fresh_inner_with_chain_graph_and_network<C>(
+    /// Regression (review, @NumberFour8): connectivity-triggered closes are appended
+    /// to the selector's ranked list, so they must still obey the selector's
+    /// per-tick close budget — not just the separate `close_max_concurrent` ceiling.
+    /// With two disconnected channels, `close_per_tick = 1` and `close_max_concurrent
+    /// = 2`, a single tick must dispatch exactly one close, not two.
+    #[tokio::test]
+    async fn connectivity_closes_obey_the_selector_per_tick_limit() -> anyhow::Result<()> {
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(5_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+        let c2 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(5_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            // Announced (true) so the peer→address map resolves both destinations;
+            // an empty network view then reports them disconnected.
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                true,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1, c2])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.population.min_open_channels = 0; // both may close
+        cfg.restart.startup_observation_period = Duration::ZERO;
+        cfg.restart.startup_close_grace_period = Duration::ZERO;
+        cfg.closure.close_after_disconnected_ticks = 1; // no debounce delay
+        cfg.closure.close_max_concurrent = 2; // in-flight ceiling above the per-tick budget
+
+        let mo = MultiObjectiveSelectorConfig {
+            close_per_tick: 1,
+            ..Default::default()
+        };
+        let selector: Arc<dyn selector::Selector> = Arc::new(selector::MultiObjectiveSelector::new(mo));
+
+        // Empty network view → both destinations resolve as disconnected.
+        let node = Arc::new(crate::testing::LifecycleNode::with_views(
+            Arc::clone(&connector),
+            crate::testing::TestGraph::new(&BOB),
+            crate::testing::TestNetworkView::new(),
+        ));
+        let inner = fresh_inner_over(cfg, selector, node);
+
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            1,
+            "connectivity closes must share the selector's close_per_tick=1 budget, not reach close_max_concurrent=2"
+        );
+        Ok(())
+    }
+
+    /// Build an inner directly over an arbitrary node and selector — used by tests
+    /// that need a controllable network view (`LifecycleNode` + `TestNetworkView`)
+    /// or a non-default selector, which the `ChainNode`-based helpers can't provide.
+    fn fresh_inner_over<N>(
         cfg: ChannelLifecycleConfig,
-        connector: Arc<C>,
-        graph: Arc<StubGraph>,
-        network: StubNetworkView,
-    ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
+        selector: Arc<dyn selector::Selector>,
+        node: Arc<N>,
+    ) -> ChannelLifecycleStrategyInner<N> {
         ChannelLifecycleStrategyInner {
             cfg,
-            node: Arc::new(ChainNode::with_graph_and_network(connector, graph, network)),
-            selector: Arc::new(selector::DefaultSelector),
+            node,
+            selector,
             open_in_flight: Default::default(),
             fund_in_flight: Default::default(),
             close_in_flight: Default::default(),
@@ -2753,7 +3065,121 @@ mod tests {
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
+            disconnect_streak: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Build an inner over a `ChainNode` with a configurable network view — for tests
+    /// that drive connectivity through the `ChainNode`-based stub.
+    fn fresh_inner_with_chain_graph_and_network<C>(
+        cfg: ChannelLifecycleConfig,
+        connector: Arc<C>,
+        graph: Arc<StubGraph>,
+        network: StubNetworkView,
+    ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
+        fresh_inner_over(
+            cfg,
+            Arc::new(selector::DefaultSelector),
+            Arc::new(ChainNode::with_graph_and_network(connector, graph, network)),
+        )
+    }
+
+    /// `fetch_forwarding_view` counts each candidate's own funded `Open` outgoing
+    /// channels to distinct third parties: a peer sourcing usable onward channels
+    /// is forwarding-capable, a peer sourcing none is a ticket sink (count 0).
+    /// Drained channels and channels back to this node are not usable onward
+    /// edges and must not count.
+    #[tokio::test]
+    async fn fetch_forwarding_view_counts_outgoing_channels() -> anyhow::Result<()> {
+        // `me` for the test connector is BOB (its chain key); a channel CHRIS -> BOB
+        // is not an onward hop for a route this node builds.
+        let drained_dest: Address = [9; Address::SIZE].into();
+        let dust_dest: Address = [8; Address::SIZE].into();
+
+        let mk = |src: Address, dst: Address, balance: HoprBalance| -> anyhow::Result<ChannelEntry> {
+            Ok(ChannelEntry::builder()
+                .between(src, dst)
+                .balance(balance)
+                .ticket_index(0)
+                .status(ChannelStatus::Open)
+                .epoch(0)
+                .build()?)
+        };
+
+        // CHRIS sources two usable onward channels (ALICE, DAVE) plus a dust one, a
+        // drained one, and one back to `me` (BOB) — the last three must be excluded.
+        // ALICE sources none. With the sim's 1 wxHOPR ticket price / win_prob 1.0 /
+        // 3 hops, one face value is 3 wxHOPR, so 5 wxHOPR counts and 1 wei does not.
+        let channels = [
+            mk(*CHRIS, *ALICE, HoprBalance::new_base(5))?,
+            mk(*CHRIS, *DAVE, HoprBalance::new_base(5))?,
+            mk(*CHRIS, dust_dest, HoprBalance::from(1_u32))?, // dust: below one face value
+            mk(*CHRIS, drained_dest, HoprBalance::zero())?,   // drained → cannot relay
+            mk(*CHRIS, *BOB, HoprBalance::new_base(5))?,      // back to this node → not an onward hop
+        ];
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE, &drained_dest, &dust_dest],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels(channels)
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let inner = fresh_inner_with_chain(ChannelLifecycleConfig::default(), Arc::clone(&connector));
+
+        let ok = *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[7u8; 32])
+            .expect("test key")
+            .public();
+        let cand = |a: Address| selector::OpenCandidate {
+            addr: a,
+            offchain_key: ok,
+            edge_info: selector::PeerEdgeInfo::default(),
+            ticket_score: 0.0,
+            subnet: selector::SubnetBucket::Unknown,
+        };
+        let candidates = vec![cand(*CHRIS), cand(*ALICE)];
+
+        let deadline = inner.read_deadline();
+        let min_onward = super::super::config::winning_ticket_face_value(
+            HoprBalance::new_base(1),
+            1.0,
+            super::super::config::ASSUMED_HOPS,
+        );
+        let view = inner
+            .fetch_forwarding_view(inner.node.chain_api(), deadline, &candidates, min_onward)
+            .await;
+
+        assert_eq!(
+            view.outgoing_channels(&CHRIS),
+            2,
+            "only the two adequately-funded onward channels count; dust, drained and to-me are excluded"
+        );
+        assert_eq!(
+            view.outgoing_channels(&ALICE),
+            0,
+            "ALICE sources no channels — a ticket sink"
+        );
+        Ok(())
+    }
+
+    fn fresh_inner_with_chain_and_graph<C>(
+        cfg: ChannelLifecycleConfig,
+        connector: Arc<C>,
+        graph: Arc<StubGraph>,
+    ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
+        fresh_inner_over(
+            cfg,
+            Arc::new(selector::DefaultSelector),
+            Arc::new(ChainNode::with_graph(connector, graph)),
+        )
     }
 
     /// try_open_channel: channel is already Open with stake >= lower_balance_threshold.
@@ -3163,6 +3589,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             funding: FundingConfig {
@@ -3252,6 +3679,7 @@ mod tests {
             start_epoch_elapsed: Duration::ZERO,
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
 
         let closes = selector::DefaultSelector.select_closes(&ctx).await;
@@ -3303,6 +3731,7 @@ mod tests {
             start_epoch_elapsed: Duration::ZERO,
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
         assert!(
             selector::DefaultSelector.select_closes(&ctx_no_data).await.is_empty(),
@@ -3328,6 +3757,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(10), // strategy running 10s > last_update 1s
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
         let closes = selector::DefaultSelector.select_closes(&ctx_with_data).await;
         assert_eq!(
@@ -3372,6 +3802,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -3450,6 +3881,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -3650,6 +4082,7 @@ mod tests {
             tick_interval: Duration::from_millis(100),
             jitter: Duration::ZERO,
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             population: PopulationConfig {
@@ -3800,6 +4233,7 @@ mod tests {
                 ..Default::default()
             },
             restart: RestartGuardConfig {
+                startup_observation_period: Duration::ZERO,
                 startup_close_grace_period: Duration::ZERO,
             },
             ..Default::default()

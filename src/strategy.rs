@@ -122,6 +122,20 @@ pub trait Strategy: Display + Send {
     fn state(&self) -> StrategyState {
         StrategyState::Running
     }
+
+    /// The shared atomic behind [`state`](Strategy::state), cloned so it can be read while
+    /// the strategy runs.
+    ///
+    /// [`run`](Strategy::run) takes `&mut self` and is usually moved into a spawned task, so
+    /// [`state`](Strategy::state) cannot be called while the strategy runs. Clone this handle
+    /// *before* running, then `load` it from anywhere — a strategy that tracks its health
+    /// returns its own live atomic, so every clone observes the same transitions.
+    ///
+    /// Default: a fresh atomic pinned to the current [`state`](Strategy::state) — a strategy
+    /// with no live health signal has nothing to share, and its state never changes.
+    fn state_handle(&self) -> std::sync::Arc<AtomicStrategyState> {
+        std::sync::Arc::new(AtomicStrategyState::new(self.state()))
+    }
 }
 
 /// Runs a group of sub-strategies concurrently, each in its own async task.
@@ -323,5 +337,33 @@ mod tests {
     fn state_ordering_is_by_severity() {
         assert!(StrategyState::Running < StrategyState::Degraded);
         assert!(StrategyState::Degraded < StrategyState::Failed);
+    }
+
+    /// A shared handle observes state transitions made *after* it was taken — the property
+    /// that makes it usable while `run` owns (or a task has moved) the strategy.
+    #[test]
+    fn shared_state_handle_tracks_live_transitions() {
+        use std::sync::{Arc, atomic::Ordering};
+
+        let state = Arc::new(AtomicStrategyState::new(StrategyState::Running));
+        let handle = Arc::clone(&state);
+        assert_eq!(handle.load(Ordering::Relaxed), StrategyState::Running);
+
+        state.store(StrategyState::Degraded, Ordering::Relaxed);
+        assert_eq!(
+            handle.load(Ordering::Relaxed),
+            StrategyState::Degraded,
+            "handle must see writes made after it was cloned"
+        );
+    }
+
+    /// The default `state_handle` mirrors `state` for a strategy that tracks no health.
+    #[test]
+    fn default_state_handle_mirrors_state() {
+        use std::sync::atomic::Ordering;
+
+        let external = ExternalStrategy { ran: false };
+        assert_eq!(external.state_handle().load(Ordering::Relaxed), external.state());
+        assert_eq!(external.state_handle().load(Ordering::Relaxed), StrategyState::Running);
     }
 }

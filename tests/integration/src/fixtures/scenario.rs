@@ -13,7 +13,9 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance, XDaiBalance},
     },
 };
-use hopr_strategy::testing::{BlokliTestStateBuilder, create_test_blokli_connector, register_test_safe};
+use hopr_strategy::testing::{
+    BlokliTestStateBuilder, TestGraph, TestNetworkView, create_test_blokli_connector, register_test_safe,
+};
 
 use super::{IntegrationFixture, TestAccount, module_address, poll_stable, poll_until};
 use crate::{
@@ -303,4 +305,115 @@ where
         async move { Ok(connector.channel_by_parties(&from, &to)?.filter(|c| predicate(c))) }
     })
     .await
+}
+
+// ─── Unhealthy-channel recovery scenario ─────────────────────────────────────
+
+/// A scenario with a source node holding one `Open` channel per entry in
+/// `channels`, plus `candidates` as further peers with generated accounts but
+/// no channel yet.
+///
+/// Neither quality nor connectivity is pre-wired: [`Self::graph`] starts with
+/// no edges and [`Self::network`] starts with nobody connected. Both are live
+/// handles — set them up with `graph.set_edge(...)` / `network.connect(...)`
+/// directly in the test body, and mutating them is visible to the strategy on
+/// its very next tick, the same way `graph.insert_edge` degrades a channel
+/// mid-run in the crate's own unit tests.
+pub struct RecoveryScenario {
+    pub connector: Arc<NodeConnector>,
+    pub source_addr: Address,
+    pub graph: TestGraph,
+    pub network: TestNetworkView,
+    /// Seeded channels, in `channels` input order.
+    pub initial: Vec<ChannelEntry>,
+}
+
+impl IntegrationFixture {
+    /// Builds a source node with one `Open` channel per `(peer, stake)` in
+    /// `channels`, plus `candidates.len()` further peers with generated
+    /// accounts but no channel yet.
+    ///
+    /// Every account is created in a single `with_generated_accounts` call —
+    /// required because key-id assignment is sequential from 0 and the call
+    /// cannot be repeated. This is the mechanical part every recovery test
+    /// needs identically; quality and connectivity are each test's own to set
+    /// up, via the returned scenario's `graph`/`network` fields.
+    pub async fn chain_with_channels(
+        &self,
+        source: &TestAccount,
+        channels: &[(&TestAccount, HoprBalance)],
+        candidates: &[&TestAccount],
+    ) -> Result<RecoveryScenario> {
+        use hopr_api::types::internal::prelude::{ChannelBuilder, ChannelStatus};
+
+        let channel_entries = channels
+            .iter()
+            .map(|(peer, balance)| {
+                ChannelBuilder::default()
+                    .between(source.address, peer.address)
+                    .balance(*balance)
+                    .ticket_index(0u64)
+                    .status(ChannelStatus::Open)
+                    .epoch(0u32)
+                    .build()
+                    .context("failed to build seeded channel")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let addresses: Vec<Address> = std::iter::once(source.address)
+            .chain(channels.iter().map(|(peer, _)| peer.address))
+            .chain(candidates.iter().map(|peer| peer.address))
+            .collect();
+        let address_refs: Vec<&Address> = addresses.iter().collect();
+        let allowance: HoprBalance = SAFE_ALLOWANCE.parse()?;
+
+        let client = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &address_refs,
+                true,
+                XDaiBalance::new_base(1u32),
+                SAFE_FUNDING.parse::<HoprBalance>()?,
+            )
+            .with_safe_allowances(addresses.iter().map(|address| (*address, allowance)))
+            .with_channels(channel_entries)
+            // The emulator floors this at 100 ms regardless; ZERO gets there fastest.
+            .with_closure_grace_period(Duration::ZERO)
+            .build_dynamic_client(module_address())
+            // Recovery is measured in wall-clock time across several sequential
+            // transactions (close, finalize, open); the harness's default 1 s
+            // simulated confirmation delay would dominate that measurement
+            // rather than the strategy's own timing logic.
+            .with_tx_simulation_delay(Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&source.keypair, client, module_address())
+            .await
+            .context("failed to connect source node")?;
+        register_test_safe(&connector, source.address)
+            .await
+            .context("failed to register source node safe")?;
+        let connector = Arc::new(connector);
+
+        let mut initial = Vec::with_capacity(channels.len());
+        for (peer, _) in channels {
+            initial.push(
+                await_channel(
+                    &connector,
+                    source.address,
+                    peer.address,
+                    self.timeouts().visibility,
+                    "scenario channel visible",
+                )
+                .await
+                .context("scenario channel never became visible")?,
+            );
+        }
+
+        Ok(RecoveryScenario {
+            connector,
+            source_addr: source.address,
+            graph: TestGraph::new(&source.address),
+            network: TestNetworkView::new(),
+            initial,
+        })
+    }
 }
