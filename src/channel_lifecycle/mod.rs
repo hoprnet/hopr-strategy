@@ -353,12 +353,17 @@ mod action_leases {
     }
 }
 
-/// Per-channel observation snapshot used by the proactive funding estimate.
+/// Per-channel observation snapshot used by the proactive funding estimate and
+/// by the closure-cooldown reconciliation.
 #[derive(Clone)]
 struct ChannelObservation {
     balance: HoprBalance,
     ticket_index: u64,
     at: Instant,
+    /// Whether the channel was `Closed` when last observed. Lets the snapshot pass
+    /// start the reopen cooldown on the first tick a closure is seen, covering a
+    /// lost or delayed `Closed` event.
+    closed: bool,
 }
 
 /// Cached `peer_id → (offchain key, chain address)` map plus the timestamp at

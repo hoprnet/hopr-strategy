@@ -186,6 +186,17 @@ pub trait Selector: Send + Sync {
     /// drops below `min_open_channels`.
     async fn select_closes(&self, ctx: &SelectorContext<'_>) -> Vec<ChannelId>;
 
+    /// Maximum channels this selector's policy permits closing in a single tick,
+    /// or `None` for no selector-level per-tick cap (only the pipeline's
+    /// `close_max_concurrent` applies).  The pipeline enforces this over the
+    /// *combined* close set — the selector's ranked closes plus any the pipeline
+    /// adds out of band (e.g. connectivity-triggered) — so no extra close reason
+    /// can push the tick's total past the policy the selector already applied to
+    /// its own ranked list.
+    fn max_closes_per_tick(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns a ranked list of peers to open channels with, ordered from most
     /// to least preferred.  The pipeline will open at most `ctx.deficit`
     /// channels and will skip any for which the safe balance is insufficient.

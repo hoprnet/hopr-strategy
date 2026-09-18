@@ -52,6 +52,8 @@ where
                 balance: ch.balance,
                 ticket_index: ch.ticket_index,
                 at: Instant::now(),
+                // This handler only fires for a balance decrease on an open channel.
+                closed: false,
             });
 
         // Reuse the economics resolved by the most-recent pipeline tick rather

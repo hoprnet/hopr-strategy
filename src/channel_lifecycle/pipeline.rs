@@ -465,21 +465,44 @@ where
 
         for ch in &all_channels {
             let id = *ch.get_id();
+            let is_closed = matches!(ch.status, ChannelStatus::Closed);
+
+            // Reconcile a closure the `Closed` event may have missed. `existing_dests`
+            // no longer blocks a `Closed` destination from reopening, but the reopen
+            // cooldown is otherwise only started by `on_channel_closed`; a lost or
+            // delayed event would let the peer be reopened immediately. The first tick
+            // a channel is observed `Closed`, start the cooldown for its destination
+            // if none is already active (an event-set cooldown, with the true close
+            // time, takes precedence). Keyed off the stored `closed` flag so it fires
+            // once per closure, not every tick the `Closed` entry lingers on-chain.
+            if is_closed && self.last_observed.get(&id).is_none_or(|obs| !obs.closed) {
+                let active = self
+                    .cooldown
+                    .get(&ch.destination)
+                    .is_some_and(|until| Instant::now() < *until);
+                if !active {
+                    self.cooldown.insert(
+                        ch.destination,
+                        Instant::now() + self.cfg.population.peer_reopen_cooldown,
+                    );
+                }
+            }
+
             self.last_observed
                 .entry(id)
                 .and_modify(|obs| {
                     if obs.balance != ch.balance || obs.ticket_index != ch.ticket_index {
-                        *obs = ChannelObservation {
-                            balance: ch.balance,
-                            ticket_index: ch.ticket_index,
-                            at: Instant::now(),
-                        };
+                        obs.balance = ch.balance;
+                        obs.ticket_index = ch.ticket_index;
+                        obs.at = Instant::now();
                     }
+                    obs.closed = is_closed;
                 })
                 .or_insert_with(|| ChannelObservation {
                     balance: ch.balance,
                     ticket_index: ch.ticket_index,
                     at: Instant::now(),
+                    closed: is_closed,
                 });
         }
 
@@ -832,8 +855,19 @@ where
             let ranked: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
             let candidates = closes_ranked.iter().chain(disconnected.difference(&ranked));
 
+            // The selector already capped its ranked list at its own per-tick
+            // budget; appending connectivity-triggered closes must not push the
+            // tick's total past it. Enforce that same cap over the combined set so
+            // an out-of-band close reason shares the budget rather than bypassing
+            // it (`close_max_concurrent` is a separate in-flight ceiling).
+            let per_tick_cap = self.selector.max_closes_per_tick();
+            let mut dispatched_this_tick = 0usize;
+
             for channel_id in candidates {
                 if close_count >= self.cfg.closure.close_max_concurrent {
+                    break;
+                }
+                if per_tick_cap.is_some_and(|cap| dispatched_this_tick >= cap) {
                     break;
                 }
                 let remaining_open = open_count.saturating_sub(close_count);
@@ -857,6 +891,7 @@ where
                     }
                     if self.try_close_channel(ch) {
                         close_count += 1;
+                        dispatched_this_tick += 1;
                     }
                 }
             }
@@ -2065,6 +2100,145 @@ mod tests {
         connector: Arc<C>,
     ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
         fresh_inner_with_chain_and_graph(cfg, connector, Arc::new(StubGraph::default()))
+    }
+
+    /// Regression (review, @NumberFour8): excluding `Closed` channels from
+    /// `existing_dests` makes their destination immediately reopen-eligible, but the
+    /// reopen cooldown is otherwise only started by `on_channel_closed`. A lost or
+    /// delayed `Closed` event would then bypass the cooldown. The snapshot pass must
+    /// reconcile an observed on-chain closure into the cooldown itself.
+    #[tokio::test]
+    async fn observing_a_closed_channel_starts_the_reopen_cooldown_without_the_event() -> anyhow::Result<()> {
+        let closed = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(0_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Closed)
+            .epoch(1)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([closed])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.population.peer_reopen_cooldown = Duration::from_secs(900);
+
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+        // No `Closed` event was delivered, so nothing has started the cooldown yet.
+        assert!(inner.cooldown.get(&*ALICE).is_none());
+
+        inner.run_pipeline().await;
+
+        let until = inner
+            .cooldown
+            .get(&*ALICE)
+            .expect("observing the on-chain closure must start the reopen cooldown");
+        assert!(Instant::now() < *until, "reconciled cooldown must be active");
+        Ok(())
+    }
+
+    /// Regression (review, @NumberFour8): connectivity-triggered closes are appended
+    /// to the selector's ranked list, so they must still obey the selector's
+    /// per-tick close budget — not just the separate `close_max_concurrent` ceiling.
+    /// With two disconnected channels, `close_per_tick = 1` and `close_max_concurrent
+    /// = 2`, a single tick must dispatch exactly one close, not two.
+    #[tokio::test]
+    async fn connectivity_closes_obey_the_selector_per_tick_limit() -> anyhow::Result<()> {
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(5_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+        let c2 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(5_u32)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            // Announced (true) so the peer→address map resolves both destinations;
+            // an empty network view then reports them disconnected.
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                true,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels([c1, c2])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.population.min_open_channels = 0; // both may close
+        cfg.restart.startup_observation_period = Duration::ZERO;
+        cfg.restart.startup_close_grace_period = Duration::ZERO;
+        cfg.closure.close_after_disconnected_ticks = 1; // no debounce delay
+        cfg.closure.close_max_concurrent = 2; // in-flight ceiling above the per-tick budget
+
+        let mo = MultiObjectiveSelectorConfig {
+            close_per_tick: 1,
+            ..Default::default()
+        };
+        let selector: Arc<dyn selector::Selector> = Arc::new(selector::MultiObjectiveSelector::new(mo));
+
+        // Empty network view → both destinations resolve as disconnected.
+        let node = Arc::new(crate::testing::LifecycleNode::with_views(
+            Arc::clone(&connector),
+            crate::testing::TestGraph::new(&BOB),
+            crate::testing::TestNetworkView::new(),
+        ));
+        let inner = fresh_inner_over(cfg, selector, node);
+
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            1,
+            "connectivity closes must share the selector's close_per_tick=1 budget, not reach close_max_concurrent=2"
+        );
+        Ok(())
+    }
+
+    /// Build an inner directly over an arbitrary node and selector — used by tests
+    /// that need a controllable network view (`LifecycleNode` + `TestNetworkView`)
+    /// or a non-default selector, which the `ChainNode`-based helpers can't provide.
+    fn fresh_inner_over<N>(
+        cfg: ChannelLifecycleConfig,
+        selector: Arc<dyn selector::Selector>,
+        node: Arc<N>,
+    ) -> ChannelLifecycleStrategyInner<N> {
+        ChannelLifecycleStrategyInner {
+            cfg,
+            node,
+            selector,
+            open_in_flight: Default::default(),
+            fund_in_flight: Default::default(),
+            close_in_flight: Default::default(),
+            finalize_in_flight: Default::default(),
+            cooldown: Arc::new(DashMap::new()),
+            start_epoch: std::time::Instant::now(),
+            last_observed: Arc::new(DashMap::new()),
+            peer_ticket_activity: Arc::new(DashMap::new()),
+            peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
+            last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
+            disconnect_streak: Arc::new(DashMap::new()),
+        }
     }
 
     fn fresh_inner_with_chain_and_graph<C>(
