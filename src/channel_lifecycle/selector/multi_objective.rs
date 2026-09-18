@@ -195,6 +195,18 @@ impl MultiObjectiveSelector {
             );
             picked.insert(c.addr);
             result.push((c.addr, c.offchain_key));
+            // Record this selection against its cell too. `fill_counts` is shared
+            // with any later tier's fill-k sweep, which would otherwise undercount
+            // peers already placed here and could re-fill a cell whose floor these
+            // utility picks already satisfied. Unknown subnets are not floor-tracked,
+            // matching Stage 1.
+            if !matches!(c.subnet, SubnetBucket::Unknown) {
+                let cell = BucketCell {
+                    latency: LatencyBucket::from_latency(c.edge_info.average_latency),
+                    subnet: c.subnet.clone(),
+                };
+                *fill_counts.entry(cell).or_insert(0) += 1;
+            }
         }
     }
 }
@@ -1093,6 +1105,55 @@ mod tests {
             opens.len(),
             2,
             "ticket sinks must still be opened to when they are the only candidates"
+        );
+    }
+
+    /// Regression (review, @NumberFour8): the utility stage must count its picks in
+    /// the shared `fill_counts`, or the sink tier's fill-k sweep undercounts the
+    /// capable tier and re-fills an already-satisfied cell instead of an empty one.
+    ///
+    /// Cell A holds two capable peers (addr 1, 2); a higher-scoring sink (addr 3)
+    /// also sits in A, and a lower-scoring sink (addr 4) sits in empty cell B. With
+    /// `k_floor = 2` and three slots, the capable tier fills A to its floor (one via
+    /// fill-k, one via utility). The remaining slot must then go to B's sink, not a
+    /// third peer in A: expected {1, 2, 4}, not {1, 2, 3}.
+    #[tokio::test]
+    async fn utility_stage_selections_count_toward_cross_tier_fill_k() {
+        let mut mo = MultiObjectiveSelectorConfig::balanced();
+        mo.k_floor = 2;
+        mo.open_per_tick = 3;
+        let sel = mk_selector(mo);
+        let lc_cfg = ChannelLifecycleConfig::default();
+
+        // Cell = (latency bucket, subnet). All four share one latency bucket (50 ms),
+        // so cell A = subnet 1 (capables + sink_a) and cell B = subnet 2 (sink_b);
+        // scores are separated by probe/ticket, not latency, to keep the cells intact.
+        let capable_a1 = mk_candidate(addr(1), offchain_key(1), Some(50), 0.6, 0.3, 1);
+        let capable_a2 = mk_candidate(addr(2), offchain_key(2), Some(50), 0.6, 0.3, 1);
+        let sink_a = mk_candidate(addr(3), offchain_key(3), Some(50), 1.0, 1.0, 1); // high score, cell A
+        let sink_b = mk_candidate(addr(4), offchain_key(4), Some(50), 0.4, 0.0, 2); // low score, empty cell B
+        let forwarding_view = fwd(&[(addr(1), 1), (addr(2), 1)]); // only 1 and 2 forward
+
+        let ctx = SelectorContext {
+            cfg: &lc_cfg,
+            deficit: 3,
+            open_candidates: &[capable_a1.clone(), capable_a2.clone(), sink_a.clone(), sink_b.clone()],
+            close_candidates: &[],
+            start_epoch_elapsed: Duration::from_secs(600),
+            bucket_view: BucketView::default(),
+            stake_view: StakeView::empty(),
+            forwarding_view,
+        };
+
+        let opens: Vec<Address> = sel.select_opens(&ctx).await.into_iter().map(|(a, _)| a).collect();
+        assert_eq!(opens.len(), 3, "three slots must be filled");
+        assert!(
+            opens.contains(&addr(4)),
+            "the empty cell B's sink must be filled, not passed over; got {opens:?}"
+        );
+        assert!(
+            !opens.contains(&addr(3)),
+            "cell A's floor is already met by the two capable picks, so its sink must not be chosen; got {opens:?}"
         );
     }
 

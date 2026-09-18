@@ -461,6 +461,22 @@ fn whole_tickets(tickets: f64) -> f64 {
     }
 }
 
+/// wxHOPR a channel must hold to fund one winning ticket at the current economics
+/// (`price × ASSUMED_HOPS / win_prob`), rounded up to whole wei — the least a peer's
+/// onward channel must carry to relay a hop. Below it the edge is dust, not a usable
+/// forwarding edge (used to keep drained ticket sinks out of the forwarding-capable
+/// tier). `win_prob` is clamped to `[f64::EPSILON, 1.0]` (NaN → EPSILON) so the ratio
+/// cannot diverge.
+pub(crate) fn winning_ticket_face_value(price: HoprBalance, win_prob: f64) -> HoprBalance {
+    let p = if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    };
+    let wei = price.amount().low_u128() as f64 * ASSUMED_HOPS as f64 / p;
+    HoprBalance::from(U256::from(wei.ceil() as u128))
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,

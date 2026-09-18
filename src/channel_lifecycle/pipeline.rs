@@ -521,6 +521,15 @@ where
         };
         let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
+        // The least an onward channel must hold to count as forwarding-capable: one
+        // winning-ticket face value at this tick's economics. Falls back to 1 wei
+        // (exclude only fully-drained edges) when economics are unavailable.
+        let min_onward_balance = ticket_price
+            .as_ref()
+            .zip(win_prob)
+            .map(|(price, wp)| super::config::winning_ticket_face_value(*price, wp))
+            .unwrap_or_else(|| HoprBalance::from(1_u32));
+
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
         // `None` when any required economic input is unavailable.
         let funding = ticket_price
@@ -779,7 +788,8 @@ where
                 // the network-wide channel scan entirely in that case, the common
                 // steady state once the population is at target.
                 if self.cfg.eligibility.demote_non_forwarding_peers && deficit > 0 {
-                    self.fetch_forwarding_view(chain, deadline, &open_candidates).await
+                    self.fetch_forwarding_view(chain, deadline, &open_candidates, min_onward_balance)
+                        .await
                 } else {
                     ForwardingView::empty()
                 }
@@ -1036,6 +1046,7 @@ where
         chain: &N::ChainApi,
         deadline: Instant,
         open_candidates: &[OpenCandidate],
+        min_onward_balance: HoprBalance,
     ) -> ForwardingView {
         let candidate_addrs: HashSet<Address> = open_candidates.iter().map(|c| c.addr).collect();
         if candidate_addrs.is_empty() {
@@ -1052,11 +1063,13 @@ where
                 let selector = ChannelSelector::default().with_allowed_states(&[ChannelStatusDiscriminants::Open]);
                 let mut stream = chain.stream_channels(selector)?;
                 while let Some(ch) = stream.next().await {
-                    // Count only a candidate's *usable onward* edges: a drained
-                    // channel cannot relay, and a channel back to this node is not
-                    // an onward hop for a route this node builds.  (The chain
+                    // Count only a candidate's *usable onward* edges: an edge below
+                    // one winning-ticket face value cannot fund a hop (a dust ticket
+                    // sink is not forwarding-capable), and a channel back to this node
+                    // is not an onward hop for a route this node builds.  (The chain
                     // forbids self-loops, so no `source == destination` guard.)
-                    if !candidate_addrs.contains(&ch.source) || ch.balance.is_zero() || ch.destination == me {
+                    if !candidate_addrs.contains(&ch.source) || ch.balance < min_onward_balance || ch.destination == me
+                    {
                         continue;
                     }
                     *counts.entry(ch.source).or_insert(0) += 1;
@@ -2304,30 +2317,33 @@ mod tests {
         // `me` for the test connector is BOB (its chain key); a channel CHRIS -> BOB
         // is not an onward hop for a route this node builds.
         let drained_dest: Address = [9; Address::SIZE].into();
+        let dust_dest: Address = [8; Address::SIZE].into();
 
-        let mk = |src: Address, dst: Address, amount: u32| -> anyhow::Result<ChannelEntry> {
+        let mk = |src: Address, dst: Address, balance: HoprBalance| -> anyhow::Result<ChannelEntry> {
             Ok(ChannelEntry::builder()
                 .between(src, dst)
-                .amount(amount)
+                .balance(balance)
                 .ticket_index(0)
                 .status(ChannelStatus::Open)
                 .epoch(0)
                 .build()?)
         };
 
-        // CHRIS sources two usable onward channels (ALICE, DAVE) plus a drained
-        // one and one back to `me` (BOB) — the latter two must be excluded.
-        // ALICE sources none.
+        // CHRIS sources two usable onward channels (ALICE, DAVE) plus a dust one, a
+        // drained one, and one back to `me` (BOB) — the last three must be excluded.
+        // ALICE sources none. With the sim's 1 wxHOPR ticket price / win_prob 1.0 /
+        // 3 hops, one face value is 3 wxHOPR, so 5 wxHOPR counts and 1 wei does not.
         let channels = [
-            mk(*CHRIS, *ALICE, 5)?,
-            mk(*CHRIS, *DAVE, 5)?,
-            mk(*CHRIS, drained_dest, 0)?, // drained → cannot relay
-            mk(*CHRIS, *BOB, 5)?,         // back to this node → not an onward hop
+            mk(*CHRIS, *ALICE, HoprBalance::new_base(5))?,
+            mk(*CHRIS, *DAVE, HoprBalance::new_base(5))?,
+            mk(*CHRIS, dust_dest, HoprBalance::from(1_u32))?, // dust: below one face value
+            mk(*CHRIS, drained_dest, HoprBalance::zero())?,   // drained → cannot relay
+            mk(*CHRIS, *BOB, HoprBalance::new_base(5))?,      // back to this node → not an onward hop
         ];
 
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
-                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE, &drained_dest],
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE, &drained_dest, &dust_dest],
                 false,
                 XDaiBalance::new_base(1),
                 HoprBalance::new_base(1000),
@@ -2355,14 +2371,15 @@ mod tests {
         let candidates = vec![cand(*CHRIS), cand(*ALICE)];
 
         let deadline = inner.read_deadline();
+        let min_onward = super::super::config::winning_ticket_face_value(HoprBalance::new_base(1), 1.0);
         let view = inner
-            .fetch_forwarding_view(inner.node.chain_api(), deadline, &candidates)
+            .fetch_forwarding_view(inner.node.chain_api(), deadline, &candidates, min_onward)
             .await;
 
         assert_eq!(
             view.outgoing_channels(&CHRIS),
             2,
-            "only the two funded onward channels count; drained and to-me are excluded"
+            "only the two adequately-funded onward channels count; dust, drained and to-me are excluded"
         );
         assert_eq!(
             view.outgoing_channels(&ALICE),
