@@ -753,7 +753,11 @@ where
                 }
             },
             async {
-                if self.cfg.eligibility.demote_non_forwarding_peers {
+                // Only consumed by the open pass's candidate ranking, so it is
+                // pointless when there is no open deficit to fill this tick — skip
+                // the network-wide channel scan entirely in that case, the common
+                // steady state once the population is at target.
+                if self.cfg.eligibility.demote_non_forwarding_peers && deficit > 0 {
                     self.fetch_forwarding_view(chain, deadline, &open_candidates).await
                 } else {
                     ForwardingView::empty()
