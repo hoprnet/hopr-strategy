@@ -15,7 +15,7 @@ use hopr_api::{
     PeerId,
     chain::{
         AccountSelector, ChainReadAccountOperations, ChainReadChannelOperations, ChainReadSafeOperations, ChainValues,
-        ChainWriteChannelOperations, ChannelSelector, SafeSelector,
+        ChainWriteChannelOperations, ChannelSelector, ChannelStatusDiscriminants, SafeSelector,
     },
     graph::{
         EdgeImmediateProtocolObservable as _, EdgeLinkObservable as _, EdgeObservableRead as _, NetworkGraphView as _,
@@ -34,8 +34,8 @@ use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
     config::{ResolvedFunding, StartupPhase},
     selector::{
-        BucketCell, BucketView, CloseCandidate, LatencyBucket, OpenCandidate, PeerEdgeInfo, SelectorContext, SignalSet,
-        StakeView, SubnetBucket,
+        BucketCell, BucketView, CloseCandidate, ForwardingView, LatencyBucket, OpenCandidate, PeerEdgeInfo,
+        SelectorContext, SignalSet, StakeView, SubnetBucket,
     },
 };
 
@@ -521,6 +521,15 @@ where
         };
         let min_ticket_price_wei = ticket_price.as_ref().map_or(0.0, |p| p.amount().low_u128() as f64);
 
+        // The least an onward channel must hold to count as forwarding-capable: one
+        // winning-ticket face value at this tick's economics. Falls back to 1 wei
+        // (exclude only fully-drained edges) when economics are unavailable.
+        let min_onward_balance = ticket_price
+            .as_ref()
+            .zip(win_prob)
+            .map(|(price, wp)| super::config::winning_ticket_face_value(*price, wp))
+            .unwrap_or_else(|| HoprBalance::from(1_u32));
+
         // Resolve data-capacity config fields to wxHOPR amounts for this tick.
         // `None` when any required economic input is unavailable.
         let funding = ticket_price
@@ -760,13 +769,32 @@ where
         let bucket_view = BucketView::new(bucket_cells);
         self.emit_bucket_metrics(&bucket_view, &close_candidates);
 
-        // On-chain stake scores — only fetched when the active selector requests STAKE.
-        let stake_view = if self.selector.required_signals().contains(SignalSet::STAKE) {
-            self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
-                .await
-        } else {
-            StakeView::empty()
-        };
+        // Two independent chain reads: stake scores (multi-objective STAKE
+        // signal) and funded-outgoing-channel counts (sink demotion, consumed by
+        // whichever selector is active).  Each is skipped when its consumer is off;
+        // when both run they overlap rather than serialize.
+        let (stake_view, forwarding_view) = futures::join!(
+            async {
+                if self.selector.required_signals().contains(SignalSet::STAKE) {
+                    self.fetch_stake_view(chain, deadline, &close_candidates, &open_candidates)
+                        .await
+                } else {
+                    StakeView::empty()
+                }
+            },
+            async {
+                // Only consumed by the open pass's candidate ranking, so it is
+                // pointless when there is no open deficit to fill this tick — skip
+                // the network-wide channel scan entirely in that case, the common
+                // steady state once the population is at target.
+                if self.cfg.eligibility.demote_non_forwarding_peers && deficit > 0 {
+                    self.fetch_forwarding_view(chain, deadline, &open_candidates, min_onward_balance)
+                        .await
+                } else {
+                    ForwardingView::empty()
+                }
+            },
+        );
 
         let selector_ctx = SelectorContext {
             cfg: &self.cfg,
@@ -776,6 +804,7 @@ where
             start_epoch_elapsed: self.start_epoch.elapsed(),
             bucket_view,
             stake_view,
+            forwarding_view,
         };
 
         self.emit_score_axis_metrics(&selector_ctx);
@@ -1000,6 +1029,58 @@ where
         });
 
         Some(map)
+    }
+
+    /// Counts each open candidate's funded outgoing channels — channels the peer
+    /// itself sources, in the `Open` state, to a third party other than this node
+    /// — keyed by chain address.  Computed only when sink demotion is enabled.
+    ///
+    /// One network-wide `Open`-channel stream (served by the local indexer) is
+    /// counted per source; a peer absent from the result has zero outgoing
+    /// channels and is a ticket sink.  Counts are restricted to candidate
+    /// addresses to bound the returned map.  When the stream is unavailable the
+    /// view is empty, so no peer is demoted for a chain read that simply did not
+    /// answer.
+    async fn fetch_forwarding_view(
+        &self,
+        chain: &N::ChainApi,
+        deadline: Instant,
+        open_candidates: &[OpenCandidate],
+        min_onward_balance: HoprBalance,
+    ) -> ForwardingView {
+        let candidate_addrs: HashSet<Address> = open_candidates.iter().map(|c| c.addr).collect();
+        if candidate_addrs.is_empty() {
+            return ForwardingView::empty();
+        }
+        let me = *chain.me();
+
+        // Per candidate source, count its usable onward Open channels.  A channel
+        // is uniquely keyed by (source, destination), so each surviving edge is a
+        // distinct destination — no dedup needed.
+        let counts: Option<HashMap<Address, u32>> = self
+            .read("stream_channels (forwarding view)", deadline, async {
+                let mut counts: HashMap<Address, u32> = HashMap::new();
+                let selector = ChannelSelector::default().with_allowed_states(&[ChannelStatusDiscriminants::Open]);
+                let mut stream = chain.stream_channels(selector)?;
+                while let Some(ch) = stream.next().await {
+                    // Count only a candidate's *usable onward* edges: an edge below
+                    // one winning-ticket face value cannot fund a hop (a dust ticket
+                    // sink is not forwarding-capable), and a channel back to this node
+                    // is not an onward hop for a route this node builds.  (The chain
+                    // forbids self-loops, so no `source == destination` guard.)
+                    if !candidate_addrs.contains(&ch.source) || ch.balance < min_onward_balance || ch.destination == me
+                    {
+                        continue;
+                    }
+                    *counts.entry(ch.source).or_insert(0) += 1;
+                }
+                Ok::<_, <N::ChainApi as ChainReadChannelOperations>::Error>(counts)
+            })
+            .await;
+
+        counts
+            .map(ForwardingView::from_counts)
+            .unwrap_or_else(ForwardingView::empty)
     }
 
     /// Fetches on-chain safe balances for all candidate peers and returns
@@ -2226,6 +2307,88 @@ mod tests {
         }
     }
 
+    /// `fetch_forwarding_view` counts each candidate's own funded `Open` outgoing
+    /// channels to distinct third parties: a peer sourcing usable onward channels
+    /// is forwarding-capable, a peer sourcing none is a ticket sink (count 0).
+    /// Drained channels and channels back to this node are not usable onward
+    /// edges and must not count.
+    #[tokio::test]
+    async fn fetch_forwarding_view_counts_outgoing_channels() -> anyhow::Result<()> {
+        // `me` for the test connector is BOB (its chain key); a channel CHRIS -> BOB
+        // is not an onward hop for a route this node builds.
+        let drained_dest: Address = [9; Address::SIZE].into();
+        let dust_dest: Address = [8; Address::SIZE].into();
+
+        let mk = |src: Address, dst: Address, balance: HoprBalance| -> anyhow::Result<ChannelEntry> {
+            Ok(ChannelEntry::builder()
+                .between(src, dst)
+                .balance(balance)
+                .ticket_index(0)
+                .status(ChannelStatus::Open)
+                .epoch(0)
+                .build()?)
+        };
+
+        // CHRIS sources two usable onward channels (ALICE, DAVE) plus a dust one, a
+        // drained one, and one back to `me` (BOB) — the last three must be excluded.
+        // ALICE sources none. With the sim's 1 wxHOPR ticket price / win_prob 1.0 /
+        // 3 hops, one face value is 3 wxHOPR, so 5 wxHOPR counts and 1 wei does not.
+        let channels = [
+            mk(*CHRIS, *ALICE, HoprBalance::new_base(5))?,
+            mk(*CHRIS, *DAVE, HoprBalance::new_base(5))?,
+            mk(*CHRIS, dust_dest, HoprBalance::from(1_u32))?, // dust: below one face value
+            mk(*CHRIS, drained_dest, HoprBalance::zero())?,   // drained → cannot relay
+            mk(*CHRIS, *BOB, HoprBalance::new_base(5))?,      // back to this node → not an onward hop
+        ];
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE, &drained_dest, &dust_dest],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels(channels)
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let inner = fresh_inner_with_chain(ChannelLifecycleConfig::default(), Arc::clone(&connector));
+
+        let ok = *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[7u8; 32])
+            .expect("test key")
+            .public();
+        let cand = |a: Address| selector::OpenCandidate {
+            addr: a,
+            offchain_key: ok,
+            edge_info: selector::PeerEdgeInfo::default(),
+            ticket_score: 0.0,
+            subnet: selector::SubnetBucket::Unknown,
+        };
+        let candidates = vec![cand(*CHRIS), cand(*ALICE)];
+
+        let deadline = inner.read_deadline();
+        let min_onward = super::super::config::winning_ticket_face_value(HoprBalance::new_base(1), 1.0);
+        let view = inner
+            .fetch_forwarding_view(inner.node.chain_api(), deadline, &candidates, min_onward)
+            .await;
+
+        assert_eq!(
+            view.outgoing_channels(&CHRIS),
+            2,
+            "only the two adequately-funded onward channels count; dust, drained and to-me are excluded"
+        );
+        assert_eq!(
+            view.outgoing_channels(&ALICE),
+            0,
+            "ALICE sources no channels — a ticket sink"
+        );
+        Ok(())
+    }
+
     fn fresh_inner_with_chain_and_graph<C>(
         cfg: ChannelLifecycleConfig,
         connector: Arc<C>,
@@ -2656,6 +2819,7 @@ mod tests {
             start_epoch_elapsed: Duration::ZERO,
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
 
         let closes = selector::DefaultSelector.select_closes(&ctx).await;
@@ -2707,6 +2871,7 @@ mod tests {
             start_epoch_elapsed: Duration::ZERO,
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
         assert!(
             selector::DefaultSelector.select_closes(&ctx_no_data).await.is_empty(),
@@ -2732,6 +2897,7 @@ mod tests {
             start_epoch_elapsed: Duration::from_secs(10), // strategy running 10s > last_update 1s
             bucket_view: selector::BucketView::default(),
             stake_view: selector::StakeView::empty(),
+            forwarding_view: selector::ForwardingView::empty(),
         };
         let closes = selector::DefaultSelector.select_closes(&ctx_with_data).await;
         assert_eq!(
