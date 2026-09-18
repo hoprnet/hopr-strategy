@@ -21,12 +21,14 @@ use crate::channel_lifecycle::ChannelLifecycleConfig;
 
 mod bucket;
 mod default;
+mod forwarding;
 mod multi_objective;
 mod stake;
 mod subnet;
 
 pub use bucket::{BucketCell, BucketView, LatencyBucket};
 pub use default::DefaultSelector;
+pub use forwarding::ForwardingView;
 pub use multi_objective::MultiObjectiveSelector;
 pub use stake::StakeView;
 pub use subnet::SubnetBucket;
@@ -162,6 +164,34 @@ pub struct SelectorContext<'a> {
     /// Normalized on-chain safe-balance scores, keyed by peer chain address.
     /// Empty when the active selector did not request the `STAKE` signal.
     pub stake_view: StakeView,
+    /// Per-peer funded-outgoing-channel counts, keyed by peer chain address.
+    /// Empty when `eligibility.demote_non_forwarding_peers` is off.
+    pub forwarding_view: ForwardingView,
+}
+
+/// Splits `candidates` into `(forwarding-capable, ticket-sink)` tiers per the
+/// shared demotion policy, so every selector can rank capable-then-sink the same
+/// way.
+///
+/// A ticket sink — a peer sourcing fewer than
+/// [`minimum_peer_outgoing_channels`](crate::channel_lifecycle::config::EligibilityConfig::minimum_peer_outgoing_channels)
+/// funded outgoing channels — can only be a path's last hop, never an
+/// intermediate relay.  When demotion is disabled every candidate lands in the
+/// capable tier and the sink tier is empty, so callers need no special case.
+pub(super) fn partition_by_forwarding<'a>(
+    candidates: &'a [OpenCandidate],
+    forwarding_view: &ForwardingView,
+    eligibility: &crate::channel_lifecycle::config::EligibilityConfig,
+) -> (Vec<&'a OpenCandidate>, Vec<&'a OpenCandidate>) {
+    if !eligibility.demote_non_forwarding_peers {
+        return (candidates.iter().collect(), Vec::new());
+    }
+    // Compare in `usize`: a threshold above `u32::MAX` must not wrap to 0 and
+    // silently mark every peer forwarding-capable.
+    let threshold = eligibility.minimum_peer_outgoing_channels.max(1);
+    candidates
+        .iter()
+        .partition(|c| forwarding_view.outgoing_channels(&c.addr) as usize >= threshold)
 }
 
 /// Selects which peers to open channels with and which open channels to close.

@@ -1,5 +1,8 @@
-//! Default selector: reproduces the original `peer_score_for` / `should_close`
-//! logic verbatim, with zero behavior change from the pre-refactor pipeline.
+//! Default selector: the original `peer_score_for` / `should_close` scoring,
+//! plus the shared ticket-sink demotion (see
+//! [`partition_by_forwarding`](super::partition_by_forwarding)).  With
+//! `eligibility.demote_non_forwarding_peers` off it is byte-for-byte the
+//! pre-refactor pipeline.
 
 use std::time::Duration;
 
@@ -9,9 +12,10 @@ use tracing::debug;
 
 use super::{CloseCandidate, OpenCandidate, Selector, SelectorContext};
 
-/// Stateless selector that exactly reproduces the behavior of the original
-/// `peer_score_for` + `should_close` methods.  This is the default selector;
-/// all existing deployments use it unless they opt in to a different profile.
+/// Stateless selector using the original `peer_score_for` + `should_close`
+/// scoring, with ticket sinks demoted to a last resort on open (shared with
+/// every selector).  This is the default selector; all existing deployments use
+/// it unless they opt in to a different profile.
 pub struct DefaultSelector;
 
 impl DefaultSelector {
@@ -114,15 +118,24 @@ impl Selector for DefaultSelector {
     }
 
     async fn select_opens(&self, ctx: &SelectorContext<'_>) -> Vec<(Address, OffchainPublicKey)> {
-        let mut scored: Vec<(&OpenCandidate, f64)> = ctx
-            .open_candidates
-            .iter()
-            .map(|c| (c, Self::peer_score(c, ctx.cfg)))
-            .collect();
+        // Rank forwarding-capable peers ahead of ticket sinks; within each tier
+        // preserve the original composite-score ordering.  Sinks are demoted,
+        // never dropped — when no capable peer is available they still fill the
+        // open slots.  With demotion disabled the sink tier is empty and this
+        // reproduces the original single ranked list exactly.
+        let (capable, sinks) =
+            super::partition_by_forwarding(ctx.open_candidates, &ctx.forwarding_view, &ctx.cfg.eligibility);
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = |tier: Vec<&OpenCandidate>| -> Vec<(Address, OffchainPublicKey)> {
+            let mut scored: Vec<(&OpenCandidate, f64)> =
+                tier.into_iter().map(|c| (c, Self::peer_score(c, ctx.cfg))).collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.into_iter().map(|(c, _)| (c.addr, c.offchain_key)).collect()
+        };
 
-        scored.into_iter().map(|(c, _)| (c.addr, c.offchain_key)).collect()
+        let mut result = rank(capable);
+        result.extend(rank(sinks));
+        result
     }
 }
 
@@ -139,7 +152,7 @@ mod tests {
     use super::*;
     use crate::channel_lifecycle::{
         ChannelLifecycleConfig,
-        selector::{CloseCandidate, PeerEdgeInfo},
+        selector::{BucketView, CloseCandidate, ForwardingView, PeerEdgeInfo, StakeView, SubnetBucket},
     };
 
     fn addr(seed: u8) -> Address {
@@ -148,6 +161,97 @@ mod tests {
 
     fn offchain_key(seed: u8) -> OffchainPublicKey {
         *OffchainKeypair::from_secret(&[seed; 32]).expect("test key").public()
+    }
+
+    /// Builds an open-candidate with a given composite-score inputs and outgoing
+    /// count; `subnet` is `Unknown` so the (multi-objective-only) anonymity logic
+    /// never applies here.
+    fn open_candidate(seed: u8, edge_score: f64, ticket_score: f64) -> OpenCandidate {
+        OpenCandidate {
+            addr: addr(seed),
+            offchain_key: offchain_key(seed),
+            edge_info: PeerEdgeInfo {
+                edge_score: Some(edge_score),
+                last_update: Duration::from_secs(1),
+                average_latency: Some(Duration::from_millis(50)),
+                probe_success_rate: Some(edge_score),
+                ack_rate: Some(edge_score),
+            },
+            ticket_score,
+            subnet: SubnetBucket::Unknown,
+        }
+    }
+
+    fn open_ctx<'a>(
+        cfg: &'a ChannelLifecycleConfig,
+        candidates: &'a [OpenCandidate],
+        forwarding_view: ForwardingView,
+    ) -> SelectorContext<'a> {
+        SelectorContext {
+            cfg,
+            deficit: 4,
+            open_candidates: candidates,
+            close_candidates: &[],
+            start_epoch_elapsed: Duration::from_secs(600),
+            bucket_view: BucketView::default(),
+            stake_view: StakeView::empty(),
+            forwarding_view,
+        }
+    }
+
+    /// The deployed default path also demotes ticket sinks: a forwarding-capable
+    /// peer with a *worse* composite score still ranks above a higher-scored sink.
+    #[tokio::test]
+    async fn default_selector_demotes_sinks_to_last_resort() {
+        let capable = open_candidate(1, 0.1, 0.0); // poor score, but forwards
+        let sink = open_candidate(2, 1.0, 1.0); // great score, no outgoing channels
+        let forwarding_view = ForwardingView::from_counts([(addr(1), 1u32)].into_iter().collect());
+
+        let cfg = ChannelLifecycleConfig::default(); // demotion on by default
+        let candidates = [capable.clone(), sink.clone()];
+        let ctx = open_ctx(&cfg, &candidates, forwarding_view);
+
+        let opens = DefaultSelector.select_opens(&ctx).await;
+        assert_eq!(
+            opens.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            vec![capable.addr, sink.addr],
+            "DefaultSelector must rank a forwarding-capable peer above a higher-scored sink"
+        );
+    }
+
+    /// With demotion disabled the default path is byte-for-byte the original
+    /// score-only ranking: the higher-scored sink wins.
+    #[tokio::test]
+    async fn default_selector_disabled_demotion_is_score_only() {
+        let capable = open_candidate(1, 0.1, 0.0);
+        let sink = open_candidate(2, 1.0, 1.0);
+        let forwarding_view = ForwardingView::from_counts([(addr(1), 1u32)].into_iter().collect());
+
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.eligibility.demote_non_forwarding_peers = false;
+        let candidates = [capable.clone(), sink.clone()];
+        let ctx = open_ctx(&cfg, &candidates, forwarding_view);
+
+        let opens = DefaultSelector.select_opens(&ctx).await;
+        assert_eq!(
+            opens[0].0, sink.addr,
+            "with demotion off, the higher-scored peer wins regardless of forwarding"
+        );
+    }
+
+    /// Demotion never bars: when every candidate is a sink they are still selected.
+    #[tokio::test]
+    async fn default_selector_all_sinks_still_selected() {
+        let cfg = ChannelLifecycleConfig::default();
+        let candidates = [open_candidate(1, 0.8, 0.5), open_candidate(2, 0.7, 0.5)];
+        let ctx = open_ctx(&cfg, &candidates, ForwardingView::empty());
+
+        let opens = DefaultSelector.select_opens(&ctx).await;
+        assert_eq!(
+            opens.len(),
+            2,
+            "sinks must still be opened when they are the only candidates"
+        );
     }
 
     fn open_channel(src: Address, dest: Address) -> ChannelEntry {
