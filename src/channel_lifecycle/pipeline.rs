@@ -475,17 +475,11 @@ where
             // if none is already active (an event-set cooldown, with the true close
             // time, takes precedence). Keyed off the stored `closed` flag so it fires
             // once per closure, not every tick the `Closed` entry lingers on-chain.
-            if is_closed && self.last_observed.get(&id).is_none_or(|obs| !obs.closed) {
-                let active = self
-                    .cooldown
-                    .get(&ch.destination)
-                    .is_some_and(|until| Instant::now() < *until);
-                if !active {
-                    self.cooldown.insert(
-                        ch.destination,
-                        Instant::now() + self.cfg.population.peer_reopen_cooldown,
-                    );
-                }
+            let was_closed = prev_observations.get(&id).is_some_and(|obs| obs.closed);
+            if is_closed && !was_closed && !self.is_on_cooldown(&ch.destination) {
+                // An event-set cooldown carries the true close time, so only fill the
+                // gap when none is already active.
+                self.start_reopen_cooldown(ch.destination);
             }
 
             self.last_observed
@@ -692,11 +686,7 @@ where
                 if self.open_in_flight.is_held(&chain_addr) {
                     return None;
                 }
-                if self
-                    .cooldown
-                    .get(&chain_addr)
-                    .is_some_and(|until| Instant::now() < *until)
-                {
+                if self.is_on_cooldown(&chain_addr) {
                     return None;
                 }
                 if self
@@ -827,26 +817,21 @@ where
             let disconnected: HashSet<ChannelId> = open_channels
                 .iter()
                 .filter(|ch| {
-                    match addr_to_peer_id
+                    // An unresolvable peer counts as connected (shielded), matching the
+                    // open pass — so only a resolvable, not-connected peer is disconnected.
+                    let disconnected_now = addr_to_peer_id
                         .get(&ch.destination)
-                        .map(|peer_id| self.node.network_view().is_connected(peer_id))
-                    {
-                        // Resolvable and disconnected — advance the streak; retire only
-                        // once it has persisted across the whole debounce window.
-                        Some(false) => {
-                            let streak = {
-                                let mut entry = self.disconnect_streak.entry(ch.destination).or_insert(0);
-                                *entry += 1;
-                                *entry
-                            };
-                            streak >= debounce
-                        }
-                        // Connected, or an unresolvable peer (shielded like a connected
-                        // one) — reset the streak and keep the channel.
-                        Some(true) | None => {
-                            self.disconnect_streak.remove(&ch.destination);
-                            false
-                        }
+                        .is_some_and(|peer_id| !self.node.network_view().is_connected(peer_id));
+                    if disconnected_now {
+                        // Advance the streak; retire only once it has persisted across
+                        // the whole debounce window.
+                        let mut streak = self.disconnect_streak.entry(ch.destination).or_insert(0);
+                        *streak += 1;
+                        *streak >= debounce
+                    } else {
+                        // Connected (or shielded) — reset the streak and keep the channel.
+                        self.disconnect_streak.remove(&ch.destination);
+                        false
                     }
                 })
                 .map(|ch| *ch.get_id())
@@ -2246,22 +2231,11 @@ mod tests {
         connector: Arc<C>,
         graph: Arc<StubGraph>,
     ) -> ChannelLifecycleStrategyInner<ChainNode<Arc<C>>> {
-        ChannelLifecycleStrategyInner {
+        fresh_inner_over(
             cfg,
-            node: Arc::new(ChainNode::with_graph(connector, graph)),
-            selector: Arc::new(selector::DefaultSelector),
-            open_in_flight: Default::default(),
-            fund_in_flight: Default::default(),
-            close_in_flight: Default::default(),
-            finalize_in_flight: Default::default(),
-            cooldown: Arc::new(DashMap::new()),
-            start_epoch: std::time::Instant::now(),
-            last_observed: Arc::new(DashMap::new()),
-            peer_ticket_activity: Arc::new(DashMap::new()),
-            peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
-            last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
-            disconnect_streak: Arc::new(DashMap::new()),
-        }
+            Arc::new(selector::DefaultSelector),
+            Arc::new(ChainNode::with_graph(connector, graph)),
+        )
     }
 
     /// try_open_channel: channel is already Open with stake >= lower_balance_threshold.

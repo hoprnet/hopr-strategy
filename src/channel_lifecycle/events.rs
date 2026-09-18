@@ -102,13 +102,26 @@ where
         tracing::info!(%ch, "channel-lifecycle: channel closure initiated");
     }
 
+    /// Starts (or restarts) the reopen cooldown for `dest`, so its peer is not
+    /// immediately re-opened after a channel to it closes. Single definition of the
+    /// cooldown window, shared by the `Closed` event path and the snapshot pass's
+    /// reconciliation of closures whose event was lost.
+    pub(super) fn start_reopen_cooldown(&self, dest: Address) {
+        self.cooldown
+            .insert(dest, Instant::now() + self.cfg.population.peer_reopen_cooldown);
+    }
+
+    /// Whether `dest` is still within an active reopen cooldown window.
+    pub(super) fn is_on_cooldown(&self, dest: &Address) -> bool {
+        self.cooldown.get(dest).is_some_and(|until| Instant::now() < *until)
+    }
+
     /// Starts the peer cooldown so the channel is not immediately re-opened.
     pub(super) fn on_channel_closed(&self, ch: ChannelEntry) {
         self.finalize_in_flight.release(ch.get_id());
         self.last_observed.remove(ch.get_id());
         self.peer_ticket_activity.remove(&ch.destination);
-        let until = Instant::now() + self.cfg.population.peer_reopen_cooldown;
-        self.cooldown.insert(ch.destination, until);
+        self.start_reopen_cooldown(ch.destination);
         tracing::info!(%ch, "channel-lifecycle: channel closed");
     }
 
