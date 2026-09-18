@@ -2388,7 +2388,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3391,9 +3391,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "4.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "750c02e904f0a6156b7da0e7324ed19b59fdbc51656d18bb82ec5e009485aff0"
+version = "4.3.1"
+source = "git+https://github.com/hoprnet/hopr-api?branch=lukas%2Fextended-offchain-key#e4b26c4435c6eb44876425bfd45eb93687943bb4"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -3519,9 +3518,8 @@ dependencies = [
 
 [[package]]
 name = "hopr-types"
-version = "4.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c46c3109d786f2688fa712240720a0ada428d99382eb2b76a996ee7ea33ba188"
+version = "4.0.2"
+source = "git+https://github.com/hoprnet/hopr-types?branch=lukas%2Fextended-offchain-key#1d4d630d69aba069f16e1a149c3fcfd50e3eddd7"
 dependencies = [
  "aes",
  "anyhow",
@@ -6478,7 +6476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
