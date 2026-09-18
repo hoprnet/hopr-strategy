@@ -265,6 +265,69 @@ async fn force_closes_disconnected_channel_regardless_of_quality(fixture: Integr
     Ok(())
 }
 
+/// Connectivity closes are debounced. `is_connected` is a point-in-time snapshot
+/// with no hysteresis, so a channel to a disconnected peer is retired only after
+/// the peer has been observed disconnected for `close_after_disconnected_ticks`
+/// consecutive ticks — never on the first missed observation.
+///
+/// The peer here is permanently disconnected, so it *does* eventually close; the
+/// point is *when*. With the debounce set to four ticks, the close cannot fire
+/// before the fourth disconnected tick, so a lower-bound timing assertion (robust
+/// to scheduling jitter, which only ever delays ticks further) distinguishes the
+/// debounced behaviour from the previous close-on-first-tick one.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn debounces_connectivity_before_closing_a_disconnected_channel(fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [source, peer] = fixture.claim_accounts::<2>();
+    let peer_addr = peer.address;
+
+    // 1. Chain state: one Open channel.
+    let scenario = fixture
+        .chain_with_channels(&source, &[(&peer, "5 wxHOPR".parse()?)], &[])
+        .await?;
+    // 2. Quality: high and recent, so only connectivity can close it.
+    scenario.graph.set_edge(&peer_addr, 1.0, Duration::from_secs(1));
+    // 3. Connectivity: peer never connected — left unset.
+
+    let tick = Duration::from_millis(150);
+    let mut cfg = recovery_config(tick);
+    cfg.restart.startup_observation_period = Duration::ZERO;
+    cfg.restart.startup_close_grace_period = Duration::ZERO;
+    cfg.population.target_open_channels = 0;
+    cfg.closure.close_after_disconnected_ticks = 4;
+
+    let node = Arc::new(LifecycleNode::with_views(
+        scenario.connector.clone(),
+        scenario.graph.clone(),
+        scenario.network.clone(),
+    ));
+    let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
+    let started = Instant::now();
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
+
+    await_channel_where(
+        &scenario.connector,
+        scenario.source_addr,
+        peer_addr,
+        timeouts.action,
+        "disconnected channel closed only after the debounce window",
+        |c| c.status != ChannelStatus::Open,
+    )
+    .await?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= 2 * tick,
+        "connectivity close must be debounced across consecutive ticks, not fired on the first disconnected tick; \
+         closed after {elapsed:?}, expected >= {:?}",
+        2 * tick
+    );
+
+    assert!(!handle.is_finished(), "channel-lifecycle strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
 /// A node holding one unusable channel recovers to a healthy, funded one within
 /// a bounded time, whether the channel is unusable through poor quality or
 /// through being drained — the two branches of `DefaultSelector::should_close`

@@ -115,6 +115,7 @@ impl ChannelLifecycleStrategy {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
+            disconnect_streak: Arc::new(DashMap::new()),
         }))
     }
 }

@@ -626,6 +626,17 @@ pub struct ClosureConfig {
     /// Default: 2.
     #[default = 2]
     pub close_max_concurrent: usize,
+
+    /// Consecutive ticks a peer must be observed disconnected before its channel is
+    /// closed for connectivity alone.  [`NetworkView::is_connected`] is a
+    /// point-in-time snapshot with no hysteresis, so a single missed observation
+    /// would otherwise retire an otherwise-healthy channel on a transient blip; a
+    /// reconnection on any tick resets the count.  `1` disables the debounce
+    /// (close on the first disconnected tick).  Default: 3.
+    ///
+    /// [`NetworkView::is_connected`]: hopr_api::network::NetworkView::is_connected
+    #[default = 3]
+    pub close_after_disconnected_ticks: usize,
 }
 
 /// Controls the finalizer phase (second `close_channel` call for `PendingToClose`

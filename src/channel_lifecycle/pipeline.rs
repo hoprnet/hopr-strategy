@@ -791,12 +791,40 @@ where
             // quality score doesn't linger. An unresolvable peer counts as
             // connected, so a cold or failed account read shields rather than
             // forces a close.
+            //
+            // `is_connected` is a point-in-time snapshot with no hysteresis of its
+            // own, so a single missed observation is debounced: a peer must be seen
+            // disconnected for `close_after_disconnected_ticks` consecutive ticks
+            // before its channel is retired, and any connected tick resets the count.
+            // The streak map is pruned to live channels each tick so it cannot grow
+            // without bound.
+            let debounce = self.cfg.closure.close_after_disconnected_ticks.max(1);
+            let live_dests: HashSet<Address> = open_channels.iter().map(|ch| ch.destination).collect();
+            self.disconnect_streak.retain(|dest, _| live_dests.contains(dest));
             let disconnected: HashSet<ChannelId> = open_channels
                 .iter()
                 .filter(|ch| {
-                    addr_to_peer_id
+                    match addr_to_peer_id
                         .get(&ch.destination)
-                        .is_some_and(|peer_id| !self.node.network_view().is_connected(peer_id))
+                        .map(|peer_id| self.node.network_view().is_connected(peer_id))
+                    {
+                        // Resolvable and disconnected — advance the streak; retire only
+                        // once it has persisted across the whole debounce window.
+                        Some(false) => {
+                            let streak = {
+                                let mut entry = self.disconnect_streak.entry(ch.destination).or_insert(0);
+                                *entry += 1;
+                                *entry
+                            };
+                            streak >= debounce
+                        }
+                        // Connected, or an unresolvable peer (shielded like a connected
+                        // one) — reset the streak and keep the channel.
+                        Some(true) | None => {
+                            self.disconnect_streak.remove(&ch.destination);
+                            false
+                        }
+                    }
                 })
                 .map(|ch| *ch.get_id())
                 .collect();
@@ -1837,6 +1865,7 @@ mod tests {
                 peer_ticket_activity: Arc::new(DashMap::new()),
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
+                disconnect_streak: Arc::new(DashMap::new()),
             }
         }
 
@@ -1960,6 +1989,7 @@ mod tests {
                 peer_ticket_activity: Arc::new(DashMap::new()),
                 peer_addr_cache: Arc::new(Mutex::new(None)),
                 last_resolved_funding: Arc::new(Mutex::new(None)),
+                disconnect_streak: Arc::new(DashMap::new()),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -1983,6 +2013,7 @@ mod tests {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(Mutex::new(None)),
             last_resolved_funding: Arc::new(Mutex::new(None)),
+            disconnect_streak: Arc::new(DashMap::new()),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -2055,6 +2086,7 @@ mod tests {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
+            disconnect_streak: Arc::new(DashMap::new()),
         }
     }
 

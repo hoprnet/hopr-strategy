@@ -405,4 +405,10 @@ struct ChannelLifecycleStrategyInner<N> {
     /// event-driven funding handler so it reuses per-tick values instead of
     /// issuing fresh chain RPC calls on every balance-decrease event.
     last_resolved_funding: Arc<Mutex<Option<ResolvedFunding>>>,
+    /// Consecutive ticks each channel's destination peer has been observed
+    /// disconnected.  Debounces the connectivity close trigger against a single
+    /// missed observation (see [`ClosureConfig::close_after_disconnected_ticks`]);
+    /// reset to zero on any tick the peer is connected, and pruned to live
+    /// channels each tick so it cannot grow without bound.
+    disconnect_streak: Arc<DashMap<Address, usize>>,
 }
