@@ -670,7 +670,16 @@ where
             let mut fund_candidates: Vec<(&ChannelEntry, &'static str)> = open_channels
                 .iter()
                 .copied()
-                .filter(|ch| !self.fund_in_flight.is_held(ch.get_id()) && !self.close_in_flight.is_held(ch.get_id()))
+                .filter(|ch| {
+                    !self.fund_in_flight.is_held(ch.get_id())
+                        && !self.close_in_flight.is_held(ch.get_id())
+                        // A channel already drained to the close threshold is destined
+                        // for retirement — topping it up (even partially) would rescue
+                        // it out from under the close pass and waste the stake. The
+                        // default threshold is zero, so this only excludes channels an
+                        // operator has explicitly configured to close on drain.
+                        && ch.balance > self.cfg.closure.close_when_drained_below
+                })
                 .filter_map(|ch| {
                     if ch.balance <= funding.lower_balance_threshold {
                         Some((ch, "below_lower_threshold"))
