@@ -68,14 +68,15 @@ fn recovery_config(tick_interval: Duration) -> ChannelLifecycleConfig {
         ..Default::default()
     };
     cfg.population.min_open_channels = 0;
-    // A resolved threshold of zero never applies to an existing balance ("< 0"
-    // is never true), so the fund pass leaves seeded channels alone — including
-    // the drained one, which must stay at zero for `close_when_drained_below`
-    // to select it. New channels still get funded through `initial_capacity`,
-    // a separate knob the open pass reads directly.
+    // A resolved threshold of zero keeps the fund pass off any seeded channel with
+    // a positive balance (the poor-quality case, above the threshold), so the close
+    // pass can retire it on quality. The fully-drained case sits at the threshold
+    // and would otherwise be a fund candidate; it stays unfunded only because its
+    // peer is disconnected (the fund pass's connectivity gate), leaving it for the
+    // close pass. New channels are funded through `initial_capacity`, a separate knob
+    // the open pass reads directly.
     cfg.funding.lower_capacity_threshold = ByteSize::b(0);
     cfg.funding.initial_capacity = ByteSize::b(1); // ~3 wxHOPR
-    cfg.funding.min_safe_capacity_required = ByteSize::b(0);
     cfg.proactive_funding.enabled = false;
     cfg
 }
@@ -329,17 +330,22 @@ async fn debounces_connectivity_before_closing_a_disconnected_channel(fixture: I
 }
 
 /// A node holding one unusable channel recovers to a healthy, funded one within
-/// a bounded time, whether the channel is unusable through poor quality or
-/// through being drained — the two branches of `DefaultSelector::should_close`
-/// a real deployment would hit.
+/// a bounded time, in the two shapes a real deployment retires a channel over:
+///
+/// * `poor_quality` — a still-connected peer whose edge has gone bad. The close pass retires it on quality; the fund
+///   pass never touches it (its balance is above the funding threshold).
+/// * `drained` — a peer drained to zero *and* disconnected. A drained channel to a peer still worth keeping is instead
+///   refunded to stay a live relay (see the fund pass's connectivity gate, exercised at the unit level), so recovery by
+///   closure only applies once the peer is no longer reachable.
 #[rstest]
-#[case::poor_quality(0.0, "5 wxHOPR")]
-#[case::drained(0.9, "0 wxHOPR")]
+#[case::poor_quality(0.0, "5 wxHOPR", true)]
+#[case::drained(0.9, "0 wxHOPR", false)]
 #[test_log::test(tokio::test)]
 async fn recovers_from_unhealthy_channels(
     fixture: IntegrationFixture,
     #[case] unhealthy_score: f64,
     #[case] unhealthy_balance: &str,
+    #[case] unhealthy_connected: bool,
 ) -> Result<()> {
     let timeouts = fixture.timeouts();
     let [source, unhealthy_peer, candidate] = fixture.claim_accounts::<3>();
@@ -356,9 +362,11 @@ async fn recovers_from_unhealthy_channels(
         .set_edge(&unhealthy_addr, unhealthy_score, Duration::from_secs(1));
     scenario.graph.set_edge(&candidate_addr, 1.0, Duration::from_secs(1));
 
-    // 3. Connectivity: both connected — quality/balance alone must drive recovery, not disconnection (covered
-    //    separately by the force-close test above).
-    scenario.network.connect(&unhealthy_addr);
+    // 3. Connectivity: the candidate is always reachable. The unhealthy peer is connected only in the quality case — a
+    //    drained-but-connected peer would be refunded rather than retired, so the drained case leaves it disconnected.
+    if unhealthy_connected {
+        scenario.network.connect(&unhealthy_addr);
+    }
     scenario.network.connect(&candidate_addr);
 
     let mut cfg = recovery_config(Duration::from_millis(100));
