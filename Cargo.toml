@@ -140,14 +140,14 @@ hex-literal          = "1.1.0"
 hopr-api             = "4.3.0"
 hopr-chain-connector = "0.26.0"
 hopr-strategy        = { path = "." }
-hopr-utils           = { package = "hopr-utilities", version = "0.14.0", default-features = false }
+hopr-utils           = { package = "hopr-utilities", version = "0.16.0", default-features = false }
 humantime-serde      = "1.1.1"
 insta                = "1.48.0"
 lazy_static          = "1.5.0"
 mockall              = "0.15.0"
 moka                 = "0.12.16"
 parking_lot          = "0.12.5"
-redb                 = "4.2.0"
+redb                 = "4.3.0"
 rstest               = "0.27.0"
 scrypt               = "0.12.0"
 serde                = "1.0.229"
