@@ -38,9 +38,13 @@ pub struct PopulationConfig {
     pub target_open_channels: usize,
 
     /// How long a peer is ineligible for a new channel after its previous
-    /// channel was closed.  Default: 30 minutes.
+    /// channel was closed.  Counted from `ChannelClosed` — after closure is
+    /// already fully confirmed on-chain, so this never races the closure
+    /// itself.  Sized at roughly one on-chain closure cycle so a reopen never
+    /// looks premature relative to how long retiring the old channel took,
+    /// without padding on top of that.  Default: 15 minutes.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub peer_reopen_cooldown: Duration,
 }
 
@@ -83,6 +87,28 @@ pub struct EligibilityConfig {
     /// Never open channels to addresses in this list.  Default: empty.
     #[default(HashSet::new())]
     pub blocklist: HashSet<Address>,
+
+    /// Prefer peers that fund their own outgoing channels.  When `true`, a
+    /// candidate with fewer than [`minimum_peer_outgoing_channels`] funded
+    /// outgoing channels is a *ticket sink*: it can only ever be a path's last
+    /// hop, never an intermediate relay, so it cannot carry the 2- and 3-hop
+    /// paths this node builds.  Every active selector ranks such peers strictly
+    /// below every forwarding-capable candidate and opens to them only as a last
+    /// resort when no capable peer can fill an open slot — never barred.
+    /// Default: true.
+    ///
+    /// [`minimum_peer_outgoing_channels`]: Self::minimum_peer_outgoing_channels
+    #[default = true]
+    pub demote_non_forwarding_peers: bool,
+
+    /// Funded outgoing channels a peer must source for it to count as
+    /// forwarding-capable rather than a ticket sink.  Only consulted when
+    /// [`demote_non_forwarding_peers`] is set.  Values below 1 are treated as 1
+    /// (a peer with zero outgoing channels is always a sink).  Default: 1.
+    ///
+    /// [`demote_non_forwarding_peers`]: Self::demote_non_forwarding_peers
+    #[default = 1]
+    pub minimum_peer_outgoing_channels: usize,
 }
 
 /// How the strategy converts a data-capacity [`ByteSize`] to a wxHOPR channel
@@ -230,6 +256,21 @@ fn default_success_probability() -> f64 {
 fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationError> {
     match duration.is_zero() {
         true => Err(validator::ValidationError::new("duration must be greater than zero")),
+        false => Ok(()),
+    }
+}
+
+/// Rejects an observation window longer than the grace window.
+///
+/// The observation window is the opening phase of the grace window, so
+/// exceeding it would leave the connectivity-aware middle phase unreachable and
+/// silently reduce the guard to blanket suppression. Rejected rather than
+/// clamped, so the misconfiguration surfaces instead of being absorbed.
+fn validate_restart_windows(cfg: &RestartGuardConfig) -> Result<(), validator::ValidationError> {
+    match cfg.startup_observation_period > cfg.startup_close_grace_period {
+        true => Err(validator::ValidationError::new(
+            "startup_observation_period must not exceed startup_close_grace_period",
+        )),
         false => Ok(()),
     }
 }
@@ -420,6 +461,22 @@ fn whole_tickets(tickets: f64) -> f64 {
     }
 }
 
+/// wxHOPR a channel must hold to fund one winning ticket at the current economics
+/// (`price × ASSUMED_HOPS / win_prob`), rounded up to whole wei — the least a peer's
+/// onward channel must carry to relay a hop. Below it the edge is dust, not a usable
+/// forwarding edge (used to keep drained ticket sinks out of the forwarding-capable
+/// tier). `win_prob` is clamped to `[f64::EPSILON, 1.0]` (NaN → EPSILON) so the ratio
+/// cannot diverge.
+pub(crate) fn winning_ticket_face_value(price: HoprBalance, win_prob: f64) -> HoprBalance {
+    let p = if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    };
+    let wei = price.amount().low_u128() as f64 * ASSUMED_HOPS as f64 / p;
+    HoprBalance::from(U256::from(wei.ceil() as u128))
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
@@ -607,6 +664,17 @@ pub struct ClosureConfig {
     /// Default: 2.
     #[default = 2]
     pub close_max_concurrent: usize,
+
+    /// Consecutive ticks a peer must be observed disconnected before its channel is
+    /// closed for connectivity alone.  [`NetworkView::is_connected`] is a
+    /// point-in-time snapshot with no hysteresis, so a single missed observation
+    /// would otherwise retire an otherwise-healthy channel on a transient blip; a
+    /// reconnection on any tick resets the count.  `1` disables the debounce
+    /// (close on the first disconnected tick).  Default: 3.
+    ///
+    /// [`NetworkView::is_connected`]: hopr_api::network::NetworkView::is_connected
+    #[default = 3]
+    pub close_after_disconnected_ticks: usize,
 }
 
 /// Controls the finalizer phase (second `close_channel` call for `PendingToClose`
@@ -621,9 +689,11 @@ pub struct FinalizerConfig {
     pub enabled: bool,
 
     /// Extra time to wait beyond the on-chain notice period before finalizing.
-    /// Provides a buffer for slow-block periods.  Default: 30 min.
+    /// Provides a buffer for slow-block periods, stacked on top of the notice
+    /// period itself.  Sized at roughly one on-chain closure cycle, matching
+    /// `PopulationConfig::peer_reopen_cooldown`.  Default: 15 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub max_closure_overdue: Duration,
 
     /// Maximum simultaneous finalization transactions initiated per pass.
@@ -634,16 +704,76 @@ pub struct FinalizerConfig {
 
 /// Guards against mass-closing channels on restart (the graph is rebuilt from
 /// scratch and peers appear unseen until heartbeats arrive).
+///
+/// Startup is staged, so a node sheds dead weight quickly without churning
+/// channels whose quality data is merely still warming up:
+///
+/// | phase | channels eligible to close |
+/// | --- | --- |
+/// | before `startup_observation_period` | none — the strategy only observes |
+/// | before `startup_close_grace_period` | only those to peers that are not connected |
+/// | after `startup_close_grace_period`  | all, by the usual closure rules |
+///
+/// A channel to a peer whose connectivity cannot be resolved counts as
+/// connected, i.e. shielded: a failed account read must not read as "nothing is
+/// connected" and trigger the mass closure this guard exists to prevent.
+///
+/// ```yaml
+/// restart:
+///   startup_observation_period: 1m
+///   startup_close_grace_period: 5m
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[validate(schema(function = "validate_restart_windows"))]
 pub struct RestartGuardConfig {
-    /// The close pass is suppressed entirely for this long after startup.
-    /// Should exceed network bootstrap time + first heartbeat round.
-    /// Default: 10 min.
+    /// No channel is closed at all for this long after startup, whatever its
+    /// peer's connectivity.
+    ///
+    /// At startup no peer is connected yet, so without this window "close the
+    /// unconnected ones" would retire every channel at once. It must therefore
+    /// cover network bootstrap; only once it elapses does absent connectivity
+    /// become evidence of a dead peer rather than of a cold view.
+    /// Default: 1 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(10 * 60))]
+    #[default(Duration::from_secs(60))]
+    pub startup_observation_period: Duration,
+
+    /// Channels to *connected* peers are shielded from closure for this long
+    /// after startup, giving their quality data time to accumulate.
+    /// Should exceed network bootstrap time + first heartbeat round.
+    /// Default: 5 min.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5 * 60))]
     pub startup_close_grace_period: Duration,
+}
+
+/// Which startup stage the close pass is in; see [`RestartGuardConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupPhase {
+    /// The strategy only observes — no channel may close.
+    Observing,
+    /// Only channels to peers that are not connected may close.
+    ShieldingConnected,
+    /// The guard has expired; the usual closure rules apply.
+    Expired,
+}
+
+impl RestartGuardConfig {
+    /// Startup stage reached `elapsed` after this strategy instance started.
+    ///
+    /// Both windows at zero yields [`StartupPhase::Expired`] immediately, which
+    /// is how a test opts out of the guard entirely.
+    pub(crate) fn phase_at(&self, elapsed: Duration) -> StartupPhase {
+        if elapsed < self.startup_observation_period {
+            StartupPhase::Observing
+        } else if elapsed < self.startup_close_grace_period {
+            StartupPhase::ShieldingConnected
+        } else {
+            StartupPhase::Expired
+        }
+    }
 }
 
 /// Concurrency knobs for the per-channel evaluation loops, and the time bounds
@@ -1399,6 +1529,80 @@ mod config_tests {
         assert!(ConcurrencyConfig::default().validate().is_ok());
     }
 
+    /// Both bounds are exclusive, so each window covers `[start, bound)` and the
+    /// instant a window ends already belongs to the next phase.
+    #[rstest]
+    #[case::start_of_observation(Duration::ZERO, StartupPhase::Observing)]
+    #[case::within_observation(Duration::from_secs(59), StartupPhase::Observing)]
+    #[case::observation_boundary(Duration::from_secs(60), StartupPhase::ShieldingConnected)]
+    #[case::within_grace(Duration::from_secs(299), StartupPhase::ShieldingConnected)]
+    #[case::grace_boundary(Duration::from_secs(300), StartupPhase::Expired)]
+    #[case::long_after_grace(Duration::from_secs(3600), StartupPhase::Expired)]
+    fn restart_guard_should_stage_startup_by_elapsed_time(#[case] elapsed: Duration, #[case] expected: StartupPhase) {
+        assert_eq!(RestartGuardConfig::default().phase_at(elapsed), expected);
+    }
+
+    /// Zeroing both windows is how a test opts out of the guard, so it must land
+    /// in `Expired` from the very first tick rather than in `Observing`.
+    #[test]
+    fn restart_guard_should_expire_immediately_when_both_windows_are_zero() {
+        let restart = RestartGuardConfig {
+            startup_observation_period: Duration::ZERO,
+            startup_close_grace_period: Duration::ZERO,
+        };
+
+        assert_eq!(restart.phase_at(Duration::ZERO), StartupPhase::Expired);
+    }
+
+    /// An observation window longer than the grace window would leave the
+    /// connectivity-aware phase unreachable, quietly degrading the guard to
+    /// blanket suppression — so it is rejected rather than clamped.
+    ///
+    /// Checked through the top-level config too, so this also pins that
+    /// `#[validate(nested)]` still reaches `RestartGuardConfig`.
+    #[test]
+    fn restart_guard_should_reject_an_observation_window_exceeding_grace() {
+        use validator::Validate as _;
+
+        let restart = RestartGuardConfig {
+            startup_observation_period: Duration::from_secs(600),
+            startup_close_grace_period: Duration::from_secs(300),
+        };
+
+        assert!(
+            restart.validate().is_err(),
+            "an observation window past the grace window must be rejected"
+        );
+        assert!(
+            ChannelLifecycleConfig {
+                restart: restart.clone(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "and must be rejected through the top-level config too"
+        );
+
+        let equal = RestartGuardConfig {
+            startup_observation_period: Duration::from_secs(300),
+            ..restart
+        };
+        assert!(
+            equal.validate().is_ok(),
+            "equal windows are valid: they collapse the shielding phase without hiding a rule"
+        );
+    }
+
+    /// Startup latency is on the critical path of recovering a usable channel
+    /// set, so these two defaults are pinned against silent inflation.
+    #[test]
+    fn restart_guard_defaults_should_stay_within_five_minutes() {
+        let restart = RestartGuardConfig::default();
+
+        assert_eq!(restart.startup_observation_period, Duration::from_secs(60));
+        assert_eq!(restart.startup_close_grace_period, Duration::from_secs(5 * 60));
+    }
+
     /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the
     /// protocol's maximum path length cannot silently rescale every stake in the strategy.
     /// A ticket's face value is linear in this count, so a move from 3 to 4 would raise
@@ -1524,7 +1728,7 @@ mod config_tests {
         assert_eq!(cfg.population.target_open_channels, 8, "sibling in the same section");
         assert_eq!(
             cfg.population.peer_reopen_cooldown,
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(15 * 60),
             "sibling of a different type"
         );
         assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");
@@ -1616,6 +1820,34 @@ mod config_tests {
         assert_eq!(mo.weights, SelectorWeights::default(), "weights default wholesale");
         // `selector` is outside the `Validate` tree, so `build()` checks this separately.
         mo.validate_trust_weights().map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn eligibility_defaults_forwarding_demotion_on() -> anyhow::Result<()> {
+        // A partial config still defaults the shared forwarding-demotion knobs on,
+        // so every selector inherits them.
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#).context("partial config")?;
+        assert!(
+            cfg.eligibility.demote_non_forwarding_peers,
+            "sink demotion defaults to enabled"
+        );
+        assert_eq!(
+            cfg.eligibility.minimum_peer_outgoing_channels, 1,
+            "capability threshold defaults to 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn eligibility_accepts_forwarding_overrides() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(
+            r#"{"eligibility":{"demote_non_forwarding_peers":false,"minimum_peer_outgoing_channels":3}}"#,
+        )
+        .context("eligibility with forwarding overrides")?;
+        assert!(!cfg.eligibility.demote_non_forwarding_peers);
+        assert_eq!(cfg.eligibility.minimum_peer_outgoing_channels, 3);
         Ok(())
     }
 
