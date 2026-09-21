@@ -71,6 +71,7 @@ strategy-pix-curvy = [
 [dependencies]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true }
+atomic_enum         = { workspace = true }
 bytesize            = { workspace = true }
 dashmap             = { workspace = true, features = ["inline"] }
 futures             = { workspace = true }
@@ -78,10 +79,12 @@ futures-concurrency = { workspace = true }
 futures-time        = { workspace = true }
 humantime-serde     = { workspace = true }
 lazy_static         = { workspace = true }
+num_enum            = { workspace = true }
 serde               = { workspace = true, features = ["derive"] }
 serde_with          = { workspace = true }
 smart-default       = { workspace = true }
 statrs              = { workspace = true }
+strum               = { workspace = true, features = ["derive"] }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = ["derive"] }
@@ -169,6 +172,7 @@ resolver = "3"
 [workspace.dependencies]
 anyhow           = "1.0.104"
 async-trait      = "0.1.92"
+atomic_enum      = "0.3.0"
 babyjubjub-ec    = { version = "0.4.0", features = ["arithmetic"] }
 backon           = { version = "1.6.0", default-features = false }
 blokli-client    = "0.33.2"
@@ -199,6 +203,7 @@ insta                = "1.48.0"
 lazy_static          = "1.5.0"
 mockall              = "0.15.0"
 moka                 = "0.12.16"
+num_enum             = "0.7.6"
 parking_lot          = "0.12.5"
 redb                 = "4.2.0"
 reqwest              = { version = "0.13.4", default-features = false }
@@ -209,6 +214,7 @@ serde_json           = "1.0.151"
 serde_with           = "3.23.0"
 smart-default        = "0.7.1"
 statrs               = "0.19.1"
+strum                = "0.28.0"
 subtle               = "2.6.1"
 tempfile             = "3.27.0"
 test-log             = "0.2.21"
