@@ -39,15 +39,16 @@ discoverable only by a per-SSA scan identity the Exit mints, and recovered depos
 
 It offers two independent choices, because the Curvy relayer never handles deposits — a shield is a self-signed transaction either way:
 
-| setting      | default                                                                    | alternative                                                             |
-| ------------ | -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| setting      | default                                                                     | alternative                                                             |
+| ------------ | --------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `shielding`  | `direct` — the node's Safe shields through the router, with no entry portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
-| `submission` | `relayer` — hand proofs to Curvy's off-chain relayer                       | `operator` — sign and submit them from this node                        |
+| `submission` | `relayer` — hand proofs to Curvy's off-chain relayer                        | `operator` — sign and submit them from this node                        |
 
 Both defaults describe a production deployment; a cluster without Curvy's off-chain services runs `submission: operator`. A **direct shield
-moves the float from the Safe straight into the vault**: through its permission module, the Safe ERC-777-`send`s it to Curvy's shield router,
-whose hook calls `directShield` in the same transaction, all or nothing. The Safe only ever calls wxHOPR, so this needs no change to the Safe
-or its module — just the node's own chain key to sign the module call, and a Blokli that publishes the router (`curvy_shield_router`).
+moves the float from the Safe straight into the vault**: through its permission module, the Safe ERC-777-`send`s it to Curvy's shield
+router, whose hook calls `directShield` in the same transaction, all or nothing. The Safe only ever calls wxHOPR, so this needs no change to
+the Safe or its module — just the node's own chain key to sign the module call, and a Blokli that publishes the router
+(`curvy_shield_router`).
 
 At runtime it needs a Blokli endpoint that exposes the Curvy deployment, the Curvy Groth16 proving artifacts (`CURVY_ZK_KEYS_DIR`: the five
 zkeys and five witness graphs published with each [`rs-sdk` release](https://github.com/0xCurvy/rs-sdk/releases), digest-checked on load),
