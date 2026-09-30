@@ -2716,9 +2716,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-abi"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4551ba4f5695f93680974402a2312cfd6a0be77ab4dfc210d650526a44a8b57"
+checksum = "65f0770ef10279dcd17c54a3a0e6519ad629267c707f560d734fc5ed3753f485"
 dependencies = [
  "alloy 1.8.3",
  "anyhow",
@@ -2729,9 +2729,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-chain-api"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bdf5c60537940c9caff4b7413b2ba9c358d7da0a6944a5c1dda9938c547cbf6"
+checksum = "4bd6441afbaa57eb29b078bccf9d2eaed18980f7d922e89a5064cb6bab5e4746"
 dependencies = [
  "async-trait",
  "curvy-types",
@@ -2740,9 +2740,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-chain-blokli"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7f6d88e85cc218b8125d728ea448e3e1756a56736379b8f627029d590f7d8b1"
+checksum = "16bb8edd39ec1dc273592393cbb5053ba6002d60e72eaece2527df9514678a32"
 dependencies = [
  "async-trait",
  "curvy-chain-api",
@@ -2799,9 +2799,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-sdk"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "399a8849af3fb5fca8f9888a8302b994664756ac4c0f2657896e96178b661392"
+checksum = "8e5325760402b684c1f94f7ee7521b01f219d36b968b493a9afb34db4a8eefb0"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
@@ -2820,9 +2820,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-types"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc2f92be7d3d4baaf23db1b8fc0832f7c8831ab7851c90252e34ed46a5ac9097"
+checksum = "86e4fc2f88a4d04b91f0b3249e0482b2b8d6379aa1fe223ca3a98c0b1983faf7"
 dependencies = [
  "serde",
 ]
@@ -2844,9 +2844,9 @@ dependencies = [
 
 [[package]]
 name = "curvy-witnesscalc"
-version = "0.1.0-rc.8"
+version = "0.1.0-rc.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e78adcfa7f75b804f20102e9823cbbb7a0b024814a83454a95e4bc2269806b43"
+checksum = "740d0f9f2b8bf206ab869c0d4aafd5363ffc069e3fbb81245ad27c36cd067cc1"
 dependencies = [
  "anyhow",
  "ark-bn254 0.6.0",
