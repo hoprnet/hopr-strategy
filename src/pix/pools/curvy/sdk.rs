@@ -1105,10 +1105,7 @@ where
     /// configured token to be the one the Safe sends. Both before the Safe is asked to send
     /// anything: without a router there is nowhere safe to send the float, and a note naming the
     /// wrong token would only revert in the router after the Safe had paid for the transaction.
-    async fn shield_router_checked(
-        &self,
-        endpoints: &CurvyChainEndpoints,
-    ) -> Result<Address, RsSdkCurvyAdapterError> {
+    async fn shield_router_checked(&self, endpoints: &CurvyChainEndpoints) -> Result<Address, RsSdkCurvyAdapterError> {
         let router: Address = endpoints
             .require_shield_router()?
             .parse()
@@ -4537,7 +4534,11 @@ mod tests {
             .ensure_funded(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
             .await?;
         let stored = store.load()?;
-        assert_eq!(stored.funding, vec![StoredNote::from(&note)], "the landed shield is the funding note");
+        assert_eq!(
+            stored.funding,
+            vec![StoredNote::from(&note)],
+            "the landed shield is the funding note"
+        );
         assert!(stored.direct_shield_in_flight.is_none(), "the journal is settled");
         assert_eq!(submissions.load(Ordering::SeqCst), 0, "the Safe sent nothing");
         Ok(())
