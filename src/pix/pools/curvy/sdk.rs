@@ -1005,18 +1005,16 @@ where
             ));
         };
         let (client, endpoints) = self.client().await?;
-        // Both before anything is prepared or journalled: without a router there is nowhere safe
-        // to send the float, and a note naming the wrong token would only revert in the router
-        // after the Safe had paid for the transaction.
-        let router: Address = endpoints
-            .require_shield_router()?
-            .parse()
-            .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("shield router address: {error}")))?;
-        self.check_vault_token(endpoints).await?;
 
         // Resume an in-flight shield rather than preparing a second one: the note is
         // deterministic in its inputs, but a fresh `prepare_direct_shield` would seal a new one.
+        //
+        // The router and token checks come before anything is prepared or journalled, but only
+        // once a journalled note has been checked against the chain: a shield that landed under
+        // an earlier version, or against a Blokli that predates the router, needs no router to be
+        // recorded, and refusing it here would leave it journalled for good.
         let in_flight = self.state.lock().direct_shield_in_flight.clone();
+        let mut router: Option<Address> = None;
         let prepared = match in_flight {
             Some(stored) if stored.gross == gross.to_string() => {
                 let note = OwnedNote::try_from(&stored.note)?;
@@ -1024,6 +1022,7 @@ where
             }
             Some(_) => return Err(RsSdkCurvyAdapterError::ShieldInProgress),
             None => {
+                router = Some(self.shield_router_checked(endpoints).await?);
                 let prepared = client
                     .prepare_direct_shield(&self.spender, gross, self.config.token)
                     .await?;
@@ -1041,6 +1040,10 @@ where
         // lost. Shielding again would spend the float twice.
         let observed = client.note_status(&prepared.note.note_id()).await?;
         if !matches!(observed, 1 | 2) {
+            let router = match router {
+                Some(router) => router,
+                None => self.shield_router_checked(endpoints).await?,
+            };
             let token: Address = endpoints
                 .token_address
                 .parse()
@@ -1096,6 +1099,19 @@ where
             self.store.save(&state)?;
         }
         self.recover_pending().await
+    }
+
+    /// The router a direct shield sends through, once the deployment is known to have one and the
+    /// configured token to be the one the Safe sends. Both before the Safe is asked to send
+    /// anything: without a router there is nowhere safe to send the float, and a note naming the
+    /// wrong token would only revert in the router after the Safe had paid for the transaction.
+    async fn shield_router_checked(&self, endpoints: &CurvyChainEndpoints) -> Result<Address, RsSdkCurvyAdapterError> {
+        let router: Address = endpoints
+            .require_shield_router()?
+            .parse()
+            .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("shield router address: {error}")))?;
+        self.check_vault_token(endpoints).await?;
+        Ok(router)
     }
 
     /// Refuses a direct shield whose note would name a different token than the one the Safe
@@ -4469,6 +4485,62 @@ mod tests {
                 "nothing was journalled"
             );
         }
+        Ok(())
+    }
+
+    /// A shield journalled by an earlier version landed through the aggregator directly, and the
+    /// node now runs against a Blokli that predates the router. Recording it needs no router: the
+    /// chain already holds the note, so nothing is sent and nothing is refused.
+    #[tokio::test]
+    async fn a_landed_shield_is_recorded_without_a_router() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = RedbCurvyDepositState::in_memory()?;
+        let note = Adapter::owned_note(&fixture(7))?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let mut persisted = store.load()?;
+        persisted.direct_shield_in_flight = Some(StoredDirectShield {
+            note: StoredNote::from(&note),
+            gross: "7".to_owned(),
+        });
+        store.save(&persisted)?;
+
+        let server = relayer::http_tests::Server::new(move |path, body| {
+            assert_eq!(path, "/graphql");
+            let query = body["query"].as_str().unwrap();
+            assert!(
+                query.contains("curvyNoteStatus"),
+                "only the note's status is needed to record a landed shield, not {query}"
+            );
+            Some(note_status_response(true))
+        })
+        .await;
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let shielder: DirectShielder = {
+            let submissions = submissions.clone();
+            Arc::new(move |_, _, _, _, _, _| {
+                submissions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+        };
+        let mut adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+        adapter
+            .client
+            .get_mut()
+            .expect("set by the test adapter")
+            .1
+            .shield_router = None;
+
+        adapter
+            .ensure_funded(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+            .await?;
+        let stored = store.load()?;
+        assert_eq!(
+            stored.funding,
+            vec![StoredNote::from(&note)],
+            "the landed shield is the funding note"
+        );
+        assert!(stored.direct_shield_in_flight.is_none(), "the journal is settled");
+        assert_eq!(submissions.load(Ordering::SeqCst), 0, "the Safe sent nothing");
         Ok(())
     }
 
