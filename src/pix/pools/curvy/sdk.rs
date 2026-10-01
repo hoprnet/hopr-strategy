@@ -109,15 +109,15 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 
 /// Performs a direct shield on behalf of the account that holds the float.
 ///
-/// Takes the `directShield` calldata plus the addresses the bundled approval needs, and is
+/// Takes the `directShield` calldata plus the addresses the routed shield needs, and is
 /// responsible for making the call originate from the fund-holding account — the node's Safe.
 /// A callback rather than a method so the pool keeps no chain key of its own and the SDK bridge
 /// stays ignorant of how the Safe is driven.
 ///
-/// Arguments: the `directShield` calldata, the token, the vault to approve, the aggregator to
-/// call, the gross amount to approve, and a check of whether the shield's note already exists —
-/// which the shielder consults before resubmitting after a nonce conflict, since an earlier copy
-/// of the same shield may be the transaction that took the nonce.
+/// Arguments: the `directShield` calldata, the token, the shield router to `send` it to, the
+/// aggregator the router shields into, the gross amount, and a check of whether the shield's note
+/// already exists — which the shielder consults before resubmitting after a nonce conflict, since
+/// an earlier copy of the same shield may be the transaction that took the nonce.
 ///
 /// `Ok` means the transaction confirmed, not that the shield took effect: the Safe reports a
 /// failed inner call without reverting, so the caller verifies the note on chain.
@@ -772,9 +772,11 @@ pub struct CurvyChainEndpoints {
     /// `portalShield` permanently unreachable). Required only for
     /// [`CurvyShielding::Portal`].
     pub portal_factory: Option<String>,
-    /// The vault, which is the `approve` target of a direct shield: the aggregator forwards its
-    /// caller as `from` and the vault is what calls `safeTransferFrom`.
+    /// The vault, which pulls a shield's funds from whoever calls the aggregator.
     pub vault: String,
+    /// The shield router a direct shield is `send` to. `None` when Blokli does not name one — it
+    /// names it only once it has found code at the router's canonical address.
+    pub shield_router: Option<String>,
     pub token_address: String,
     pub chain_id: u64,
 }
@@ -803,6 +805,7 @@ impl CurvyChainEndpoints {
             aggregator: contract("curvy_aggregator")?,
             portal_factory: optional_contract("curvy_portal_factory"),
             vault: contract("curvy_vault")?,
+            shield_router: optional_contract("curvy_shield_router"),
             token_address: contract("token")?,
             chain_id: u64::try_from(chain_info.chain_id)
                 .map_err(|_| RsSdkCurvyAdapterError::Discovery("negative chain id".to_owned()))?,
@@ -820,6 +823,18 @@ fn is_zero_address(address: &str) -> bool {
 }
 
 impl CurvyChainEndpoints {
+    /// The shield router, or a diagnostic saying why a direct shield cannot run without it.
+    pub fn require_shield_router(&self) -> Result<&str, RsSdkCurvyAdapterError> {
+        self.shield_router.as_deref().ok_or_else(|| {
+            RsSdkCurvyAdapterError::Discovery(
+                "Blokli names no Curvy shield router (`curvy_shield_router`), so `shielding: direct` cannot run: the \
+                 router is not deployed on this network, or this Blokli predates it. Nothing was sent — a `send` to \
+                 an undeployed router would strand the float."
+                    .to_owned(),
+            )
+        })
+    }
+
     /// The portal factory, or a diagnostic naming the mode that needs it.
     pub fn require_portal_factory(&self) -> Result<&str, RsSdkCurvyAdapterError> {
         self.portal_factory.as_deref().ok_or_else(|| {
@@ -941,6 +956,7 @@ where
                 tracing::info!(
                     aggregator = %endpoints.aggregator,
                     portal_factory = endpoints.portal_factory.as_deref().unwrap_or("<none: direct-shield only>"),
+                    shield_router = endpoints.shield_router.as_deref().unwrap_or("<none: no direct shielding>"),
                     vault = %endpoints.vault,
                     token = %endpoints.token_address,
                     chain_id = endpoints.chain_id,
@@ -989,6 +1005,14 @@ where
             ));
         };
         let (client, endpoints) = self.client().await?;
+        // Both before anything is prepared or journalled: without a router there is nowhere safe
+        // to send the float, and a note naming the wrong token would only revert in the router
+        // after the Safe had paid for the transaction.
+        let router: Address = endpoints
+            .require_shield_router()?
+            .parse()
+            .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("shield router address: {error}")))?;
+        self.check_vault_token(endpoints).await?;
 
         // Resume an in-flight shield rather than preparing a second one: the note is
         // deterministic in its inputs, but a fresh `prepare_direct_shield` would seal a new one.
@@ -1021,10 +1045,6 @@ where
                 .token_address
                 .parse()
                 .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("token address: {error}")))?;
-            let vault: Address = endpoints
-                .vault
-                .parse()
-                .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("vault address: {error}")))?;
             let aggregator: Address = endpoints
                 .aggregator
                 .parse()
@@ -1044,18 +1064,10 @@ where
                     })
                 })
             };
-            tracing::info!(%gross, %vault, "shielding the Curvy funding note directly from the Safe");
-            shielder(calldata, token, vault, aggregator, gross, landed)
+            tracing::info!(%gross, %router, "shielding the Curvy funding note from the Safe through the shield router");
+            shielder(calldata, token, router, aggregator, gross, landed)
                 .await
-                // A revert here is most often the one setup step nothing performs automatically,
-                // so the error says which rather than leaving an operator to decode a receipt.
-                .map_err(|error| {
-                    RsSdkCurvyAdapterError::Funding(format!(
-                        "{error}\n\nA direct shield reverts until the node's Safe is allowed to call the Curvy \
-                         aggregator ({aggregator}). Grant it once per Safe with `scripts/scope-curvy-aggregator.sh`, \
-                         or check that the deployment has `directShieldEnabled` set."
-                    ))
-                })?;
+                .map_err(RsSdkCurvyAdapterError::Funding)?;
         }
         let observed = if matches!(observed, 1 | 2) {
             observed
@@ -1086,6 +1098,26 @@ where
         self.recover_pending().await
     }
 
+    /// Refuses a direct shield whose note would name a different token than the one the Safe
+    /// sends — a wrong [`RsSdkCurvyAdapterConfig`] token id — before anything reaches the chain.
+    async fn check_vault_token(&self, endpoints: &CurvyChainEndpoints) -> Result<(), RsSdkCurvyAdapterError> {
+        let vault_token = self
+            .blokli
+            .query_curvy_vault_token(self.config.token.to_string())
+            .await
+            .map_err(|error| {
+                RsSdkCurvyAdapterError::Discovery(format!("vault token {}: {error}", self.config.token))
+            })?;
+        if !vault_token.token_address.eq_ignore_ascii_case(&endpoints.token_address) {
+            return Err(RsSdkCurvyAdapterError::InvalidValue(format!(
+                "Curvy vault token {} is {}, but the Safe holds {}: the configured token id is wrong for this \
+                 deployment",
+                self.config.token, vault_token.token_address, endpoints.token_address
+            )));
+        }
+        Ok(())
+    }
+
     /// The note's status once a submitted direct shield has confirmed.
     ///
     /// A confirmed module call is not a shield: the Safe reports a failed inner call — an
@@ -1112,8 +1144,8 @@ where
         }
         Err(RsSdkCurvyAdapterError::Funding(
             "the direct shield transaction confirmed, but the Curvy aggregator does not know its note: the Safe's \
-             inner call failed. Check the Safe's wxHOPR balance, that it may call the aggregator \
-             (`scripts/scope-curvy-aggregator.sh`), and that the deployment has `directShieldEnabled` set."
+             inner call failed, and the router reverted it, so the float is still in the Safe. Check the Safe's \
+             wxHOPR balance and that the deployment has `directShieldEnabled` set."
                 .to_owned(),
         ))
     }
@@ -2598,6 +2630,7 @@ mod tests {
             aggregator: format!("0x{}", "01".repeat(20)),
             portal_factory: None,
             vault: format!("0x{}", "02".repeat(20)),
+            shield_router: Some(format!("0x{}", "05".repeat(20))),
             token_address: format!("0x{}", "03".repeat(20)),
             chain_id: 100,
         };
@@ -2636,7 +2669,11 @@ mod tests {
                 let landed = landed.clone();
                 move |path, body| {
                     assert_eq!(path, "/graphql");
-                    assert!(body["query"].as_str().unwrap().contains("curvyNoteStatus"));
+                    let query = body["query"].as_str().unwrap();
+                    if query.contains("curvyVaultToken") {
+                        return Some(vault_token_response(&"03".repeat(20)));
+                    }
+                    assert!(query.contains("curvyNoteStatus"));
                     Some(note_status_response(landed.load(Ordering::SeqCst)))
                 }
             })
@@ -3134,6 +3171,19 @@ mod tests {
             std::slice::from_ref(&record),
         )?;
         Ok((record, StoredNote::from(&change)))
+    }
+
+    /// Blokli's answer to `curvyVaultToken`: the vault's token `0x<hex_address>`.
+    fn vault_token_response(hex_address: &str) -> (u16, serde_json::Value) {
+        let zero = format!("0x{}", "0".repeat(64));
+        (
+            200,
+            serde_json::json!({"data":{"curvyVaultToken":{
+                "__typename":"CurvyVaultToken",
+                "tokenAddress": format!("0x{hex_address}"),
+                "gasFees":{"tokenId":zero,"portalDeployment":zero,"pendingNoteCommitment":zero,"withdrawal":zero}
+            }}}),
+        )
     }
 
     fn note_status_response(known: bool) -> (u16, serde_json::Value) {
@@ -4328,6 +4378,7 @@ mod tests {
             aggregator: "0x01".to_owned(),
             portal_factory: None,
             vault: "0x02".to_owned(),
+            shield_router: None,
             token_address: "0x03".to_owned(),
             chain_id: 100,
         };
@@ -4346,10 +4397,78 @@ mod tests {
             aggregator: "0x01".to_owned(),
             portal_factory: Some("0xfac".to_owned()),
             vault: "0x02".to_owned(),
+            shield_router: None,
             token_address: "0x03".to_owned(),
             chain_id: 100,
         };
         assert_eq!(endpoints.require_portal_factory()?, "0xfac");
+        Ok(())
+    }
+
+    #[test]
+    fn a_deployment_without_a_router_refuses_direct_shielding_by_name() {
+        let endpoints = CurvyChainEndpoints {
+            aggregator: "0x01".to_owned(),
+            portal_factory: None,
+            vault: "0x02".to_owned(),
+            shield_router: None,
+            token_address: "0x03".to_owned(),
+            chain_id: 100,
+        };
+        let message = endpoints
+            .require_shield_router()
+            .expect_err("no router, no direct shield")
+            .to_string();
+        assert!(message.contains("curvy_shield_router"), "{message}");
+    }
+
+    /// The two refusals that must happen before the Safe is asked to send anything: no router to
+    /// send to, or a note that would name another token than the one being sent.
+    #[tokio::test]
+    async fn a_direct_shield_is_refused_before_the_safe_sends_anything() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (router, vault_token, expected) in [
+            (None, "03".repeat(20), "curvy_shield_router"),
+            (
+                Some(format!("0x{}", "05".repeat(20))),
+                "04".repeat(20),
+                "token id is wrong",
+            ),
+        ] {
+            let state = RedbCurvyDepositState::in_memory()?;
+            let server = relayer::http_tests::Server::new(move |path, body| {
+                assert_eq!(path, "/graphql");
+                assert!(body["query"].as_str().unwrap().contains("curvyVaultToken"));
+                Some(vault_token_response(&vault_token))
+            })
+            .await;
+            let submissions = Arc::new(AtomicUsize::new(0));
+            let shielder: DirectShielder = {
+                let submissions = submissions.clone();
+                Arc::new(move |_, _, _, _, _, _| {
+                    submissions.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(()) })
+                })
+            };
+            let mut adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+            adapter
+                .client
+                .get_mut()
+                .expect("set by the test adapter")
+                .1
+                .shield_router = router;
+
+            let error = adapter
+                .ensure_funded(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(submissions.load(Ordering::SeqCst), 0, "the Safe sent nothing");
+            assert!(
+                adapter.store.load()?.direct_shield_in_flight.is_none(),
+                "nothing was journalled"
+            );
+        }
         Ok(())
     }
 

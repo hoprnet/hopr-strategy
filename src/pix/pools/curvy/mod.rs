@@ -32,17 +32,18 @@
 //!
 //! | | default | alternative |
 //! |---|---|---|
-//! | [`CurvyDepositPoolConfig::shielding`] | `direct` — the Safe calls `directShield`, no portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
+//! | [`CurvyDepositPoolConfig::shielding`] | `direct` — the Safe shields through the shield router, no portal | `portal` — fund a deterministic entry portal, then deploy and shield it |
 //! | [`CurvyDepositPoolConfig::submission`] | `relayer` — hand proofs to Curvy's off-chain relayer | `operator` — sign and submit them here |
 //! | [`CurvyDepositPoolConfig::note_source`] | `blokli` — notes from Blokli's own Curvy index | `curvy_indexer` — notes from Curvy's shared indexer (`/sync`), see [`indexer`] |
 //!
 //! Both defaults describe a production deployment. The localcluster runs
 //! `submission: operator`, since it has no off-chain Curvy infrastructure at all.
 //!
-//! **A direct shield never takes the float out of the Safe.** The vault pulls with
-//! `safeTransferFrom(msg.sender_of_the_aggregator_call, ...)`, so the Safe itself calls
-//! `directShield`, through its permission module, in one transaction that also approves the
-//! vault. That needs a one-time grant per Safe — see *Setup* below — and the node's own chain key
+//! **A direct shield moves the float from the Safe straight into the vault.** The Safe, through its
+//! permission module, ERC-777-`send`s it to Curvy's shield router, whose `tokensReceived` hook
+//! calls `directShield` in the same transaction; any failure reverts the `send`, leaving the float
+//! in the Safe. The only call the Safe makes is on wxHOPR, which every node Safe may call from
+//! deployment, so this needs **no** change to the Safe or its module — only the node's own chain key
 //! to sign the module call, which is why the builder takes one.
 //!
 //! **Under `submission: relayer` the pool commits nothing.** The relayer refuses
@@ -50,24 +51,19 @@
 //! anyway. Discovery is unaffected: it waits for *committed and final* through Blokli, and does
 //! not care who committed.
 //!
-//! ### Setup, once per Safe
+//! ### The shield router
 //!
-//! A direct shield reverts with `NonExistentKey()` until the node's Safe is allowed to call the
-//! Curvy aggregator. Nothing does this automatically:
-//!
-//! ```text
-//! ./scripts/scope-curvy-aggregator.sh --module 0xMODULE --aggregator 0xAGGREGATOR
-//! ```
-//!
-//! which prints the Safe transaction to execute. The grant is `ALLOW_ALL` on that one address —
-//! the module's selector whitelist is hardcoded and cannot express `directShield` any other way —
-//! so point it at an aggregator you have verified. See the script for what that permits.
+//! The router lives at one address on every chain (a CreateX deployment with no constructor
+//! arguments, see `curvy-bindings`), and Blokli publishes it as `curvy_shield_router` only after
+//! finding code there. Direct shielding refuses to run without it: an ERC-777 `send` to an address
+//! with no code succeeds, and would strand the float.
 //!
 //! ### What it needs at runtime
 //!
 //! * A **Blokli endpoint** ([`CurvyDepositPoolConfig::blokli_url`]) whose `chain_info` names the Curvy deployment
-//!   (`curvy_aggregator`, `curvy_vault`, `token`, and `curvy_portal_factory` where one exists) and that indexes Curvy
-//!   notes. Reads go through it, and so do submissions under `submission: operator`.
+//!   (`curvy_aggregator`, `curvy_vault`, `token`, `curvy_shield_router` for direct shielding, and
+//!   `curvy_portal_factory` where one exists) and that indexes Curvy notes. Reads go through it, and so do submissions
+//!   under `submission: operator`.
 //! * A **Curvy indexer endpoint** ([`CurvyDepositPoolConfig::curvy_indexer_url`]) under `note_source: curvy_indexer` —
 //!   the same gateway host as the relayer. Only notes are read from it; Blokli still serves everything else, and need
 //!   not have indexed Curvy at all.
@@ -259,8 +255,9 @@ impl FromStr for CurvyNoteSource {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CurvyShielding {
-    /// `CurvyAggregatorAlphaV2.directShield`, paid straight from the Safe. No portal is deployed,
-    /// so the deployment's `portalDeployment` gas-fee leg is not charged.
+    /// `CurvyAggregatorAlphaV2.directShield`, paid straight from the Safe through the deployment's
+    /// shield router. No portal is deployed, so the deployment's `portalDeployment` gas-fee leg is
+    /// not charged.
     ///
     /// The default, and the only option on a portal-less deployment — where `portalFactory` is
     /// `address(0)` and `portalShield` is permanently unreachable.
@@ -336,13 +333,8 @@ fn default_operator_key_env() -> String {
     "HOPRD_CURVY_OPERATOR_PRIVATE_KEY".to_owned()
 }
 
-/// The Gnosis Safe MultiSend deployment the node's permission module accepts a `DelegateCall`
-/// to — the same address `hopr-types` builds its own Safe bundles against.
-///
-/// Deterministically deployed, hence identical across chains, but a value the module reads from
-/// its own storage rather than a constant of the protocol. Overridable for that reason: a
-/// deployment whose module names a different MultiSend would otherwise reject every bundle, and
-/// nothing available here can read `module.multisend()` back to check.
+/// The canonical Gnosis Safe MultiSend: the default of the deprecated
+/// [`CurvyDepositPoolConfig::safe_multisend_address`], which nothing reads any more.
 const SAFE_MULTI_SEND_ADDRESS: [u8; 20] = [
     0x38, 0x86, 0x9b, 0xf6, 0x6a, 0x61, 0xcf, 0x6b, 0xdb, 0x99, 0x6a, 0x6a, 0xe4, 0x0d, 0x58, 0x53, 0xfd, 0x43, 0xb5,
     0x26,
@@ -496,13 +488,9 @@ pub struct CurvyDepositPoolConfig {
     #[serde(default)]
     pub curvy_indexer_url: Option<Url>,
 
-    /// The Safe MultiSend the node's permission module delegate-calls for a bundled transaction.
-    ///
-    /// Only consulted for [`CurvyShielding::Direct`], which bundles the vault approval and the
-    /// shield into one transaction so that no allowance outlives the shield it was granted for.
-    /// Defaults to the canonical deterministic deployment,
-    /// `0x38869bf66a61cf6bdb996a6ae40d5853fd43b526` — the same one `hopr-types` builds its own
-    /// Safe bundles against.
+    /// Deprecated and ignored: a direct shield is now one call on wxHOPR through the shield router,
+    /// so nothing is bundled through MultiSend any more. Kept so existing configurations still
+    /// parse.
     #[serde_as(as = "DisplayFromStr")]
     #[default(default_safe_multisend_address())]
     #[serde(default = "default_safe_multisend_address")]
@@ -657,23 +645,17 @@ impl From<CurvyDepositPoolError> for StrategyError {
     }
 }
 
-/// A [`DirectShielder`] that makes the node's **Safe** approve the vault and call
-/// `directShield`, in one transaction, through the Safe's permission module.
+/// A [`DirectShielder`] that makes the node's **Safe** ERC-777-`send` the float to the shield
+/// router, which shields it in the same transaction, through the Safe's permission module.
 ///
-/// This is what keeps a direct deposit non-custodial: the vault pulls from whoever calls
-/// `directShield`, so that caller must be the account holding the float. Routing the float
-/// through an EOA first would work equally well on chain and would put the node's whole PIX
-/// budget behind a hot key.
+/// This is what keeps a direct deposit non-custodial: the float goes from the Safe into the vault
+/// in one atomic call. Routing it through an EOA first would work equally well on chain and would
+/// put the node's whole PIX budget behind a hot key.
 ///
 /// Signed with the node's own chain key, which is what the module's `nodeOnly` check requires —
 /// no new key material. See [`module::SafeModuleSubmitter`] for the nonce it shares with the
 /// node's connector, and why that is safe.
-fn safe_direct_shielder<C>(
-    client: Arc<C>,
-    chain_key: hopr_api::ChainKeypair,
-    module_address: Address,
-    multisend: Address,
-) -> DirectShielder
+fn safe_direct_shielder<C>(client: Arc<C>, chain_key: hopr_api::ChainKeypair, module_address: Address) -> DirectShielder
 where
     C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliTransactionClient + Send + Sync + 'static,
 {
@@ -681,16 +663,16 @@ where
     Arc::new(
         move |calldata: Vec<u8>,
               token: Address,
-              vault: Address,
+              router: Address,
               aggregator: Address,
               gross: u128,
               landed: sdk::ShieldLanded| {
             let submitter = Arc::clone(&submitter);
             Box::pin(async move {
-                let bundle =
-                    module::encode_safe_direct_shield(&multisend, &token, &vault, &aggregator, gross, calldata);
+                let call = module::encode_safe_router_shield(&token, &router, &aggregator, gross, &calldata)
+                    .map_err(|error| error.to_string())?;
                 submitter
-                    .submit(bundle, SAFE_DIRECT_SHIELD_GAS, landed)
+                    .submit(call, SAFE_DIRECT_SHIELD_GAS, landed)
                     .await
                     .map_err(|error| error.to_string())
             }) as BoxFuture<'static, Result<(), String>>
@@ -698,7 +680,7 @@ where
     )
 }
 
-/// Gas for the bundled approval and shield.
+/// Gas for the routed shield: the ERC-777 `send`, the router's hook and the shield it makes.
 ///
 /// The shield is a Groth16-free call — the proving happens off chain — but it deploys nothing and
 /// writes one pending note, so this is generous rather than measured. An over-estimate costs
@@ -908,7 +890,6 @@ where
                     Arc::clone(&blokli),
                     node_key,
                     node.identity().module_address,
-                    cfg.safe_multisend_address,
                 )),
                 CurvyShielding::Portal => None,
             },

@@ -1,28 +1,29 @@
 //! Calldata for spending from the node's Safe through its permission module.
 //!
-//! A direct shield has to originate from the address that holds the wxHOPR, because the vault
-//! pulls with `safeTransferFrom(msg.sender_of_the_aggregator_call, vault, amount)`. That address
-//! is the node's Safe, and the Safe acts only through
-//! `HoprNodeManagementModule.execTransactionFromModule`, which forwards to the Safe and so makes
-//! the Safe the `msg.sender` of the inner call. The float therefore never leaves Safe custody —
-//! which is the whole point of shielding this way rather than through an EOA.
+//! A direct shield is paid from the node's Safe, which acts only through
+//! `HoprNodeManagementModule.execTransactionFromModule`. The Safe does not call the Curvy aggregator
+//! itself: it ERC-777-`send`s the float to Curvy's shield router, whose `tokensReceived` hook calls
+//! `directShield` in the same transaction —
+//!
+//! ```text
+//! Safe ──wxHOPR.send(router, gross, aggregator ‖ note)──▶ router.tokensReceived ──▶ aggregator.directShield(note)
+//! ```
+//!
+//! — so the float goes from the Safe straight into the vault, all or nothing: any failure in the
+//! hook reverts the `send`, and the wxHOPR stays in the Safe.
 //!
 //! `hopr-api` exposes no generic "execute a call through the Safe" operation, and the encoders in
-//! `hopr-types` are private, so the two payloads are built here. Both are plain ABI encodings of
+//! `hopr-types` are private, so the payloads are built here. They are plain ABI encodings of
 //! well-known signatures, pinned by the golden vectors in this module's tests.
 //!
 //! ### What the module permits
 //!
 //! `execTransactionFromModule` is `nodeOnly` — the node's own chain key must sign it — and every
-//! inner call is checked against the module's target set:
-//!
-//! * the target must be **scoped**, or the call reverts `NonExistentKey()`. wxHOPR already is; the Curvy aggregator has
-//!   to be added once per Safe with `scopeTargetToken`, which accepts any address and, at
-//!   `TargetPermission::ALLOW_ALL`, any selector.
-//! * `value` must be zero unless the target is a `SEND` target, so this only ever moves ERC-20 value.
-//! * `DelegateCall` is rejected unless the target is exactly the module's configured MultiSend — which is why
-//!   [`CurvyDepositPoolConfig::safe_multisend_address`](super::CurvyDepositPoolConfig::safe_multisend_address) is
-//!   configurable rather than compiled in.
+//! inner call is checked against the module's target set. The only target here is wxHOPR, which
+//! every node Safe scopes at deployment with target-level `ALLOW_ALL` (and `send` allowed even
+//! without it), so the shield needs **no** change to the Safe or its module. Calling the aggregator
+//! directly would: it is not a scoped target, and scoping it takes a transaction signed by the
+//! Safe's owner.
 
 use std::sync::Arc;
 
@@ -37,16 +38,18 @@ use crate::errors::StrategyError;
 
 /// `execTransactionFromModule(address,uint256,bytes,uint8)`.
 const EXEC_TRANSACTION_FROM_MODULE: [u8; 4] = [0x46, 0x87, 0x21, 0xa7];
-/// `multiSend(bytes)`.
-const MULTI_SEND: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
-/// `approve(address,uint256)`.
-const ERC20_APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
+/// ERC-777 `send(address,uint256,bytes)`.
+const ERC777_SEND: [u8; 4] = [0x9b, 0xd9, 0xbb, 0xc6];
+/// `CurvyAggregatorAlphaV2.directShield((uint256,uint256,uint256,uint256[2],uint16))`.
+const DIRECT_SHIELD: [u8; 4] = [0x39, 0xf8, 0xb8, 0x5d];
+/// The `directShield` arguments: one `Note`, six static words.
+const NOTE_LEN: usize = 6 * 32;
 
-/// Gnosis Safe `Enum.Operation`.
+/// Gnosis Safe `Enum.Operation`. Only `Call` is ever used: the module rejects a `DelegateCall`
+/// to anything but its own MultiSend, and nothing here needs one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
     Call = 0,
-    DelegateCall = 1,
 }
 
 fn word(value: u128) -> [u8; 32] {
@@ -66,42 +69,17 @@ fn pad_to_word(out: &mut Vec<u8>, len: usize) {
     out.extend(std::iter::repeat_n(0u8, (32 - len % 32) % 32));
 }
 
-/// `IERC20.approve(spender, amount)`.
-pub fn encode_approve(spender: &Address, amount: u128) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 64);
-    out.extend_from_slice(&ERC20_APPROVE);
-    out.extend_from_slice(&address_word(spender));
+/// ERC-777 `send(recipient, amount, data)`.
+pub fn encode_erc777_send(recipient: &Address, amount: u128, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 128 + data.len() + 32);
+    out.extend_from_slice(&ERC777_SEND);
+    out.extend_from_slice(&address_word(recipient));
     out.extend_from_slice(&word(amount));
-    out
-}
-
-/// One entry of a MultiSend blob: `operation ‖ to ‖ value ‖ data.len ‖ data`, tightly packed.
-///
-/// Packed rather than ABI-encoded — MultiSend walks the blob with explicit offsets — so this is
-/// the one payload here that is *not* a standard encoding.
-fn multisend_entry(to: &Address, data: &[u8], operation: Operation) -> Vec<u8> {
-    let mut out = Vec::with_capacity(85 + data.len());
-    out.push(operation as u8);
-    out.extend_from_slice(to.as_ref());
-    out.extend_from_slice(&word(0));
+    // Offset to `data`: three head words.
+    out.extend_from_slice(&word(3 * 32));
     out.extend_from_slice(&word(data.len() as u128));
     out.extend_from_slice(data);
-    out
-}
-
-/// `MultiSend.multiSend(transactions)` over the given calls, each an `Operation::Call`.
-pub fn encode_multi_send(calls: &[(Address, Vec<u8>)]) -> Vec<u8> {
-    let blob: Vec<u8> = calls
-        .iter()
-        .flat_map(|(to, data)| multisend_entry(to, data, Operation::Call))
-        .collect();
-    let mut out = Vec::with_capacity(4 + 64 + blob.len() + 32);
-    out.extend_from_slice(&MULTI_SEND);
-    // Offset to the single dynamic argument: one head word, so always 32.
-    out.extend_from_slice(&word(32));
-    out.extend_from_slice(&word(blob.len() as u128));
-    out.extend_from_slice(&blob);
-    pad_to_word(&mut out, blob.len());
+    pad_to_word(&mut out, data.len());
     out
 }
 
@@ -123,24 +101,43 @@ pub fn encode_exec_from_module(to: &Address, data: &[u8], operation: Operation) 
     out
 }
 
-/// The atomic `approve` + `directShield` bundle, as the module call that runs it.
+/// The shield router's `userData`: `abi.encode(aggregator, note)`, i.e. the aggregator word
+/// followed by the `directShield` arguments — the calldata the SDK prepared, minus its selector.
 ///
-/// One transaction rather than two, so no allowance outlives the shield it was granted for. The
-/// bundle is a `DelegateCall` to `multisend`, which is the only target the module permits one
-/// for; `multisend` must therefore be the module's own configured address.
-pub fn encode_safe_direct_shield(
-    multisend: &Address,
+/// Checked rather than sliced blindly: the router reverts on any other length, but only after
+/// the Safe has paid for the transaction.
+pub fn router_user_data(aggregator: &Address, direct_shield_calldata: &[u8]) -> Result<Vec<u8>, StrategyError> {
+    match direct_shield_calldata.split_first_chunk::<4>() {
+        Some((selector, note)) if *selector == DIRECT_SHIELD && note.len() == NOTE_LEN => {
+            let mut out = Vec::with_capacity(32 + NOTE_LEN);
+            out.extend_from_slice(&address_word(aggregator));
+            out.extend_from_slice(note);
+            Ok(out)
+        }
+        _ => Err(StrategyError::other(anyhow::anyhow!(
+            "the SDK's direct-shield calldata is not `directShield(Note)` ({} bytes)",
+            direct_shield_calldata.len()
+        ))),
+    }
+}
+
+/// The routed direct shield, as the module call that runs it: the Safe `send`s `gross` of
+/// `token` to `router`, whose hook shields it into `aggregator` as the prepared note.
+///
+/// A plain `Call` to the token — the one target every node Safe already scopes.
+pub fn encode_safe_router_shield(
     token: &Address,
-    vault: &Address,
+    router: &Address,
     aggregator: &Address,
     gross: u128,
-    direct_shield_calldata: Vec<u8>,
-) -> Vec<u8> {
-    let bundle = encode_multi_send(&[
-        (*token, encode_approve(vault, gross)),
-        (*aggregator, direct_shield_calldata),
-    ]);
-    encode_exec_from_module(multisend, &bundle, Operation::DelegateCall)
+    direct_shield_calldata: &[u8],
+) -> Result<Vec<u8>, StrategyError> {
+    let user_data = router_user_data(aggregator, direct_shield_calldata)?;
+    Ok(encode_exec_from_module(
+        token,
+        &encode_erc777_send(router, gross, &user_data),
+        Operation::Call,
+    ))
 }
 
 /// Signs and submits one `execTransactionFromModule` call with the node's own chain key.
@@ -517,80 +514,77 @@ mod tests {
         );
     }
 
+    /// `directShield((1, 2, 1000, [4, 5], 6))`, as the SDK prepares it.
+    fn direct_shield_calldata() -> Vec<u8> {
+        const_hex::decode(concat!(
+            "39f8b85d0000000000000000000000000000000000000000000000000000000000000001000000000000000000000000",
+            "000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000",
+            "000003e80000000000000000000000000000000000000000000000000000000000000004000000000000000000000000",
+            "000000000000000000000000000000000000000500000000000000000000000000000000000000000000000000000000",
+            "00000006",
+        ))
+        .unwrap()
+    }
+
     #[test]
-    fn the_atomic_bundle_matches_the_reference_encoding() {
-        let mut shield = vec![0xde, 0xad, 0xbe, 0xef];
-        shield.extend_from_slice(&word(7));
-        let encoded = encode_safe_direct_shield(
-            &Address::from(hex_literal::hex!("38869bf66a61cf6bdb996a6ae40d5853fd43b526")),
-            &addr(0xaa),
-            &addr(0xbb),
-            &addr(0xcc),
-            1000,
-            shield,
-        );
+    fn the_routed_shield_matches_the_reference_encoding() -> anyhow::Result<()> {
+        let encoded =
+            encode_safe_router_shield(&addr(0xaa), &addr(0xbb), &addr(0xcc), 1000, &direct_shield_calldata())?;
         let expected = concat!(
-            "468721a700000000000000000000000038869bf66a61cf6bdb996a6ae40d5853fd43b526000000000000000000000000",
+            "468721a7000000000000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000000000000000000000",
             "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "000000800000000000000000000000000000000000000000000000000000000000000001000000000000000000000000",
-            "00000000000000000000000000000000000001648d80ff0a000000000000000000000000000000000000000000000000",
-            "0000000000000020000000000000000000000000000000000000000000000000000000000000011200aaaaaaaaaaaaaa",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaa0000000000000000000000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000044095ea7b3000000000000000000000000bbbbbb",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000000000000000000000000000000000000000000000003",
-            "e800cccccccccccccccccccccccccccccccccccccccc0000000000000000000000000000000000000000000000000000",
-            "0000000000000000000000000000000000000000000000000000000000000000000000000024deadbeef000000000000",
-            "000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000",
+            "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "00000000000000000000000000000000000001649bd9bbc6000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbb",
+            "bbbbbbbbbbbbbbbb00000000000000000000000000000000000000000000000000000000000003e80000000000000000",
+            "000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000",
+            "00000000000000e0000000000000000000000000cccccccccccccccccccccccccccccccccccccccc0000000000000000",
+            "000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000",
+            "000000000000000200000000000000000000000000000000000000000000000000000000000003e80000000000000000",
+            "000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000",
+            "000000000000000500000000000000000000000000000000000000000000000000000000000000060000000000000000",
             "0000000000000000000000000000000000000000",
         );
         assert_eq!(hex(&encoded), expected);
+        Ok(())
     }
 
     #[test]
-    fn the_bundle_blob_matches_the_reference_encoding() {
-        let mut shield = vec![0xde, 0xad, 0xbe, 0xef];
-        shield.extend_from_slice(&word(7));
-        let blob = encode_multi_send(&[(addr(0xaa), encode_approve(&addr(0xbb), 1000)), (addr(0xcc), shield)]);
-        assert_eq!(
-            hex(&blob),
-            "8d80ff0a\
-             0000000000000000000000000000000000000000000000000000000000000020\
-             0000000000000000000000000000000000000000000000000000000000000112\
-             00aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
-             0000000000000000000000000000000000000000000000000000000000000000\
-             0000000000000000000000000000000000000000000000000000000000000044\
-             095ea7b3000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\
-             00000000000000000000000000000000000000000000000000000000000003e8\
-             00cccccccccccccccccccccccccccccccccccccccc\
-             0000000000000000000000000000000000000000000000000000000000000000\
-             0000000000000000000000000000000000000000000000000000000000000024\
-             deadbeef0000000000000000000000000000000000000000000000000000000000000007\
-             0000000000000000000000000000"
-                .replace(['\n', ' '], "")
-        );
-    }
-
-    #[test]
-    fn the_bundle_delegatecalls_only_to_multisend() {
-        // The module rejects a DelegateCall to anything but its own MultiSend, so the operation
-        // byte and the target must travel together. A regression that made this a plain `Call`
-        // would revert inside MultiSend instead, which is far harder to read from a receipt.
-        let multisend = addr(0x11);
-        let encoded = encode_safe_direct_shield(&multisend, &addr(0xaa), &addr(0xbb), &addr(0xcc), 1, vec![0xff]);
+    fn the_routed_shield_is_a_plain_call_to_the_token() -> anyhow::Result<()> {
+        // The token is the one target every node Safe already scopes; a `DelegateCall`, or any
+        // other target, would need a change to the Safe's module.
+        let token = addr(0xaa);
+        let encoded = encode_safe_router_shield(&token, &addr(0xbb), &addr(0xcc), 1, &direct_shield_calldata())?;
         assert_eq!(&encoded[..4], &EXEC_TRANSACTION_FROM_MODULE);
-        assert_eq!(&encoded[4 + 12..4 + 32], multisend.as_ref());
+        assert_eq!(&encoded[4 + 12..4 + 32], token.as_ref());
         // Fourth head word is the operation.
-        assert_eq!(encoded[4 + 4 * 32 - 1], Operation::DelegateCall as u8);
+        assert_eq!(encoded[4 + 4 * 32 - 1], Operation::Call as u8);
+        Ok(())
     }
 
     #[test]
-    fn an_approval_names_the_vault_not_the_aggregator() {
-        // The aggregator forwards its caller as `from`; the vault is what pulls. Approving the
-        // aggregator would leave the shield reverting inside the vault.
-        let vault = addr(0xbb);
-        let encoded = encode_approve(&vault, 42);
-        assert_eq!(&encoded[..4], &ERC20_APPROVE);
-        assert_eq!(&encoded[4 + 12..4 + 32], vault.as_ref());
-        assert_eq!(encoded[4 + 32..], word(42));
+    fn the_router_user_data_is_the_aggregator_then_the_note() -> anyhow::Result<()> {
+        // What the router decodes as `abi.encode(address aggregator, Note note)`, and exactly the
+        // 224 bytes it accepts.
+        let calldata = direct_shield_calldata();
+        let user_data = router_user_data(&addr(0xcc), &calldata)?;
+        assert_eq!(user_data.len(), 224);
+        assert_eq!(&user_data[..32], &address_word(&addr(0xcc)));
+        assert_eq!(&user_data[32..], &calldata[4..]);
+        Ok(())
+    }
+
+    #[test]
+    fn anything_but_a_direct_shield_is_refused_before_it_reaches_the_safe() {
+        let calldata = direct_shield_calldata();
+        let mut wrong_selector = calldata.clone();
+        wrong_selector[0] ^= 0xff;
+        for bad in [
+            Vec::new(),
+            calldata[..calldata.len() - 1].to_vec(),
+            [calldata.clone(), vec![0]].concat(),
+            wrong_selector,
+        ] {
+            assert!(router_user_data(&addr(0xcc), &bad).is_err(), "{} bytes", bad.len());
+        }
     }
 }
