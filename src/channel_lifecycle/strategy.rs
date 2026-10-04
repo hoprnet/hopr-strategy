@@ -18,6 +18,7 @@ use hopr_api::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView,
         PacketTransport,
     },
+    types::internal::prelude::ChannelDirection,
 };
 use validator::Validate as _;
 
@@ -202,27 +203,47 @@ where
                 LoopEvent::Tick => {
                     self.run_pipeline().await;
                 }
-                LoopEvent::Chain(e) => match *e {
-                    ChainEvent::ChannelBalanceDecreased(ch, _) => {
-                        self.on_balance_decreased(ch, me).await;
+                LoopEvent::Chain(e) => {
+                    // The chain-event stream carries every channel in the network, not
+                    // just the node's own. Each handler below mutates per-peer state —
+                    // scoring, reopen cooldowns, in-flight leases — keyed by the
+                    // channel's peer, so an event for a channel the node is not the
+                    // source of must not reach them (hoprnet/hopr-strategy#76).
+                    // `on_balance_decreased` keeps its own copy of this check too.
+                    let is_own_outgoing = match &*e {
+                        ChainEvent::ChannelBalanceDecreased(ch, _)
+                        | ChainEvent::ChannelBalanceIncreased(ch, _)
+                        | ChainEvent::ChannelOpened(ch)
+                        | ChainEvent::ChannelClosureInitiated(ch)
+                        | ChainEvent::ChannelClosed(ch)
+                        | ChainEvent::TicketRedeemed(ch, _) => ch.direction(&me) == Some(ChannelDirection::Outgoing),
+                        _ => false,
+                    };
+                    if !is_own_outgoing {
+                        continue;
                     }
-                    ChainEvent::ChannelBalanceIncreased(ch, _) => {
-                        self.on_balance_increased(ch);
+                    match *e {
+                        ChainEvent::ChannelBalanceDecreased(ch, _) => {
+                            self.on_balance_decreased(ch, me).await;
+                        }
+                        ChainEvent::ChannelBalanceIncreased(ch, _) => {
+                            self.on_balance_increased(ch);
+                        }
+                        ChainEvent::ChannelOpened(ch) => {
+                            self.on_channel_opened(ch);
+                        }
+                        ChainEvent::ChannelClosureInitiated(ch) => {
+                            self.on_channel_closure_initiated(ch);
+                        }
+                        ChainEvent::ChannelClosed(ch) => {
+                            self.on_channel_closed(ch);
+                        }
+                        ChainEvent::TicketRedeemed(ch, _) => {
+                            self.on_ticket_redeemed(ch);
+                        }
+                        _ => {}
                     }
-                    ChainEvent::ChannelOpened(ch) => {
-                        self.on_channel_opened(ch);
-                    }
-                    ChainEvent::ChannelClosureInitiated(ch) => {
-                        self.on_channel_closure_initiated(ch);
-                    }
-                    ChainEvent::ChannelClosed(ch) => {
-                        self.on_channel_closed(ch);
-                    }
-                    ChainEvent::TicketRedeemed(ch, _) => {
-                        self.on_ticket_redeemed(ch);
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
