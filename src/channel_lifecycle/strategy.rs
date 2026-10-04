@@ -204,12 +204,6 @@ where
                     self.run_pipeline().await;
                 }
                 LoopEvent::Chain(e) => {
-                    // The chain-event stream carries every channel in the network, not
-                    // just the node's own. Each handler below mutates per-peer state —
-                    // scoring, reopen cooldowns, in-flight leases — keyed by the
-                    // channel's peer, so an event for a channel the node is not the
-                    // source of must not reach them (hoprnet/hopr-strategy#76).
-                    // `on_balance_decreased` keeps its own copy of this check too.
                     let is_own_outgoing = match &*e {
                         ChainEvent::ChannelBalanceDecreased(ch, _)
                         | ChainEvent::ChannelBalanceIncreased(ch, _)
