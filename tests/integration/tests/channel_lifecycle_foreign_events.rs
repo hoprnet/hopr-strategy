@@ -55,7 +55,8 @@ fn reopen_config(cooldown: Duration) -> ChannelLifecycleConfig {
         ..Default::default()
     };
     cfg.population.min_open_channels = 0;
-    cfg.population.target_open_channels = 1;
+    // Room for the warmup peer (the synchronization barrier) and dest.
+    cfg.population.target_open_channels = 2;
     cfg.population.peer_reopen_cooldown = cooldown;
     cfg.restart.startup_observation_period = Duration::ZERO;
     cfg.restart.startup_close_grace_period = Duration::ZERO;
@@ -75,8 +76,9 @@ fn reopen_config(cooldown: Duration) -> ChannelLifecycleConfig {
 #[test_log::test(tokio::test)]
 async fn foreign_channel_close_must_not_block_opening_to_that_peer(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
-    let [subject, foreign_src, dest] = fixture.claim_accounts::<3>();
+    let [subject, foreign_src, dest, warmup] = fixture.claim_accounts::<4>();
     let dest_addr = dest.address;
+    let warmup_addr = warmup.address;
 
     // Chain state: one foreign channel foreign_src -> dest, Open. The subject is
     // neither end of it and holds no channel of its own.
@@ -89,7 +91,7 @@ async fn foreign_channel_close_must_not_block_opening_to_that_peer(fixture: Inte
         .build()
         .context("failed to build foreign channel")?;
 
-    let addresses = [&subject.address, &foreign_src.address, &dest.address];
+    let addresses = [&subject.address, &foreign_src.address, &dest.address, &warmup.address];
     let allowance: HoprBalance = SAFE_ALLOWANCE.parse()?;
     let client = BlokliTestStateBuilder::default()
         .with_generated_accounts(
@@ -125,9 +127,10 @@ async fn foreign_channel_close_must_not_block_opening_to_that_peer(fixture: Inte
         .await
         .context("register foreign source safe")?;
 
-    // dest starts ineligible (disconnected, no edge) so the open pass cannot pick
-    // it before the foreign close has been processed — the two are decoupled so
-    // the cooldown, if wrongly started, is already in place when dest goes live.
+    // Both candidate peers start ineligible (disconnected, no edge), so the open
+    // pass can only pick one once the test makes it so. This decouples the foreign
+    // close from the open under test: if it wrongly starts a cooldown, that
+    // cooldown is already in place before dest ever becomes a candidate.
     let graph = TestGraph::new(&subject.address);
     let network = TestNetworkView::new();
 
@@ -155,8 +158,9 @@ async fn foreign_channel_close_must_not_block_opening_to_that_peer(fixture: Inte
     foreign_connector.close_channel(&channel_id).await?.await?; // Open -> PendingToClose
     foreign_connector.close_channel(&channel_id).await?.await?; // PendingToClose -> Closed
 
-    // Once the subject's own view shows the foreign channel Closed, its event
-    // subscription has delivered ChannelClosed to the strategy.
+    // Once the subject's own view shows the foreign channel Closed, the same
+    // background step has already enqueued ChannelClosed onto the strategy's event
+    // stream.
     await_channel_where(
         &subject_connector,
         foreign_src.address,
@@ -166,11 +170,27 @@ async fn foreign_channel_close_must_not_block_opening_to_that_peer(fixture: Inte
         |c| c.status == ChannelStatus::Closed,
     )
     .await?;
-    // Give the strategy time to drain that event before dest becomes a candidate.
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // dest is now a healthy, connected candidate, and there is a population
-    // deficit for it.
+    // Behavioral barrier instead of a blind sleep: make a *different* peer
+    // eligible and wait until the subject opens its own channel to it. The
+    // strategy drains its event stream in FIFO order and interleaves it with
+    // ticks, so completing a whole open-pass cycle (submit, confirm, observe
+    // Open) guarantees the earlier-enqueued ChannelClosed has been dispatched —
+    // and, under the old unfiltered code, has already started dest's cooldown.
+    graph.set_edge(&warmup_addr, 1.0, Duration::from_secs(1));
+    network.connect(&warmup_addr);
+    await_channel_where(
+        &subject_connector,
+        subject.address,
+        warmup_addr,
+        timeouts.action,
+        "subject opened its channel to the warmup peer",
+        |c| c.status == ChannelStatus::Open,
+    )
+    .await?;
+
+    // dest is now a healthy, connected candidate, and the population target still
+    // leaves a deficit for it.
     graph.set_edge(&dest_addr, 1.0, Duration::from_secs(1));
     network.connect(&dest_addr);
 
