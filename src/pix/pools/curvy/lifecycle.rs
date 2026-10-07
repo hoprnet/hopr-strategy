@@ -43,6 +43,7 @@ use hopr_api::{
 use super::{
     detect::{CurvyDetectionError, RsCoreCurvyNoteDetector, bjj_point},
     state::{CurvyDepositState, CurvyEventKind, CurvyStateError, cursor_component, note_id_key},
+    token::VaultToken,
 };
 
 const QUERY_PAGE_SIZE: u32 = 1_000;
@@ -189,11 +190,28 @@ pub enum CurvyLifecycleError {
     Detection(#[from] CurvyDetectionError),
     #[error(transparent)]
     State(#[from] CurvyStateError),
+    #[error("could not resolve the Curvy vault token id: {0}")]
+    VaultToken(String),
+}
+
+/// Where a tracker's detector comes from.
+enum Detector {
+    /// Handed in ready-made.
+    Given(Arc<RsCoreCurvyNoteDetector>),
+    /// Built the first time a note has to be judged, for the vault token the pool resolves.
+    ///
+    /// A detector is restricted to one token, and when the operator did not state its id that
+    /// is a lookup. The tracker is constructed synchronously, so the lookup waits until the
+    /// watcher — which is not — needs the answer.
+    ForVaultToken {
+        token: VaultToken,
+        built: tokio::sync::OnceCell<RsCoreCurvyNoteDetector>,
+    },
 }
 
 /// Correlates Blokli's public note events with the allocations this node is waiting on.
 pub struct CurvyLifecycleTracker<S> {
-    detector: Arc<RsCoreCurvyNoteDetector>,
+    detector: Detector,
     pub(super) state: Arc<S>,
     waiters: parking_lot::Mutex<HashMap<PixAddressId, WatchedAllocation>>,
     pub(super) replay_history: AtomicBool,
@@ -204,11 +222,46 @@ where
     S: CurvyDepositState,
 {
     pub(super) fn new(detector: Arc<RsCoreCurvyNoteDetector>, state: Arc<S>) -> Self {
+        Self::with_detector(Detector::Given(detector), state)
+    }
+
+    /// A tracker whose detector is built for `token` once that is known.
+    pub(super) fn for_vault_token(token: VaultToken, state: Arc<S>) -> Self {
+        Self::with_detector(
+            Detector::ForVaultToken {
+                token,
+                built: tokio::sync::OnceCell::new(),
+            },
+            state,
+        )
+    }
+
+    fn with_detector(detector: Detector, state: Arc<S>) -> Self {
         Self {
             detector,
             state,
             waiters: Default::default(),
             replay_history: AtomicBool::new(false),
+        }
+    }
+
+    /// The detector, built first if this is the first note to be judged.
+    ///
+    /// A failed lookup builds nothing, so the next note asks again.
+    async fn detector(&self) -> Result<&RsCoreCurvyNoteDetector, CurvyLifecycleError> {
+        match &self.detector {
+            Detector::Given(detector) => Ok(detector),
+            Detector::ForVaultToken { token, built } => {
+                built
+                    .get_or_try_init(|| async {
+                        token
+                            .resolve()
+                            .await
+                            .map(RsCoreCurvyNoteDetector::for_token)
+                            .map_err(CurvyLifecycleError::VaultToken)
+                    })
+                    .await
+            }
         }
     }
 
@@ -331,7 +384,10 @@ where
 
         let cursor = CurvyEventCursor::from(&candidate.position);
 
-        let detected = match self.detector.detect_owned_note(&candidate, &watched) {
+        // Before the cursor is touched: without a detector the event is neither ours nor not
+        // ours, so a failure here leaves it to be judged again on the next pass.
+        let detector = self.detector().await?;
+        let detected = match detector.detect_owned_note(&candidate, &watched) {
             Ok(detected) => detected,
             Err(CurvyDetectionError::InvalidCandidate(error)) => {
                 tracing::error!(

@@ -75,6 +75,7 @@ use super::{
     indexer,
     relayer::{self, RelayClient},
     state::{RedbCurvyDepositState, id_bytes},
+    token::VaultToken,
 };
 
 const SDK_STATE_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_sdk_state");
@@ -176,8 +177,8 @@ pub struct RsSdkCurvyAdapterConfig {
     /// Required for operator submission or portal shielding. Empty only when direct shielding
     /// is paired with relayed proof submission.
     pub operator_private_key: String,
-    /// Token identifier used by all pool notes.
-    pub token: u64,
+    /// Token identifier used by all pool notes: stated, or resolved through Blokli on first use.
+    pub token: VaultToken,
     /// Transaction route for locally-submitted calls. Production should use [`Route::Blokli`].
     ///
     /// Orthogonal to [`Self::submission`]: this picks *how* a self-submitted transaction reaches
@@ -207,10 +208,10 @@ impl RsSdkCurvyAdapterConfig {
     /// Self-submitting configuration: portal shielding, proofs signed with `operator_private_key`.
     ///
     /// This is what the localcluster runs, and what every caller got before the modes existed.
-    pub fn new(operator_private_key: String, token: u64) -> Self {
+    pub fn new(operator_private_key: String, token: impl Into<VaultToken>) -> Self {
         Self {
             operator_private_key,
-            token,
+            token: token.into(),
             route: Route::Blokli,
             fee_recipient: None,
             shielding: CurvyShielding::Portal,
@@ -988,6 +989,21 @@ where
             .await
     }
 
+    /// The vault token id every note of this pool carries, looked up the first time it is needed
+    /// when the operator did not state one.
+    async fn token(&self) -> Result<u64, RsSdkCurvyAdapterError> {
+        if let Some(token) = self.config.token.get() {
+            return Ok(token);
+        }
+        // The lookup matches on the token the Safe holds, which discovery has already read.
+        let (_, endpoints) = self.client().await?;
+        self.config
+            .token
+            .resolve_for(&endpoints.token_address)
+            .await
+            .map_err(RsSdkCurvyAdapterError::Discovery)
+    }
+
     /// Shields without an entry portal, paid by whatever account the [`DirectShielder`] drives —
     /// the node's Safe.
     ///
@@ -1024,7 +1040,7 @@ where
             None => {
                 router = Some(self.shield_router_checked(endpoints).await?);
                 let prepared = client
-                    .prepare_direct_shield(&self.spender, gross, self.config.token)
+                    .prepare_direct_shield(&self.spender, gross, self.token().await?)
                     .await?;
                 let mut state = self.state.lock();
                 state.direct_shield_in_flight = Some(StoredDirectShield {
@@ -1117,18 +1133,22 @@ where
     /// Refuses a direct shield whose note would name a different token than the one the Safe
     /// sends — a wrong [`RsSdkCurvyAdapterConfig`] token id — before anything reaches the chain.
     async fn check_vault_token(&self, endpoints: &CurvyChainEndpoints) -> Result<(), RsSdkCurvyAdapterError> {
+        let token = self.token().await?;
+        // An id the pool resolved was picked by this very comparison. Only a stated one can
+        // disagree with the deployment.
+        if !self.config.token.is_configured() {
+            return Ok(());
+        }
         let vault_token = self
             .blokli
-            .query_curvy_vault_token(self.config.token.to_string())
+            .query_curvy_vault_token(token.to_string())
             .await
-            .map_err(|error| {
-                RsSdkCurvyAdapterError::Discovery(format!("vault token {}: {error}", self.config.token))
-            })?;
+            .map_err(|error| RsSdkCurvyAdapterError::Discovery(format!("vault token {token}: {error}")))?;
         if !vault_token.token_address.eq_ignore_ascii_case(&endpoints.token_address) {
             return Err(RsSdkCurvyAdapterError::InvalidValue(format!(
-                "Curvy vault token {} is {}, but the Safe holds {}: the configured token id is wrong for this \
+                "Curvy vault token {token} is {}, but the Safe holds {}: the configured token id is wrong for this \
                  deployment",
-                self.config.token, vault_token.token_address, endpoints.token_address
+                vault_token.token_address, endpoints.token_address
             )));
         }
         Ok(())
@@ -1189,7 +1209,7 @@ where
             shield
         } else {
             let prepared = client
-                .prepare_deposit(&self.spender, gross, self.config.token, recovery_address)
+                .prepare_deposit(&self.spender, gross, self.token().await?, recovery_address)
                 .await?;
             let shield = StoredShield {
                 note: StoredNote::from(&prepared.note),
@@ -1515,7 +1535,7 @@ where
         let relay = self.relay.as_ref().ok_or_else(|| {
             RsSdkCurvyAdapterError::InvalidValue("configure the relayer to recover the pending aggregation".to_owned())
         })?;
-        let relay_fee = Self::relay_fee_recipient(relay, endpoints.chain_id, self.config.token).await?;
+        let relay_fee = Self::relay_fee_recipient(relay, endpoints.chain_id, self.token().await?).await?;
         let fee_recipient = self.fee_recipient().await?;
         let request = client
             .build_pix_aggregation(
@@ -2195,7 +2215,7 @@ where
             // a self-submitted one pays its own gas and carries none.
             let relay_fee = match (self.config.submission, self.relay.as_ref()) {
                 (CurvySubmission::Relayer, Some(relay)) => {
-                    Self::relay_fee_recipient(relay, endpoints.chain_id, self.config.token).await?
+                    Self::relay_fee_recipient(relay, endpoints.chain_id, self.token().await?).await?
                 }
                 (CurvySubmission::Relayer, None) => {
                     return Err(RsSdkCurvyAdapterError::InvalidValue(
@@ -2218,7 +2238,9 @@ where
                     .checked_add(*amount)
                     .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("allocation total overflows u128".to_owned()))
             })?;
-            let minimum = client.pix_minimum_input(&Fr::from(self.config.token), total, 0).await?;
+            let minimum = client
+                .pix_minimum_input(&Fr::from(self.token().await?), total, 0)
+                .await?;
             let funding = {
                 let state = self.state.lock();
                 let mut candidates = state
@@ -4485,6 +4507,48 @@ mod tests {
                 "nothing was journalled"
             );
         }
+        Ok(())
+    }
+
+    /// The bridge with no token id stated. It takes the id from the vault, matching on the Safe's
+    /// token it already knows from discovery, and does not then check the answer it was given.
+    #[tokio::test]
+    async fn an_unstated_token_id_is_resolved_from_the_vault_once() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let queries = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let server = relayer::http_tests::Server::new({
+            let queries = queries.clone();
+            move |path, body| {
+                assert_eq!(path, "/graphql");
+                let query = body["query"].as_str().unwrap();
+                if query.contains("curvyVaultTokenCount") {
+                    queries.lock().push("count");
+                    return Some((
+                        200,
+                        serde_json::json!({"data":{"curvyVaultTokenCount":{
+                            "__typename":"CurvyVaultTokenCount","count":"2"
+                        }}}),
+                    ));
+                }
+                assert!(query.contains("curvyVaultToken"), "{query}");
+                queries.lock().push("token");
+                // The token the test adapter's Safe holds.
+                Some(vault_token_response(&"03".repeat(20)))
+            }
+        })
+        .await;
+        let mut adapter = test_adapter_with_shielder(&state, server.url.clone(), None)?;
+        adapter.config.token = VaultToken::from_blokli(adapter.blokli.clone());
+
+        assert_eq!(adapter.token().await?, 2);
+        let (_, endpoints) = adapter.client().await?;
+        adapter.check_vault_token(endpoints).await?;
+        assert_eq!(adapter.token().await?, 2);
+        assert_eq!(
+            *queries.lock(),
+            ["count", "token"],
+            "one lookup, and no second read to check its own answer"
+        );
         Ok(())
     }
 
