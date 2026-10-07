@@ -126,6 +126,10 @@ pub struct LifecycleNode<C, G = EmptyGraph, V = EmptyNetworkView> {
     chain: C,
     graph: G,
     network: V,
+    /// When set, [`subscribe_to_actionable_events`](ActionableEventSource::subscribe_to_actionable_events)
+    /// fails instead of delegating to the chain, so a test can drive the
+    /// strategy's run-before-first-tick failure path.
+    fail_subscription: bool,
 }
 
 impl<C> LifecycleNode<C> {
@@ -135,6 +139,7 @@ impl<C> LifecycleNode<C> {
             chain,
             graph: EmptyGraph,
             network: EmptyNetworkView,
+            fail_subscription: false,
         }
     }
 }
@@ -145,7 +150,19 @@ impl<C, G, V> LifecycleNode<C, G, V> {
     /// Required by any test exercising the open pass or a quality-driven close:
     /// both read peer state exclusively through these two views.
     pub fn with_views(chain: C, graph: G, network: V) -> Self {
-        Self { chain, graph, network }
+        Self {
+            chain,
+            graph,
+            network,
+            fail_subscription: false,
+        }
+    }
+
+    /// Makes event-subscription fail, so the strategy's `run` returns before its
+    /// first tick — the path that must still publish a `Failed` state.
+    pub fn with_failing_subscription(mut self) -> Self {
+        self.fail_subscription = true;
+        self
     }
 }
 
@@ -190,6 +207,9 @@ where
         &self,
         _filter: Option<&[ActionableEventDiscriminant]>,
     ) -> Result<BoxStream<'static, ActionableEvent>, String> {
+        if self.fail_subscription {
+            return Err("injected subscription failure".to_string());
+        }
         Ok(self
             .chain
             .subscribe()

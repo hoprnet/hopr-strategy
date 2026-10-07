@@ -165,16 +165,28 @@ where
         // confirm while it is still running, and the broadcast only reaches
         // subscribers that already exist — a slot released by an event nobody
         // was listening for would stay held until its lease expires.
-        let event_stream = self
+        //
+        // This is the one `run` exit that precedes the first `run_pipeline`, so it is
+        // the only error path that would otherwise leave `state` at its initial
+        // `Running`. `MultiStrategy` logs and swallows the error this returns, so the
+        // shared state cell is the sole failure signal an external observer ever sees;
+        // record `Failed` here before returning.
+        let subscription = match self
             .node
             .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Chain]))
-            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
-            .filter_map(|ev| {
-                futures::future::ready(match ev {
-                    ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
-                    _ => None,
-                })
-            });
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.set_state(crate::strategy::StrategyState::Failed);
+                return Err(StrategyError::Other(anyhow::anyhow!(e)));
+            }
+        };
+        let event_stream = subscription.filter_map(|ev| {
+            futures::future::ready(match ev {
+                ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
+                _ => None,
+            })
+        });
 
         self.run_pipeline().await;
 
