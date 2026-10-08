@@ -68,6 +68,7 @@
 mod config;
 pub use config::*;
 
+mod consolidation;
 mod events;
 mod pipeline;
 pub mod selector;
