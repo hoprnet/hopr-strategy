@@ -5,7 +5,7 @@ use hopr_api::{
     node::PacketTransport,
     types::{
         internal::routing::RoutingOptions,
-        primitive::prelude::{Address, HoprBalance, U256},
+        primitive::prelude::{Address, HoprBalance, U256, UnitaryFloatOps},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -510,28 +510,43 @@ fn whole_tickets(tickets: f64) -> f64 {
     }
 }
 
-/// wei value of one winning ticket, `price × hops / win_prob`, with `win_prob`
-/// clamped to `[f64::EPSILON, 1.0]` (NaN → EPSILON) so the ratio can neither
-/// diverge to `f64::INFINITY` nor go non-positive.  This is the one-ticket floor
-/// [`capacity_to_balance`] quantises every stake to; kept here as the single
-/// definition of the formula so callers cannot drift from it.
-fn winning_ticket_face_value_wei(price_wei: f64, win_prob: f64, hops: u32) -> f64 {
-    let p = if win_prob.is_nan() {
+/// `win_prob` clamped into `(0, 1]`, the exact domain [`UnitaryFloatOps::div_f64`]
+/// accepts (it errors on `rhs <= 0 || rhs > 1`). `NaN` maps to `f64::EPSILON`.
+fn clamped_win_prob(win_prob: f64) -> f64 {
+    if win_prob.is_nan() {
         f64::EPSILON
     } else {
         win_prob.clamp(f64::EPSILON, 1.0_f64)
-    };
-    price_wei * hops as f64 / p
+    }
 }
 
-/// Face value of one winning ticket as a [`HoprBalance`] — the least a channel must
+/// f64 estimate of the face value, used only for the ticket-*count* ratio in
+/// [`capacity_to_balance`], where it must stay consistent with the f64 capacity
+/// target so the count snaps cleanly. The stake itself is sized from the exact
+/// [`winning_ticket_face_value`], never from this.
+fn winning_ticket_face_value_wei(price_wei: f64, win_prob: f64, hops: u32) -> f64 {
+    price_wei * hops as f64 / clamped_win_prob(win_prob)
+}
+
+/// Face value of one winning ticket as a [`HoprBalance`]: the least a channel must
 /// hold to issue its next ticket (and, for a peer's onward channel, to relay a hop),
-/// and the quantum every stake is a whole multiple of.  Rounds up to whole wei (the
-/// on-chain face value is integer wei), so a top-up sized in these units can never
-/// land a wei below an issuable ticket.  Pass [`ASSUMED_HOPS`] for the default path.
+/// and the quantum every stake is a whole multiple of. Divided exactly in U256 by
+/// [`UnitaryFloatOps::div_f64`], the same truncating division the planner uses, so
+/// the value is bit-identical to the selector's. Pass [`ASSUMED_HOPS`] for the
+/// default path.
 pub(crate) fn winning_ticket_face_value(price: HoprBalance, win_prob: f64, hops: u32) -> HoprBalance {
-    let wei = winning_ticket_face_value_wei(price.amount().low_u128() as f64, win_prob, hops);
-    HoprBalance::from(U256::from(wei.ceil() as u128))
+    // One winning ticket, divided exactly in U256 (hopr-strategy#87): bit-identical
+    // to what the planner stores in `push_ticket_face_value` (`price.div_f64(win_prob)`),
+    // so the strategy's floor and the selector's floor agree to the wei.
+    //
+    // Divide once, then integer-multiply by the hop count, the planner's operation
+    // order. Folding `hops` into the numerator before dividing would truncate at a
+    // different step and disagree again.
+    let p = clamped_win_prob(win_prob);
+    // `p` is in `(0, 1]`, the domain `div_f64` accepts, so this cannot error; fall
+    // back to `price` only to stay panic-free if that invariant ever changes.
+    let single = price.div_f64(p).unwrap_or(price);
+    HoprBalance::from(single.amount().saturating_mul(U256::from(hops)))
 }
 
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
@@ -582,27 +597,38 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
 
     // A channel pays out in whole tickets of this face value, and it must always
     // be able to issue at least one or it cannot relay at all — so it is both the
-    // floor and the quantum.
-    let face_value = winning_ticket_face_value_wei(price_f64, win_prob, hops);
+    // floor and the quantum. Computed exactly in U256 (hopr-strategy#87) so the
+    // stake is a whole multiple of the planner's face value, not an f64 estimate
+    // of it; only the ticket *count* below stays f64, since it is a count.
+    let face_value = winning_ticket_face_value(price, win_prob, hops);
+    let face_wei = face_value.amount();
+    if face_wei.is_zero() {
+        // Zero only when the price or hop count is zero, and then the target is too.
+        return HoprBalance::zero();
+    }
+
+    // The ticket *count* is computed against the f64 face estimate, kept consistent
+    // with the f64 `target` so `whole_tickets` snaps cleanly (target / face is a
+    // near-integer); using the exact face here would round the count up by a whole
+    // ticket whenever the ratio drifts off an integer.
+    let face_f64 = winning_ticket_face_value_wei(price_f64, win_prob, hops);
 
     // Quantise up to a whole number of tickets.  A remainder below one face value
     // can never leave the channel, so it funds no further ticket and buys none of
     // the confidence the mode was asked for: at `target = 10.9 × face_value` only
     // 10 tickets are payable, which is a lower confidence than requested.  Rounding
-    // up makes the stake deliver the mode's stated guarantee instead of just under
-    // it.  `face_value` is zero only when the price or hop count is, and then the
-    // target is zero too.
-    let target = target.max(face_value).max(0.0);
-    let stake_f64 = if face_value > 0.0 {
-        whole_tickets(target / face_value) * face_value
+    // up makes the stake deliver the mode's stated guarantee instead of just under it.
+    let target = target.max(face_f64).max(0.0);
+    let tickets = if face_f64 > 0.0 {
+        whole_tickets(target / face_f64)
     } else {
-        target
+        1.0
     };
 
-    // Round up: the one-ticket floor is a strict safety guarantee (the on-chain
-    // face value is integer wei), so a downward-truncating cast could yield a
-    // stake one wei below face value and still trip `OutOfFunds`.
-    HoprBalance::from(U256::from(stake_f64.ceil() as u128))
+    // The stake is exactly `tickets × face_value` in U256 (hopr-strategy#87), so a
+    // floor-binding channel is funded to the planner's exact face value, and every
+    // stake is a whole multiple of it rather than an f64 estimate a few wei off.
+    HoprBalance::from(face_wei.saturating_mul(U256::from(tickets as u128)))
 }
 
 impl FundingConfig {
@@ -1033,9 +1059,21 @@ mod config_tests {
         bytes.div_ceil(PAYLOAD) as u128
     }
 
-    /// One full-path winning ticket face value in wei: `tp × hops / p`.
+    /// One full-path winning ticket face value in wei, computed exactly as
+    /// production does (U256 `div_f64`, then integer-multiply by hops), so the
+    /// floor assertions track the exact arithmetic rather than an f64 estimate.
     fn floor_wei(tp_wei: u128, hops: u32, p: f64) -> u128 {
-        (tp_wei as f64 * hops as f64 / p) as u128
+        let p = if p.is_nan() {
+            f64::EPSILON
+        } else {
+            p.clamp(f64::EPSILON, 1.0_f64)
+        };
+        (balance_from_wei(tp_wei)
+            .div_f64(p)
+            .expect("win prob in (0, 1]")
+            .amount()
+            * U256::from(hops))
+        .low_u128()
     }
 
     /// Mean drain in wei: `N × hops × tp`.
@@ -1080,6 +1118,55 @@ mod config_tests {
     const JURA_P: f64 = 4.0e-6; // 288230376143 / (2^56 - 1)
     const ROTSEE_TP: u128 = 100; // 1e-16 wxHOPR
     const ROTSEE_P: f64 = 1.25e-4; // 9007199254735 / (2^56 - 1)
+
+    // ── hopr-strategy#87: exact face value (U256 div_f64, not f64) ────────────
+
+    /// The strategy's single-ticket face value must equal the planner's exact
+    /// U256 division (`price.div_f64(win_prob)`, as `push_ticket_face_value`
+    /// stores it) to the wei, for every network's economics. One hop is the
+    /// planner's single ticket.
+    #[rstest]
+    #[case(PRICE_WEI, 0.5)]
+    #[case(PRICE_WEI, 0.999)]
+    #[case(JURA_TP, JURA_P)]
+    #[case(ROTSEE_TP, ROTSEE_P)]
+    #[case(1, 1.0)]
+    fn face_value_matches_the_planner_exact_division(#[case] tp_wei: u128, #[case] p: f64) {
+        let price = balance_from_wei(tp_wei);
+        let planner = price.div_f64(p).expect("win prob is in (0, 1]");
+        assert_eq!(
+            winning_ticket_face_value(price, p, 1).amount(),
+            planner.amount(),
+            "tp={tp_wei} p={p}: strategy face value must equal the planner's to the wei"
+        );
+    }
+
+    /// Multi-hop face value is the single ticket times the hop count, computed by
+    /// integer multiply after the one exact division, matching the planner's
+    /// operation order (divide once, then multiply).
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn face_value_is_single_ticket_times_hops(#[case] hops: u32) {
+        let price = balance_from_wei(JURA_TP);
+        let single = price.div_f64(JURA_P).expect("valid");
+        assert_eq!(
+            winning_ticket_face_value(price, JURA_P, hops).amount(),
+            single.amount() * U256::from(hops),
+            "hops={hops}"
+        );
+    }
+
+    /// Regression: above 2^53 the old `price.low_u128() as f64` cast dropped low
+    /// bits; the exact path keeps every wei.
+    #[test]
+    fn face_value_is_exact_for_prices_above_the_f64_mantissa() {
+        let price = balance_from_wei(1u128 << 60); // far above 2^53
+        let p = 0.25;
+        let planner = price.div_f64(p).expect("valid");
+        assert_eq!(winning_ticket_face_value(price, p, 1).amount(), planner.amount());
+    }
 
     // ── Deterministic: stake = max(floor, N × hops × tp) ─────────────────────
 
@@ -1255,12 +1342,14 @@ mod config_tests {
                 for &cap in &caps {
                     for mode in [DET, prob(0.99), prob(0.999)] {
                         let got = stake_wei(cap, tp, p, 3, &mode);
-                        let face = tp as f64 * 3.0 / p;
-                        let tickets = got as f64 / face;
-                        assert_close(
-                            got,
-                            (tickets.round() * face) as u128,
-                            &format!("{mode:?} p={p} tp={tp} cap={cap:?} ({tickets} tickets)"),
+                        // Exact: the stake is a whole multiple of the exact face value
+                        // (hopr-strategy#87), so the modulo is zero to the wei rather
+                        // than only close to it as an f64 round-trip would be.
+                        let face = floor_wei(tp, 3, p);
+                        assert_eq!(
+                            got % face,
+                            0,
+                            "{mode:?} p={p} tp={tp} cap={cap:?}: stake {got} must be a whole multiple of face {face}"
                         );
                     }
                 }
