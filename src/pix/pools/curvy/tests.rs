@@ -9,7 +9,10 @@
 use std::{
     collections::HashSet,
     num::NonZeroU32,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,7 +43,8 @@ use super::{
     CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
     OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
-    lifecycle::CurvyLifecycleTracker,
+    lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
+    token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
 };
 use crate::{
@@ -164,6 +168,41 @@ fn owned_candidate(block: u64) -> anyhow::Result<OwnedCandidateFixture> {
         note,
         note_id,
     })
+}
+
+/// A vault that registers the Safe's token under `id`, read through a Blokli that can be down.
+struct ScriptedVault {
+    id: u64,
+    reachable: AtomicBool,
+}
+
+impl ScriptedVault {
+    const SAFE_TOKEN: &'static str = "0x03";
+
+    fn registering(id: u64) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            reachable: AtomicBool::new(true),
+        })
+    }
+}
+
+#[async_trait]
+impl VaultTokenTable for ScriptedVault {
+    async fn safe_token(&self) -> Result<String, String> {
+        if !self.reachable.load(Ordering::SeqCst) {
+            return Err("Blokli is not reachable".to_owned());
+        }
+        Ok(Self::SAFE_TOKEN.to_owned())
+    }
+
+    async fn token_count(&self) -> Result<u64, String> {
+        Ok(self.id)
+    }
+
+    async fn token_address(&self, id: u64) -> Result<String, String> {
+        Ok(if id == self.id { Self::SAFE_TOKEN } else { "0x00" }.to_owned())
+    }
 }
 
 fn completion(note_id: &str, block: u64) -> CurvyCommittedNote {
@@ -388,6 +427,37 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
 
     assert!(tracker.process_candidate(fixture.note).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
+    Ok(())
+}
+
+/// The Exit's side of an unstated token id. Its first use of the id is here, in the watcher, and
+/// possibly before the pool has made any other call that would have resolved it — a restart
+/// re-registers a recovered allocation straight through `notify_deposit`.
+#[tokio::test]
+async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let fixture = owned_candidate(2)?;
+    let vault = ScriptedVault::registering(4);
+    let tracker = CurvyLifecycleTracker::for_vault_token(VaultToken::from_table(vault.clone()), state.clone());
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The lookup fails: the event is neither accepted nor skipped, so it is seen again.
+    vault.reachable.store(false, Ordering::SeqCst);
+    let error = tracker
+        .process_candidate(fixture.note.clone())
+        .await
+        .expect_err("the candidate cannot be judged without the token id");
+    assert!(matches!(error, CurvyLifecycleError::VaultToken(_)), "{error}");
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+    assert!(state.owned_note_ids()?.is_empty());
+
+    // Blokli is back: the same event is now recognised as the allocation it is.
+    vault.reachable.store(true, Ordering::SeqCst);
+    let cursor = CurvyEventCursor::from(&fixture.note.position);
+    assert!(tracker.process_candidate(fixture.note).await?);
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
+    assert_eq!(state.owned_note_ids()?.len(), 1);
     Ok(())
 }
 
@@ -763,7 +833,7 @@ async fn harness(adapter: RecordingAdapter, tracking_time: Duration) -> anyhow::
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: tracking_time,
-        token: 4,
+        token: Some(4),
         ..Default::default()
     };
     let pool = CurvyDepositPool::with_parts(
@@ -1327,6 +1397,30 @@ fn a_config_without_the_mode_keys_still_parses() -> anyhow::Result<()> {
 }
 
 #[test]
+fn the_vault_token_is_unset_unless_the_file_states_it() -> anyhow::Result<()> {
+    // Unset is what makes the pool resolve the id through Blokli; no number is right for both
+    // Blokli's local chain and Gnosis, so there is no default to fall back to.
+    assert_eq!(CurvyDepositPoolConfig::default().token, None);
+    let unstated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_url":"http://127.0.0.1:8080/"}"#)?;
+    assert_eq!(unstated.token, None);
+    StrategyError::validate_config(&unstated)?;
+
+    // A file written for an earlier version, which had to state it, keeps meaning what it said.
+    let stated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"token":2}"#)?;
+    assert_eq!(stated.token, Some(2));
+    StrategyError::validate_config(&stated)?;
+    assert_eq!(
+        serde_json::from_str::<CurvyDepositPoolConfig>(&serde_json::to_string(&stated)?)?,
+        stated
+    );
+
+    // Ids start at 1 (the vault's native currency), so 0 names nothing.
+    let zero: CurvyDepositPoolConfig = serde_json::from_str(r#"{"token":0}"#)?;
+    assert!(StrategyError::validate_config(&zero).is_err());
+    Ok(())
+}
+
+#[test]
 fn the_note_source_defaults_to_blokli_and_the_indexer_needs_its_url() -> anyhow::Result<()> {
     let cfg = CurvyDepositPoolConfig::default();
     assert_eq!(cfg.note_source, CurvyNoteSource::Blokli);
@@ -1384,7 +1478,7 @@ async fn replay_pool_watch_against_staging() -> anyhow::Result<()> {
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: Duration::from_secs(30),
-        token: 2,
+        token: Some(2),
         ..Default::default()
     };
     let api =
@@ -1500,7 +1594,7 @@ async fn staging_watcher_catches_up_on_gnosis() -> anyhow::Result<()> {
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: Duration::from_secs(20),
-        token: 2,
+        token: Some(2),
         ..Default::default()
     };
     let api =

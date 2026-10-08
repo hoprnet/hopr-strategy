@@ -63,7 +63,8 @@
 //! * A **Blokli endpoint** ([`CurvyDepositPoolConfig::blokli_url`]) whose `chain_info` names the Curvy deployment
 //!   (`curvy_aggregator`, `curvy_vault`, `token`, `curvy_shield_router` for direct shielding, and
 //!   `curvy_portal_factory` where one exists) and that indexes Curvy notes. Reads go through it, and so do submissions
-//!   under `submission: operator`.
+//!   under `submission: operator`. It also answers which vault token id the Safe's token has, unless
+//!   [`CurvyDepositPoolConfig::token`] states it.
 //! * A **Curvy indexer endpoint** ([`CurvyDepositPoolConfig::curvy_indexer_url`]) under `note_source: curvy_indexer` —
 //!   the same gateway host as the relayer. Only notes are read from it; Blokli still serves everything else, and need
 //!   not have indexed Curvy at all.
@@ -110,6 +111,7 @@ mod sdk;
 mod state;
 #[cfg(test)]
 mod tests;
+mod token;
 
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
@@ -135,6 +137,7 @@ pub use sdk::{
 };
 use serde_with::{DisplayFromStr, serde_as};
 pub use state::{CurvyDepositState, CurvyEventKind, CurvyStateError, RedbCurvyDepositState};
+pub use token::VaultToken;
 use validator::Validate;
 use zeroize::Zeroizing;
 
@@ -202,10 +205,10 @@ pub const RELAYER_URL_ENV: &str = "HOPRD_CURVY_RELAYER_URL";
 
 /// Environment variable that overrides [`CurvyDepositPoolConfig::token`].
 ///
-/// The vault token id is deployment-specific — 3 on Blokli's local chain, 2 on Gnosis — and,
-/// like the other overrides here, it is unreachable as a YAML key from a harness that writes the
-/// plain pool's config type. Getting it wrong is silent (see the field docs), so a cluster run
-/// against a real deployment must be able to state it.
+/// The vault token id is deployment-specific — 3 on Blokli's local chain, 2 on Gnosis — and the
+/// pool resolves it through Blokli when nothing states it, so this is for pinning it. Like the
+/// other overrides here, it exists because the key is unreachable from a harness that writes the
+/// plain pool's config type.
 pub const TOKEN_ENV: &str = "HOPRD_CURVY_TOKEN";
 
 /// Environment variable that overrides [`CurvyDepositPoolConfig::note_source`].
@@ -321,10 +324,6 @@ fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
 
-fn default_token() -> u64 {
-    3
-}
-
 fn default_initial_funding() -> HoprBalance {
     HoprBalance::new_base(100)
 }
@@ -407,25 +406,25 @@ pub struct CurvyDepositPoolConfig {
     #[validate(custom(function = "validate_min_1sec"))]
     pub max_deposit_tracking_time: Duration,
 
-    /// The Curvy vault token id of wxHOPR. Default: 3, which is what Blokli's local Curvy
-    /// deployment registers it as.
+    /// The Curvy vault token id of wxHOPR. Default: unset, and the pool resolves it through
+    /// Blokli. Overridden by [`TOKEN_ENV`].
     ///
-    /// **A real deployment almost certainly needs another value.** Ids are assigned sequentially
-    /// by `CurvyVaultV2.registerToken`, starting at 2 because id 1 is the vault's pre-seeded
-    /// native currency — so on Gnosis, where wxHOPR is the first registered ERC-20, it is **2**.
+    /// The id is deployment-specific. `CurvyVaultV2.registerToken` assigns ids in registration
+    /// order, starting at 2 because id 1 is the vault's pre-seeded native currency — so wxHOPR is
+    /// **2** on Gnosis, where it is the first registered ERC-20, and **3** on Blokli's local
+    /// chain. No single default is right for both, which is why there is none.
     ///
-    /// That is read off the deployed Gnosis contracts rather than inferred: `initialize` seeds
-    /// `_numberOfTokens = 1` for the native currency, `registerToken` pre-increments before it
-    /// assigns, and the staging and production Gnosis deployments each register exactly one
-    /// ERC-20 — `0xD4fdec44DB9D44B8f2b6d529620f9C0C7066A2c1`, the sole entry under `gnosis` in the
-    /// contracts repo's network parameters. Gnosis is **2**, and the default of 3 is wrong there.
+    /// Unset, the pool takes the id whose registered address is the token the Safe holds
+    /// (`token` in Blokli's chain info), read back through Blokli's `curvyVaultToken`. That is
+    /// the same comparison a direct shield already makes before the Safe sends anything, so
+    /// resolving it can only produce an id that check accepts.
     ///
-    /// Getting this wrong does not fail loudly: the pool would allocate against whatever token
-    /// that id names. Read it back with Blokli's `curvyVaultToken` before deploying.
-    #[default(default_token())]
-    #[serde(default = "default_token")]
+    /// Set, the id is used as given and never looked up. A wrong one is refused by that check
+    /// under [`CurvyShielding::Direct`]; under [`CurvyShielding::Portal`] nothing compares it
+    /// first, so there the pool would prepare notes in whatever token the id names.
+    #[serde(default)]
     #[validate(range(min = 1))]
-    pub token: u64,
+    pub token: Option<u64>,
 
     /// wxHOPR shielded from the Safe into the private pool on the first deposit, gross of the
     /// deployment's shield fees. Default: 100 wxHOPR. Overridden by [`INITIAL_FUNDING_ENV`].
@@ -834,9 +833,9 @@ where
             })?);
         }
         if let Ok(raw) = std::env::var(TOKEN_ENV) {
-            cfg.token = raw.trim().parse().map_err(|error| {
+            cfg.token = Some(raw.trim().parse().map_err(|error| {
                 StrategyError::InvalidConfiguration(format!("{TOKEN_ENV} must be a vault token id: {error}"))
-            })?;
+            })?);
         }
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
@@ -876,10 +875,16 @@ where
         let state = RedbCurvyDepositState::open(&state_path)
             .map_err(|error| StrategyError::other(anyhow::anyhow!("{}: {error}", state_path.display())))?;
         let blokli = Arc::new(BlokliClient::new(cfg.blokli_url.clone(), BlokliClientConfig::default()));
+        // One handle, shared by the bridge that stamps the id on notes and the tracker whose
+        // detector filters on it, so an unstated id is looked up once and both use the same answer.
+        let token = match cfg.token {
+            Some(id) => VaultToken::configured(id),
+            None => VaultToken::from_blokli(Arc::clone(&blokli)),
+        };
         let adapter = RsSdkCurvyAdapter::new(
             Arc::clone(&blokli),
             cfg.blokli_url.to_string(),
-            RsSdkCurvyAdapterConfig::new(operator_key, cfg.token)
+            RsSdkCurvyAdapterConfig::new(operator_key, token.clone())
                 .with_modes(cfg.shielding, cfg.submission, cfg.relayer_url.clone())
                 .with_note_source(cfg.note_source, cfg.curvy_indexer_url.clone()),
             safe_funder(node.chain_api().clone()),
@@ -910,7 +915,7 @@ where
             state = %state_path.display(),
             blokli = %cfg.blokli_url,
             %initial_funding,
-            token = cfg.token,
+            %token,
             shielding = ?cfg.shielding,
             submission = ?cfg.submission,
             relayer = cfg.relayer_url.as_ref().map(|url| url.to_string()),
@@ -934,16 +939,22 @@ where
                 )))
             }
         };
-        let detector = RsCoreCurvyNoteDetector::for_token(cfg.token);
-        Ok(Self::with_parts(
-            node,
-            cfg,
-            initial_funding,
-            index,
-            adapter,
-            detector,
-            state,
-        ))
+        // Nothing asks for an unstated id until the first deposit or the first watched note.
+        // Asking now puts the answer, or the reason there is none, next to the line above
+        // instead of minutes later in the middle of a Session. It is only a head start: a
+        // lookup that fails here is made again when the id is needed.
+        if token.get().is_none()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let token = token.clone();
+            runtime.spawn(async move {
+                if let Err(error) = token.resolve().await {
+                    tracing::warn!(%error, "could not resolve the Curvy vault token id yet; it is looked up again when first needed");
+                }
+            });
+        }
+        let tracker = CurvyLifecycleTracker::for_vault_token(token, Arc::new(state));
+        Ok(Self::assemble(node, cfg, initial_funding, index, adapter, tracker))
     }
 }
 
@@ -968,11 +979,23 @@ where
         detector: RsCoreCurvyNoteDetector,
         state: S,
     ) -> Self {
+        let tracker = CurvyLifecycleTracker::new(Arc::new(detector), Arc::new(state));
+        Self::assemble(node, cfg, initial_funding, index, adapter, tracker)
+    }
+
+    fn assemble(
+        node: Arc<N>,
+        cfg: CurvyDepositPoolConfig,
+        initial_funding: HoprBalance,
+        index: I,
+        adapter: A,
+        tracker: CurvyLifecycleTracker<S>,
+    ) -> Self {
         Self {
             node,
             index: Arc::new(index),
             adapter: Arc::new(adapter),
-            tracker: Arc::new(CurvyLifecycleTracker::new(Arc::new(detector), Arc::new(state))),
+            tracker: Arc::new(tracker),
             cfg,
             initial_funding,
             reconciled: tokio::sync::OnceCell::new(),
