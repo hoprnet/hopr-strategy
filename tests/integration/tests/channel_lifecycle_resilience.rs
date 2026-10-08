@@ -31,14 +31,16 @@ use hopr_strategy_integration_tests::{
 use rstest::rstest;
 
 /// One top-up, at the harness's default economics (ticket price 1 wxHOPR,
-/// win_prob 1.0, assumed_hops 3): 1 packet of capacity = 3 wxHOPR.
-const TOPUP: &str = "3 wxHOPR";
+/// win_prob 1.0, assumed_hops 3): one face value is 3 wxHOPR and a 1-packet
+/// capacity floors at the selector's first-edge requirement,
+/// `MIN_BALANCE_HEADROOM (2) × face value` = 6 wxHOPR (hopr-strategy#86).
+const TOPUP: &str = "6 wxHOPR";
 
 /// Payload bytes per packet, per `PacketTransport::packet_payload_size()`.
 ///
 /// Capacity rounds *up* to whole packets, so every `ByteSize` from 1 byte to a
-/// full packet is the same 3 wxHOPR — a threshold wider than one top-up has to
-/// be spelled out in packets.
+/// full packet floors at the same 6 wxHOPR; a threshold wider than one top-up has
+/// to be spelled out in packets.
 const PACKET: u64 = 1036;
 
 /// Ticks fast enough that several passes fit inside the action timeout.
@@ -68,10 +70,10 @@ const EVERY_READ: [ChainOp; 7] = [
 /// hang on purpose.
 const READ_BUDGET: Duration = Duration::from_millis(200);
 
-/// A channel that stays below its funding threshold across several top-ups: the
-/// threshold is 4 packets (12 wxHOPR), each top-up 1 packet (3 wxHOPR), so 1
-/// wxHOPR is still under it at 4, 7 and 10.  "Did it fund again?" is therefore
-/// about willingness to act, never about the channel becoming healthy.
+/// A channel that stays below its funding threshold across top-ups: the threshold
+/// is 4 packets (12 wxHOPR) and each top-up is 6 wxHOPR, so the balance runs
+/// 1 -> 7 and is still under 12, clearing it only at 13.  "Did it fund again?" is
+/// therefore about willingness to act, never about the channel becoming healthy.
 fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
     let mut cfg = ChannelLifecycleConfig {
         tick_interval: TICK,
@@ -81,7 +83,7 @@ fn perpetually_underfunded_config(lease: Duration) -> ChannelLifecycleConfig {
     cfg.population.min_open_channels = 1;
     cfg.population.target_open_channels = 1;
     cfg.funding.lower_capacity_threshold = ByteSize::b(PACKET * 4); // 12 wxHOPR
-    cfg.funding.topup_capacity = ByteSize::b(1); // 1 packet → 3 wxHOPR per top-up
+    cfg.funding.topup_capacity = ByteSize::b(1); // 1 packet, floored at 2 x face value = 6 wxHOPR per top-up
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
     cfg.concurrency.action_lease_timeout = lease;
@@ -232,9 +234,9 @@ async fn strategy_should_stop_funding_when_the_channel_is_funded_without_events(
 
     scenario.connector.faults().withhold_event(EventKind::BalanceIncreased);
 
-    // A threshold one top-up wide: 1 wxHOPR is under it, 1 + 3 wxHOPR is over.
+    // A threshold one top-up wide: 1 wxHOPR is under it, 1 + 6 wxHOPR is over.
     let mut cfg = perpetually_underfunded_config(LEASE);
-    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // 1 packet → 3 wxHOPR
+    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // 1 packet, floored at 2 x face value = 6 wxHOPR
 
     let node = Arc::new(LifecycleNode::new(scenario.connector.clone()));
     let mut strategy = ChannelLifecycleStrategy::new(cfg).build(node)?;
@@ -470,7 +472,7 @@ async fn strategy_should_keep_acting_on_other_channels_when_slots_are_stranded(
     let mut cfg = perpetually_underfunded_config(LEASE);
     cfg.population.min_open_channels = destinations.len();
     cfg.population.target_open_channels = destinations.len();
-    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // 1 packet → 3 wxHOPR
+    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // 1 packet, floored at 2 x face value = 6 wxHOPR
     // Two channels are enough to exhaust the action budget and strand it.
     cfg.concurrency.max_concurrent_actions = 2;
 
