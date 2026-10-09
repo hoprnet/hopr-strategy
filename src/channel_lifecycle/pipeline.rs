@@ -33,6 +33,7 @@ use tracing::{debug, warn};
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
     config::{ResolvedFunding, StartupPhase},
+    consolidation::{ConsolidationCandidate, consolidation_closes},
     selector::{
         BucketCell, BucketView, CloseCandidate, ForwardingView, LatencyBucket, OpenCandidate, PeerEdgeInfo,
         SelectorContext, SignalSet, StakeView, SubnetBucket,
@@ -495,6 +496,129 @@ where
         }
     }
 
+    /// Consolidation pass (hopr-strategy#85), called from the pipeline after the
+    /// close pass. It acts only on the channels the fund pass deferred to it
+    /// (`deferred`): under-funded, refundable, and only when the Safe is stranded.
+    /// An empty `deferred` set (the common, non-stranded case) makes it a no-op.
+    ///
+    /// Closes the minimal set of under-funded channels so the stake they return
+    /// can lift the best survivors to `face_value` (see [`super::consolidation`]
+    /// for why the count is `floor(pool / face_value)`), then tops those survivors
+    /// up to exactly `face_value`, cheapest-to-complete first so scarce safe
+    /// reaches the most channels. The decision is re-evaluated each tick and
+    /// converges as closures reclaim stake over the next ones.
+    ///
+    /// The closes share the close concurrency cap but override `min_open_channels`,
+    /// the same trade the issue asks for: a few usable channels beat many useless
+    /// ones. They run only once the startup guard has fully elapsed, like the
+    /// regular close pass under `ShieldingConnected`. The top-ups are bounded to
+    /// one face value per survivor, never toward full capacity, so the scarce safe
+    /// reaches as many channels as it can.
+    #[allow(clippy::too_many_arguments)] // cohesive per-tick inputs; a wrapper struct would not clarify
+    fn consolidate_stranded_stake(
+        &self,
+        close_candidates: &[CloseCandidate],
+        deferred: &HashSet<ChannelId>,
+        face_value: HoprBalance,
+        reclaiming: HoprBalance,
+        startup_phase: StartupPhase,
+        safe_remaining: &mut HoprBalance,
+        state: &mut StatePublisher<'_, N>,
+    ) {
+        if face_value.amount().is_zero() || deferred.is_empty() {
+            return;
+        }
+
+        // Act only on the channels the fund pass actually deferred here: under-funded,
+        // refundable, and only when the Safe was stranded. A channel the operator
+        // marked retire-don't-refund (a positive `close_when_drained_below`) is not
+        // refundable, so it never lands in `deferred` and is not rescued here. Skip
+        // any with an in-flight action, since another pass has already acted on it.
+        let is_free = |c: &&CloseCandidate| {
+            deferred.contains(c.channel.get_id())
+                && !self.fund_in_flight.is_held(c.channel.get_id())
+                && !self.close_in_flight.is_held(c.channel.get_id())
+        };
+
+        let underfunded: Vec<ConsolidationCandidate> = close_candidates
+            .iter()
+            .filter(is_free)
+            .map(|c| ConsolidationCandidate {
+                id: *c.channel.get_id(),
+                balance: c.channel.balance,
+                rank: self.cfg.eligibility.peer_quality_weight * c.edge_info.quality_score()
+                    + self.cfg.eligibility.ticket_activity_weight * c.ticket_score,
+            })
+            .collect();
+
+        if underfunded.is_empty() {
+            return;
+        }
+
+        // Closes reclaim stranded stake, overriding the population floor. They run
+        // only once the startup guard has fully elapsed: a cold view must not drive
+        // mass closures, and during the `ShieldingConnected` window the regular
+        // close pass still shields connected peers, so consolidation holds off too
+        // rather than close a connected (but under-funded) channel out from under it.
+        // `reclaiming` (stake from prior ticks' closures, not yet back in the Safe)
+        // is counted in the pool so the pass does not over-close while they finalize.
+        let closes_ranked: Vec<ChannelId> = if startup_phase == StartupPhase::Expired {
+            consolidation_closes(&underfunded, *safe_remaining, reclaiming, face_value)
+        } else {
+            Vec::new()
+        };
+        let closes: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
+
+        // Dispatch in the decision's worst-first order (not chain-snapshot order), so
+        // the concurrency cap trims the least-bad candidates, leaving the best as
+        // survivors.
+        let by_id: HashMap<ChannelId, &CloseCandidate> =
+            close_candidates.iter().map(|c| (*c.channel.get_id(), c)).collect();
+        let mut close_count = self.close_in_flight.held_count();
+        for id in &closes_ranked {
+            if close_count >= self.cfg.closure.close_max_concurrent {
+                break;
+            }
+            if let Some(c) = by_id.get(id)
+                && self.try_close_channel(&c.channel)
+            {
+                close_count += 1;
+                state.set(StrategyState::Degraded);
+                debug!(channel = %c.channel, "channel-lifecycle: consolidation close");
+            }
+        }
+
+        // Top the kept survivors up to exactly one face value, cheapest first so
+        // the scarce safe makes the most channels usable this tick.
+        let mut survivors: Vec<&CloseCandidate> = close_candidates
+            .iter()
+            .filter(|c| is_free(c) && !closes.contains(c.channel.get_id()))
+            .collect();
+        survivors.sort_by(|a, b| {
+            b.channel
+                .balance
+                .partial_cmp(&a.channel.balance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for c in survivors {
+            let topup = face_value - c.channel.balance;
+            if topup.amount().is_zero() {
+                continue;
+            }
+            if *safe_remaining < topup {
+                // This survivor, and every needier one left, cannot be made
+                // usable this tick; demand is unmet until more stake is reclaimed.
+                state.set(StrategyState::Degraded);
+                break;
+            }
+            if self.try_fund_channel(&c.channel, topup) {
+                *safe_remaining -= topup;
+                debug!(channel = %c.channel, %topup, "channel-lifecycle: consolidation top-up to face value");
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Pipeline
     // ─────────────────────────────────────────────────────────────────────
@@ -682,6 +806,12 @@ where
         // safe balance is unknown, which keeps both passes from spending.
         let mut safe_remaining = safe_balance.unwrap_or_else(HoprBalance::zero);
 
+        // Under-funded channels the fund pass declines to top up in the stranded
+        // regime, handed to the consolidation pass (hopr-strategy#85). Only
+        // refundable channels reach the fund loop, so operator retire-don't-refund
+        // channels never land here and are not rescued by consolidation.
+        let mut deferred_to_consolidation: HashSet<ChannelId> = HashSet::new();
+
         // `state` (declared above): `Degraded` means a pass evaluated fine but was
         // short of what it needed (an affordability gate, or missing peer data); `Failed`
         // means a required chain read was unavailable so a pass couldn't even be
@@ -766,10 +896,24 @@ where
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_REQUIRED_SAFE_BALANCE.set(required_safe.amount().low_u128() as f64);
 
+            // Stranded: the safe cannot meet the demand it can see. Only then does
+            // the consolidation pass (hopr-strategy#85) take over the under-funded
+            // channels (below one face value, so unable to issue a ticket) to
+            // spread the scarce safe to exactly face value across the most channels,
+            // rather than let this pass pour whole face values into the neediest one.
+            // When the safe can meet demand, this pass funds them toward capacity as
+            // usual, so the common case is unchanged.
+            let stranded = safe_balance < required_safe;
+
             if funding.topup_balance.is_zero() || funding.face_value.is_zero() {
                 debug!("channel-lifecycle: fund pass skipped: resolved topup is zero");
             } else {
                 for (ch, reason) in fund_candidates {
+                    if stranded && ch.balance < funding.face_value {
+                        // Deferred to the consolidation pass; leave the safe for it.
+                        deferred_to_consolidation.insert(*ch.get_id());
+                        continue;
+                    }
                     // Fund a full top-up when the safe can afford one; otherwise the
                     // largest whole number of winning-ticket face values it can still
                     // supply, so a channel keeps issuing tickets instead of stranding
@@ -1129,6 +1273,36 @@ where
                 elapsed = ?self.start_epoch.elapsed(),
                 grace = ?self.cfg.restart.startup_close_grace_period,
                 "channel-lifecycle: close pass skipped: startup grace period active"
+            );
+        }
+
+        // ── 3b. Consolidation pass (hopr-strategy#85) ─────────────────────────
+        // Handles the under-funded channels the fund pass deferred: when the pooled
+        // stake cannot keep them all usable, close the worst so the reclaimed stake
+        // lifts the best to face value, then top the survivors up to exactly face
+        // value, spreading scarce safe across the most channels.  Needs the resolved
+        // economics for `face_value` and a known safe balance; otherwise there is
+        // nothing to size against and the channels wait for a tick that can read the
+        // chain.
+        if let (Some(funding), Some(_)) = (funding, safe_balance) {
+            // Stake from closures already in flight (PendingToClose, or an open
+            // channel whose close was initiated), not yet back in the Safe. Counted
+            // in the pool so the pass does not over-close while they finalize.
+            let reclaiming: HoprBalance = all_channels
+                .iter()
+                .filter(|c| {
+                    matches!(c.status, ChannelStatus::PendingToClose(_)) || self.close_in_flight.is_held(c.get_id())
+                })
+                .fold(HoprBalance::zero(), |acc, c| acc + c.balance);
+
+            self.consolidate_stranded_stake(
+                &close_candidates,
+                &deferred_to_consolidation,
+                funding.face_value,
+                reclaiming,
+                startup_phase,
+                &mut safe_remaining,
+                &mut state,
             );
         }
 
@@ -2116,17 +2290,21 @@ mod tests {
     }
 
     /// A safe that cannot afford a full top-up but holds at least one winning-ticket
-    /// face value must still fund the drained channel with the largest whole number
-    /// of face values it can supply — keeping the channel able to issue tickets
-    /// rather than stranding both it and the leftover safe balance. The strategy
-    /// still reports `Degraded`, because a partial top-up leaves demand unmet.
+    /// face value must still fund a needy channel with the largest whole number of
+    /// face values it can supply, keeping the channel issuing tickets rather than
+    /// stranding both it and the leftover safe balance. The strategy still reports
+    /// `Degraded`, because a partial top-up leaves demand unmet.
+    ///
+    /// The channel sits *at* one face value (3 wxHOPR): needy (below the top-up
+    /// target) but still usable, so the fund pass owns it. A channel below face
+    /// value is instead the consolidation pass's (hopr-strategy#85).
     #[tokio::test]
     async fn fund_pass_partially_tops_up_when_the_safe_cannot_afford_a_full_topup() -> anyhow::Result<()> {
-        let start_balance = HoprBalance::from(2_u32); // 2 wei, far below the 3 wxHOPR threshold
+        let start_balance = HoprBalance::new_base(3); // one face value: needy but usable
 
         let c1 = ChannelEntry::builder()
             .between(*BOB, *ALICE)
-            .amount(2_u32)
+            .amount(start_balance.amount())
             .ticket_index(0)
             .status(ChannelStatus::Open)
             .epoch(0)
@@ -2138,7 +2316,7 @@ mod tests {
                 false,
                 XDaiBalance::new_base(1),
                 // Between one face value (3 wxHOPR) and a full top-up (6 wxHOPR):
-                // enough for exactly one whole winning ticket, not two.
+                // enough for exactly one more whole winning ticket, not two.
                 HoprBalance::new_base(4),
             )
             .with_channels([c1])
@@ -2921,6 +3099,158 @@ mod tests {
         Ok(())
     }
 
+    // ── Consolidation pass wiring (hopr-strategy#85) ──────────────────────────
+
+    /// `count` open channels from `BOB`, each staked `stake` wei, to distinct
+    /// announced peers, with the node's Safe holding `safe` wei and a 1-wei ticket
+    /// price (so one winning-ticket face value is 3 wei). Peers are announced, so
+    /// `ChainNode`'s stub network view reports them connected, so connectivity closes
+    /// cannot fire, isolating the consolidation pass.
+    async fn stranded_stake_scenario(
+        count: u8,
+        stake: u32,
+        safe: u32,
+    ) -> anyhow::Result<Arc<crate::testing::TestChainConnector<crate::testing::FullStateEmulator>>> {
+        let peers: Vec<Address> = (20..20 + count).map(|n| [n; Address::SIZE].into()).collect();
+        let mut account_refs: Vec<&Address> = vec![&*BOB];
+        account_refs.extend(peers.iter());
+
+        let channels = peers
+            .iter()
+            .map(|p| {
+                ChannelEntry::builder()
+                    .between(*BOB, *p)
+                    .amount(stake)
+                    .ticket_index(0)
+                    .status(ChannelStatus::Open)
+                    .epoch(0)
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(&account_refs, true, XDaiBalance::new_base(1), HoprBalance::from(safe))
+            .with_ticket_price(HoprBalance::from(1_u32))
+            .with_channels(channels)
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+        Ok(connector)
+    }
+
+    /// Config for the consolidation wiring tests: the startup guard off, the close
+    /// cap wide enough to dispatch every consolidation close in one pass, and the
+    /// default `min_open_channels = 5` kept so the pass demonstrably overrides it.
+    fn consolidation_cfg() -> ChannelLifecycleConfig {
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.population.min_open_channels = 5;
+        cfg.population.target_open_channels = 7;
+        cfg.restart.startup_observation_period = Duration::ZERO;
+        cfg.restart.startup_close_grace_period = Duration::ZERO;
+        cfg.closure.close_max_concurrent = 8;
+        cfg.finalizer.enabled = false;
+        cfg.proactive_funding.enabled = false;
+        cfg.funding.lower_capacity_threshold = ByteSize::b(1);
+        cfg.funding.topup_capacity = ByteSize::b(1);
+        cfg
+    }
+
+    /// hopr-strategy#85: with the Safe empty and every channel staked below one
+    /// winning-ticket face value (2 < 3 wei), the consolidation pass closes the
+    /// minimum needed so the reclaimed stake can lift the rest to face value.
+    /// Pool is 7×2 = 14 wei, face value 3 → `floor(14/3) = 4` survive, so 3 close.
+    /// That drops the open count to 4, below `min_open_channels = 5`, which the
+    /// pass deliberately overrides: a few usable channels beat many useless ones.
+    #[tokio::test]
+    async fn consolidation_closes_the_excess_under_a_depleted_safe() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(7, 2, 0).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            3,
+            "pool 14 / face 3 → keep 4, close 3; overriding the min_open_channels floor of 5"
+        );
+        Ok(())
+    }
+
+    /// The counterpart: when the Safe can meet demand, nothing is closed. The Safe
+    /// is not stranded, so the fund pass (not consolidation) tops the channels up,
+    /// and consolidation no-ops because every channel already holds a fund slot.
+    #[tokio::test]
+    async fn consolidation_does_not_close_when_the_safe_can_fund() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(7, 2, 1000).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            0,
+            "a funded Safe must not trigger any consolidation closure"
+        );
+        assert!(
+            !inner.fund_in_flight.is_empty(),
+            "the fund pass should top the under-funded channels up instead"
+        );
+        Ok(())
+    }
+
+    /// Healthy channels (`>= face value`) are never closed to consolidate, only
+    /// under-funded ones are candidates. One channel at 5 wei (`>= 3`) alongside
+    /// six at 2 wei, Safe empty: the pool over the six is 12, face value 3, so
+    /// `floor(12/3) = 4` survive and 2 of the six close, while the healthy channel
+    /// is left untouched.
+    #[tokio::test]
+    async fn consolidation_preserves_healthy_channels() -> anyhow::Result<()> {
+        let peers: Vec<Address> = (20u8..27).map(|n| [n; Address::SIZE].into()).collect();
+        let mut account_refs: Vec<&Address> = vec![&*BOB];
+        account_refs.extend(peers.iter());
+
+        // peer[0] is healthy (5 wei ≥ face value 3); the rest are under-funded.
+        let channels = peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                ChannelEntry::builder()
+                    .between(*BOB, *p)
+                    .amount(if i == 0 { 5_u32 } else { 2_u32 })
+                    .ticket_index(0)
+                    .status(ChannelStatus::Open)
+                    .epoch(0)
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let healthy_id = *channels[0].get_id();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(&account_refs, true, XDaiBalance::new_base(1), HoprBalance::zero())
+            .with_ticket_price(HoprBalance::from(1_u32))
+            .with_channels(channels)
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            2,
+            "six under-funded, pool 12 / face 3 → keep 4, close 2"
+        );
+        assert!(
+            !inner.close_in_flight.is_held(&healthy_id),
+            "a channel already at face value must never be closed to consolidate"
+        );
+        Ok(())
+    }
+
     fn fresh_inner_with_chain<C>(
         cfg: ChannelLifecycleConfig,
         connector: Arc<C>,
@@ -3554,7 +3884,8 @@ mod tests {
         // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0; hops is the protocol max, 3.
         // Deterministic sizing (win_prob still sets the one-ticket floor):
         //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic)
-        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR.
+        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR, floored at
+        //   the selector's first-edge requirement 2 × 3 = 6 wxHOPR (hopr-strategy#86).
         let expected_topup = {
             use super::super::config::CapacitySizingMode;
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
@@ -3594,9 +3925,9 @@ mod tests {
             },
             funding: FundingConfig {
                 // threshold = 0 → only the initial 0-balance channel triggers funding.
-                // After the topup (3 wxHOPR), balance > 0 → no further funding on next tick.
+                // After the topup (6 wxHOPR), balance > 0 → no further funding on next tick.
                 lower_capacity_threshold: ByteSize::b(0),
-                // 1 byte = 1 packet → 3 wxHOPR topup at default sim economics.
+                // 1 byte = 1 packet → 6 wxHOPR topup (floored at the selector floor) at default sim economics.
                 topup_capacity: ByteSize::b(1),
                 ..Default::default()
             },
@@ -3607,6 +3938,15 @@ mod tests {
             },
             ..Default::default()
         };
+        // Match the population to the single seeded channel: with the default
+        // min_open_channels (5) the four missing channels make the Safe-balance
+        // demand (one GiB-sized opening stake each) far exceed the funded Safe, so
+        // the node reads as stranded and the consolidation pass (hopr-strategy#85)
+        // tops the channel to one face value instead. This test isolates the fund
+        // pass, which tops to the full capacity-derived amount.
+        let mut cfg = cfg;
+        cfg.population.min_open_channels = 1;
+        cfg.population.target_open_channels = 1;
 
         let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
         let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
