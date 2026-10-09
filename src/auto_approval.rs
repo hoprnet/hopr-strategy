@@ -11,8 +11,8 @@
 //! through the Safe module. This **sets** the allowance to `allowance_amount`, it does not add to it.
 //!
 //! ### Triggers
-//! - every [`ChainEvent::SafeAllowanceChanged`] of the node's Safe that is below the threshold
-//!   (the allowance also goes down when channel funding spends it),
+//! - every [`ChainEvent::SafeAllowanceChanged`] of the node's Safe that is below the threshold (the allowance also goes
+//!   down when channel funding spends it),
 //! - at startup,
 //! - periodically, to recover from missed events and failed transactions.
 //!
