@@ -3834,12 +3834,13 @@ mod tests {
     /// protocol's 3 hops and `topup_capacity = 1 byte` (= 1 packet):
     ///
     /// ```text
-    /// topup_balance = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR
+    /// topup_balance = 1 packet × 1 wxHOPR × 3 hops = 3 wxHOPR, floored at the
+    ///                 selector's first-edge requirement 2 × 3 = 6 wxHOPR (hopr-strategy#86)
     /// ```
     ///
     /// The channel starts with 0 balance (< resolved threshold), triggering a
     /// fund tx.  After confirmation the on-chain balance must equal exactly
-    /// 3 wxHOPR.
+    /// 6 wxHOPR.
     #[tokio::test]
     async fn pipeline_funds_underfunded_channel_with_capacity_derived_wxhopr_amount() -> anyhow::Result<()> {
         use super::super::config::capacity_to_balance;
@@ -3847,7 +3848,8 @@ mod tests {
         // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0; hops is the protocol max, 3.
         // Deterministic sizing (win_prob still sets the one-ticket floor):
         //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic)
-        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR.
+        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR, floored at
+        //   the selector's first-edge requirement 2 × 3 = 6 wxHOPR (hopr-strategy#86).
         let expected_topup = {
             use super::super::config::CapacitySizingMode;
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
@@ -3887,9 +3889,9 @@ mod tests {
             },
             funding: FundingConfig {
                 // threshold = 0 → only the initial 0-balance channel triggers funding.
-                // After the topup (3 wxHOPR), balance > 0 → no further funding on next tick.
+                // After the topup (6 wxHOPR), balance > 0 → no further funding on next tick.
                 lower_capacity_threshold: ByteSize::b(0),
-                // 1 byte = 1 packet → 3 wxHOPR topup at default sim economics.
+                // 1 byte = 1 packet → 6 wxHOPR topup (floored at the selector floor) at default sim economics.
                 topup_capacity: ByteSize::b(1),
                 ..Default::default()
             },
@@ -3900,6 +3902,16 @@ mod tests {
             },
             ..Default::default()
         };
+
+        // Match the population to the single seeded channel: with the default
+        // min_open_channels (5) the four missing channels make the Safe-balance
+        // demand (one GiB-sized opening stake each) far exceed the funded Safe, so
+        // the node reads as stranded and the consolidation pass (hopr-strategy#85)
+        // tops the channel to one face value instead. This test isolates the fund
+        // pass, which tops to the full capacity-derived amount.
+        let mut cfg = cfg;
+        cfg.population.min_open_channels = 1;
+        cfg.population.target_open_channels = 1;
 
         let node = Arc::new(ChainNode::new(Arc::clone(&connector)));
         let mut strategy: Box<dyn crate::strategy::Strategy + Send> = ChannelLifecycleStrategy::new(cfg).build(node)?;
