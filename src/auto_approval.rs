@@ -163,7 +163,7 @@ struct AutoApprovalStrategyInner<N> {
     node: Arc<N>,
     cfg: AutoApprovalStrategyConfig,
     interval: Duration,
-    /// `Degraded` while the node has no Safe or the last approval failed.
+    /// `Degraded` while a Safe lookup, allowance read, or approval has failed.
     state: Arc<AtomicStrategyState>,
 }
 
@@ -211,6 +211,7 @@ where
             .map_err(StrategyError::other)?;
 
         if allowance >= self.cfg.min_allowance_threshold {
+            self.state.store(StrategyState::Running, Ordering::Relaxed);
             trace!(%safe, %allowance, threshold = %self.cfg.min_allowance_threshold, "safe allowance is sufficient");
             return Ok(false);
         }
@@ -282,6 +283,7 @@ where
                     return;
                 }
                 Err(error) => {
+                    self.state.store(StrategyState::Degraded, Ordering::Relaxed);
                     warn!(%error, trigger, "auto-approval skipped: cannot look up the node's safe");
                     return;
                 }
@@ -291,6 +293,7 @@ where
         if let Some(safe) = *safe
             && let Err(error) = self.check_allowance(safe, pending).await
         {
+            self.state.store(StrategyState::Degraded, Ordering::Relaxed);
             warn!(%safe, %error, trigger, "auto-approval allowance check failed");
         }
     }
@@ -646,6 +649,71 @@ mod tests {
         eventually(|| async { allowance(&connector, safe).await.ok() == Some(HoprBalance::new_base(100)) }).await?;
         handle.abort();
 
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn should_recover_after_confirmation_error_when_allowance_is_sufficient() -> anyhow::Result<()> {
+        let (connector, ..) = setup(HoprBalance::new_base(5)).await?;
+        connector
+            .faults()
+            .set_confirmation(ChainOp::SetSafeAllowance, Fault::Fail);
+        let strategy = AutoApprovalStrategyInner::new(config(), INTERVAL, Arc::new(ChainNode(connector.clone())));
+        let mut safe = None;
+        let mut pending = PendingApproval::terminated();
+        strategy.on_trigger(&mut safe, &mut pending, "startup").await;
+        (&mut pending).await;
+        assert_eq!(strategy.state(), StrategyState::Degraded);
+
+        // Submission succeeded even though confirmation failed. A fresh read recovers health
+        // without submitting a second approval.
+        strategy.on_trigger(&mut safe, &mut pending, "tick").await;
+        assert_eq!(strategy.state(), StrategyState::Running);
+        assert_eq!(connector.faults().calls(ChainOp::SetSafeAllowance), 1);
+        assert!(pending.is_terminated());
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn should_degrade_on_safe_lookup_failure_and_recover() -> anyhow::Result<()> {
+        let (connector, expected_safe, _) = setup(HoprBalance::new_base(50)).await?;
+        connector.faults().set(ChainOp::SafeInfo, Fault::Fail);
+        let strategy = AutoApprovalStrategyInner::new(config(), INTERVAL, Arc::new(ChainNode(connector.clone())));
+        let mut safe = None;
+        let mut pending = PendingApproval::terminated();
+        strategy.on_trigger(&mut safe, &mut pending, "startup").await;
+        assert_eq!(strategy.state(), StrategyState::Degraded);
+        assert_eq!(safe, None);
+
+        connector.faults().clear(ChainOp::SafeInfo);
+        strategy.on_trigger(&mut safe, &mut pending, "tick").await;
+        assert_eq!(safe, Some(expected_safe));
+        assert_eq!(strategy.state(), StrategyState::Running);
+        assert_eq!(connector.faults().calls(ChainOp::SetSafeAllowance), 0);
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn should_degrade_on_invalid_allowance_and_recover() -> anyhow::Result<()> {
+        let (connector, safe, _) = setup(HoprBalance::new_base(50)).await?;
+        let strategy = AutoApprovalStrategyInner::new(config(), INTERVAL, Arc::new(ChainNode(connector.clone())));
+        let mut cached_safe = Some(safe);
+        let mut pending = PendingApproval::terminated();
+        connector.client().hidden_state_update(|state| {
+            for allowance in state.safe_allowances.values_mut() {
+                allowance.allowance.0 = "invalid".into();
+            }
+        });
+        strategy.on_trigger(&mut cached_safe, &mut pending, "tick").await;
+        assert_eq!(strategy.state(), StrategyState::Degraded);
+
+        connector.client().update_safe_allowance(
+            &safe.into(),
+            blokli_client::api::types::TokenValueString(HoprBalance::new_base(50).to_string()),
+        );
+        strategy.on_trigger(&mut cached_safe, &mut pending, "tick").await;
+        assert_eq!(strategy.state(), StrategyState::Running);
+        assert_eq!(connector.faults().calls(ChainOp::SetSafeAllowance), 0);
         Ok(())
     }
 
