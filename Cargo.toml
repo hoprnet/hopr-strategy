@@ -23,6 +23,7 @@ telemetry     = ["hopr-api/types-telemetry"]
 ## Exposes `crate::testing` node adapters to downstream test crates.
 testing = ["hopr-utils/testing-blokli"]
 ## Strategy features — each enables one strategy implementation.
+strategy-auto-approval     = []
 strategy-auto-funding      = []
 strategy-auto-redeeming    = []
 strategy-channel-lifecycle = []
