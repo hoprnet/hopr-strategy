@@ -497,9 +497,9 @@ where
     }
 
     /// Consolidation pass (hopr-strategy#85), called from the pipeline after the
-    /// close pass. It scans the open channels (passed as `close_candidates`) for
-    /// under-funded ones itself, via `is_free`; the fund pass leaves those to it in
-    /// the stranded regime by not topping them up.
+    /// close pass. It acts only on the channels the fund pass deferred to it
+    /// (`deferred`): under-funded, refundable, and only when the Safe is stranded.
+    /// An empty `deferred` set (the common, non-stranded case) makes it a no-op.
     ///
     /// Closes the minimal set of under-funded channels so the stake they return
     /// can lift the best survivors to `face_value` (see [`super::consolidation`]
@@ -514,23 +514,28 @@ where
     /// regular close pass under `ShieldingConnected`. The top-ups are bounded to
     /// one face value per survivor, never toward full capacity, so the scarce safe
     /// reaches as many channels as it can.
+    #[allow(clippy::too_many_arguments)] // cohesive per-tick inputs; a wrapper struct would not clarify
     fn consolidate_stranded_stake(
         &self,
         close_candidates: &[CloseCandidate],
+        deferred: &HashSet<ChannelId>,
         face_value: HoprBalance,
+        reclaiming: HoprBalance,
         startup_phase: StartupPhase,
         safe_remaining: &mut HoprBalance,
         state: &mut StatePublisher<'_, N>,
     ) {
-        if face_value.amount().is_zero() {
+        if face_value.amount().is_zero() || deferred.is_empty() {
             return;
         }
 
-        // Under-funded open channels not already being funded or closed this tick;
-        // an in-flight action means another pass has acted, so acting again would
-        // double-spend a slot or re-close the channel.
+        // Act only on the channels the fund pass actually deferred here: under-funded,
+        // refundable, and only when the Safe was stranded. A channel the operator
+        // marked retire-don't-refund (a positive `close_when_drained_below`) is not
+        // refundable, so it never lands in `deferred` and is not rescued here. Skip
+        // any with an in-flight action, since another pass has already acted on it.
         let is_free = |c: &&CloseCandidate| {
-            c.channel.balance < face_value
+            deferred.contains(c.channel.get_id())
                 && !self.fund_in_flight.is_held(c.channel.get_id())
                 && !self.close_in_flight.is_held(c.channel.get_id())
         };
@@ -555,20 +560,28 @@ where
         // mass closures, and during the `ShieldingConnected` window the regular
         // close pass still shields connected peers, so consolidation holds off too
         // rather than close a connected (but under-funded) channel out from under it.
-        let closes: HashSet<ChannelId> = if startup_phase == StartupPhase::Expired {
-            consolidation_closes(&underfunded, *safe_remaining, face_value)
-                .into_iter()
-                .collect()
+        // `reclaiming` (stake from prior ticks' closures, not yet back in the Safe)
+        // is counted in the pool so the pass does not over-close while they finalize.
+        let closes_ranked: Vec<ChannelId> = if startup_phase == StartupPhase::Expired {
+            consolidation_closes(&underfunded, *safe_remaining, reclaiming, face_value)
         } else {
-            HashSet::new()
+            Vec::new()
         };
+        let closes: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
 
+        // Dispatch in the decision's worst-first order (not chain-snapshot order), so
+        // the concurrency cap trims the least-bad candidates, leaving the best as
+        // survivors.
+        let by_id: HashMap<ChannelId, &CloseCandidate> =
+            close_candidates.iter().map(|c| (*c.channel.get_id(), c)).collect();
         let mut close_count = self.close_in_flight.held_count();
-        for c in close_candidates.iter().filter(|c| closes.contains(c.channel.get_id())) {
+        for id in &closes_ranked {
             if close_count >= self.cfg.closure.close_max_concurrent {
                 break;
             }
-            if self.try_close_channel(&c.channel) {
+            if let Some(c) = by_id.get(id)
+                && self.try_close_channel(&c.channel)
+            {
                 close_count += 1;
                 state.set(StrategyState::Degraded);
                 debug!(channel = %c.channel, "channel-lifecycle: consolidation close");
@@ -793,6 +806,12 @@ where
         // safe balance is unknown, which keeps both passes from spending.
         let mut safe_remaining = safe_balance.unwrap_or_else(HoprBalance::zero);
 
+        // Under-funded channels the fund pass declines to top up in the stranded
+        // regime, handed to the consolidation pass (hopr-strategy#85). Only
+        // refundable channels reach the fund loop, so operator retire-don't-refund
+        // channels never land here and are not rescued by consolidation.
+        let mut deferred_to_consolidation: HashSet<ChannelId> = HashSet::new();
+
         // `state` (declared above): `Degraded` means a pass evaluated fine but was
         // short of what it needed (an affordability gate, or missing peer data); `Failed`
         // means a required chain read was unavailable so a pass couldn't even be
@@ -892,6 +911,7 @@ where
                 for (ch, reason) in fund_candidates {
                     if stranded && ch.balance < funding.face_value {
                         // Deferred to the consolidation pass; leave the safe for it.
+                        deferred_to_consolidation.insert(*ch.get_id());
                         continue;
                     }
                     // Fund a full top-up when the safe can afford one; otherwise the
@@ -1257,17 +1277,29 @@ where
         }
 
         // ── 3b. Consolidation pass (hopr-strategy#85) ─────────────────────────
-        // The fund pass deferred every under-funded channel (below one face value,
-        // so unable to issue a ticket) to here.  When the pooled stake cannot keep
-        // them all usable, close the worst so the reclaimed stake lifts the best to
-        // face value; then top the survivors up to exactly face value, spreading
-        // scarce safe across the most channels.  Needs the resolved economics for
-        // `face_value` and a known safe balance; otherwise there is nothing to size
-        // against and the channels wait for a tick that can read the chain.
+        // Handles the under-funded channels the fund pass deferred: when the pooled
+        // stake cannot keep them all usable, close the worst so the reclaimed stake
+        // lifts the best to face value, then top the survivors up to exactly face
+        // value, spreading scarce safe across the most channels.  Needs the resolved
+        // economics for `face_value` and a known safe balance; otherwise there is
+        // nothing to size against and the channels wait for a tick that can read the
+        // chain.
         if let (Some(funding), Some(_)) = (funding, safe_balance) {
+            // Stake from closures already in flight (PendingToClose, or an open
+            // channel whose close was initiated), not yet back in the Safe. Counted
+            // in the pool so the pass does not over-close while they finalize.
+            let reclaiming: HoprBalance = all_channels
+                .iter()
+                .filter(|c| {
+                    matches!(c.status, ChannelStatus::PendingToClose(_)) || self.close_in_flight.is_held(c.get_id())
+                })
+                .fold(HoprBalance::zero(), |acc, c| acc + c.balance);
+
             self.consolidate_stranded_stake(
                 &close_candidates,
+                &deferred_to_consolidation,
                 funding.face_value,
+                reclaiming,
                 startup_phase,
                 &mut safe_remaining,
                 &mut state,

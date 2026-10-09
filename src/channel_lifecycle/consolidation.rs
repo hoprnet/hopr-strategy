@@ -30,7 +30,7 @@ pub(crate) struct ConsolidationCandidate {
 /// The count of channels that can be made usable from the pooled stake is
 ///
 /// ```text
-/// achievable = floor( (safe_remaining + Σ under-funded balances) / face_value )
+/// achievable = floor( (safe_remaining + reclaiming + Σ under-funded balances) / face_value )
 /// ```
 ///
 /// independent of which channels are kept: keeping `k` channels and topping each
@@ -38,6 +38,12 @@ pub(crate) struct ConsolidationCandidate {
 /// `safe_remaining + Σ_closed balances`; the kept/closed balances cancel and this
 /// reduces to `k ≤ pool / face_value`. So the best `achievable` channels are kept
 /// and the rest are closed, worst-ranked first.
+///
+/// `reclaiming` is stake from channels whose closure is already in flight (not yet
+/// returned to the Safe). Counting it keeps the target stable across ticks: without
+/// it, each tick's pool would omit the stake of the channels this pass closed on the
+/// previous tick, and the pass would close additional survivors while the first
+/// closures await finalization.
 ///
 /// Returns an empty set when nothing can be improved by closing:
 ///
@@ -49,6 +55,7 @@ pub(crate) struct ConsolidationCandidate {
 pub(crate) fn consolidation_closes(
     underfunded: &[ConsolidationCandidate],
     safe_remaining: HoprBalance,
+    reclaiming: HoprBalance,
     face_value: HoprBalance,
 ) -> Vec<ChannelId> {
     if face_value.amount().is_zero() || underfunded.is_empty() {
@@ -57,7 +64,9 @@ pub(crate) fn consolidation_closes(
 
     let pool = underfunded
         .iter()
-        .fold(safe_remaining.amount(), |acc, c| acc + c.balance.amount());
+        .fold(safe_remaining.amount() + reclaiming.amount(), |acc, c| {
+            acc + c.balance.amount()
+        });
     let achievable = pool / face_value.amount();
 
     // Cannot sustain even one usable channel (closing would only strand the
@@ -109,7 +118,7 @@ mod tests {
     #[test]
     fn closes_the_excess_so_the_pool_funds_the_rest() {
         let channels = uniform(7, bal(10));
-        let closes = consolidation_closes(&channels, bal(0), bal(15));
+        let closes = consolidation_closes(&channels, bal(0), bal(0), bal(15));
         assert_eq!(closes.len(), 3, "7 channels, pool 70, face 15 → keep 4, close 3");
     }
 
@@ -117,7 +126,7 @@ mod tests {
     #[test]
     fn closes_the_worst_ranked_first() {
         let channels = uniform(7, bal(10));
-        let closes = consolidation_closes(&channels, bal(0), bal(15));
+        let closes = consolidation_closes(&channels, bal(0), bal(0), bal(15));
         // Seeds 0..7 have ascending rank; the three worst are seeds 0, 1, 2.
         let expected: Vec<ChannelId> = (0u8..3).map(|i| ChannelId::create(&[&[i]])).collect();
         let closes_set: std::collections::HashSet<_> = closes.iter().map(|id| id.as_ref().to_vec()).collect();
@@ -130,7 +139,7 @@ mod tests {
     #[test]
     fn exact_multiple_funds_whole_channels_only() {
         let channels = uniform(6, bal(10));
-        let closes = consolidation_closes(&channels, bal(0), bal(15));
+        let closes = consolidation_closes(&channels, bal(0), bal(0), bal(15));
         assert_eq!(closes.len(), 2, "pool 60, face 15 → keep 4, close 2");
     }
 
@@ -140,7 +149,7 @@ mod tests {
     #[test]
     fn unachievable_pool_closes_nothing() {
         let channels = uniform(2, bal(5)); // pool 10 < face 15
-        let closes = consolidation_closes(&channels, bal(0), bal(15));
+        let closes = consolidation_closes(&channels, bal(0), bal(0), bal(15));
         assert!(closes.is_empty(), "pool below one face value must not close anything");
     }
 
@@ -149,7 +158,7 @@ mod tests {
     #[test]
     fn safe_covers_all_closes_nothing() {
         let channels = uniform(2, bal(10));
-        let closes = consolidation_closes(&channels, bal(100), bal(15));
+        let closes = consolidation_closes(&channels, bal(100), bal(0), bal(15));
         assert!(closes.is_empty(), "a pool covering every channel needs no closure");
     }
 
@@ -158,15 +167,35 @@ mod tests {
     #[test]
     fn safe_plus_reclaimable_decides_the_count() {
         let channels = uniform(2, bal(10));
-        let closes = consolidation_closes(&channels, bal(15), bal(15));
+        let closes = consolidation_closes(&channels, bal(15), bal(0), bal(15));
         assert!(closes.is_empty(), "pool 35 keeps both (floor(35/15)=2)");
+    }
+
+    /// Stake already in flight from a prior tick's closures counts toward the
+    /// pool, so the pass does not close further survivors while those closures
+    /// finalize. 4 survivors at 10, face 15, with 30 reclaiming (the two closed
+    /// last tick): pool is 30 + 40 = 70, achievable 4 = the survivor count, so
+    /// nothing more closes. Without the reclaiming term the pool would be 40 and
+    /// two more would close.
+    #[test]
+    fn reclaiming_stake_prevents_further_closes() {
+        let channels = uniform(4, bal(10));
+        assert!(
+            consolidation_closes(&channels, bal(0), bal(30), bal(15)).is_empty(),
+            "pending reclaimable stake must not trigger more closes"
+        );
+        assert_eq!(
+            consolidation_closes(&channels, bal(0), bal(0), bal(15)).len(),
+            2,
+            "without reclaiming, the shrunken pool would close two more"
+        );
     }
 
     /// A zero face value (economics unavailable) must never be divided by.
     #[test]
     fn zero_face_value_closes_nothing() {
         let channels = uniform(3, bal(10));
-        let closes = consolidation_closes(&channels, bal(0), bal(0));
+        let closes = consolidation_closes(&channels, bal(0), bal(0), bal(0));
         assert!(closes.is_empty());
     }
 }
