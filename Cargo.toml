@@ -223,3 +223,11 @@ zeroize              = "1.9.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
+
+# Development only: build against the unreleased CORE-1024 branches of the upstream repos.
+[patch.crates-io]
+blokli-client        = { git = "https://github.com/hoprnet/blokli-client", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
+hopr-api             = { git = "https://github.com/hoprnet/hopr-api", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
+hopr-chain-connector = { git = "https://github.com/hoprnet/hopr-impls", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
+hopr-types           = { git = "https://github.com/hoprnet/hopr-types", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
+hopr-utilities       = { git = "https://github.com/hoprnet/hopr-utilities", branch = "q-core-1024-jura-prod-safes-wxhopr-allowance-exhausted-all-channel" }
