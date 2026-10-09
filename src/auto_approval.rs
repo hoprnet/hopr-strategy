@@ -24,15 +24,15 @@
 //! - `hopr_strategy_auto_approval_failure_count` — incremented on enqueue/confirm failure
 use std::{
     fmt::{Debug, Display, Formatter},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{
+    FutureExt, StreamExt,
+    future::{BoxFuture, Fuse, FusedFuture},
+};
 use hopr_api::{
     chain::{ChainEvent, ChainReadChannelOperations, ChainReadSafeOperations, ChainWriteSafeOperations, SafeSelector},
     node::{ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, HasChainApi},
@@ -156,13 +156,13 @@ impl AutoApprovalStrategy {
     }
 }
 
+type PendingApproval = Fuse<BoxFuture<'static, ()>>;
+
 /// Private generic runner — constructed by [`AutoApprovalStrategy::build`].
 struct AutoApprovalStrategyInner<N> {
     node: Arc<N>,
     cfg: AutoApprovalStrategyConfig,
     interval: Duration,
-    /// Set while an approval transaction is being submitted or confirmed.
-    in_flight: Arc<AtomicBool>,
     /// `Degraded` while the node has no Safe or the last approval failed.
     state: Arc<AtomicStrategyState>,
 }
@@ -176,7 +176,6 @@ where
             node,
             cfg,
             interval,
-            in_flight: Arc::new(AtomicBool::new(false)),
             state: Arc::new(AtomicStrategyState::new(StrategyState::Running)),
         }
     }
@@ -195,10 +194,10 @@ where
 
     /// Reads the current allowance and starts an approval if it is below the threshold.
     ///
-    /// Returns `Ok(true)` if an approval was started. The approval itself runs in a background task,
-    /// so that allowance updates keep being processed while it is pending.
-    async fn check_allowance(&self, safe: Address) -> crate::errors::Result<bool> {
-        if self.in_flight.load(Ordering::Acquire) {
+    /// Returns `Ok(true)` if an approval was started. The run loop owns and polls the approval
+    /// alongside incoming events, so cancelling the loop also drops any pending approval.
+    async fn check_allowance(&self, safe: Address, pending: &mut PendingApproval) -> crate::errors::Result<bool> {
+        if !pending.is_terminated() {
             debug!(%safe, "skipping allowance check while an approval is in flight");
             return Ok(false);
         }
@@ -216,20 +215,12 @@ where
             return Ok(false);
         }
 
-        Ok(self.try_set_allowance(safe, allowance))
+        *pending = self.approve(safe, allowance).fuse();
+        Ok(true)
     }
 
-    /// Starts an approval of `allowance_amount` in the background, unless one is already in flight.
-    fn try_set_allowance(&self, safe: Address, current: HoprBalance) -> bool {
-        if self
-            .in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            debug!(%safe, "skipping approval: another approval is in flight");
-            return false;
-        }
-
+    /// Creates the one approval future owned by the run loop.
+    fn approve(&self, safe: Address, current: HoprBalance) -> BoxFuture<'static, ()> {
         info!(
             %safe,
             allowance = %current,
@@ -240,10 +231,9 @@ where
 
         let chain = self.node.chain_api().clone();
         let amount = self.cfg.allowance_amount;
-        let in_flight = Arc::clone(&self.in_flight);
         let state = Arc::clone(&self.state);
 
-        hopr_utils::runtime::prelude::spawn(async move {
+        async move {
             let result = match chain.set_safe_allowance(amount).await {
                 Ok(confirmation) => {
                     #[cfg(all(feature = "telemetry", not(test)))]
@@ -274,15 +264,12 @@ where
                 },
                 Ordering::Relaxed,
             );
-            // Released only once the outcome is known, so no second approval is sent meanwhile.
-            in_flight.store(false, Ordering::Release);
-        });
-
-        true
+        }
+        .boxed()
     }
 
     /// Resolves the node's Safe, then checks its allowance. Does nothing while the node has no Safe.
-    async fn on_trigger(&self, safe: &mut Option<Address>, trigger: &str) {
+    async fn on_trigger(&self, safe: &mut Option<Address>, pending: &mut PendingApproval, trigger: &str) {
         if safe.is_none() {
             match self.resolve_safe().await {
                 Ok(Some(resolved)) => {
@@ -302,7 +289,7 @@ where
         }
 
         if let Some(safe) = *safe
-            && let Err(error) = self.check_allowance(safe).await
+            && let Err(error) = self.check_allowance(safe, pending).await
         {
             warn!(%safe, %error, trigger, "auto-approval allowance check failed");
         }
@@ -340,21 +327,29 @@ where
             .map(|e| Event::Actionable(Box::new(e)));
 
         let mut safe = None;
-        self.on_trigger(&mut safe, "startup").await;
+        let mut pending = PendingApproval::terminated();
+        self.on_trigger(&mut safe, &mut pending, "startup").await;
 
         let tick_stream = futures_time::stream::interval(self.interval.into()).map(|_| Event::Tick);
         let mut combined = futures_concurrency::stream::Merge::merge((tick_stream, event_stream));
 
-        while let Some(event) = combined.next().await {
+        loop {
+            let event = futures::select_biased! {
+                () = pending => continue,
+                event = combined.next().fuse() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
-                Event::Tick => self.on_trigger(&mut safe, "tick").await,
+                Event::Tick => self.on_trigger(&mut safe, &mut pending, "tick").await,
                 Event::Actionable(event) => {
                     if let ActionableEvent::Chain(ChainEvent::SafeAllowanceChanged(owner, allowance)) = *event
                         && safe.is_none_or(|safe| safe == owner)
                         && allowance < self.cfg.min_allowance_threshold
                     {
                         debug!(%owner, %allowance, "safe allowance changed below threshold");
-                        self.on_trigger(&mut safe, "allowance changed").await;
+                        self.on_trigger(&mut safe, &mut pending, "allowance changed").await;
                     }
                 }
             }
@@ -566,6 +561,51 @@ mod tests {
 
         assert_eq!(connector.faults().calls(ChainOp::SetSafeAllowance), 1);
         assert_eq!(connector.faults().peak_in_flight(ChainOp::SetSafeAllowance), 1);
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn cancellation_releases_a_pending_submission() -> anyhow::Result<()> {
+        let (connector, safe, _) = setup(HoprBalance::new_base(5)).await?;
+        connector.faults().set(ChainOp::SetSafeAllowance, Fault::Hang);
+        let (handle, state) = start(&connector)?;
+        let state_lifetime = Arc::downgrade(&state);
+        drop(state);
+        eventually(|| async { connector.faults().calls(ChainOp::SetSafeAllowance) == 1 }).await?;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+
+        // A detached submission would still own the strategy's state after cancellation.
+        assert!(state_lifetime.upgrade().is_none());
+        assert_eq!(allowance(&connector, safe).await?, HoprBalance::new_base(5));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn cancellation_releases_confirmation_before_restart() -> anyhow::Result<()> {
+        let (connector, safe, _) = setup(HoprBalance::new_base(5)).await?;
+        connector
+            .faults()
+            .set_confirmation(ChainOp::SetSafeAllowance, Fault::Hang);
+        let (handle, _) = start(&connector)?;
+        eventually(|| async { connector.faults().peak_in_flight(ChainOp::SetSafeAllowance) == 1 }).await?;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+
+        connector.client().update_safe_allowance(
+            &safe.into(),
+            blokli_client::api::types::TokenValueString(HoprBalance::new_base(5).to_string()),
+        );
+        let (restarted, _) = start(&connector)?;
+        eventually(|| async { connector.faults().calls(ChainOp::SetSafeAllowance) == 2 }).await?;
+        eventually(|| async { allowance(&connector, safe).await.ok() == Some(HoprBalance::new_base(100)) }).await?;
+        restarted.abort();
+        assert!(restarted.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            connector.faults().peak_in_flight(ChainOp::SetSafeAllowance),
+            1,
+            "the cancelled confirmation must release its local in-flight guard",
+        );
         Ok(())
     }
 
