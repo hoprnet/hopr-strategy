@@ -177,7 +177,7 @@ pub struct EligibilityConfig {
 /// # Configuration (YAML)
 ///
 /// ```yaml
-/// # Mean-drain stake (default); floored at one winning ticket.
+/// # Mean-drain stake (default); floored at the selector first-edge requirement.
 /// sizing_mode: deterministic
 ///
 /// # Statistical guarantee; adds k·σ above the mean drain.
@@ -192,17 +192,17 @@ pub struct EligibilityConfig {
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapacitySizingMode {
-    /// `stake = max( ticket_price × hops / win_prob ,  N × hops × ticket_price )`
+    /// `stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  N × hops × ticket_price )`
     ///
     /// Sizes the stake to the **expected** drain `N × hops × ticket_price`,
-    /// floored at one winning ticket.  The main term is independent of
+    /// floored at the selector first-edge requirement.  The main term is independent of
     /// `win_prob`, so the stake is insensitive to win-prob fluctuations; the
     /// floor is the only win-prob-dependent part.
     ///
     /// This is the **default**.  Because payouts are lumpy, roughly half of all
     /// fund cycles see the channel drain slightly faster than the mean — this
     /// triggers a top-up sooner (handled by proactive funding), never message
-    /// loss, as long as the balance stays above the one-ticket floor.
+    /// loss, as long as the balance stays above the selector first-edge floor.
     ///
     /// ```yaml
     /// sizing_mode: deterministic
@@ -210,7 +210,7 @@ pub enum CapacitySizingMode {
     #[default]
     Deterministic,
 
-    /// `stake = max( ticket_price × hops / win_prob ,  E[D] + k·σ[D] )`
+    /// `stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  E[D] + k·σ[D] )`
     /// where `k = Φ⁻¹(success_probability)`,
     /// `E[D] = N × hops × ticket_price` and
     /// `σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)`.
@@ -330,7 +330,7 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// ```
 ///
 /// The floor only binds for tiny capacities (`N < 1 / win_prob`), where it lifts
-/// the stake up to one winning ticket so the channel can still relay.
+/// the stake up to the selector first-edge floor so the channel can still relay.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FundingConfig {
@@ -350,7 +350,7 @@ pub struct FundingConfig {
     pub lower_capacity_threshold: ByteSize,
 
     /// How each capacity field is converted to a wxHOPR stake.
-    /// Default: `Deterministic` (mean drain, floored at one winning ticket).
+    /// Default: `Deterministic` (mean drain, floored at the selector first-edge requirement).
     ///
     /// See [`CapacitySizingMode`] for the full tradeoff analysis.
     #[default(CapacitySizingMode::default())]
@@ -652,7 +652,7 @@ impl FundingConfig {
     /// economics.  Called once per pipeline tick.
     ///
     /// `win_prob` must be in `(0, 1]`.  Every mode uses it to compute the
-    /// one-winning-ticket floor, so it is always required.
+    /// selector first-edge floor, so it is always required.
     ///
     /// # Reporting what the strategy will lock
     ///
