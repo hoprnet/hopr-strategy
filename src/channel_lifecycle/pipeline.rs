@@ -3078,7 +3078,9 @@ mod tests {
         count: u8,
         stake: u32,
         safe: u32,
-    ) -> anyhow::Result<Arc<crate::testing::TestChainConnector<crate::testing::FullStateEmulator>>> {
+    ) -> anyhow::Result<
+        Arc<crate::testing::TestChainConnector<crate::testing::BlokliTestClient<crate::testing::FullStateEmulator>>>,
+    > {
         let peers: Vec<Address> = (20..20 + count).map(|n| [n; Address::SIZE].into()).collect();
         let mut account_refs: Vec<&Address> = vec![&*BOB];
         account_refs.extend(peers.iter());
