@@ -11,6 +11,7 @@ Each strategy is gated behind its own Cargo feature, so a consumer compiles only
 | strategy          | module              | feature                      |
 | ----------------- | ------------------- | ---------------------------- |
 | Multi / passive   | `strategy`          | _(always available)_         |
+| Auto approval     | `auto_approval`     | `strategy-auto-approval`     |
 | Auto funding      | `auto_funding`      | `strategy-auto-funding`      |
 | Auto redeeming    | `auto_redeeming`    | `strategy-auto-redeeming`    |
 | Closure finalizer | `channel_finalizer` | `strategy-closure-finalizer` |
@@ -18,6 +19,30 @@ Each strategy is gated behind its own Cargo feature, so a consumer compiles only
 | PIX               | `pix`               | `strategy-pix`               |
 
 `MultiStrategy` runs any combination of them concurrently, and accepts strategies defined outside this crate.
+
+### Auto approval
+
+Every channel opening or funding from the node's Safe spends the wxHOPR allowance that the Safe grants to the `HoprChannels` contract. When
+the allowance runs out, these transactions revert even if the Safe holds enough wxHOPR.
+
+`AutoApprovalStrategy` keeps this allowance topped up. When the allowance is strictly below `min_allowance_threshold`, it calls
+`approve(HoprChannels, allowance_amount)` on the wxHOPR token through the Safe module. This **sets** the allowance to `allowance_amount`; it
+does not add to it.
+
+The strategy reacts to `ChainEvent::SafeAllowanceChanged` events of the node's Safe, and also checks at startup and on every `interval` tick
+to recover from missed events and failed transactions. It reads the current allowance before every approval and keeps at most one approval
+in flight.
+
+```yaml
+- AutoApproval:
+    min_allowance_threshold: "100 wxHOPR"
+    allowance_amount: "1000 wxHOPR"
+```
+
+These are the defaults. The threshold must be greater than zero and the amount must be greater than the threshold. Pick a threshold at least
+as large as the biggest amount moved into a channel at once.
+
+Construct it with `AutoApprovalStrategy::new(config, interval).build(node)?`. The returned strategy can be passed to `MultiStrategy`.
 
 ### PIX deposit pools
 

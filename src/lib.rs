@@ -3,6 +3,7 @@
 //! during node runtime.
 //!
 //! - [passive strategy](crate::strategy::MultiStrategy)
+//! - auto approval strategy (`auto_approval` module, feature `strategy-auto-approval`)
 //! - auto funding strategy (`auto_funding` module, feature `strategy-auto-funding`)
 //! - auto redeeming strategy (`auto_redeeming` module, feature `strategy-auto-redeeming`)
 //! - closure finalizer (`channel_finalizer` module, feature `strategy-closure-finalizer`)
@@ -35,6 +36,8 @@
 //!       funding_amount: 20
 //! ```
 
+#[cfg(feature = "strategy-auto-approval")]
+pub mod auto_approval;
 #[cfg(feature = "strategy-auto-funding")]
 pub mod auto_funding;
 #[cfg(feature = "strategy-auto-redeeming")]
