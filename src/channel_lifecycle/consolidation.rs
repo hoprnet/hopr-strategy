@@ -35,8 +35,8 @@ pub(crate) struct ConsolidationCandidate {
 ///
 /// independent of which channels are kept: keeping `k` channels and topping each
 /// to `face_value` costs `k·face_value − Σ_kept balances`, funded from
-/// `safe_remaining + Σ_closed balances`; the kept/closed balances cancel and this
-/// reduces to `k ≤ pool / face_value`. So the best `achievable` channels are kept
+/// `safe_remaining + reclaiming + Σ_closed balances`; the kept/closed balances cancel
+/// and this reduces to `k ≤ pool / face_value`. So the best `achievable` channels are kept
 /// and the rest are closed, worst-ranked first.
 ///
 /// `reclaiming` is stake from channels whose closure is already in flight (not yet
