@@ -32,10 +32,9 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
     // Funding is expressed as data capacity (hoprnet #8243). With the harness's
     // default economics (ticket price 1 wxHOPR, win_prob 1.0, assumed_hops 3) one
     // face value is 3 wxHOPR, and `ByteSize::b(1)` = 1 packet floors at the path
-    // selector's first-edge requirement: `MIN_BALANCE_HEADROOM (2) × face value`
-    // = 6 wxHOPR (hopr-strategy#86), not one face value, so a funded channel is
-    // actually selectable.
-    let topup: HoprBalance = "6 wxHOPR".parse()?; // = resolve(topup_capacity = ByteSize::b(1))
+    // selector's first-edge requirement, one full-path winning ticket = 3 wxHOPR,
+    // so a funded channel is actually selectable.
+    let topup: HoprBalance = "3 wxHOPR".parse()?; // = resolve(topup_capacity = ByteSize::b(1))
     let mut cfg = ChannelLifecycleConfig {
         tick_interval: Duration::from_secs(3600),
         jitter: Duration::ZERO,
@@ -43,8 +42,8 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
     };
     cfg.population.min_open_channels = 1;
     cfg.population.target_open_channels = 1;
-    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // ~6 wxHOPR floor; channel at 1 wxHOPR is below → tops up
-    cfg.funding.topup_capacity = ByteSize::b(1); // adds ~6 wxHOPR (2 × face value)
+    cfg.funding.lower_capacity_threshold = ByteSize::b(1); // ~3 wxHOPR floor; channel at 1 wxHOPR is below → tops up
+    cfg.funding.topup_capacity = ByteSize::b(1); // adds ~3 wxHOPR (one face value)
     cfg.proactive_funding.enabled = false;
     cfg.finalizer.enabled = false;
 

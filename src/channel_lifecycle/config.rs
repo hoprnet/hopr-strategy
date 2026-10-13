@@ -2,7 +2,6 @@ use std::{collections::HashSet, time::Duration};
 
 use bytesize::ByteSize;
 use hopr_api::{
-    graph::function::MIN_BALANCE_HEADROOM,
     node::PacketTransport,
     types::{
         internal::routing::RoutingOptions,
@@ -148,25 +147,25 @@ pub struct EligibilityConfig {
 /// proportionally larger payouts, so the mean drain is unchanged while the
 /// variance grows as `1 / win_prob`.
 ///
-/// # The selector first-edge floor (applies to every mode)
+/// # The one-winning-ticket floor (applies to every mode)
 ///
 /// A channel is useless to the path selector unless its balance clears the
-/// first-edge requirement `remaining_hops × ticket_price / win_prob ×
-/// MIN_BALANCE_HEADROOM` (`hopr_api::graph::function::balance_suffices`); below
-/// it the edge is pruned and the channel cannot be a first hop (hopr-strategy#86).
-/// A channel also cannot *issue* a ticket whose face value exceeds its balance.
-/// The larger of the two is the selector floor, so every resolved stake is
-/// floored there:
+/// first-edge requirement `remaining_hops × ticket_price / win_prob`
+/// (`hopr_api::graph::function::balance_suffices`); below it the edge is pruned
+/// and the channel cannot be a first hop.  This coincides with the floor below
+/// which a channel cannot even *issue* its next ticket (face value exceeds
+/// balance), so a single full-path winning ticket is the floor every resolved
+/// stake is floored at:
 ///
 /// ```text
-/// stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  <mode term> )
+/// stake = max( ticket_price × hops / win_prob ,  <mode term> )
 /// ```
 ///
 /// Without this floor, at HOPR's production win-probs (1e-4 … 1e-6) a stake
-/// sized to the *mean* drain can be smaller than the selector requires, so a
-/// fully funded channel is silently unselectable.  The floor guarantees every
-/// field (initial, top-up, and lower threshold) clears the selector's first-edge
-/// requirement for the deepest path the node routes.
+/// sized to the *mean* drain can be smaller than one winning ticket, so a
+/// channel cannot relay a single packet.  The floor guarantees every field
+/// (initial, top-up, and lower threshold) covers at least one full-path winning
+/// ticket for the deepest path the node routes.
 ///
 /// # Modes
 ///
@@ -177,7 +176,7 @@ pub struct EligibilityConfig {
 /// # Configuration (YAML)
 ///
 /// ```yaml
-/// # Mean-drain stake (default); floored at the selector first-edge requirement.
+/// # Mean-drain stake (default); floored at one winning ticket.
 /// sizing_mode: deterministic
 ///
 /// # Statistical guarantee; adds k·σ above the mean drain.
@@ -192,17 +191,17 @@ pub struct EligibilityConfig {
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapacitySizingMode {
-    /// `stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  N × hops × ticket_price )`
+    /// `stake = max( ticket_price × hops / win_prob ,  N × hops × ticket_price )`
     ///
     /// Sizes the stake to the **expected** drain `N × hops × ticket_price`,
-    /// floored at the selector first-edge requirement.  The main term is independent of
+    /// floored at one winning ticket.  The main term is independent of
     /// `win_prob`, so the stake is insensitive to win-prob fluctuations; the
     /// floor is the only win-prob-dependent part.
     ///
     /// This is the **default**.  Because payouts are lumpy, roughly half of all
     /// fund cycles see the channel drain slightly faster than the mean — this
     /// triggers a top-up sooner (handled by proactive funding), never message
-    /// loss, as long as the balance stays above the selector first-edge floor.
+    /// loss, as long as the balance stays above the one-winning-ticket floor.
     ///
     /// ```yaml
     /// sizing_mode: deterministic
@@ -210,7 +209,7 @@ pub enum CapacitySizingMode {
     #[default]
     Deterministic,
 
-    /// `stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  E[D] + k·σ[D] )`
+    /// `stake = max( ticket_price × hops / win_prob ,  E[D] + k·σ[D] )`
     /// where `k = Φ⁻¹(success_probability)`,
     /// `E[D] = N × hops × ticket_price` and
     /// `σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)`.
@@ -619,15 +618,14 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
     // ticket whenever the ratio drifts off an integer.
     let face_f64 = winning_ticket_face_value_wei(price_f64, win_prob, hops);
 
-    // Floor at the path selector's first-edge requirement (hopr-strategy#86), not
-    // just one ticket: the selector prunes a first edge below
-    // `remaining_hops × single_ticket × MIN_BALANCE_HEADROOM`
-    // (`hopr_api::graph::function::balance_suffices`). `face_f64` is already the
-    // `remaining_hops × single_ticket` term for `hops` hops, so the floor is that
-    // times `MIN_BALANCE_HEADROOM`. Sizing for `hops = ASSUMED_HOPS` (the deepest
-    // path) clears the floor for every shorter path too. Without this, a fully
-    // funded channel can sit on or below the selector floor and go silently unselectable.
-    let selector_floor = face_f64 * MIN_BALANCE_HEADROOM as f64;
+    // Floor at one full-path winning ticket, the planner's first-edge funding
+    // requirement: `hopr_api::graph::function::balance_suffices` prunes a first
+    // edge below `remaining_hops × single_ticket`. `face_f64` is already that
+    // `remaining_hops × single_ticket` term for `hops` hops, so it is the floor
+    // directly. Sizing for `hops = ASSUMED_HOPS` (the deepest path) clears the
+    // floor for every shorter path too. Without this, a fully funded channel can
+    // sit on or below the planner floor and go silently unselectable.
+    let selector_floor = face_f64;
 
     // Quantise up to a whole number of tickets.  A remainder below one face value
     // can never leave the channel, so it funds no further ticket and buys none of
@@ -1097,11 +1095,11 @@ mod config_tests {
         n * hops as u128 * tp_wei
     }
 
-    /// The path selector's first-edge floor in wei (hopr-strategy#86):
-    /// `floor_wei(hops) × MIN_BALANCE_HEADROOM`. This is the minimum stake the
-    /// strategy funds a channel to, replacing the old one-winning-ticket floor.
+    /// The path selector's first-edge floor in wei: one full-path winning ticket,
+    /// `remaining_hops × ticket_price / win_prob`. This is the minimum stake the
+    /// strategy funds a channel to, and the planner's first-edge funding requirement.
     fn selector_floor_wei(tp_wei: u128, hops: u32, p: f64) -> u128 {
-        floor_wei(tp_wei, hops, p) * MIN_BALANCE_HEADROOM as u128
+        floor_wei(tp_wei, hops, p)
     }
 
     /// Φ⁻¹(alpha) — the z-score used by `Probabilistic`.
@@ -1145,9 +1143,9 @@ mod config_tests {
     // ── hopr-strategy#86: funding clears the selector's first-edge floor ──────
 
     /// The path selector prunes a first edge whose balance is below
-    /// `remaining_hops × single_ticket_face_value × MIN_BALANCE_HEADROOM`
+    /// `remaining_hops × single_ticket_face_value`
     /// (`hopr_api::graph::function::balance_suffices`). The strategy must fund
-    /// every usable first edge above that floor, in integer wei, for every hop
+    /// every usable first edge at or above that floor, in integer wei, for every hop
     /// count the node routes at, or a fully funded channel is silently unselectable.
     #[rstest]
     #[case(PRICE_WEI, 0.5)]
@@ -1175,7 +1173,7 @@ mod config_tests {
             .amount();
 
         for hops in 1..=ASSUMED_HOPS {
-            let planner_floor = single * U256::from(hops) * U256::from(MIN_BALANCE_HEADROOM);
+            let planner_floor = single * U256::from(hops);
             assert!(
                 resolved.topup_balance.amount() >= planner_floor,
                 "tp={tp_wei} p={p} hops={hops}: topup {} below planner floor {planner_floor}",
@@ -1278,17 +1276,17 @@ mod config_tests {
         assert_close(got, mean_wei(1_000_000, 3, PRICE_WEI), &format!("p={p}"));
     }
 
-    /// Sub-packet capacity rounds up to the selector floor (MIN_BALANCE_HEADROOM
-    /// tickets), the smallest selectable stake.
+    /// Sub-packet capacity rounds up to the selector floor (one winning ticket),
+    /// the smallest selectable stake.
     #[rstest]
     #[case(1)]
     #[case(500)]
     #[case(1035)]
     fn sub_packet_rounds_up_to_the_selector_floor(#[case] bytes: u64) {
-        // p = 1.0, h = 1 → face = tp; the selector floor is MIN_BALANCE_HEADROOM
-        // tickets (hopr-strategy#86), so a sub-packet capacity rounds up to it.
+        // p = 1.0, h = 1 → face = tp; the selector floor is one winning ticket,
+        // so a sub-packet capacity rounds up to it.
         let got = stake_wei(ByteSize::b(bytes), PRICE_WEI, 1.0, 1, &DET);
-        assert_eq!(got, PRICE_WEI * MIN_BALANCE_HEADROOM as u128, "bytes={bytes}");
+        assert_eq!(got, PRICE_WEI, "bytes={bytes}");
     }
 
     // ── The one-winning-ticket floor (the core fix) ──────────────────────────

@@ -3886,8 +3886,8 @@ mod tests {
         // Blokli defaults: ticket_price = "1 wxHOPR", win_prob = 1.0; hops is the protocol max, 3.
         // Deterministic sizing (win_prob still sets the one-ticket floor):
         //   capacity_to_balance(1 byte, 1 wxHOPR, 1.0, 3, Deterministic)
-        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR, floored at
-        //   the selector's first-edge requirement 2 × 3 = 6 wxHOPR (hopr-strategy#86).
+        //     = max(floor = tp·h/p = 3, mean = N·h·tp = 3) = 3 wxHOPR, which is also
+        //   the selector's first-edge requirement (one full-path winning ticket).
         let expected_topup = {
             use super::super::config::CapacitySizingMode;
             let price = HoprBalance::new_base(1); // 1 wxHOPR (Blokli default)
@@ -3927,9 +3927,9 @@ mod tests {
             },
             funding: FundingConfig {
                 // threshold = 0 → only the initial 0-balance channel triggers funding.
-                // After the topup (6 wxHOPR), balance > 0 → no further funding on next tick.
+                // After the topup (3 wxHOPR), balance > 0 → no further funding on next tick.
                 lower_capacity_threshold: ByteSize::b(0),
-                // 1 byte = 1 packet → 6 wxHOPR topup (floored at the selector floor) at default sim economics.
+                // 1 byte = 1 packet → 3 wxHOPR topup (floored at the selector floor) at default sim economics.
                 topup_capacity: ByteSize::b(1),
                 ..Default::default()
             },
