@@ -223,10 +223,3 @@ zeroize              = "1.9.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
-
-# TEMPORARY dev-pin (hopr-api#144): redirects the whole graph — including the
-# transitive hopr-utilities -> hopr-api edge the test connector's chain-trait
-# impls live on — to the unpublished 4.4.0 branch, so both resolve to one
-# version. Drop this section once hopr-api 4.4.0 is published to crates.io.
-[patch.crates-io]
-hopr-api = { git = "https://github.com/hoprnet/hopr-api.git", branch = "kauki/fix/graph/drop-balance-headroom" }
