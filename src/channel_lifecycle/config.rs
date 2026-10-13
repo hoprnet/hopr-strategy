@@ -2,10 +2,11 @@ use std::{collections::HashSet, time::Duration};
 
 use bytesize::ByteSize;
 use hopr_api::{
+    graph::function::MIN_BALANCE_HEADROOM,
     node::PacketTransport,
     types::{
         internal::routing::RoutingOptions,
-        primitive::prelude::{Address, HoprBalance, U256},
+        primitive::prelude::{Address, HoprBalance, U256, UnitaryFloatOps},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -14,13 +15,19 @@ use validator::Validate;
 
 /// Paid downstream relay hops every channel stake is sized for.
 ///
-/// Fixed at the longest path the protocol can encode — not a tuning parameter.  A ticket's
-/// face value is `ticket_price × hops / win_prob`, and the issuing node cannot know how long
-/// a path a given packet will take, so sizing below the maximum under-funds the tickets a
-/// relayer must issue and the channel stalls mid-relay on any path that exceeds the guess.
-/// Sizing at the maximum over-funds shorter paths instead, which only leaves balance idle
-/// until the channel closes.
-const ASSUMED_HOPS: u32 = RoutingOptions::MAX_INTERMEDIATE_HOPS as u32;
+/// Sourced from hopr-lib's published maximum intermediate hop count
+/// ([`RoutingOptions::MAX_INTERMEDIATE_HOPS`]) — the longest path the protocol can encode,
+/// not a tuning parameter, and currently `3`. hopr-lib publishes it as this routing constant
+/// rather than as a per-node chain value (the chain exposes ticket price and win probability,
+/// but no path-length), so it is read from there rather than the chain interface, and the
+/// value falls back to the protocol maximum whichever way it is obtained.
+///
+/// A ticket's face value is `ticket_price × hops / win_prob`, and the issuing node cannot know
+/// how long a path a given packet will take, so sizing below the maximum under-funds the
+/// tickets a relayer must issue and the channel stalls mid-relay on any path that exceeds the
+/// guess. Sizing at the maximum over-funds shorter paths instead, which only leaves balance
+/// idle until the channel closes.
+pub(crate) const ASSUMED_HOPS: u32 = RoutingOptions::MAX_INTERMEDIATE_HOPS as u32;
 
 /// Population thresholds: how many open channels to maintain.
 #[serde_as]
@@ -38,9 +45,13 @@ pub struct PopulationConfig {
     pub target_open_channels: usize,
 
     /// How long a peer is ineligible for a new channel after its previous
-    /// channel was closed.  Default: 30 minutes.
+    /// channel was closed.  Counted from `ChannelClosed` — after closure is
+    /// already fully confirmed on-chain, so this never races the closure
+    /// itself.  Sized at roughly one on-chain closure cycle so a reopen never
+    /// looks premature relative to how long retiring the old channel took,
+    /// without padding on top of that.  Default: 15 minutes.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub peer_reopen_cooldown: Duration,
 }
 
@@ -83,6 +94,28 @@ pub struct EligibilityConfig {
     /// Never open channels to addresses in this list.  Default: empty.
     #[default(HashSet::new())]
     pub blocklist: HashSet<Address>,
+
+    /// Prefer peers that fund their own outgoing channels.  When `true`, a
+    /// candidate with fewer than [`minimum_peer_outgoing_channels`] funded
+    /// outgoing channels is a *ticket sink*: it can only ever be a path's last
+    /// hop, never an intermediate relay, so it cannot carry the 2- and 3-hop
+    /// paths this node builds.  Every active selector ranks such peers strictly
+    /// below every forwarding-capable candidate and opens to them only as a last
+    /// resort when no capable peer can fill an open slot — never barred.
+    /// Default: true.
+    ///
+    /// [`minimum_peer_outgoing_channels`]: Self::minimum_peer_outgoing_channels
+    #[default = true]
+    pub demote_non_forwarding_peers: bool,
+
+    /// Funded outgoing channels a peer must source for it to count as
+    /// forwarding-capable rather than a ticket sink.  Only consulted when
+    /// [`demote_non_forwarding_peers`] is set.  Values below 1 are treated as 1
+    /// (a peer with zero outgoing channels is always a sink).  Default: 1.
+    ///
+    /// [`demote_non_forwarding_peers`]: Self::demote_non_forwarding_peers
+    #[default = 1]
+    pub minimum_peer_outgoing_channels: usize,
 }
 
 /// How the strategy converts a data-capacity [`ByteSize`] to a wxHOPR channel
@@ -115,20 +148,25 @@ pub struct EligibilityConfig {
 /// proportionally larger payouts, so the mean drain is unchanged while the
 /// variance grows as `1 / win_prob`.
 ///
-/// # The one-winning-ticket floor (applies to every mode)
+/// # The selector first-edge floor (applies to every mode)
 ///
-/// A channel cannot even *issue* a ticket whose face value exceeds its balance
-/// — the factory returns `OutOfFunds`.  Every resolved stake is therefore
-/// floored at a single full-path winning ticket:
+/// A channel is useless to the path selector unless its balance clears the
+/// first-edge requirement `remaining_hops × ticket_price / win_prob ×
+/// MIN_BALANCE_HEADROOM` (`hopr_api::graph::function::balance_suffices`); below
+/// it the edge is pruned and the channel cannot be a first hop (hopr-strategy#86).
+/// A channel also cannot *issue* a ticket whose face value exceeds its balance.
+/// The larger of the two is the selector floor, so every resolved stake is
+/// floored there:
 ///
 /// ```text
-/// stake = max( ticket_price × hops / win_prob ,  <mode term> )
+/// stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  <mode term> )
 /// ```
 ///
 /// Without this floor, at HOPR's production win-probs (1e-4 … 1e-6) a stake
-/// sized to the *mean* drain can be smaller than one ticket, leaving the
-/// channel unable to relay a single packet.  The floor guarantees every field —
-/// initial, top-up, and lower threshold — always covers ≥ 1 winning ticket.
+/// sized to the *mean* drain can be smaller than the selector requires, so a
+/// fully funded channel is silently unselectable.  The floor guarantees every
+/// field (initial, top-up, and lower threshold) clears the selector's first-edge
+/// requirement for the deepest path the node routes.
 ///
 /// # Modes
 ///
@@ -139,7 +177,7 @@ pub struct EligibilityConfig {
 /// # Configuration (YAML)
 ///
 /// ```yaml
-/// # Mean-drain stake (default); floored at one winning ticket.
+/// # Mean-drain stake (default); floored at the selector first-edge requirement.
 /// sizing_mode: deterministic
 ///
 /// # Statistical guarantee; adds k·σ above the mean drain.
@@ -154,17 +192,17 @@ pub struct EligibilityConfig {
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CapacitySizingMode {
-    /// `stake = max( ticket_price × hops / win_prob ,  N × hops × ticket_price )`
+    /// `stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  N × hops × ticket_price )`
     ///
     /// Sizes the stake to the **expected** drain `N × hops × ticket_price`,
-    /// floored at one winning ticket.  The main term is independent of
+    /// floored at the selector first-edge requirement.  The main term is independent of
     /// `win_prob`, so the stake is insensitive to win-prob fluctuations; the
     /// floor is the only win-prob-dependent part.
     ///
     /// This is the **default**.  Because payouts are lumpy, roughly half of all
     /// fund cycles see the channel drain slightly faster than the mean — this
     /// triggers a top-up sooner (handled by proactive funding), never message
-    /// loss, as long as the balance stays above the one-ticket floor.
+    /// loss, as long as the balance stays above the selector first-edge floor.
     ///
     /// ```yaml
     /// sizing_mode: deterministic
@@ -172,7 +210,7 @@ pub enum CapacitySizingMode {
     #[default]
     Deterministic,
 
-    /// `stake = max( ticket_price × hops / win_prob ,  E[D] + k·σ[D] )`
+    /// `stake = max( ticket_price × hops / win_prob × MIN_BALANCE_HEADROOM ,  E[D] + k·σ[D] )`
     /// where `k = Φ⁻¹(success_probability)`,
     /// `E[D] = N × hops × ticket_price` and
     /// `σ[D] = hops × ticket_price × √(N × (1 − win_prob) / win_prob)`.
@@ -234,6 +272,21 @@ fn validate_non_zero(duration: &Duration) -> Result<(), validator::ValidationErr
     }
 }
 
+/// Rejects an observation window longer than the grace window.
+///
+/// The observation window is the opening phase of the grace window, so
+/// exceeding it would leave the connectivity-aware middle phase unreachable and
+/// silently reduce the guard to blanket suppression. Rejected rather than
+/// clamped, so the misconfiguration surfaces instead of being absorbed.
+fn validate_restart_windows(cfg: &RestartGuardConfig) -> Result<(), validator::ValidationError> {
+    match cfg.startup_observation_period > cfg.startup_close_grace_period {
+        true => Err(validator::ValidationError::new(
+            "startup_observation_period must not exceed startup_close_grace_period",
+        )),
+        false => Ok(()),
+    }
+}
+
 fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::ValidationError> {
     if let CapacitySizingMode::Probabilistic { success_probability } = mode
         && !(*success_probability >= 0.5001 && *success_probability <= 0.99999)
@@ -249,7 +302,7 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// data volumes, plus the [`CapacitySizingMode`] that controls how those volumes
 /// are converted to wxHOPR stakes at runtime.
 ///
-/// All four capacity fields share the same sizing mode.  [`FundingConfig::resolve`]
+/// All three capacity fields share the same sizing mode.  [`FundingConfig::resolve`]
 /// converts them to [`ResolvedFunding`] balances once per tick using the live
 /// ticket price (and, for `Expected`/`Probabilistic` modes, the live winning
 /// probability).
@@ -260,7 +313,6 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// initial_capacity: 1 GiB
 /// topup_capacity: 1 GiB
 /// lower_capacity_threshold: 256 MiB
-/// min_safe_capacity_required: 1 GiB
 /// sizing_mode: deterministic
 /// ```
 ///
@@ -278,7 +330,7 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// ```
 ///
 /// The floor only binds for tiny capacities (`N < 1 / win_prob`), where it lifts
-/// the stake up to one winning ticket so the channel can still relay.
+/// the stake up to the selector first-edge floor so the channel can still relay.
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FundingConfig {
@@ -297,18 +349,8 @@ pub struct FundingConfig {
     #[default(ByteSize::mib(256))]
     pub lower_capacity_threshold: ByteSize,
 
-    /// Minimum safe balance (expressed as data capacity) required before the
-    /// strategy opens or funds any channel.  Default: 1 GiB.
-    #[default(ByteSize::gib(1))]
-    pub min_safe_capacity_required: ByteSize,
-
-    /// When `true` the fund and open passes are skipped entirely if the safe
-    /// balance is below `min_safe_capacity_required`.  Default: true.
-    #[default = true]
-    pub stop_when_unfunded: bool,
-
     /// How each capacity field is converted to a wxHOPR stake.
-    /// Default: `Deterministic` (mean drain, floored at one winning ticket).
+    /// Default: `Deterministic` (mean drain, floored at the selector first-edge requirement).
     ///
     /// See [`CapacitySizingMode`] for the full tradeoff analysis.
     #[default(CapacitySizingMode::default())]
@@ -329,8 +371,11 @@ pub struct FundingConfig {
 /// because it *is* the strategy's own calculation.
 ///
 /// Each field resolves its own capacity independently; no ordering is implied. Under
-/// [`FundingConfig::default`] the top-up, initial and min-safe capacities are all 1 GiB
-/// and resolve equal, with only the lower threshold (256 MiB) below them.
+/// [`FundingConfig::default`] the top-up and initial capacities are both 1 GiB and
+/// resolve equal, with only the lower threshold (256 MiB) below them.
+///
+/// There is no resolved minimum safe balance: what a safe must hold is a property of
+/// live channel state, not of config — see [`Self::required_safe_balance`].
 ///
 /// ```no_run
 /// # use hopr_strategy::channel_lifecycle::FundingConfig;
@@ -348,8 +393,59 @@ pub struct ResolvedFunding {
     pub topup_balance: HoprBalance,
     /// Channel balance below which a top-up is triggered.
     pub lower_balance_threshold: HoprBalance,
-    /// Minimum safe balance required before opening or funding any channel.
-    pub min_safe_balance_required: HoprBalance,
+    /// Face value of one winning ticket (`price × hops / win_prob`): the least a
+    /// channel must hold to issue its next ticket, and the quantum every stake is a
+    /// whole multiple of.  When the safe cannot afford a full [`Self::topup_balance`],
+    /// the fund pass tops up the largest whole number of these the safe can still
+    /// supply — anything below one funds no issuable ticket and is left unspent.
+    pub face_value: HoprBalance,
+}
+
+impl ResolvedFunding {
+    /// wxHOPR the safe must hold for the demand this tick observed to be met in full.
+    ///
+    /// ```text
+    /// required = topup_balance × channels_needing_topup + initial_balance × open_deficit
+    /// ```
+    ///
+    /// `channels_needing_topup` is the count of open channels that need a top-up right
+    /// now (or would before a funding transaction could confirm) and have no
+    /// funding/closing transaction already in flight for them.
+    ///
+    /// `open_deficit` is measured against [`PopulationConfig::min_open_channels`] — the
+    /// floor below which the node stops being a useful relay — **not**
+    /// `PopulationConfig::target_open_channels`, which is an ambition funded from
+    /// surplus rather than a requirement. A safe sized to the target would report a
+    /// figure the node does not need.
+    ///
+    /// Zero when nothing is outstanding: every term here is something the strategy
+    /// would spend this tick if it could afford to. There is no standing minimum — a
+    /// node at its population floor whose channels are all healthy needs nothing.
+    ///
+    /// Saturating throughout ([`HoprBalance`]'s arithmetic saturates at `U256::MAX`
+    /// rather than wrapping), so an absurd count reads as "unaffordable" rather than
+    /// wrapping to something small.
+    ///
+    /// ```
+    /// # use hopr_strategy::channel_lifecycle::ResolvedFunding;
+    /// # use hopr_api::types::primitive::prelude::HoprBalance;
+    /// let resolved = ResolvedFunding {
+    ///     initial_balance: HoprBalance::new_base(100),
+    ///     topup_balance: HoprBalance::new_base(10),
+    ///     lower_balance_threshold: HoprBalance::new_base(5),
+    ///     face_value: HoprBalance::new_base(1),
+    /// };
+    ///
+    /// // Nothing outstanding: no standing minimum.
+    /// assert_eq!(resolved.required_safe_balance(0, 0), HoprBalance::zero());
+    ///
+    /// // Two channels need a top-up, and the node is one channel short of its floor.
+    /// let required = resolved.required_safe_balance(2, 1);
+    /// assert_eq!(required, HoprBalance::new_base(10) * 2 + HoprBalance::new_base(100));
+    /// ```
+    pub fn required_safe_balance(&self, channels_needing_topup: usize, open_deficit: usize) -> HoprBalance {
+        self.topup_balance * channels_needing_topup + self.initial_balance * open_deficit
+    }
 }
 
 /// Convert a data `capacity` to a wxHOPR channel stake using the live ticket
@@ -420,6 +516,45 @@ fn whole_tickets(tickets: f64) -> f64 {
     }
 }
 
+/// `win_prob` clamped into `(0, 1]`, the exact domain [`UnitaryFloatOps::div_f64`]
+/// accepts (it errors on `rhs <= 0 || rhs > 1`). `NaN` maps to `f64::EPSILON`.
+fn clamped_win_prob(win_prob: f64) -> f64 {
+    if win_prob.is_nan() {
+        f64::EPSILON
+    } else {
+        win_prob.clamp(f64::EPSILON, 1.0_f64)
+    }
+}
+
+/// f64 estimate of the face value, used only for the ticket-*count* ratio in
+/// [`capacity_to_balance`], where it must stay consistent with the f64 capacity
+/// target so the count snaps cleanly. The stake itself is sized from the exact
+/// [`winning_ticket_face_value`], never from this.
+fn winning_ticket_face_value_wei(price_wei: f64, win_prob: f64, hops: u32) -> f64 {
+    price_wei * hops as f64 / clamped_win_prob(win_prob)
+}
+
+/// Face value of one winning ticket as a [`HoprBalance`]: the least a channel must
+/// hold to issue its next ticket (and, for a peer's onward channel, to relay a hop),
+/// and the quantum every stake is a whole multiple of. Divided exactly in U256 by
+/// [`UnitaryFloatOps::div_f64`], the same truncating division the planner uses, so
+/// the value is bit-identical to the selector's. Pass [`ASSUMED_HOPS`] for the
+/// default path.
+pub(crate) fn winning_ticket_face_value(price: HoprBalance, win_prob: f64, hops: u32) -> HoprBalance {
+    // One winning ticket, divided exactly in U256 (hopr-strategy#87): bit-identical
+    // to what the planner stores in `push_ticket_face_value` (`price.div_f64(win_prob)`),
+    // so the strategy's floor and the selector's floor agree to the wei.
+    //
+    // Divide once, then integer-multiply by the hop count, the planner's operation
+    // order. Folding `hops` into the numerator before dividing would truncate at a
+    // different step and disagree again.
+    let p = clamped_win_prob(win_prob);
+    // `p` is in `(0, 1]`, the domain `div_f64` accepts, so this cannot error; fall
+    // back to `price` only to stay panic-free if that invariant ever changes.
+    let single = price.div_f64(p).unwrap_or(price);
+    HoprBalance::from(single.amount().saturating_mul(U256::from(hops)))
+}
+
 pub(crate) fn capacity_to_balance<C: PacketTransport>(
     capacity: ByteSize,
     price: HoprBalance,
@@ -468,27 +603,48 @@ pub(crate) fn capacity_to_balance<C: PacketTransport>(
 
     // A channel pays out in whole tickets of this face value, and it must always
     // be able to issue at least one or it cannot relay at all — so it is both the
-    // floor and the quantum.
-    let face_value = price_f64 * h / p;
+    // floor and the quantum. Computed exactly in U256 (hopr-strategy#87) so the
+    // stake is a whole multiple of the planner's face value, not an f64 estimate
+    // of it; only the ticket *count* below stays f64, since it is a count.
+    let face_value = winning_ticket_face_value(price, win_prob, hops);
+    let face_wei = face_value.amount();
+    if face_wei.is_zero() {
+        // Zero only when the price or hop count is zero, and then the target is too.
+        return HoprBalance::zero();
+    }
+
+    // The ticket *count* is computed against the f64 face estimate, kept consistent
+    // with the f64 `target` so `whole_tickets` snaps cleanly (target / face is a
+    // near-integer); using the exact face here would round the count up by a whole
+    // ticket whenever the ratio drifts off an integer.
+    let face_f64 = winning_ticket_face_value_wei(price_f64, win_prob, hops);
+
+    // Floor at the path selector's first-edge requirement (hopr-strategy#86), not
+    // just one ticket: the selector prunes a first edge below
+    // `remaining_hops × single_ticket × MIN_BALANCE_HEADROOM`
+    // (`hopr_api::graph::function::balance_suffices`). `face_f64` is already the
+    // `remaining_hops × single_ticket` term for `hops` hops, so the floor is that
+    // times `MIN_BALANCE_HEADROOM`. Sizing for `hops = ASSUMED_HOPS` (the deepest
+    // path) clears the floor for every shorter path too. Without this, a fully
+    // funded channel can sit on or below the selector floor and go silently unselectable.
+    let selector_floor = face_f64 * MIN_BALANCE_HEADROOM as f64;
 
     // Quantise up to a whole number of tickets.  A remainder below one face value
     // can never leave the channel, so it funds no further ticket and buys none of
     // the confidence the mode was asked for: at `target = 10.9 × face_value` only
     // 10 tickets are payable, which is a lower confidence than requested.  Rounding
-    // up makes the stake deliver the mode's stated guarantee instead of just under
-    // it.  `face_value` is zero only when the price or hop count is, and then the
-    // target is zero too.
-    let target = target.max(face_value).max(0.0);
-    let stake_f64 = if face_value > 0.0 {
-        whole_tickets(target / face_value) * face_value
+    // up makes the stake deliver the mode's stated guarantee instead of just under it.
+    let target = target.max(selector_floor).max(0.0);
+    let tickets = if face_f64 > 0.0 {
+        whole_tickets(target / face_f64)
     } else {
-        target
+        1.0
     };
 
-    // Round up: the one-ticket floor is a strict safety guarantee (the on-chain
-    // face value is integer wei), so a downward-truncating cast could yield a
-    // stake one wei below face value and still trip `OutOfFunds`.
-    HoprBalance::from(U256::from(stake_f64.ceil() as u128))
+    // The stake is exactly `tickets × face_value` in U256 (hopr-strategy#87), so a
+    // floor-binding channel is funded to the planner's exact face value, and every
+    // stake is a whole multiple of it rather than an f64 estimate a few wei off.
+    HoprBalance::from(face_wei.saturating_mul(U256::from(tickets as u128)))
 }
 
 impl FundingConfig {
@@ -496,7 +652,7 @@ impl FundingConfig {
     /// economics.  Called once per pipeline tick.
     ///
     /// `win_prob` must be in `(0, 1]`.  Every mode uses it to compute the
-    /// one-winning-ticket floor, so it is always required.
+    /// selector first-edge floor, so it is always required.
     ///
     /// # Reporting what the strategy will lock
     ///
@@ -505,17 +661,18 @@ impl FundingConfig {
     ///
     /// Build funding recommendations from here, not from a reimplementation: a copy
     /// compiles fine after the formula changes here, then reports figures the strategy
-    /// disagrees with.  Since [`FundingConfig::min_safe_capacity_required`] gates opening
-    /// when `stop_when_unfunded` is set, reporting below this leaves a node unable to
-    /// open a single channel.
+    /// disagrees with. For "how much must the safe hold", there is no configured answer
+    /// to read — combine these balances with live channel state through
+    /// [`ResolvedFunding::required_safe_balance`].
     ///
     /// ```no_run
     /// # use hopr_strategy::channel_lifecycle::FundingConfig;
     /// # use hopr_api::{node::PacketTransport, types::primitive::prelude::HoprBalance};
     /// # fn example<C: PacketTransport>(funding: &FundingConfig, price: HoprBalance, win_prob: f64) {
     /// let resolved = funding.resolve::<C>(price, win_prob);
-    /// // Fund the safe to at least this before expecting any channel to open.
-    /// let required = resolved.min_safe_balance_required;
+    /// // Fund the safe to at least this: one top-up for each of two needy channels,
+    /// // and one opening stake to climb back to the population floor.
+    /// let required = resolved.required_safe_balance(2, 1);
     /// # let _ = required;
     /// # }
     /// ```
@@ -532,13 +689,7 @@ impl FundingConfig {
                 hops,
                 mode,
             ),
-            min_safe_balance_required: capacity_to_balance::<C>(
-                self.min_safe_capacity_required,
-                price,
-                win_prob,
-                hops,
-                mode,
-            ),
+            face_value: winning_ticket_face_value(price, win_prob, hops),
         }
     }
 }
@@ -607,6 +758,17 @@ pub struct ClosureConfig {
     /// Default: 2.
     #[default = 2]
     pub close_max_concurrent: usize,
+
+    /// Consecutive ticks a peer must be observed disconnected before its channel is
+    /// closed for connectivity alone.  [`NetworkView::is_connected`] is a
+    /// point-in-time snapshot with no hysteresis, so a single missed observation
+    /// would otherwise retire an otherwise-healthy channel on a transient blip; a
+    /// reconnection on any tick resets the count.  `1` disables the debounce
+    /// (close on the first disconnected tick).  Default: 3.
+    ///
+    /// [`NetworkView::is_connected`]: hopr_api::network::NetworkView::is_connected
+    #[default = 3]
+    pub close_after_disconnected_ticks: usize,
 }
 
 /// Controls the finalizer phase (second `close_channel` call for `PendingToClose`
@@ -621,9 +783,11 @@ pub struct FinalizerConfig {
     pub enabled: bool,
 
     /// Extra time to wait beyond the on-chain notice period before finalizing.
-    /// Provides a buffer for slow-block periods.  Default: 30 min.
+    /// Provides a buffer for slow-block periods, stacked on top of the notice
+    /// period itself.  Sized at roughly one on-chain closure cycle, matching
+    /// `PopulationConfig::peer_reopen_cooldown`.  Default: 15 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(30 * 60))]
+    #[default(Duration::from_secs(15 * 60))]
     pub max_closure_overdue: Duration,
 
     /// Maximum simultaneous finalization transactions initiated per pass.
@@ -634,16 +798,76 @@ pub struct FinalizerConfig {
 
 /// Guards against mass-closing channels on restart (the graph is rebuilt from
 /// scratch and peers appear unseen until heartbeats arrive).
+///
+/// Startup is staged, so a node sheds dead weight quickly without churning
+/// channels whose quality data is merely still warming up:
+///
+/// | phase | channels eligible to close |
+/// | --- | --- |
+/// | before `startup_observation_period` | none — the strategy only observes |
+/// | before `startup_close_grace_period` | only those to peers that are not connected |
+/// | after `startup_close_grace_period`  | all, by the usual closure rules |
+///
+/// A channel to a peer whose connectivity cannot be resolved counts as
+/// connected, i.e. shielded: a failed account read must not read as "nothing is
+/// connected" and trigger the mass closure this guard exists to prevent.
+///
+/// ```yaml
+/// restart:
+///   startup_observation_period: 1m
+///   startup_close_grace_period: 5m
+/// ```
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, smart_default::SmartDefault, Validate, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[validate(schema(function = "validate_restart_windows"))]
 pub struct RestartGuardConfig {
-    /// The close pass is suppressed entirely for this long after startup.
-    /// Should exceed network bootstrap time + first heartbeat round.
-    /// Default: 10 min.
+    /// No channel is closed at all for this long after startup, whatever its
+    /// peer's connectivity.
+    ///
+    /// At startup no peer is connected yet, so without this window "close the
+    /// unconnected ones" would retire every channel at once. It must therefore
+    /// cover network bootstrap; only once it elapses does absent connectivity
+    /// become evidence of a dead peer rather than of a cold view.
+    /// Default: 1 min.
     #[serde(with = "humantime_serde")]
-    #[default(Duration::from_secs(10 * 60))]
+    #[default(Duration::from_secs(60))]
+    pub startup_observation_period: Duration,
+
+    /// Channels to *connected* peers are shielded from closure for this long
+    /// after startup, giving their quality data time to accumulate.
+    /// Should exceed network bootstrap time + first heartbeat round.
+    /// Default: 5 min.
+    #[serde(with = "humantime_serde")]
+    #[default(Duration::from_secs(5 * 60))]
     pub startup_close_grace_period: Duration,
+}
+
+/// Which startup stage the close pass is in; see [`RestartGuardConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupPhase {
+    /// The strategy only observes — no channel may close.
+    Observing,
+    /// Only channels to peers that are not connected may close.
+    ShieldingConnected,
+    /// The guard has expired; the usual closure rules apply.
+    Expired,
+}
+
+impl RestartGuardConfig {
+    /// Startup stage reached `elapsed` after this strategy instance started.
+    ///
+    /// Both windows at zero yields [`StartupPhase::Expired`] immediately, which
+    /// is how a test opts out of the guard entirely.
+    pub(crate) fn phase_at(&self, elapsed: Duration) -> StartupPhase {
+        if elapsed < self.startup_observation_period {
+            StartupPhase::Observing
+        } else if elapsed < self.startup_close_grace_period {
+            StartupPhase::ShieldingConnected
+        } else {
+            StartupPhase::Expired
+        }
+    }
 }
 
 /// Concurrency knobs for the per-channel evaluation loops, and the time bounds
@@ -851,14 +1075,33 @@ mod config_tests {
         bytes.div_ceil(PAYLOAD) as u128
     }
 
-    /// One full-path winning ticket face value in wei: `tp × hops / p`.
+    /// One full-path winning ticket face value in wei, computed exactly as
+    /// production does (U256 `div_f64`, then integer-multiply by hops), so the
+    /// floor assertions track the exact arithmetic rather than an f64 estimate.
     fn floor_wei(tp_wei: u128, hops: u32, p: f64) -> u128 {
-        (tp_wei as f64 * hops as f64 / p) as u128
+        let p = if p.is_nan() {
+            f64::EPSILON
+        } else {
+            p.clamp(f64::EPSILON, 1.0_f64)
+        };
+        (balance_from_wei(tp_wei)
+            .div_f64(p)
+            .expect("win prob in (0, 1]")
+            .amount()
+            * U256::from(hops))
+        .low_u128()
     }
 
     /// Mean drain in wei: `N × hops × tp`.
     fn mean_wei(n: u128, hops: u32, tp_wei: u128) -> u128 {
         n * hops as u128 * tp_wei
+    }
+
+    /// The path selector's first-edge floor in wei (hopr-strategy#86):
+    /// `floor_wei(hops) × MIN_BALANCE_HEADROOM`. This is the minimum stake the
+    /// strategy funds a channel to, replacing the old one-winning-ticket floor.
+    fn selector_floor_wei(tp_wei: u128, hops: u32, p: f64) -> u128 {
+        floor_wei(tp_wei, hops, p) * MIN_BALANCE_HEADROOM as u128
     }
 
     /// Φ⁻¹(alpha) — the z-score used by `Probabilistic`.
@@ -898,6 +1141,102 @@ mod config_tests {
     const JURA_P: f64 = 4.0e-6; // 288230376143 / (2^56 - 1)
     const ROTSEE_TP: u128 = 100; // 1e-16 wxHOPR
     const ROTSEE_P: f64 = 1.25e-4; // 9007199254735 / (2^56 - 1)
+
+    // ── hopr-strategy#86: funding clears the selector's first-edge floor ──────
+
+    /// The path selector prunes a first edge whose balance is below
+    /// `remaining_hops × single_ticket_face_value × MIN_BALANCE_HEADROOM`
+    /// (`hopr_api::graph::function::balance_suffices`). The strategy must fund
+    /// every usable first edge above that floor, in integer wei, for every hop
+    /// count the node routes at, or a fully funded channel is silently unselectable.
+    #[rstest]
+    #[case(PRICE_WEI, 0.5)]
+    #[case(PRICE_WEI, 0.999)]
+    #[case(JURA_TP, JURA_P)]
+    #[case(ROTSEE_TP, ROTSEE_P)]
+    fn funding_clears_the_selector_first_edge_floor(#[case] tp_wei: u128, #[case] p: f64) {
+        // Tiny capacities so the selector floor, not the capacity target, is what
+        // the thresholds must clear.
+        let cfg = FundingConfig {
+            initial_capacity: ByteSize::b(1),
+            topup_capacity: ByteSize::b(1),
+            lower_capacity_threshold: ByteSize::b(1),
+            ..FundingConfig::default()
+        };
+        let price = balance_from_wei(tp_wei);
+        let resolved = cfg.resolve::<TestTransport>(price, p);
+        let single = price
+            .div_f64(if p.is_nan() {
+                f64::EPSILON
+            } else {
+                p.clamp(f64::EPSILON, 1.0)
+            })
+            .expect("win prob in (0, 1]")
+            .amount();
+
+        for hops in 1..=ASSUMED_HOPS {
+            let planner_floor = single * U256::from(hops) * U256::from(MIN_BALANCE_HEADROOM);
+            assert!(
+                resolved.topup_balance.amount() >= planner_floor,
+                "tp={tp_wei} p={p} hops={hops}: topup {} below planner floor {planner_floor}",
+                resolved.topup_balance.amount()
+            );
+            assert!(
+                resolved.lower_balance_threshold.amount() >= planner_floor,
+                "tp={tp_wei} p={p} hops={hops}: lower threshold {} below planner floor {planner_floor}",
+                resolved.lower_balance_threshold.amount()
+            );
+        }
+    }
+
+    // ── hopr-strategy#87: exact face value (U256 div_f64, not f64) ────────────
+
+    /// The strategy's single-ticket face value must equal the planner's exact
+    /// U256 division (`price.div_f64(win_prob)`, as `push_ticket_face_value`
+    /// stores it) to the wei, for every network's economics. One hop is the
+    /// planner's single ticket.
+    #[rstest]
+    #[case(PRICE_WEI, 0.5)]
+    #[case(PRICE_WEI, 0.999)]
+    #[case(JURA_TP, JURA_P)]
+    #[case(ROTSEE_TP, ROTSEE_P)]
+    #[case(1, 1.0)]
+    fn face_value_matches_the_planner_exact_division(#[case] tp_wei: u128, #[case] p: f64) {
+        let price = balance_from_wei(tp_wei);
+        let planner = price.div_f64(p).expect("win prob is in (0, 1]");
+        assert_eq!(
+            winning_ticket_face_value(price, p, 1).amount(),
+            planner.amount(),
+            "tp={tp_wei} p={p}: strategy face value must equal the planner's to the wei"
+        );
+    }
+
+    /// Multi-hop face value is the single ticket times the hop count, computed by
+    /// integer multiply after the one exact division, matching the planner's
+    /// operation order (divide once, then multiply).
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn face_value_is_single_ticket_times_hops(#[case] hops: u32) {
+        let price = balance_from_wei(JURA_TP);
+        let single = price.div_f64(JURA_P).expect("valid");
+        assert_eq!(
+            winning_ticket_face_value(price, JURA_P, hops).amount(),
+            single.amount() * U256::from(hops),
+            "hops={hops}"
+        );
+    }
+
+    /// Regression: above 2^53 the old `price.low_u128() as f64` cast dropped low
+    /// bits; the exact path keeps every wei.
+    #[test]
+    fn face_value_is_exact_for_prices_above_the_f64_mantissa() {
+        let price = balance_from_wei(1u128 << 60); // far above 2^53
+        let p = 0.25;
+        let planner = price.div_f64(p).expect("valid");
+        assert_eq!(winning_ticket_face_value(price, p, 1).amount(), planner.amount());
+    }
 
     // ── Deterministic: stake = max(floor, N × hops × tp) ─────────────────────
 
@@ -939,15 +1278,17 @@ mod config_tests {
         assert_close(got, mean_wei(1_000_000, 3, PRICE_WEI), &format!("p={p}"));
     }
 
-    /// Sub-packet capacity rounds up to exactly one packet.
+    /// Sub-packet capacity rounds up to the selector floor (MIN_BALANCE_HEADROOM
+    /// tickets), the smallest selectable stake.
     #[rstest]
     #[case(1)]
     #[case(500)]
     #[case(1035)]
-    fn sub_packet_rounds_up_to_one_packet(#[case] bytes: u64) {
-        // p = 1.0 → floor = tp·h = mean for N=1, so stake = tp·h.
+    fn sub_packet_rounds_up_to_the_selector_floor(#[case] bytes: u64) {
+        // p = 1.0, h = 1 → face = tp; the selector floor is MIN_BALANCE_HEADROOM
+        // tickets (hopr-strategy#86), so a sub-packet capacity rounds up to it.
         let got = stake_wei(ByteSize::b(bytes), PRICE_WEI, 1.0, 1, &DET);
-        assert_eq!(got, PRICE_WEI, "bytes={bytes}");
+        assert_eq!(got, PRICE_WEI * MIN_BALANCE_HEADROOM as u128, "bytes={bytes}");
     }
 
     // ── The one-winning-ticket floor (the core fix) ──────────────────────────
@@ -962,13 +1303,13 @@ mod config_tests {
     #[case(1, 1.0e-9)]
     fn floor_binds_below_one_ticket(#[case] n_pkts: u64, #[case] p: f64) {
         let cap = ByteSize::b(PAYLOAD * n_pkts);
-        let want_floor = floor_wei(PRICE_WEI, 3, p);
+        let want_floor = selector_floor_wei(PRICE_WEI, 3, p);
         let got = stake_wei(cap, PRICE_WEI, p, 3, &DET);
         assert_close(got, want_floor, &format!("n={n_pkts} p={p}"));
-        // And it must be ≥ one ticket by construction.
+        // And it must be at least the selector floor by construction.
         assert!(
             got >= want_floor - 4,
-            "n={n_pkts} p={p}: {got} below one ticket {want_floor}"
+            "n={n_pkts} p={p}: {got} below the selector floor {want_floor}"
         );
     }
 
@@ -1003,21 +1344,19 @@ mod config_tests {
     /// The floor is applied independently to every FundingConfig field, so even
     /// with 1-byte capacities every resolved balance covers one winning ticket.
     #[test]
-    fn floor_applies_to_all_four_fields() {
+    fn floor_applies_to_all_three_fields() {
         let cfg = FundingConfig {
             initial_capacity: ByteSize::b(1),
             topup_capacity: ByteSize::b(1),
             lower_capacity_threshold: ByteSize::b(1),
-            min_safe_capacity_required: ByteSize::b(1),
             ..FundingConfig::default()
         };
-        let floor = floor_wei(JURA_TP, 3, JURA_P);
+        let floor = selector_floor_wei(JURA_TP, 3, JURA_P);
         let r = cfg.resolve::<TestTransport>(balance_from_wei(JURA_TP), JURA_P);
         for (name, bal) in [
             ("initial", r.initial_balance),
             ("topup", r.topup_balance),
             ("lower_threshold", r.lower_balance_threshold),
-            ("min_safe", r.min_safe_balance_required),
         ] {
             assert_close(bal.amount().low_u128(), floor, name);
         }
@@ -1075,12 +1414,14 @@ mod config_tests {
                 for &cap in &caps {
                     for mode in [DET, prob(0.99), prob(0.999)] {
                         let got = stake_wei(cap, tp, p, 3, &mode);
-                        let face = tp as f64 * 3.0 / p;
-                        let tickets = got as f64 / face;
-                        assert_close(
-                            got,
-                            (tickets.round() * face) as u128,
-                            &format!("{mode:?} p={p} tp={tp} cap={cap:?} ({tickets} tickets)"),
+                        // Exact: the stake is a whole multiple of the exact face value
+                        // (hopr-strategy#87), so the modulo is zero to the wei rather
+                        // than only close to it as an f64 round-trip would be.
+                        let face = floor_wei(tp, 3, p);
+                        assert_eq!(
+                            got % face,
+                            0,
+                            "{mode:?} p={p} tp={tp} cap={cap:?}: stake {got} must be a whole multiple of face {face}"
                         );
                     }
                 }
@@ -1212,7 +1553,6 @@ mod config_tests {
                     ("initial", det.initial_balance, pr.initial_balance),
                     ("topup", det.topup_balance, pr.topup_balance),
                     ("lower", det.lower_balance_threshold, pr.lower_balance_threshold),
-                    ("min_safe", det.min_safe_balance_required, pr.min_safe_balance_required),
                 ] {
                     let dw = d.amount().low_u128();
                     let qw = q.amount().low_u128();
@@ -1244,7 +1584,7 @@ mod config_tests {
     fn edge_extreme_low_win_prob_uses_floor() {
         let p = 1e-9;
         let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
-        let floor = floor_wei(PRICE_WEI, 3, p);
+        let floor = selector_floor_wei(PRICE_WEI, 3, p);
         assert!(got > 0, "must not underflow to zero");
         assert_close(got, floor, "p=1e-9");
     }
@@ -1255,7 +1595,7 @@ mod config_tests {
     /// such inputs resolve to the large-but-finite floor at `p = f64::EPSILON`.
     #[test]
     fn degenerate_win_prob_is_clamped_not_saturated() {
-        let floor_at_eps = floor_wei(PRICE_WEI, 3, f64::EPSILON);
+        let floor_at_eps = selector_floor_wei(PRICE_WEI, 3, f64::EPSILON);
         for p in [0.0_f64, -1.0, f64::NAN, f64::NEG_INFINITY] {
             let got = stake_wei(ByteSize::gib(1), PRICE_WEI, p, 3, &DET);
             assert!(got < u128::MAX, "p={p}: must not saturate to u128::MAX");
@@ -1279,7 +1619,7 @@ mod config_tests {
         let floor = floor_wei(JURA_TP, 3, JURA_P); // 7.5e18
         assert_close(floor, 7_500_000_000_000_000_000, "jura 1-ticket floor");
 
-        // initial / topup / min_safe = 1 GiB → mean drain ≈ 31.09 wxHOPR = 4.15
+        // initial / topup = 1 GiB → mean drain ≈ 31.09 wxHOPR = 4.15
         // tickets, rounded up to 5 × 7.5 = 37.5 wxHOPR.
         let n_gib = packets(ByteSize::gib(1).as_u64()); // 1_036_431
         assert_close(mean_wei(n_gib, 3, JURA_TP), 31_092_930_000_000_000_000, "jura mean");
@@ -1337,7 +1677,7 @@ mod config_tests {
     // ── FundingConfig::resolve, defaults, validation, serde ──────────────────
 
     #[test]
-    fn resolve_maps_all_four_fields() {
+    fn resolve_maps_all_three_fields() {
         let cfg = FundingConfig::default();
         let price = balance_from_wei(PRICE_WEI);
         let p = 0.5_f64;
@@ -1346,7 +1686,86 @@ mod config_tests {
         assert_eq!(r.initial_balance, cap(cfg.initial_capacity));
         assert_eq!(r.topup_balance, cap(cfg.topup_capacity));
         assert_eq!(r.lower_balance_threshold, cap(cfg.lower_capacity_threshold));
-        assert_eq!(r.min_safe_balance_required, cap(cfg.min_safe_capacity_required));
+    }
+
+    // ── winning ticket face value ─────────────────────────────────────────────
+
+    /// The face value is `price × hops / win_prob`, in whole wei.
+    #[test]
+    fn winning_ticket_face_value_is_price_times_hops_over_win_prob() {
+        // 0.01 wxHOPR × 3 hops / 0.5 = 0.06 wxHOPR.
+        let f = winning_ticket_face_value(balance_from_wei(PRICE_WEI), 0.5, 3);
+        assert_eq!(f, balance_from_wei(PRICE_WEI * 3 * 2));
+    }
+
+    /// A non-positive or NaN win probability is clamped rather than diverging, and
+    /// yields a larger face value than a certain-win ticket — never zero, never a panic.
+    #[test]
+    fn winning_ticket_face_value_clamps_nonpositive_win_prob() {
+        let clamped = winning_ticket_face_value(balance_from_wei(PRICE_WEI), 0.0, 3);
+        let certain = winning_ticket_face_value(balance_from_wei(PRICE_WEI), 1.0, 3);
+        assert!(!certain.is_zero());
+        assert!(clamped > certain, "p→0 must inflate the face value, not collapse it");
+    }
+
+    /// `resolve` exposes exactly the standalone face value, so the fund pass and any
+    /// recommendation agree on the top-up quantum.
+    #[test]
+    fn resolve_exposes_the_winning_ticket_face_value() {
+        let r = FundingConfig::default().resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert_eq!(
+            r.face_value,
+            winning_ticket_face_value(balance_from_wei(PRICE_WEI), 0.5, ASSUMED_HOPS)
+        );
+        assert!(!r.face_value.is_zero());
+    }
+
+    // ── ResolvedFunding::required_safe_balance ────────────────────────────────
+
+    /// No standing minimum: a node with nothing to do must be told it needs nothing.
+    #[test]
+    fn required_safe_balance_is_zero_when_the_node_wants_nothing() {
+        let r = FundingConfig::default().resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert_eq!(r.required_safe_balance(0, 0), HoprBalance::zero());
+    }
+
+    /// Each term is scaled by the balance it would actually spend: top-ups by
+    /// `topup_balance`, opens by `initial_balance`. Uses distinct capacities so a term
+    /// scaled by the wrong balance would be visible.
+    #[rstest]
+    #[case(1, 0)]
+    #[case(0, 1)]
+    #[case(3, 2)]
+    #[case(7, 5)]
+    fn required_safe_balance_sums_one_topup_per_needy_channel_and_one_stake_per_missing_channel(
+        #[case] topups: usize,
+        #[case] opens: usize,
+    ) {
+        let cfg = FundingConfig {
+            initial_capacity: ByteSize::gib(2),
+            topup_capacity: ByteSize::gib(1),
+            ..FundingConfig::default()
+        };
+        let r = cfg.resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert_ne!(
+            r.initial_balance, r.topup_balance,
+            "test setup: the two terms must differ"
+        );
+
+        // Repeated addition rather than the multiplication under test, so this isn't
+        // just a restatement of `required_safe_balance`'s own formula.
+        let expected: HoprBalance = std::iter::repeat_n(r.topup_balance, topups)
+            .chain(std::iter::repeat_n(r.initial_balance, opens))
+            .fold(HoprBalance::zero(), |acc, b| acc + b);
+        assert_eq!(r.required_safe_balance(topups, opens), expected);
+    }
+
+    /// Monotone in both arguments: more demand is never less money.
+    #[test]
+    fn required_safe_balance_grows_with_demand() {
+        let r = FundingConfig::default().resolve::<TestTransport>(balance_from_wei(PRICE_WEI), 0.5);
+        assert!(r.required_safe_balance(1, 0) > r.required_safe_balance(0, 0));
+        assert!(r.required_safe_balance(1, 1) > r.required_safe_balance(1, 0));
     }
 
     #[test]
@@ -1399,6 +1818,80 @@ mod config_tests {
         assert!(ConcurrencyConfig::default().validate().is_ok());
     }
 
+    /// Both bounds are exclusive, so each window covers `[start, bound)` and the
+    /// instant a window ends already belongs to the next phase.
+    #[rstest]
+    #[case::start_of_observation(Duration::ZERO, StartupPhase::Observing)]
+    #[case::within_observation(Duration::from_secs(59), StartupPhase::Observing)]
+    #[case::observation_boundary(Duration::from_secs(60), StartupPhase::ShieldingConnected)]
+    #[case::within_grace(Duration::from_secs(299), StartupPhase::ShieldingConnected)]
+    #[case::grace_boundary(Duration::from_secs(300), StartupPhase::Expired)]
+    #[case::long_after_grace(Duration::from_secs(3600), StartupPhase::Expired)]
+    fn restart_guard_should_stage_startup_by_elapsed_time(#[case] elapsed: Duration, #[case] expected: StartupPhase) {
+        assert_eq!(RestartGuardConfig::default().phase_at(elapsed), expected);
+    }
+
+    /// Zeroing both windows is how a test opts out of the guard, so it must land
+    /// in `Expired` from the very first tick rather than in `Observing`.
+    #[test]
+    fn restart_guard_should_expire_immediately_when_both_windows_are_zero() {
+        let restart = RestartGuardConfig {
+            startup_observation_period: Duration::ZERO,
+            startup_close_grace_period: Duration::ZERO,
+        };
+
+        assert_eq!(restart.phase_at(Duration::ZERO), StartupPhase::Expired);
+    }
+
+    /// An observation window longer than the grace window would leave the
+    /// connectivity-aware phase unreachable, quietly degrading the guard to
+    /// blanket suppression — so it is rejected rather than clamped.
+    ///
+    /// Checked through the top-level config too, so this also pins that
+    /// `#[validate(nested)]` still reaches `RestartGuardConfig`.
+    #[test]
+    fn restart_guard_should_reject_an_observation_window_exceeding_grace() {
+        use validator::Validate as _;
+
+        let restart = RestartGuardConfig {
+            startup_observation_period: Duration::from_secs(600),
+            startup_close_grace_period: Duration::from_secs(300),
+        };
+
+        assert!(
+            restart.validate().is_err(),
+            "an observation window past the grace window must be rejected"
+        );
+        assert!(
+            ChannelLifecycleConfig {
+                restart: restart.clone(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "and must be rejected through the top-level config too"
+        );
+
+        let equal = RestartGuardConfig {
+            startup_observation_period: Duration::from_secs(300),
+            ..restart
+        };
+        assert!(
+            equal.validate().is_ok(),
+            "equal windows are valid: they collapse the shielding phase without hiding a rule"
+        );
+    }
+
+    /// Startup latency is on the critical path of recovering a usable channel
+    /// set, so these two defaults are pinned against silent inflation.
+    #[test]
+    fn restart_guard_defaults_should_stay_within_five_minutes() {
+        let restart = RestartGuardConfig::default();
+
+        assert_eq!(restart.startup_observation_period, Duration::from_secs(60));
+        assert_eq!(restart.startup_close_grace_period, Duration::from_secs(5 * 60));
+    }
+
     /// Pins the hop count a stake is sized for, so a `hopr-types` bump that changes the
     /// protocol's maximum path length cannot silently rescale every stake in the strategy.
     /// A ticket's face value is linear in this count, so a move from 3 to 4 would raise
@@ -1421,14 +1914,38 @@ mod config_tests {
         );
     }
 
+    /// The safe floor is no longer configured: it is computed from live channel state by
+    /// [`ResolvedFunding::required_safe_balance`]. A config naming it must be rejected
+    /// rather than silently ignored — a quietly dropped key would leave an operator
+    /// believing a floor they set is still in force.
+    #[test]
+    fn min_safe_capacity_required_is_no_longer_accepted_in_config() {
+        let err = serde_json::from_str::<FundingConfig>(r#"{"min_safe_capacity_required":1}"#)
+            .expect_err("min_safe_capacity_required must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("min_safe_capacity_required"),
+            "error should name the offending key, got: {err}"
+        );
+    }
+
+    /// The fund and open passes now gate on exactly what each spends, so there is no
+    /// all-or-nothing switch left for this flag to control.
+    #[test]
+    fn stop_when_unfunded_is_no_longer_accepted_in_config() {
+        let err = serde_json::from_str::<FundingConfig>(r#"{"stop_when_unfunded":false}"#)
+            .expect_err("stop_when_unfunded must be rejected, not ignored");
+        assert!(
+            err.to_string().contains("stop_when_unfunded"),
+            "error should name the offending key, got: {err}"
+        );
+    }
+
     #[test]
     fn funding_config_serde_roundtrip_probabilistic() -> anyhow::Result<()> {
         let cfg = FundingConfig {
             initial_capacity: ByteSize::gib(5),
             topup_capacity: ByteSize::mib(512),
             lower_capacity_threshold: ByteSize::mib(128),
-            min_safe_capacity_required: ByteSize::gib(2),
-            stop_when_unfunded: false,
             sizing_mode: prob(0.9999),
         };
         let json = serde_json::to_string(&cfg).context("serialize")?;
@@ -1524,7 +2041,7 @@ mod config_tests {
         assert_eq!(cfg.population.target_open_channels, 8, "sibling in the same section");
         assert_eq!(
             cfg.population.peer_reopen_cooldown,
-            Duration::from_secs(30 * 60),
+            Duration::from_secs(15 * 60),
             "sibling of a different type"
         );
         assert_eq!(cfg.funding, FundingConfig::default(), "untouched section");
@@ -1616,6 +2133,34 @@ mod config_tests {
         assert_eq!(mo.weights, SelectorWeights::default(), "weights default wholesale");
         // `selector` is outside the `Validate` tree, so `build()` checks this separately.
         mo.validate_trust_weights().map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    #[test]
+    fn eligibility_defaults_forwarding_demotion_on() -> anyhow::Result<()> {
+        // A partial config still defaults the shared forwarding-demotion knobs on,
+        // so every selector inherits them.
+        let cfg: ChannelLifecycleConfig =
+            serde_json::from_str(r#"{"population":{"min_open_channels":3}}"#).context("partial config")?;
+        assert!(
+            cfg.eligibility.demote_non_forwarding_peers,
+            "sink demotion defaults to enabled"
+        );
+        assert_eq!(
+            cfg.eligibility.minimum_peer_outgoing_channels, 1,
+            "capability threshold defaults to 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn eligibility_accepts_forwarding_overrides() -> anyhow::Result<()> {
+        let cfg: ChannelLifecycleConfig = serde_json::from_str(
+            r#"{"eligibility":{"demote_non_forwarding_peers":false,"minimum_peer_outgoing_channels":3}}"#,
+        )
+        .context("eligibility with forwarding overrides")?;
+        assert!(!cfg.eligibility.demote_non_forwarding_peers);
+        assert_eq!(cfg.eligibility.minimum_peer_outgoing_channels, 3);
         Ok(())
     }
 

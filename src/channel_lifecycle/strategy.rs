@@ -18,6 +18,7 @@ use hopr_api::{
         ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, HasChainApi, HasGraphView, HasNetworkView,
         PacketTransport,
     },
+    types::internal::prelude::ChannelDirection,
 };
 use validator::Validate as _;
 
@@ -115,6 +116,11 @@ impl ChannelLifecycleStrategy {
             peer_ticket_activity: Arc::new(DashMap::new()),
             peer_addr_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_resolved_funding: Arc::new(parking_lot::Mutex::new(None)),
+            state: Arc::new(crate::strategy::AtomicStrategyState::new(
+                crate::strategy::StrategyState::Running,
+            )),
+            tick_counter: std::sync::atomic::AtomicU64::new(0),
+            disconnect_streak: Arc::new(DashMap::new()),
         }))
     }
 }
@@ -159,16 +165,28 @@ where
         // confirm while it is still running, and the broadcast only reaches
         // subscribers that already exist — a slot released by an event nobody
         // was listening for would stay held until its lease expires.
-        let event_stream = self
+        //
+        // This is the one `run` exit that precedes the first `run_pipeline`, so it is
+        // the only error path that would otherwise leave `state` at its initial
+        // `Running`. `MultiStrategy` logs and swallows the error this returns, so the
+        // shared state cell is the sole failure signal an external observer ever sees;
+        // record `Failed` here before returning.
+        let subscription = match self
             .node
             .subscribe_to_actionable_events(Some(&[ActionableEventDiscriminant::Chain]))
-            .map_err(|e| StrategyError::Other(anyhow::anyhow!(e)))?
-            .filter_map(|ev| {
-                futures::future::ready(match ev {
-                    ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
-                    _ => None,
-                })
-            });
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                self.set_state(crate::strategy::StrategyState::Failed);
+                return Err(StrategyError::Other(anyhow::anyhow!(e)));
+            }
+        };
+        let event_stream = subscription.filter_map(|ev| {
+            futures::future::ready(match ev {
+                ActionableEvent::Chain(e) => Some(LoopEvent::Chain(Box::new(e))),
+                _ => None,
+            })
+        });
 
         self.run_pipeline().await;
 
@@ -197,31 +215,53 @@ where
                 LoopEvent::Tick => {
                     self.run_pipeline().await;
                 }
-                LoopEvent::Chain(e) => match *e {
-                    ChainEvent::ChannelBalanceDecreased(ch, _) => {
-                        self.on_balance_decreased(ch, me).await;
+                LoopEvent::Chain(e) => {
+                    let is_own_outgoing = match &*e {
+                        ChainEvent::ChannelBalanceDecreased(ch, _)
+                        | ChainEvent::ChannelBalanceIncreased(ch, _)
+                        | ChainEvent::ChannelOpened(ch)
+                        | ChainEvent::ChannelClosureInitiated(ch)
+                        | ChainEvent::ChannelClosed(ch)
+                        | ChainEvent::TicketRedeemed(ch, _) => ch.direction(&me) == Some(ChannelDirection::Outgoing),
+                        _ => false,
+                    };
+                    if !is_own_outgoing {
+                        continue;
                     }
-                    ChainEvent::ChannelBalanceIncreased(ch, _) => {
-                        self.on_balance_increased(ch);
+                    match *e {
+                        ChainEvent::ChannelBalanceDecreased(ch, _) => {
+                            self.on_balance_decreased(ch, me).await;
+                        }
+                        ChainEvent::ChannelBalanceIncreased(ch, _) => {
+                            self.on_balance_increased(ch);
+                        }
+                        ChainEvent::ChannelOpened(ch) => {
+                            self.on_channel_opened(ch);
+                        }
+                        ChainEvent::ChannelClosureInitiated(ch) => {
+                            self.on_channel_closure_initiated(ch);
+                        }
+                        ChainEvent::ChannelClosed(ch) => {
+                            self.on_channel_closed(ch);
+                        }
+                        ChainEvent::TicketRedeemed(ch, _) => {
+                            self.on_ticket_redeemed(ch);
+                        }
+                        _ => {}
                     }
-                    ChainEvent::ChannelOpened(ch) => {
-                        self.on_channel_opened(ch);
-                    }
-                    ChainEvent::ChannelClosureInitiated(ch) => {
-                        self.on_channel_closure_initiated(ch);
-                    }
-                    ChainEvent::ChannelClosed(ch) => {
-                        self.on_channel_closed(ch);
-                    }
-                    ChainEvent::TicketRedeemed(ch, _) => {
-                        self.on_ticket_redeemed(ch);
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn state(&self) -> crate::strategy::StrategyState {
+        self.state.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn state_handle(&self) -> std::sync::Arc<crate::strategy::AtomicStrategyState> {
+        self.state.clone()
     }
 }
 
