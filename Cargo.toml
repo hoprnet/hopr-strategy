@@ -191,10 +191,10 @@ futures              = "0.3.34"
 futures-concurrency  = "7.7.1"
 futures-time         = "3.1.0"
 hex-literal          = "1.1.0"
-hopr-api             = "4.3.2"
-hopr-chain-connector = "0.28.0"
+hopr-api             = "5.0.0"
+hopr-chain-connector = "0.29.0"
 hopr-strategy        = { path = "." }
-hopr-utils           = { package = "hopr-utilities", version = "0.17.3", default-features = false }
+hopr-utils           = { package = "hopr-utilities", version = "0.18.0", default-features = false }
 humantime-serde      = "1.1.1"
 insta                = "1.48.0"
 lazy_static          = "1.5.1"
@@ -223,3 +223,13 @@ zeroize              = "1.9.0"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
+
+# Points at the branches carrying the compact/expanded `OffchainPublicKey` split
+# (hopr-types#52). Drop these once the train is published.
+[patch.crates-io]
+hopr-api       = { git = "https://github.com/hoprnet/hopr-api", branch = "lukas/extended-offchain-key" }
+hopr-types     = { git = "https://github.com/hoprnet/hopr-types", branch = "lukas/extended-offchain-key" }
+hopr-utilities = { git = "https://github.com/hoprnet/hopr-utilities", branch = "lukas/extended-offchain-key" }
+# Only reached under `strategy-pix-test`, but kept on the branch so the whole train resolves to
+# one hopr-impls tree rather than a mix of branch and published crates.
+hopr-chain-connector = { git = "https://github.com/hoprnet/hopr-impls", branch = "lukas/extended-offchain-key" }
