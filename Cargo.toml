@@ -196,7 +196,7 @@ hopr-chain-connector = "0.28.0"
 hopr-strategy        = { path = "." }
 hopr-utils           = { package = "hopr-utilities", version = "0.17.3", default-features = false }
 humantime-serde      = "1.1.1"
-insta                = "1.48.0"
+insta                = "1.49.0"
 lazy_static          = "1.5.1"
 mockall              = "0.15.0"
 moka                 = "0.12.16"
@@ -207,7 +207,7 @@ reqwest              = { version = "0.13.5", default-features = false }
 rstest               = "0.27.0"
 scrypt               = "0.12.0"
 serde                = "1.0.229"
-serde_json           = "1.0.151"
+serde_json           = "1.0.154"
 serde_with           = "3.24.0"
 smart-default        = "0.7.1"
 statrs               = "0.19.1"
@@ -216,10 +216,10 @@ subtle               = "2.6.1"
 tempfile             = "3.27.0"
 test-log             = "0.2.21"
 thiserror            = "2.0.21"
-tokio                = "1.53.1"
+tokio                = "1.53.2"
 tracing              = "0.1.44"
 validator            = "0.21.0"
-zeroize              = "1.9.0"
+zeroize              = "1.9.1"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
