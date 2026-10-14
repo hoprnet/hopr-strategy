@@ -824,6 +824,163 @@ async fn test_node() -> anyhow::Result<Arc<ChainNodeOf>> {
     Ok(Arc::new(ChainNode(Arc::new(connector))))
 }
 
+/// `directShield((1, 2, 1000, [4, 5], 6))`, as the SDK prepares it.
+fn direct_shield_calldata() -> Vec<u8> {
+    let mut calldata = vec![0x39, 0xf8, 0xb8, 0x5d];
+    for value in [1u64, 2, 1000, 4, 5, 6] {
+        let mut word = [0u8; 32];
+        word[24..].copy_from_slice(&value.to_be_bytes());
+        calldata.extend_from_slice(&word);
+    }
+    calldata
+}
+
+/// A direct shield is one ERC-777 `send` from the node's Safe, made by the node's own chain API:
+/// the Safe pays the gross amount, the router is credited, and the node account, which only signs,
+/// is not drawn on.
+#[test_log::test(tokio::test)]
+async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow::Result<()> {
+    use hopr_api::{
+        chain::ChainValues,
+        types::{
+            crypto::prelude::OffchainKeypair,
+            internal::prelude::{AccountEntry, AccountType},
+        },
+    };
+
+    let me = ChainKeypair::random();
+    let safe: Address = [0x5a; 20].into();
+    let router: Address = [0xbb; 20].into();
+    let aggregator: Address = [0xcc; 20].into();
+    let sim = BlokliTestStateBuilder::default()
+        .with_accounts([(
+            AccountEntry {
+                public_key: *OffchainKeypair::random().public(),
+                chain_addr: me.public().to_address(),
+                entry_type: AccountType::NotAnnounced,
+                safe_address: Some(safe),
+                key_id: 0u32.into(),
+            },
+            HoprBalance::new_base(1000),
+            XDaiBalance::new_base(10),
+        )])
+        .build_dynamic_client(Address::from(SAFE));
+    let api = Arc::new(create_test_blokli_connector(&me, sim, Address::from(SAFE)).await?);
+
+    let gross = 25_u128;
+    let shielder = super::safe_direct_shielder(Arc::clone(&api));
+    shielder(direct_shield_calldata(), router, aggregator, gross)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let hopr = |address: Address| {
+        let api = Arc::clone(&api);
+        async move { ChainValues::balance::<_, Address>(&*api, address).await }
+    };
+    let moved = HoprBalance::from(U256::from(gross));
+    assert_eq!(hopr(safe).await?, HoprBalance::new_base(1000) - moved, "the Safe pays");
+    assert_eq!(hopr(router).await?, moved, "the router is credited");
+    assert!(
+        hopr(me.public().to_address()).await?.is_zero(),
+        "the node account signs the module call and pays nothing but gas"
+    );
+    Ok(())
+}
+
+/// What the chain API is handed is exactly the ERC-777 `send` a direct shield is: the gross
+/// amount, the router as the recipient, and the router's user data wrapping the `directShield`
+/// calldata — not the raw calldata.
+#[test_log::test(tokio::test)]
+async fn the_direct_shielder_hands_the_router_user_data_to_the_chain_api() -> anyhow::Result<()> {
+    use futures::{FutureExt, future::BoxFuture};
+    use hopr_api::types::internal::prelude::Multiaddr;
+    use hopr_api::{
+        chain::{AnnouncementError, ChainReceipt, ChainWriteAccountOperations, SafeRegistrationError},
+        types::{
+            crypto::prelude::OffchainKeypair,
+            primitive::prelude::{Balance, Currency},
+        },
+    };
+
+    /// One recorded `send`: the amount, the recipient and the data.
+    type RecordedSend = (HoprBalance, Address, Vec<u8>);
+
+    /// Records every `send`; nothing else is part of a direct shield.
+    #[derive(Clone, Default)]
+    struct RecordingChainApi {
+        sends: Arc<parking_lot::Mutex<Vec<RecordedSend>>>,
+    }
+
+    #[async_trait]
+    impl ChainWriteAccountOperations for RecordingChainApi {
+        type Error = ScriptedFailure;
+
+        async fn announce(
+            &self,
+            _multiaddrs: &[Multiaddr],
+            _key: &OffchainKeypair,
+        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, AnnouncementError<Self::Error>> {
+            unreachable!("a direct shield does not announce")
+        }
+
+        async fn withdraw<C: Currency + Send>(
+            &self,
+            _balance: Balance<C>,
+            _recipient: &Address,
+        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
+            unreachable!("a direct shield does not withdraw")
+        }
+
+        async fn send(
+            &self,
+            balance: HoprBalance,
+            recipient: &Address,
+            data: &[u8],
+        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
+            self.sends.lock().push((balance, *recipient, data.to_vec()));
+            Ok(futures::future::ready(Ok(ChainReceipt::default())).boxed())
+        }
+
+        async fn withdraw_from_signer<C: Currency + Send>(
+            &self,
+            _signer: &ChainKeypair,
+            _balance: Balance<C>,
+            _recipient: &Address,
+        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
+            unreachable!("a direct shield does not withdraw from the node account")
+        }
+
+        async fn register_safe(
+            &self,
+            _safe_address: &Address,
+        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, SafeRegistrationError<Self::Error>> {
+            unreachable!("a direct shield does not register a Safe")
+        }
+    }
+
+    let api = RecordingChainApi::default();
+    let router: Address = [0xbb; 20].into();
+    let aggregator: Address = [0xcc; 20].into();
+    let gross = 25_u128;
+
+    let shielder = super::safe_direct_shielder(api.clone());
+    shielder(direct_shield_calldata(), router, aggregator, gross)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let sends = api.sends.lock().clone();
+    assert_eq!(
+        sends,
+        vec![(
+            HoprBalance::from(U256::from(gross)),
+            router,
+            super::module::router_user_data(&aggregator, &direct_shield_calldata())?,
+        )],
+        "one send: the gross amount to the router, carrying the router's user data"
+    );
+    Ok(())
+}
+
 struct Harness {
     pool: CurvyDepositPool<ChainNodeOf, ScriptedIndex, RecordingAdapter, RedbCurvyDepositState>,
     index: Arc<ScriptedIndex>,

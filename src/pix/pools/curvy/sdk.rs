@@ -115,21 +115,12 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 /// A callback rather than a method so the pool keeps no chain key of its own and the SDK bridge
 /// stays ignorant of how the Safe is driven.
 ///
-/// Arguments: the `directShield` calldata, the token, the shield router to `send` it to, the
-/// aggregator the router shields into, the gross amount, and a check of whether the shield's note
-/// already exists — which the shielder consults before resubmitting after a nonce conflict, since
-/// an earlier copy of the same shield may be the transaction that took the nonce.
+/// Arguments: the `directShield` calldata, the shield router to `send` it to, the aggregator the
+/// router shields into, and the gross amount.
 ///
-/// `Ok` means the transaction confirmed, not that the shield took effect: the Safe reports a
-/// failed inner call without reverting, so the caller verifies the note on chain.
-pub type DirectShielder = Arc<
-    dyn Fn(Vec<u8>, Address, Address, Address, u128, ShieldLanded) -> BoxFuture<'static, Result<(), String>>
-        + Send
-        + Sync,
->;
-
-/// Whether a direct shield's note is known to the aggregator, i.e. whether the shield executed.
-pub type ShieldLanded = Arc<dyn Fn() -> BoxFuture<'static, Result<bool, String>> + Send + Sync>;
+/// `Ok` means the transaction confirmed; the caller still verifies the note on chain.
+pub type DirectShielder =
+    Arc<dyn Fn(Vec<u8>, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 /// Curvy chain operations that require SDK knowledge.
 ///
@@ -1060,31 +1051,13 @@ where
                 Some(router) => router,
                 None => self.shield_router_checked(endpoints).await?,
             };
-            let token: Address = endpoints
-                .token_address
-                .parse()
-                .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("token address: {error}")))?;
             let aggregator: Address = endpoints
                 .aggregator
                 .parse()
                 .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("aggregator address: {error}")))?;
             let calldata = prepared.calldata()?;
-            let landed: ShieldLanded = {
-                let client = Arc::clone(client);
-                let note_id = prepared.note.note_id();
-                Arc::new(move || {
-                    let client = Arc::clone(&client);
-                    Box::pin(async move {
-                        client
-                            .note_status(&note_id)
-                            .await
-                            .map(|status| matches!(status, 1 | 2))
-                            .map_err(|error| error.to_string())
-                    })
-                })
-            };
             tracing::info!(%gross, %router, "shielding the Curvy funding note from the Safe through the shield router");
-            shielder(calldata, token, router, aggregator, gross, landed)
+            shielder(calldata, router, aggregator, gross)
                 .await
                 .map_err(RsSdkCurvyAdapterError::Funding)?;
         }
@@ -1158,8 +1131,9 @@ where
     ///
     /// A confirmed module call is not a shield: the Safe reports a failed inner call — an
     /// allowance it lacks, a balance too small, the gate closed — through `safeExecution` rather
-    /// than by reverting, and Blokli's confirming submission returns only the hash. The aggregator
-    /// is asked instead, a few times, since the read may be served by a node a block behind.
+    /// than by reverting. The node's chain API already turns that into an error; the aggregator
+    /// is asked as well, a few times, so that nothing is recorded as funding on the strength of a
+    /// receipt alone, and since the read may be served by a node a block behind.
     ///
     /// On failure the shield stays journalled as in flight and nothing is recorded as funding, so
     /// the next attempt re-checks the chain before shielding again rather than trusting a phantom
@@ -2726,7 +2700,7 @@ mod tests {
             let shielder: DirectShielder = {
                 let landed = landed.clone();
                 let submissions = submissions.clone();
-                Arc::new(move |_, _, _, _, _, _| {
+                Arc::new(move |_, _, _, _| {
                     submissions.fetch_add(1, Ordering::SeqCst);
                     // The transaction confirms either way; only the inner call differs.
                     landed.store(inner_call_succeeds, Ordering::SeqCst);
@@ -4490,7 +4464,7 @@ mod tests {
             let submissions = Arc::new(AtomicUsize::new(0));
             let shielder: DirectShielder = {
                 let submissions = submissions.clone();
-                Arc::new(move |_, _, _, _, _, _| {
+                Arc::new(move |_, _, _, _| {
                     submissions.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async { Ok(()) })
                 })
@@ -4588,7 +4562,7 @@ mod tests {
         let submissions = Arc::new(AtomicUsize::new(0));
         let shielder: DirectShielder = {
             let submissions = submissions.clone();
-            Arc::new(move |_, _, _, _, _, _| {
+            Arc::new(move |_, _, _, _| {
                 submissions.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             })

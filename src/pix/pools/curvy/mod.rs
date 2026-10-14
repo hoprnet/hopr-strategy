@@ -43,8 +43,8 @@
 //! permission module, ERC-777-`send`s it to Curvy's shield router, whose `tokensReceived` hook
 //! calls `directShield` in the same transaction; any failure reverts the `send`, leaving the float
 //! in the Safe. The only call the Safe makes is on wxHOPR, which every node Safe may call from
-//! deployment, so this needs **no** change to the Safe or its module — only the node's own chain key
-//! to sign the module call, which is why the builder takes one.
+//! deployment, so this needs **no** change to the Safe or its module: the node's chain API signs
+//! the module call with the node's own key, exactly as it does for a withdrawal.
 //!
 //! **Under `submission: relayer` the pool commits nothing.** The relayer refuses
 //! `commitPendingNotes`, and the deployment's shared batch-prover commits every pending note
@@ -651,40 +651,29 @@ impl From<CurvyDepositPoolError> for StrategyError {
 /// in one atomic call. Routing it through an EOA first would work equally well on chain and would
 /// put the node's whole PIX budget behind a hot key.
 ///
-/// Signed with the node's own chain key, which is what the module's `nodeOnly` check requires —
-/// no new key material. See [`module::SafeModuleSubmitter`] for the nonce it shares with the
-/// node's connector, and why that is safe.
-fn safe_direct_shielder<C>(client: Arc<C>, chain_key: hopr_api::ChainKeypair, module_address: Address) -> DirectShielder
+/// [`ChainWriteAccountOperations::send`] settles through the Safe module like
+/// [`withdraw`](ChainWriteAccountOperations::withdraw) does for [`safe_funder`], so the shield goes
+/// through the node's own transaction sequencer.
+fn safe_direct_shielder<Api>(api: Api) -> DirectShielder
 where
-    C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliTransactionClient + Send + Sync + 'static,
+    Api: ChainWriteAccountOperations + Clone + Send + Sync + 'static,
 {
-    let submitter = Arc::new(module::SafeModuleSubmitter::new(client, chain_key, module_address));
     Arc::new(
-        move |calldata: Vec<u8>,
-              token: Address,
-              router: Address,
-              aggregator: Address,
-              gross: u128,
-              landed: sdk::ShieldLanded| {
-            let submitter = Arc::clone(&submitter);
+        move |calldata: Vec<u8>, router: Address, aggregator: Address, gross: u128| {
+            let api = api.clone();
             Box::pin(async move {
-                let call = module::encode_safe_router_shield(&token, &router, &aggregator, gross, &calldata)
-                    .map_err(|error| error.to_string())?;
-                submitter
-                    .submit(call, SAFE_DIRECT_SHIELD_GAS, landed)
+                let user_data = module::router_user_data(&aggregator, &calldata).map_err(|error| error.to_string())?;
+                let pending = api
+                    .send(HoprBalance::from(U256::from(gross)), &router, &user_data)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                let tx = pending.await.map_err(|error| error.to_string())?;
+                tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
+                Ok(())
             }) as BoxFuture<'static, Result<(), String>>
         },
     )
 }
-
-/// Gas for the routed shield: the ERC-777 `send`, the router's hook and the shield it makes.
-///
-/// The shield is a Groth16-free call — the proving happens off chain — but it deploys nothing and
-/// writes one pending note, so this is generous rather than measured. An over-estimate costs
-/// nothing but the block's unused gas.
-const SAFE_DIRECT_SHIELD_GAS: u64 = 1_500_000;
 
 /// How long a single relayer HTTP request may take.
 ///
@@ -804,13 +793,12 @@ where
     /// funding source.
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
-    /// state file cannot be opened, an environment override does not parse, or direct shielding is
-    /// given a key that is not the node's.
-    pub fn new(
-        node: Arc<N>,
-        node_key: hopr_api::ChainKeypair,
-        mut cfg: CurvyDepositPoolConfig,
-    ) -> Result<Self, StrategyError> {
+    /// state file cannot be opened, or an environment override does not parse.
+    ///
+    /// No chain key is taken: a direct shield is submitted by the node's chain API, which signs
+    /// with the node's own key, and the portal path signs with the operator key from the
+    /// environment.
+    pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig) -> Result<Self, StrategyError> {
         // Environment overrides are applied before validation, so an override that contradicts
         // the file is caught here rather than at the first deposit.
         if let Ok(raw) = std::env::var(SHIELDING_ENV) {
@@ -840,15 +828,6 @@ where
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
-        // The Safe module's `nodeOnly` check rejects any other signer, so a foreign key would pass
-        // startup and then make every direct shield revert. The portal path never signs with it.
-        if cfg.shielding == CurvyShielding::Direct && node_key.public().to_address() != node.identity().node_address {
-            return Err(StrategyError::InvalidConfiguration(format!(
-                "direct shielding signs with the node key, but the given key belongs to {} while the node is {}",
-                node_key.public().to_address(),
-                node.identity().node_address
-            )));
-        }
 
         // Portal deployment is self-signed even when proofs go through the relayer.
         let operator_key = if cfg.submission == CurvySubmission::Operator || cfg.shielding == CurvyShielding::Portal {
@@ -889,13 +868,7 @@ where
                 .with_note_source(cfg.note_source, cfg.curvy_indexer_url.clone()),
             safe_funder(node.chain_api().clone()),
             match cfg.shielding {
-                // The node's own chain key, because the module's `nodeOnly` check accepts no
-                // other signer; nothing new is minted or stored here.
-                CurvyShielding::Direct => Some(safe_direct_shielder(
-                    Arc::clone(&blokli),
-                    node_key,
-                    node.identity().module_address,
-                )),
+                CurvyShielding::Direct => Some(safe_direct_shielder(node.chain_api().clone())),
                 CurvyShielding::Portal => None,
             },
             match cfg.submission {
