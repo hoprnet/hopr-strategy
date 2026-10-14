@@ -43,8 +43,8 @@
 //! permission module, ERC-777-`send`s it to Curvy's shield router, whose `tokensReceived` hook
 //! calls `directShield` in the same transaction; any failure reverts the `send`, leaving the float
 //! in the Safe. The only call the Safe makes is on wxHOPR, which every node Safe may call from
-//! deployment, so this needs **no** change to the Safe or its module — only the node's own chain key
-//! to sign the module call, which is why the builder takes one.
+//! deployment, so this needs **no** change to the Safe or its module: the node's chain API signs
+//! the module call with the node's own key, exactly as it does for a withdrawal.
 //!
 //! **Under `submission: relayer` the pool commits nothing.** The relayer refuses
 //! `commitPendingNotes`, and the deployment's shared batch-prover commits every pending note
@@ -80,10 +80,11 @@
 //!   `*.signet.zst` graph per circuit, digest-checked; a `CURVY_*_ZKEY` / `CURVY_*_GRAPH` pair per circuit overrides
 //!   the directory). All ten files ship with each SDK release. Without them the first deposit fails with "location is
 //!   not configured".
-//! * A **Safe with wxHOPR** (Entry): the shield is funded from it through the node's own chain API, like the plain
-//!   pool's deposits. The amount is [`CurvyDepositPoolConfig::initial_funding`], overridable through
-//!   [`INITIAL_FUNDING_ENV`], and it is shielded **lazily** — on the first deposit, not at startup — so a node that
-//!   never deposits never moves anything.
+//! * A **Safe with wxHOPR** (Entry): [`DepositPool::fund`] shields from it through the node's own chain API, like the
+//!   plain pool's deposits. The pool never funds itself: a deposit is a [`DepositPool::pool_transfer`] from the
+//!   funding, and when the funding runs out the deposit fails with [`StrategyError::CriteriaNotSatisfied`] until
+//!   whoever decides to fund — the strategy's funding policy, or an operator — calls `fund` again.
+//!   [`DepositPool::available_balance`] is what is left to allocate.
 //! * A **state file** ([`CurvyDepositPoolConfig::state_path`]) that survives restarts: it holds the node's Curvy
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
@@ -120,7 +121,7 @@ use curvy_core::{eddsa::ScalarSigningKey, field::fr_to_be_32, stealth, witness::
 pub use detect::RsCoreCurvyNoteDetector;
 use futures::future::BoxFuture;
 use hopr_api::{
-    chain::{BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool},
+    chain::{BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
         crypto::prelude::{
@@ -180,13 +181,6 @@ impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-
-/// Environment variable that overrides [`CurvyDepositPoolConfig::initial_funding`].
-///
-/// The shield is the one Safe debit this pool makes, and a deployment may size it per run rather
-/// than per config file — the PIX soak test, for one, budgets the Entry to the wxHOPR it expects
-/// to see leave the Safe.
-pub const INITIAL_FUNDING_ENV: &str = "HOPRD_CURVY_INITIAL_FUNDING";
 
 /// Environment variable that overrides [`CurvyDepositPoolConfig::shielding`].
 ///
@@ -324,10 +318,6 @@ fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
 
-fn default_initial_funding() -> HoprBalance {
-    HoprBalance::new_base(100)
-}
-
 fn default_operator_key_env() -> String {
     "HOPRD_CURVY_OPERATOR_PRIVATE_KEY".to_owned()
 }
@@ -425,16 +415,6 @@ pub struct CurvyDepositPoolConfig {
     #[serde(default)]
     #[validate(range(min = 1))]
     pub token: Option<u64>,
-
-    /// wxHOPR shielded from the Safe into the private pool on the first deposit, gross of the
-    /// deployment's shield fees. Default: 100 wxHOPR. Overridden by [`INITIAL_FUNDING_ENV`].
-    ///
-    /// Deposits are allocated out of this until it runs out, at which point they fail with
-    /// [`StrategyError::CriteriaNotSatisfied`]; the pool does not top itself up.
-    #[default(default_initial_funding())]
-    #[serde_as(as = "DisplayFromStr")]
-    #[serde(default = "default_initial_funding")]
-    pub initial_funding: HoprBalance,
 
     /// Where the pool's durable state lives. Default: `curvy-pix-<node address>.redb` in the
     /// working directory — the address keeps two nodes started from one directory apart.
@@ -636,6 +616,9 @@ pub enum CurvyDepositPoolError {
         "Curvy pool-to-pool transfer is not supported; PIX settlement withdraws reconstructed deposits to the Safe"
     )]
     UnsupportedPoolTransfer,
+    /// A transfer from the funding was asked for without an amount.
+    #[error("a transfer from the funding needs an amount: an allocation is paid from one funding note plus fees")]
+    FundingTransferNeedsAmount,
 }
 
 impl From<CurvyDepositPoolError> for StrategyError {
@@ -651,40 +634,29 @@ impl From<CurvyDepositPoolError> for StrategyError {
 /// in one atomic call. Routing it through an EOA first would work equally well on chain and would
 /// put the node's whole PIX budget behind a hot key.
 ///
-/// Signed with the node's own chain key, which is what the module's `nodeOnly` check requires —
-/// no new key material. See [`module::SafeModuleSubmitter`] for the nonce it shares with the
-/// node's connector, and why that is safe.
-fn safe_direct_shielder<C>(client: Arc<C>, chain_key: hopr_api::ChainKeypair, module_address: Address) -> DirectShielder
+/// [`ChainWriteAccountOperations::send`] settles through the Safe module like
+/// [`withdraw`](ChainWriteAccountOperations::withdraw) does for [`safe_funder`], so the shield goes
+/// through the node's own transaction sequencer.
+fn safe_direct_shielder<Api>(api: Api) -> DirectShielder
 where
-    C: blokli_client::api::BlokliQueryClient + blokli_client::api::BlokliTransactionClient + Send + Sync + 'static,
+    Api: ChainWriteAccountOperations + Clone + Send + Sync + 'static,
 {
-    let submitter = Arc::new(module::SafeModuleSubmitter::new(client, chain_key, module_address));
     Arc::new(
-        move |calldata: Vec<u8>,
-              token: Address,
-              router: Address,
-              aggregator: Address,
-              gross: u128,
-              landed: sdk::ShieldLanded| {
-            let submitter = Arc::clone(&submitter);
+        move |calldata: Vec<u8>, router: Address, aggregator: Address, gross: u128| {
+            let api = api.clone();
             Box::pin(async move {
-                let call = module::encode_safe_router_shield(&token, &router, &aggregator, gross, &calldata)
-                    .map_err(|error| error.to_string())?;
-                submitter
-                    .submit(call, SAFE_DIRECT_SHIELD_GAS, landed)
+                let user_data = module::router_user_data(&aggregator, &calldata).map_err(|error| error.to_string())?;
+                let pending = api
+                    .send(HoprBalance::from(U256::from(gross)), &router, &user_data)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                let tx = pending.await.map_err(|error| error.to_string())?;
+                tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
+                Ok(())
             }) as BoxFuture<'static, Result<(), String>>
         },
     )
 }
-
-/// Gas for the routed shield: the ERC-777 `send`, the router's hook and the shield it makes.
-///
-/// The shield is a Groth16-free call — the proving happens off chain — but it deploys nothing and
-/// writes one pending note, so this is generous rather than measured. An over-estimate costs
-/// nothing but the block's unused gas.
-const SAFE_DIRECT_SHIELD_GAS: u64 = 1_500_000;
 
 /// How long a single relayer HTTP request may take.
 ///
@@ -790,7 +762,6 @@ pub struct CurvyDepositPool<N, I = NoteIndex, A = RsSdkCurvyAdapter<BlokliClient
     adapter: Arc<A>,
     tracker: Arc<CurvyLifecycleTracker<S>>,
     cfg: CurvyDepositPoolConfig,
-    initial_funding: HoprBalance,
     reconciled: tokio::sync::OnceCell<()>,
     watcher: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -804,13 +775,12 @@ where
     /// funding source.
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
-    /// state file cannot be opened, an environment override does not parse, or direct shielding is
-    /// given a key that is not the node's.
-    pub fn new(
-        node: Arc<N>,
-        node_key: hopr_api::ChainKeypair,
-        mut cfg: CurvyDepositPoolConfig,
-    ) -> Result<Self, StrategyError> {
+    /// state file cannot be opened, or an environment override does not parse.
+    ///
+    /// No chain key is taken: a direct shield is submitted by the node's chain API, which signs
+    /// with the node's own key, and the portal path signs with the operator key from the
+    /// environment.
+    pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig) -> Result<Self, StrategyError> {
         // Environment overrides are applied before validation, so an override that contradicts
         // the file is caught here rather than at the first deposit.
         if let Ok(raw) = std::env::var(SHIELDING_ENV) {
@@ -840,15 +810,6 @@ where
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
-        // The Safe module's `nodeOnly` check rejects any other signer, so a foreign key would pass
-        // startup and then make every direct shield revert. The portal path never signs with it.
-        if cfg.shielding == CurvyShielding::Direct && node_key.public().to_address() != node.identity().node_address {
-            return Err(StrategyError::InvalidConfiguration(format!(
-                "direct shielding signs with the node key, but the given key belongs to {} while the node is {}",
-                node_key.public().to_address(),
-                node.identity().node_address
-            )));
-        }
 
         // Portal deployment is self-signed even when proofs go through the relayer.
         let operator_key = if cfg.submission == CurvySubmission::Operator || cfg.shielding == CurvyShielding::Portal {
@@ -861,12 +822,6 @@ where
             })?
         } else {
             String::new()
-        };
-        let initial_funding = match std::env::var(INITIAL_FUNDING_ENV) {
-            Ok(raw) => HoprBalance::from_str(&raw).map_err(|error| {
-                StrategyError::InvalidConfiguration(format!("{INITIAL_FUNDING_ENV} must be a wxHOPR amount: {error}"))
-            })?,
-            Err(_) => cfg.initial_funding,
         };
         let state_path = cfg
             .state_path
@@ -889,13 +844,7 @@ where
                 .with_note_source(cfg.note_source, cfg.curvy_indexer_url.clone()),
             safe_funder(node.chain_api().clone()),
             match cfg.shielding {
-                // The node's own chain key, because the module's `nodeOnly` check accepts no
-                // other signer; nothing new is minted or stored here.
-                CurvyShielding::Direct => Some(safe_direct_shielder(
-                    Arc::clone(&blokli),
-                    node_key,
-                    node.identity().module_address,
-                )),
+                CurvyShielding::Direct => Some(safe_direct_shielder(node.chain_api().clone())),
                 CurvyShielding::Portal => None,
             },
             match cfg.submission {
@@ -914,7 +863,6 @@ where
         tracing::info!(
             state = %state_path.display(),
             blokli = %cfg.blokli_url,
-            %initial_funding,
             %token,
             shielding = ?cfg.shielding,
             submission = ?cfg.submission,
@@ -954,7 +902,7 @@ where
             });
         }
         let tracker = CurvyLifecycleTracker::for_vault_token(token, Arc::new(state));
-        Ok(Self::assemble(node, cfg, initial_funding, index, adapter, tracker))
+        Ok(Self::assemble(node, cfg, index, adapter, tracker))
     }
 }
 
@@ -973,20 +921,18 @@ where
     pub fn with_parts(
         node: Arc<N>,
         cfg: CurvyDepositPoolConfig,
-        initial_funding: HoprBalance,
         index: I,
         adapter: A,
         detector: RsCoreCurvyNoteDetector,
         state: S,
     ) -> Self {
         let tracker = CurvyLifecycleTracker::new(Arc::new(detector), Arc::new(state));
-        Self::assemble(node, cfg, initial_funding, index, adapter, tracker)
+        Self::assemble(node, cfg, index, adapter, tracker)
     }
 
     fn assemble(
         node: Arc<N>,
         cfg: CurvyDepositPoolConfig,
-        initial_funding: HoprBalance,
         index: I,
         adapter: A,
         tracker: CurvyLifecycleTracker<S>,
@@ -997,7 +943,6 @@ where
             adapter: Arc::new(adapter),
             tracker: Arc::new(tracker),
             cfg,
-            initial_funding,
             reconciled: tokio::sync::OnceCell::new(),
             watcher: parking_lot::Mutex::new(None),
         }
@@ -1180,7 +1125,6 @@ where
         deposits: Vec<(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)>,
     ) -> Result<(), StrategyError> {
         self.ensure_reconciled().await?;
-        let safe_address = self.node.identity().safe_address;
         // The funding note has to be *committed* before it can be spent, and committed by
         // whoever commits on this deployment: under `submission: relayer` that is the shared
         // batch-prover, on its own schedule, and the SDK's tree — read from a finalized
@@ -1188,30 +1132,44 @@ where
         // that arrives in that window is not a failure, it is early: wait for the tree, within
         // the same budget discovery gets, rather than fail the flush. The strategy's spend
         // ledger is never refunded (by design), so failing here would burn the budget on a race.
+        self.wait_out_lag(move || self.adapter.allocate(deposits.clone()))
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                // Out of shielded funds is the expected end of a run, not a fault: the
+                // strategy's budget usually gets there first, and either way the kill switch
+                // ends the Session.
+                if message.contains("no committed note large enough") {
+                    tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
+                    StrategyError::CriteriaNotSatisfied
+                } else {
+                    StrategyError::other(CurvyDepositPoolError::Adapter(error.into()))
+                }
+            })
+    }
+
+    /// Runs `op` until it succeeds or fails with something other than lag, within
+    /// [`CurvyDepositPoolConfig::max_deposit_tracking_time`].
+    ///
+    /// Lag — the committed tree not yet holding a note, a chain read served from behind, a
+    /// pending finality — is waited out rather than reported, because the next attempt sees a
+    /// different answer; see [`is_retryable_lag`]. Shared by allocating and funding, which meet
+    /// the same lag at the same places.
+    async fn wait_out_lag<T, F, Fut>(&self, mut op: F) -> Result<T, A::Error>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, A::Error>>,
+    {
         let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
         let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
         let mut waited = 0u32;
-        let mut funded = false;
         loop {
-            let result = async {
-                // Reconciliation can await finality before funding as well as before allocation.
-                // Retry here so the adapter's chain lock is released during the delay.
-                if !funded {
-                    self.adapter.ensure_funded(self.initial_funding, safe_address).await?;
-                    funded = true;
-                }
-                self.adapter.allocate(deposits.clone()).await
-            }
-            .await;
-            match result {
-                Ok(()) => {
+            match op().await {
+                Ok(value) => {
                     if waited > 0 {
-                        tracing::info!(
-                            attempts = waited + 1,
-                            "allocated once the funding note reached the committed tree"
-                        );
+                        tracing::info!(attempts = waited + 1, "done once the chain state caught up");
                     }
-                    return Ok(());
+                    return Ok(value);
                 }
                 Err(error) if is_retryable_lag(&error.to_string()) && tokio::time::Instant::now() + poll < deadline => {
                     waited += 1;
@@ -1223,18 +1181,7 @@ where
                     );
                     tokio::time::sleep(poll).await;
                 }
-                Err(error) => {
-                    let message = error.to_string();
-                    // Out of shielded funds is the expected end of a run, not a fault: the
-                    // strategy's budget usually gets there first, and either way the kill switch
-                    // ends the Session.
-                    return Err(if message.contains("no committed note large enough") {
-                        tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
-                        StrategyError::CriteriaNotSatisfied
-                    } else {
-                        StrategyError::other(CurvyDepositPoolError::Adapter(error.into()))
-                    });
-                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1325,22 +1272,25 @@ where
         Ok(CurvyDepositData::new(*id, secret.public()))
     }
 
-    async fn deposit_funds_to(
-        &self,
-        id: &PixAddressId,
-        dst: &BjjPublicKey,
-        amount: HoprBalance,
-        additional_data: Self::PoolDepositData,
-    ) -> Result<Self::Receipt, Self::Error> {
-        if additional_data.id() != id {
-            return Err(CurvyDepositPoolError::MismatchedDepositData {
-                expected: *id,
-                actual: *additional_data.id(),
-            }
-            .into());
-        }
-        self.allocate(vec![(*id, *dst, *additional_data.scan_key(), amount)])
+    /// Shields `amount` from the node's Safe into the pool, adding a funding note.
+    ///
+    /// Gross of the deployment's shield fee: what becomes allocatable is `amount` less the vault's
+    /// deposit fee.
+    async fn fund(&self, amount: HoprBalance) -> Result<(), Self::Error> {
+        self.ensure_reconciled().await?;
+        let safe_address = self.node.identity().safe_address;
+        self.wait_out_lag(move || self.adapter.fund(amount, safe_address))
             .await
+            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))
+    }
+
+    /// The funding notes as the adapter journals them, which counts a note from the moment its
+    /// shield is submitted: see [`CurvySdkAdapter::available_balance`].
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        self.adapter
+            .available_balance()
+            .await
+            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))
     }
 
     /// One proof for the whole batch (up to the aggregator's output budget per proof).
@@ -1518,15 +1468,30 @@ where
         Ok(outcomes)
     }
 
+    /// From the funding: one allocation, paid out of the pool's funding notes, which needs an
+    /// `amount` — an allocation is paid from one note plus fees, so "everything the funding has"
+    /// is not an amount a proof can take. From a deposit: not supported — a PIX deposit is swept
+    /// to an Ethereum address, never moved to another deposit.
     async fn pool_transfer(
         &self,
-        _src_id: &PixAddressId,
-        _key: &BjjKeypair,
-        _dst_id: &PixAddressId,
-        _dst: BjjPublicKey,
-        _additional_dst_data: Self::PoolDepositData,
-        _amount: Option<HoprBalance>,
+        src: PoolTransferSource<'_, BjjKeypair>,
+        dst_id: &PixAddressId,
+        dst: BjjPublicKey,
+        additional_dst_data: Self::PoolDepositData,
+        amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        Err(CurvyDepositPoolError::UnsupportedPoolTransfer.into())
+        if matches!(src, PoolTransferSource::Deposit { .. }) {
+            return Err(CurvyDepositPoolError::UnsupportedPoolTransfer.into());
+        }
+        if additional_dst_data.id() != dst_id {
+            return Err(CurvyDepositPoolError::MismatchedDepositData {
+                expected: *dst_id,
+                actual: *additional_dst_data.id(),
+            }
+            .into());
+        }
+        let amount = amount.ok_or(CurvyDepositPoolError::FundingTransferNeedsAmount)?;
+        self.allocate(vec![(*dst_id, dst, *additional_dst_data.scan_key(), amount)])
+            .await
     }
 }

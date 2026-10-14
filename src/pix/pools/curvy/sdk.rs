@@ -115,21 +115,12 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 /// A callback rather than a method so the pool keeps no chain key of its own and the SDK bridge
 /// stays ignorant of how the Safe is driven.
 ///
-/// Arguments: the `directShield` calldata, the token, the shield router to `send` it to, the
-/// aggregator the router shields into, the gross amount, and a check of whether the shield's note
-/// already exists — which the shielder consults before resubmitting after a nonce conflict, since
-/// an earlier copy of the same shield may be the transaction that took the nonce.
+/// Arguments: the `directShield` calldata, the shield router to `send` it to, the aggregator the
+/// router shields into, and the gross amount.
 ///
-/// `Ok` means the transaction confirmed, not that the shield took effect: the Safe reports a
-/// failed inner call without reverting, so the caller verifies the note on chain.
-pub type DirectShielder = Arc<
-    dyn Fn(Vec<u8>, Address, Address, Address, u128, ShieldLanded) -> BoxFuture<'static, Result<(), String>>
-        + Send
-        + Sync,
->;
-
-/// Whether a direct shield's note is known to the aggregator, i.e. whether the shield executed.
-pub type ShieldLanded = Arc<dyn Fn() -> BoxFuture<'static, Result<bool, String>> + Send + Sync>;
+/// `Ok` means the transaction confirmed; the caller still verifies the note on chain.
+pub type DirectShielder =
+    Arc<dyn Fn(Vec<u8>, Address, Address, u128) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 /// Curvy chain operations that require SDK knowledge.
 ///
@@ -140,9 +131,23 @@ pub type ShieldLanded = Arc<dyn Fn() -> BoxFuture<'static, Result<bool, String>>
 pub trait CurvySdkAdapter: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Shields `gross` into the private pool if no durable funding exists yet, with
-    /// `recovery_address` as the portal's recovery address. Idempotent and crash-resumable.
-    async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error>;
+    /// Shields `gross` wxHOPR from the Safe into the pool's funding, adding to whatever is there;
+    /// `recovery_address` is the portal's recovery address where a portal is used.
+    ///
+    /// Crash-resumable, not idempotent: an interrupted shield of the same amount is resumed
+    /// rather than started again, and a different amount while one is in flight is refused, but
+    /// once a shield has landed and been journalled, the next call shields again. An error after
+    /// the note is journalled — committing it did not go through — is not one, so that a retry
+    /// cannot shield twice for one failure.
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error>;
+
+    /// The pool's funding notes, net of allocations, as the pool's own ledger has them.
+    ///
+    /// A note counts from the moment its shield is journalled, before it is committed and
+    /// spendable; under relayer submission the inputs of an aggregation still count until its
+    /// outcome is observed. What is reported can therefore run ahead of what an allocation can
+    /// draw on right now.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error>;
 
     /// Allocates the given amounts to the given Baby JubJub owners, each discoverable by its scan
     /// identity. Succeeds or fails as a whole per proof.
@@ -1060,31 +1065,13 @@ where
                 Some(router) => router,
                 None => self.shield_router_checked(endpoints).await?,
             };
-            let token: Address = endpoints
-                .token_address
-                .parse()
-                .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("token address: {error}")))?;
             let aggregator: Address = endpoints
                 .aggregator
                 .parse()
                 .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("aggregator address: {error}")))?;
             let calldata = prepared.calldata()?;
-            let landed: ShieldLanded = {
-                let client = Arc::clone(client);
-                let note_id = prepared.note.note_id();
-                Arc::new(move || {
-                    let client = Arc::clone(&client);
-                    Box::pin(async move {
-                        client
-                            .note_status(&note_id)
-                            .await
-                            .map(|status| matches!(status, 1 | 2))
-                            .map_err(|error| error.to_string())
-                    })
-                })
-            };
             tracing::info!(%gross, %router, "shielding the Curvy funding note from the Safe through the shield router");
-            shielder(calldata, token, router, aggregator, gross, landed)
+            shielder(calldata, router, aggregator, gross)
                 .await
                 .map_err(RsSdkCurvyAdapterError::Funding)?;
         }
@@ -1114,7 +1101,14 @@ where
             state.direct_shield_in_flight = None;
             self.store.save(&state)?;
         }
-        self.recover_pending().await
+        // As in `shield`: journalled is funded, and committing is retried by every reconciliation.
+        match self.recover_pending().await {
+            Ok(ledger) => Ok(ledger),
+            Err(error) => {
+                tracing::warn!(%error, "the funding note is journalled but could not be committed yet; the next reconciliation retries");
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// The router a direct shield sends through, once the deployment is known to have one and the
@@ -1158,8 +1152,9 @@ where
     ///
     /// A confirmed module call is not a shield: the Safe reports a failed inner call — an
     /// allowance it lacks, a balance too small, the gate closed — through `safeExecution` rather
-    /// than by reverting, and Blokli's confirming submission returns only the hash. The aggregator
-    /// is asked instead, a few times, since the read may be served by a node a block behind.
+    /// than by reverting. The node's chain API already turns that into an error; the aggregator
+    /// is asked as well, a few times, so that nothing is recorded as funding on the strength of a
+    /// receipt alone, and since the read may be served by a node a block behind.
     ///
     /// On failure the shield stays journalled as in flight and nothing is recorded as funding, so
     /// the next attempt re-checks the chain before shielding again rather than trusting a phantom
@@ -1186,19 +1181,13 @@ where
         ))
     }
 
-    /// Shields initial private-pool funding if no durable funding already exists.
+    /// Shields `gross` into the pool as one more funding note, resuming a journalled shield of the
+    /// same amount first.
     async fn shield(&self, gross: u128, recovery_address: &str) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         let (client, endpoints) = self.client().await?;
         self.reconcile_relay_aggregation().await?;
         self.recover_pending().await?;
-        let already_funded = {
-            let state = self.state.lock();
-            !state.funding.is_empty() && state.shield_in_flight.is_none() && state.direct_shield_in_flight.is_none()
-        };
-        if already_funded {
-            return Ok(Vec::new());
-        }
         if self.config.shielding == CurvyShielding::Direct {
             return self.direct_shield(gross).await;
         }
@@ -1280,7 +1269,15 @@ where
             state.shield_in_flight = None;
             self.store.save(&state)?;
         }
-        ledger.extend(self.recover_pending().await?);
+        // The note is journalled: the shield is done whatever happens to committing it, and a
+        // retry of `fund` on this error would shield a second time. Every reconciliation retries
+        // the commitment instead.
+        match self.recover_pending().await {
+            Ok(entries) => ledger.extend(entries),
+            Err(error) => {
+                tracing::warn!(%error, "the funding note is journalled but could not be committed yet; the next reconciliation retries")
+            }
+        }
         Ok(ledger)
     }
 
@@ -2433,10 +2430,26 @@ where
 {
     type Error = RsSdkCurvyAdapterError;
 
-    async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
         self.shield(balance_u128(gross)?, &recovery_address.to_string())
             .await
             .map(|_| ())
+    }
+
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        // `state.funding` is kept net of allocations: a spent note is replaced by its change as
+        // soon as the spend is journalled. It is not filtered by note status — a note shielded a
+        // moment ago is listed before it is committed — which is what the trait documents.
+        let total = self.state.lock().funding.iter().try_fold(0_u128, |total, stored| {
+            let note = OwnedNote::try_from(stored)?;
+            let amount: u128 = fr_to_biguint(&note.amount)
+                .try_into()
+                .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned()))?;
+            total
+                .checked_add(amount)
+                .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned()))
+        })?;
+        Ok(HoprBalance::from(U256::from(total)))
     }
 
     async fn allocate(
@@ -2726,27 +2739,54 @@ mod tests {
             let shielder: DirectShielder = {
                 let landed = landed.clone();
                 let submissions = submissions.clone();
-                Arc::new(move |_, _, _, _, _, _| {
+                Arc::new(move |_, _, _, _| {
                     submissions.fetch_add(1, Ordering::SeqCst);
                     // The transaction confirms either way; only the inner call differs.
                     landed.store(inner_call_succeeds, Ordering::SeqCst);
                     Box::pin(async { Ok(()) })
                 })
             };
-            let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+            let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder.clone()))?;
             let safe = Address::from([9_u8; 20]);
 
             if inner_call_succeeds {
-                adapter.ensure_funded(HoprBalance::from(U256::from(7_u8)), safe).await?;
-                adapter.ensure_funded(HoprBalance::from(U256::from(7_u8)), safe).await?;
+                adapter.fund(HoprBalance::from(U256::from(7_u8)), safe).await?;
                 let stored = store.load()?;
                 assert_eq!(stored.funding, vec![StoredNote::from(&note)]);
-                assert!(stored.direct_shield_in_flight.is_none());
-                assert_eq!(submissions.load(Ordering::SeqCst), 1, "funded once, then left alone");
+                assert!(stored.direct_shield_in_flight.is_none(), "the journal is settled");
+                assert_eq!(submissions.load(Ordering::SeqCst), 1);
+
+                // Funding adds: a second shield — journalled here in place of preparing one, which
+                // would need a fee quote, and picked up by a fresh adapter as after a restart —
+                // lands as a second note beside the first, and while it is in flight any other
+                // amount is refused before the Safe sends anything.
+                let second = Adapter::owned_note(&fixture(8))?;
+                let mut persisted = store.load()?;
+                persisted.direct_shield_in_flight = Some(StoredDirectShield {
+                    note: StoredNote::from(&second),
+                    gross: "7".to_owned(),
+                });
+                store.save(&persisted)?;
+                landed.store(false, Ordering::SeqCst);
+                let restarted = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
+                let refused = restarted
+                    .fund(HoprBalance::from(U256::from(8_u8)), safe)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(refused, RsSdkCurvyAdapterError::ShieldInProgress), "{refused}");
+                assert_eq!(submissions.load(Ordering::SeqCst), 1, "a refused amount sends nothing");
+                restarted.fund(HoprBalance::from(U256::from(7_u8)), safe).await?;
+                let stored = store.load()?;
+                assert_eq!(
+                    stored.funding,
+                    vec![StoredNote::from(&note), StoredNote::from(&second)],
+                    "the second funding is added, not substituted"
+                );
+                assert_eq!(submissions.load(Ordering::SeqCst), 2);
             } else {
                 for attempt in 1..=2 {
                     let error = adapter
-                        .ensure_funded(HoprBalance::from(U256::from(7_u8)), safe)
+                        .fund(HoprBalance::from(U256::from(7_u8)), safe)
                         .await
                         .unwrap_err();
                     assert!(matches!(error, RsSdkCurvyAdapterError::Funding(_)), "{error}");
@@ -4490,7 +4530,7 @@ mod tests {
             let submissions = Arc::new(AtomicUsize::new(0));
             let shielder: DirectShielder = {
                 let submissions = submissions.clone();
-                Arc::new(move |_, _, _, _, _, _| {
+                Arc::new(move |_, _, _, _| {
                     submissions.fetch_add(1, Ordering::SeqCst);
                     Box::pin(async { Ok(()) })
                 })
@@ -4504,7 +4544,7 @@ mod tests {
                 .shield_router = router;
 
             let error = adapter
-                .ensure_funded(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
@@ -4588,7 +4628,7 @@ mod tests {
         let submissions = Arc::new(AtomicUsize::new(0));
         let shielder: DirectShielder = {
             let submissions = submissions.clone();
-            Arc::new(move |_, _, _, _, _, _| {
+            Arc::new(move |_, _, _, _| {
                 submissions.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })
             })
@@ -4602,7 +4642,7 @@ mod tests {
             .shield_router = None;
 
         adapter
-            .ensure_funded(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+            .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
             .await?;
         let stored = store.load()?;
         assert_eq!(
