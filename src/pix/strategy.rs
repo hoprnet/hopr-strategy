@@ -124,6 +124,14 @@ fn default_spend_window() -> Duration {
 }
 
 // `Result` in this module is the crate alias, which fixes the error type.
+
+fn validate_positive_balance(balance: &HoprBalance) -> std::result::Result<(), validator::ValidationError> {
+    if balance.is_zero() {
+        return Err(validator::ValidationError::new("must be more than zero"));
+    }
+    Ok(())
+}
+
 fn validate_min_1sec(duration: &Duration) -> std::result::Result<(), validator::ValidationError> {
     if duration.as_secs() < 1 {
         return Err(validator::ValidationError::new("must be at least 1 second"));
@@ -259,6 +267,38 @@ pub struct PixStrategyConfig {
     #[default(default_withdrawal_buffer_period())]
     #[serde(with = "humantime_serde", default = "default_withdrawal_buffer_period")]
     pub withdrawal_buffer_period: Duration,
+    /// When set, the strategy keeps the pool funded: see [`PixFundingPolicy`]. Default: unset,
+    /// and the pool is funded only by whoever calls [`DepositPool::fund`] from outside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub funding: Option<PixFundingPolicy>,
+}
+
+/// How the strategy keeps the deposit pool funded.
+///
+/// A pool never funds itself. With this policy the strategy does, by configuration: once at
+/// startup and at the head of every deposit flush, it reads [`DepositPool::available_balance`]
+/// and, when that is below `min_available`, asks the pool to [`fund`](DepositPool::fund) `top_up`
+/// from the Safe. Both run off the event loop, in the task that flushes, so a funding that takes
+/// a shield and a commitment round never holds up PIX events; one funding at a time, so that
+/// concurrent flushes cannot each top up. Without the policy, deposits fail with
+/// [`StrategyError::CriteriaNotSatisfied`] once the pool is empty until an operator funds it.
+///
+/// `min_available` should cover the deposits that can arrive while a funding lands, and a
+/// margin: [`available_balance`](DepositPool::available_balance) is the pool's own ledger, which
+/// for a privacy pool counts a funding note before it is spendable.
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct PixFundingPolicy {
+    /// Fund when the pool can pay less than this. Zero would never fund; leave the policy out instead.
+    #[serde_as(as = "DisplayFromStr")]
+    #[validate(custom(function = "validate_positive_balance"))]
+    pub min_available: HoprBalance,
+    /// How much to move from the Safe each time, gross of the pool's own fees.
+    #[serde_as(as = "DisplayFromStr")]
+    #[validate(custom(function = "validate_positive_balance"))]
+    pub top_up: HoprBalance,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +479,14 @@ impl PixStrategy {
     {
         StrategyError::validate_config(&pool_cfg)?;
 
+        // The plain pool pays deposits from the Safe, so there is nothing a funding policy could
+        // top up: it would read the Safe's balance and "fund" nothing on every flush.
+        if self.cfg.funding.is_some() {
+            return Err(StrategyError::InvalidConfiguration(
+                "the plain pool pays from the Safe and cannot be funded; drop the `funding` policy".to_owned(),
+            ));
+        }
+
         // The pool signs sweep-gas top-ups with `node_key` directly, and its reserve gate reads
         // that key's own balance. A key that is not the node's would therefore spend and gate an
         // account unrelated to the one `node.chain_api()` settles deposits from — a wiring mistake
@@ -474,10 +522,9 @@ impl PixStrategy {
     /// `<HoprPixSpec as PixSpec>::DepositAddress`; `hopr-lib/pix-bjj` is the default, so a consumer
     /// enabling only this feature already agrees.
     ///
-    /// `node_key` is the node's own chain keypair, and must be the node's: under the default
-    /// `shielding: direct` the pool spends the float by driving the node's Safe through its
-    /// permission module, whose `execTransactionFromModule` accepts no other signer. It is used
-    /// for nothing else, and no key is derived from or stored alongside it.
+    /// Unlike `build_non_anonymous`, no chain key is taken: under the default `shielding: direct`
+    /// the pool spends the float by having the node's Safe ERC-777-`send` it to the Curvy shield
+    /// router, and that transaction goes through the node's own chain API, which signs it.
     ///
     /// The pool needs one more thing the config cannot carry: a Blokli endpoint that exposes the
     /// Curvy deployment (`pool_cfg.blokli_url`). Under `submission: operator` it additionally
@@ -503,14 +550,13 @@ impl PixStrategy {
     ///     // `CurvyDepositPool` settles to `BjjPublicKey`, so this pairing is rejected here
     ///     // rather than failing on every event at runtime.
     ///     let _ = PixStrategy::new(PixStrategyConfig::default())
-    ///         .build_curvy::<_, Address>(node, hopr_api::ChainKeypair::random(), Default::default());
+    ///         .build_curvy::<_, Address>(node, Default::default());
     /// }
     /// ```
     #[cfg(feature = "strategy-pix-curvy")]
     pub fn build_curvy<N, A>(
         self,
         node: Arc<N>,
-        node_key: hopr_api::ChainKeypair,
         pool_cfg: crate::pix::pools::curvy::PoolConfig,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
@@ -526,7 +572,6 @@ impl PixStrategy {
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
         let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
             Arc::clone(&node),
-            node_key,
             pool_cfg,
         )?);
         let safe_address = node.identity().safe_address;
@@ -613,6 +658,7 @@ impl PixStrategy {
             withdrawal_buffer: Vec::new(),
             spend_ledger: std::collections::VecDeque::new(),
             detach_flushes: false,
+            funding_gate: Arc::new(futures::lock::Mutex::new(())),
         }))
     }
 }
@@ -698,6 +744,9 @@ where
     /// no loop to protect and "no debounce" is most useful meaning the work is done when
     /// [`Self::on_pix_event`] returns.
     detach_flushes: bool,
+    /// Held across one application of the funding policy — the balance read and the funding it
+    /// decides on — so that concurrent flush tasks fund once between them, not once each.
+    funding_gate: Arc<futures::lock::Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -744,6 +793,7 @@ where
             withdrawal_buffer: Vec::new(),
             spend_ledger: std::collections::VecDeque::new(),
             detach_flushes: false,
+            funding_gate: Arc::new(futures::lock::Mutex::new(())),
         }
     }
 }
@@ -1085,6 +1135,35 @@ where
         Ok(())
     }
 
+    /// Applies the funding policy, if one is configured, waiting for it.
+    ///
+    /// Used where the loop is not running: at the end of `run`, ahead of the final flush. The
+    /// loop itself applies it inside [`Self::detach_flush_deposits`]'s task, and at startup in a
+    /// task of its own.
+    async fn apply_funding_policy(&self) {
+        if let Some(policy) = &self.cfg.funding {
+            apply_funding_policy::<D, K>(&self.pool, policy, &self.funding_gate).await;
+        }
+    }
+
+    /// Hand the startup application of the funding policy to a task and return immediately.
+    ///
+    /// A pool that starts empty is funded before the first deposit arrives rather than at its
+    /// flush, which is the moment the deposit is already waiting. Detached for the same reason
+    /// every flush is: a funding can take a shield and a commitment round, and the event stream
+    /// must be read meanwhile. The first flush's own application waits behind the gate and sees
+    /// the funded balance, so the two do not fund twice.
+    fn detach_startup_funding(&self) {
+        let Some(policy) = self.cfg.funding.clone() else {
+            return;
+        };
+        let pool = self.pool.clone();
+        let gate = Arc::clone(&self.funding_gate);
+        hopr_utils::runtime::prelude::spawn(async move {
+            apply_funding_policy::<D, K>(&pool, &policy, &gate).await;
+        });
+    }
+
     /// Flush the buffered deposits, waiting for the pool to finish.
     ///
     /// Retries are the pool's responsibility, so an error here means the pool already
@@ -1122,8 +1201,15 @@ where
         let pool = self.pool.clone();
         let processed_deposits = self.processed_deposits.clone();
         let in_flight_destinations = self.in_flight_destinations.clone();
+        let policy = self.cfg.funding.clone();
+        let gate = Arc::clone(&self.funding_gate);
 
+        // The policy runs at the head of the flush, in the task: the deposits in this batch are
+        // what it is funding for, and the loop must not wait on the funding any more than on them.
         hopr_utils::runtime::prelude::spawn(async move {
+            if let Some(policy) = &policy {
+                apply_funding_policy::<D, K>(&pool, policy, &gate).await;
+            }
             flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, batch).await;
         });
     }
@@ -1172,6 +1258,43 @@ where
         hopr_utils::runtime::prelude::spawn(async move {
             flush_withdrawal_batch::<D, K>(pool, safe_address, in_flight_sweeps, recovery_store, batch).await;
         });
+    }
+}
+
+/// Applies a [`PixFundingPolicy`] once: reads the pool's available balance and funds `top_up` when
+/// it is below `min_available`.
+///
+/// A free function so that the startup task, the flush tasks and the final awaited flush share
+/// one body. `gate` is held for the whole of it, so that two tasks applying the policy at once
+/// read the balance one after the other and the second sees the first's funding; a `fund` that
+/// fails is logged and left to the next application, and the deposits it was for then fail on
+/// their own, through the pool, rather than here.
+async fn apply_funding_policy<D, K>(pool: &D, policy: &PixFundingPolicy, gate: &futures::lock::Mutex<()>)
+where
+    D: DepositPool<K> + Send + Sync,
+    D::Error: Into<StrategyError>,
+    K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+    K::Public: Into<PixDepositAddress> + Send + Sync + 'static,
+{
+    let _one_at_a_time = gate.lock().await;
+    let available = match pool.available_balance().await.map_err(Into::<StrategyError>::into) {
+        Ok(available) => available,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the deposit pool's available balance");
+            return;
+        }
+    };
+    if available >= policy.min_available {
+        return;
+    }
+    tracing::info!(
+        %available,
+        min_available = %policy.min_available,
+        top_up = %policy.top_up,
+        "funding the deposit pool from the Safe"
+    );
+    if let Err(error) = pool.fund(policy.top_up).await.map_err(Into::<StrategyError>::into) {
+        tracing::error!(%error, "funding the deposit pool failed; the next flush retries");
     }
 }
 
@@ -1580,6 +1703,7 @@ where
         // it — including the one a zero buffer period triggers from inside a handler. See
         // `detach_flushes`.
         self.detach_flushes = true;
+        self.detach_startup_funding();
 
         let mut event_stream = self
             .node
@@ -1667,6 +1791,11 @@ where
 
         // Flush any remaining buffered items. Awaited, not detached: the loop is over, so there is
         // nothing left to keep responsive, and a task spawned here would race `run` returning.
+        // The policy only for deposits that are actually left: a pool drained by a run that is
+        // ending is not topped up on the way out.
+        if !self.deposit_buffer.is_empty() {
+            self.apply_funding_policy().await;
+        }
         self.flush_deposits().await;
         self.flush_withdrawals().await;
 
@@ -2780,6 +2909,30 @@ mod tests {
         Ok(())
     }
 
+    /// The plain pool pays from the Safe: a funding policy would read the Safe and fund nothing
+    /// on every flush, so the builder refuses it rather than letting it run as a no-op.
+    #[test_log::test(tokio::test)]
+    async fn test_build_non_anonymous_rejects_a_funding_policy() -> anyhow::Result<()> {
+        let (cc, node, _pool) = entry_side(&[]).await?;
+        let cfg = PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(1),
+                top_up: HoprBalance::new_base(1),
+            }),
+            ..Default::default()
+        };
+
+        let result = PixStrategy::new(cfg)
+            .build_non_anonymous_with_client::<_, Address, _>(node, BOB_KP.clone(), Default::default(), cc.client())
+            .map(|_| ());
+
+        assert!(
+            matches!(result, Err(StrategyError::InvalidConfiguration(_))),
+            "a funding policy on the plain pool must be refused, got {result:?}"
+        );
+        Ok(())
+    }
+
     /// Zero retries means "one attempt, no backoff" — the documented meaning of a budget counted
     /// *in addition to* the first attempt, and what most of the tests in this file rely on.
     ///
@@ -2817,7 +2970,6 @@ mod tests {
 
         let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
             node,
-            hopr_api::ChainKeypair::random(),
             crate::pix::pools::curvy::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
                 ..Default::default()
@@ -2825,36 +2977,6 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
-        Ok(())
-    }
-
-    /// Direct shielding signs `execTransactionFromModule` with the node key, which the module's
-    /// `nodeOnly` check accepts from the node alone — so a foreign key is refused at startup
-    /// rather than reverting every shield.
-    #[cfg(feature = "strategy-pix-curvy")]
-    #[test_log::test(tokio::test)]
-    async fn test_build_curvy_rejects_a_foreign_node_key_for_direct_shielding() -> anyhow::Result<()> {
-        use hopr_api::types::crypto::prelude::BjjPublicKey;
-
-        let (_cc, node, _pool) = entry_side(&[]).await?;
-        let state = tempfile::tempdir()?;
-        let cfg = || crate::pix::pools::curvy::PoolConfig {
-            relayer_url: Some("http://127.0.0.1:1/".parse().unwrap()),
-            state_path: Some(state.path().join("curvy.redb")),
-            ..Default::default()
-        };
-
-        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
-            Arc::clone(&node),
-            hopr_api::ChainKeypair::random(),
-            cfg(),
-        );
-        match result {
-            Err(StrategyError::InvalidConfiguration(message)) => assert!(message.contains("node key"), "{message}"),
-            other => panic!("expected a rejected node key, got {:?}", other.err()),
-        }
-
-        PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg())?;
         Ok(())
     }
 
@@ -3164,8 +3286,10 @@ mod tests {
 
         let dst_id = pix_id(2);
         pool.pool_transfer(
-            &pix_id(1),
-            &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            hopr_api::chain::PoolTransferSource::Deposit {
+                id: &pix_id(1),
+                key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            },
             &dst_id,
             *CHRIS,
             ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -3227,8 +3351,10 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                &pix_id(1),
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                hopr_api::chain::PoolTransferSource::Deposit {
+                    id: &pix_id(1),
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -3309,8 +3435,10 @@ mod tests {
         let dst_id = pix_id(2);
         let transferred = pool
             .pool_transfer(
-                &id,
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                hopr_api::chain::PoolTransferSource::Deposit {
+                    id: &id,
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, [0xde, 0xad, 0xbe, 0xef]),
@@ -3416,8 +3544,10 @@ mod tests {
         let dst_id = pix_id(3);
         let transferred = pool
             .pool_transfer(
-                &id,
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                hopr_api::chain::PoolTransferSource::Deposit {
+                    id: &id,
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 misfiled,
@@ -3487,8 +3617,10 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                &pix_id(1),
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                hopr_api::chain::PoolTransferSource::Deposit {
+                    id: &pix_id(1),
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -4336,6 +4468,120 @@ mod tests {
                 "every id must be released from the in-flight guard"
             );
         }
+        Ok(())
+    }
+
+    /// A pool that records what the funding policy asks of it and answers with a scripted
+    /// available balance. Everything else is unreachable from the policy.
+    struct FundingProbePool {
+        available: HoprBalance,
+        funded: Arc<parking_lot::Mutex<Vec<HoprBalance>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl hopr_api::chain::DepositPool<crate::pix::pools::plain::EthDepositKey> for FundingProbePool {
+        type Error = StrategyError;
+        type PoolDepositData = crate::pix::ByteDepositData;
+        type Receipt = ();
+
+        async fn generate_deposit_data(
+            &self,
+            _id: &PixAddressId,
+        ) -> std::result::Result<Self::PoolDepositData, StrategyError> {
+            unreachable!("the funding policy generates nothing")
+        }
+
+        async fn fund(&self, amount: HoprBalance) -> std::result::Result<(), StrategyError> {
+            self.funded.lock().push(amount);
+            Ok(())
+        }
+
+        async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
+            Ok(self.available)
+        }
+
+        async fn deposit_funds_to(
+            &self,
+            _id: &PixAddressId,
+            _dst: &Address,
+            _amount: HoprBalance,
+            _additional_data: Self::PoolDepositData,
+        ) -> std::result::Result<(), StrategyError> {
+            unreachable!("the funding policy deposits nothing")
+        }
+
+        fn notify_deposit(
+            &self,
+            _id: PixAddressId,
+            _dst: Address,
+            _min_amount: HoprBalance,
+        ) -> std::result::Result<hopr_api::chain::DepositNotification<'static, Address, Self::Error>, StrategyError>
+        {
+            unreachable!("the funding policy watches nothing")
+        }
+
+        async fn withdraw_deposit(
+            &self,
+            _id: &PixAddressId,
+            _key: &crate::pix::pools::plain::EthDepositKey,
+            _dst: Address,
+            _amount: Option<HoprBalance>,
+        ) -> std::result::Result<(), StrategyError> {
+            unreachable!("the funding policy withdraws nothing")
+        }
+
+        async fn pool_transfer(
+            &self,
+            _src: hopr_api::chain::PoolTransferSource<'_, crate::pix::pools::plain::EthDepositKey>,
+            _dst_id: &PixAddressId,
+            _dst: Address,
+            _additional_dst_data: Self::PoolDepositData,
+            _amount: Option<HoprBalance>,
+        ) -> std::result::Result<(), StrategyError> {
+            unreachable!("the funding policy transfers nothing")
+        }
+    }
+
+    async fn funding_policy_run(
+        available: HoprBalance,
+        funding: Option<crate::pix::strategy::PixFundingPolicy>,
+    ) -> anyhow::Result<Vec<HoprBalance>> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available,
+            funded: Arc::clone(&funded),
+        });
+        let cfg = PixStrategyConfig {
+            funding,
+            ..Default::default()
+        };
+        let strategy = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+        strategy.apply_funding_policy().await;
+        let calls = funded.lock().clone();
+        Ok(calls)
+    }
+
+    /// The policy is the only thing in the strategy that funds, and only when the pool reports
+    /// less than `min_available`.
+    #[test_log::test(tokio::test)]
+    async fn the_funding_policy_tops_up_only_below_its_floor() -> anyhow::Result<()> {
+        let policy = crate::pix::strategy::PixFundingPolicy {
+            min_available: HoprBalance::new_base(50),
+            top_up: HoprBalance::new_base(200),
+        };
+
+        let low = funding_policy_run(HoprBalance::new_base(49), Some(policy.clone())).await?;
+        assert_eq!(low, vec![HoprBalance::new_base(200)], "below the floor: fund top_up");
+
+        let at_floor = funding_policy_run(HoprBalance::new_base(50), Some(policy.clone())).await?;
+        assert!(at_floor.is_empty(), "at the floor: nothing to do");
+
+        let unconfigured = funding_policy_run(HoprBalance::zero(), None).await?;
+        assert!(
+            unconfigured.is_empty(),
+            "no policy: the strategy never funds, whatever the pool holds"
+        );
         Ok(())
     }
 }

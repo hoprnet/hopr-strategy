@@ -47,14 +47,18 @@ It offers two independent choices, because the Curvy relayer never handles depos
 Both defaults describe a production deployment; a cluster without Curvy's off-chain services runs `submission: operator`. A **direct shield
 moves the float from the Safe straight into the vault**: through its permission module, the Safe ERC-777-`send`s it to Curvy's shield
 router, whose hook calls `directShield` in the same transaction, all or nothing. The Safe only ever calls wxHOPR, so this needs no change to
-the Safe or its module — just the node's own chain key to sign the module call, and a Blokli that publishes the router
-(`curvy_shield_router`).
+the Safe or its module. The `send` is submitted by the node's own chain API, like any other Safe transaction the node makes, so the strategy
+holds no chain key for it; it needs a Blokli that publishes the router (`curvy_shield_router`).
 
 At runtime it needs a Blokli endpoint that exposes the Curvy deployment, the Curvy Groth16 proving artifacts (`CURVY_ZK_KEYS_DIR`: the five
 zkeys and five witness graphs published with each [`rs-sdk` release](https://github.com/0xCurvy/rs-sdk/releases), digest-checked on load),
 and a state file that survives restarts. Under `submission: relayer` it also needs a relayer URL, and **no EVM key of its own**; under
 `submission: operator` it needs the Curvy operator's key in the environment (`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by default). See the
 `pix::pools::curvy` module documentation.
+
+**A pool never funds itself.** The funding gets there through `DepositPool::fund`, called by the strategy when its stanza carries
+a `funding` policy (`top_up` from the Safe whenever `available_balance` drops below `min_available`) or by an operator through
+hoprd's API; without either, deposits fail once the pool is empty. The plain pool's funding is the Safe itself and refuses both.
 
 Enabling `strategy-pix` alone gives the engine without a pool, for a consumer supplying its own.
 

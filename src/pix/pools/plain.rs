@@ -44,7 +44,7 @@ use backon::Retryable;
 use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool},
+    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
@@ -1116,11 +1116,31 @@ where
     /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
     /// anonymity set while a withdrawal leaves it.
     ///
-    /// `src_id` identifies the allocation whose key is being spent, which is what the underlying
-    /// sweep acts on. `dst_id` names an allocation on the receiving side, a notion this pool does
-    /// not have — the destination is just another Ethereum account, and nothing here is filed per
-    /// allocation — so it is used only to check `additional_dst_data` against, and to attribute it
-    /// when that check fails.
+    /// The Safe is this pool's funding: there is nothing to move it into, so this is refused
+    /// rather than reported as done. Fund the Safe itself.
+    async fn fund(&self, _amount: HoprBalance) -> Result<(), Self::Error> {
+        Err(StrategyError::other(anyhow::anyhow!(
+            "the plain pool pays from the Safe and cannot be funded; fund the Safe instead"
+        )))
+    }
+
+    /// The Safe's wxHOPR, which is what every deposit here is paid from.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        self.node
+            .chain_api()
+            .balance(self.node.identity().safe_address)
+            .await
+            .map_err(StrategyError::other)
+    }
+
+    /// From the funding: a plain Safe transfer, the same as [`deposit_funds_to`](Self::deposit_funds_to),
+    /// which needs an `amount`. From a deposit: a withdrawal to the destination address.
+    ///
+    /// For a transfer from a deposit, `src_id` identifies the allocation whose key is being
+    /// spent, which is what the underlying sweep acts on. `dst_id` names an allocation on the
+    /// receiving side, a notion this pool does not have — the destination is just another
+    /// Ethereum account, and nothing here is filed per allocation — so it is used only to check
+    /// `additional_dst_data` against, and to attribute it when that check fails.
     ///
     /// `additional_dst_data` is checked exactly as in
     /// [`deposit_funds_to`](Self::deposit_funds_to), and for the same reason: every payload this
@@ -1130,16 +1150,26 @@ where
     /// that compares the ids on the wire form first.
     async fn pool_transfer(
         &self,
-        src_id: &PixAddressId,
-        key: &EthDepositKey,
+        src: PoolTransferSource<'_, EthDepositKey>,
         dst_id: &PixAddressId,
         dst: Address,
         additional_dst_data: Self::PoolDepositData,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        check_deposit_payload(dst_id, &additional_dst_data)?;
-
-        self.withdraw_deposit(src_id, key, dst, amount).await
+        match src {
+            PoolTransferSource::Deposit { id, key } => {
+                check_deposit_payload(dst_id, &additional_dst_data)?;
+                self.withdraw_deposit(id, key, dst, amount).await
+            }
+            PoolTransferSource::Funding => {
+                let amount = amount.ok_or_else(|| {
+                    StrategyError::other(anyhow::anyhow!(
+                        "a transfer from the Safe needs an amount; the Safe is not emptied into a deposit"
+                    ))
+                })?;
+                self.deposit_funds_to(dst_id, &dst, amount, additional_dst_data).await
+            }
+        }
     }
 }
 
