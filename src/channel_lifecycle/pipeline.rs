@@ -28,7 +28,7 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance, WxHOPR},
     },
 };
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
@@ -327,13 +327,15 @@ where
         }
 
         let leases = Arc::clone(leases);
-        hopr_utils::runtime::prelude::spawn(async move {
+        let action = async move {
             submit().await;
             // Released however it went.  A confirmation resolves only once the
             // state it wrote is readable, so the next pass sees that state
             // rather than repeating the operation.
             leases.release_owned(&key, holder);
-        });
+        };
+        // The transaction outlives the tick, but its lines keep the `tick` of the pass that started it.
+        hopr_utils::runtime::prelude::spawn(action.instrument(tracing::Span::current()));
 
         true
     }
@@ -352,11 +354,15 @@ where
             super::METRIC_CHANNEL_FUNDS.increment();
 
             match chain.fund_channel(&channel_id, topup).await {
-                Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%channel_id, %e, "channel-lifecycle: funding tx failed");
-                    }
-                }
+                Ok(confirmation) => match confirmation.await {
+                    Ok(_) => info!(
+                        %channel_id,
+                        destination = %channel.destination,
+                        %topup,
+                        "channel-lifecycle: channel funded"
+                    ),
+                    Err(e) => warn!(%channel_id, %e, "channel-lifecycle: funding tx failed"),
+                },
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit funding tx"),
             }
         })
@@ -377,11 +383,15 @@ where
             super::METRIC_CHANNEL_CLOSES.increment();
 
             match chain.close_channel(&channel_id).await {
-                Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%channel_id, %e, "channel-lifecycle: close tx failed");
-                    }
-                }
+                Ok(confirmation) => match confirmation.await {
+                    Ok(_) => info!(
+                        %channel_id,
+                        destination = %channel.destination,
+                        balance = %channel.balance,
+                        "channel-lifecycle: channel closure started"
+                    ),
+                    Err(e) => warn!(%channel_id, %e, "channel-lifecycle: close tx failed"),
+                },
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit close tx"),
             }
         })
@@ -403,11 +413,15 @@ where
             super::METRIC_CHANNEL_FINALIZES.increment();
 
             match chain.close_channel(&channel_id).await {
-                Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed");
-                    }
-                }
+                Ok(confirmation) => match confirmation.await {
+                    Ok(_) => info!(
+                        %channel_id,
+                        destination = %channel.destination,
+                        balance = %channel.balance,
+                        "channel-lifecycle: channel closed"
+                    ),
+                    Err(e) => warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed"),
+                },
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit finalize tx"),
             }
         })
@@ -480,11 +494,10 @@ where
             super::METRIC_CHANNEL_OPENS.increment();
 
             match chain.open_channel(&dest, amount).await {
-                Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%dest, %e, "channel-lifecycle: open tx failed");
-                    }
-                }
+                Ok(confirmation) => match confirmation.await {
+                    Ok(_) => info!(destination = %dest, %amount, "channel-lifecycle: channel opened"),
+                    Err(e) => warn!(%dest, %e, "channel-lifecycle: open tx failed"),
+                },
                 Err(e) => warn!(%dest, %e, "channel-lifecycle: failed to submit open tx"),
             }
         });
