@@ -12,7 +12,7 @@ use hopr_api::{
     types::{internal::prelude::ChannelStatusDiscriminants, primitive::prelude::Utc},
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 use validator::Validate;
 
 use crate::{errors, errors::StrategyError, strategy::Strategy as StrategyTrait};
@@ -103,6 +103,33 @@ impl ClosureFinalizerStrategy {
     }
 }
 
+/// What one closure finalizer tick did, logged as one line per tick (#7918).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TickSummary {
+    /// Outgoing channels whose closure grace period has ended, within `max_closure_overdue`.
+    due: usize,
+    /// Close transactions submitted.
+    submitted: usize,
+    /// Close transactions that could not be submitted; they are tried again on the next tick.
+    failed: usize,
+}
+
+impl TickSummary {
+    fn log(&self, max_closure_overdue: Duration) {
+        if self.due > 0 {
+            info!(
+                due = self.due,
+                submitted = self.submitted,
+                failed = self.failed,
+                max_closure_overdue = ?max_closure_overdue,
+                "closure finalizer tick"
+            );
+        } else {
+            debug!(due = 0, "closure finalizer tick");
+        }
+    }
+}
+
 /// Private generic runner — constructed by [`ClosureFinalizerStrategy::build`].
 struct ClosureFinalizerStrategyInner<N: HasChainApi> {
     node: Arc<N>,
@@ -116,7 +143,11 @@ where
     <N as HasChainApi>::ChainApi:
         ChainReadChannelOperations + ChainWriteChannelOperations + Clone + Send + Sync + 'static,
 {
-    async fn on_tick(&self) -> errors::Result<()> {
+    /// Submits the final close transaction for every outgoing channel whose grace period has ended.
+    ///
+    /// Logs one summary line for the tick and returns it.
+    #[tracing::instrument(name = "closure_finalizer::tick", level = "debug", skip_all)]
+    async fn on_tick(&self) -> errors::Result<TickSummary> {
         let now = Utc::now();
         let chain = self.node.chain_api();
         let mut outgoing_channels = chain
@@ -128,20 +159,26 @@ where
             )
             .map_err(|e| errors::StrategyError::Other(e.into()))?;
 
+        let mut summary = TickSummary::default();
         while let Some(channel) = outgoing_channels.next().await {
-            info!(%channel, "channel closure finalizer: finalizing closure");
+            summary.due += 1;
             match self.node.chain_api().close_channel(channel.get_id()).await {
                 Ok(_) => {
-                    debug!(%channel, "channel closure finalizer: submitted close transaction");
+                    summary.submitted += 1;
+                    info!(%channel, "channel closure finalizer: submitted close transaction");
                     #[cfg(all(feature = "telemetry", not(test)))]
                     METRIC_COUNT_CLOSURE_FINALIZATIONS.increment();
                 }
-                Err(e) => error!(%channel, error = %e, "channel closure finalizer: failed to finalize closure"),
+                Err(e) => {
+                    // Retried on the next tick until the channel is `max_closure_overdue` late.
+                    summary.failed += 1;
+                    warn!(%channel, error = %e, "channel closure finalizer: failed to finalize closure");
+                }
             }
         }
 
-        debug!("channel closure finalizer: initiated closure finalization done");
-        Ok(())
+        summary.log(self.cfg.max_closure_overdue);
+        Ok(summary)
     }
 }
 
@@ -278,7 +315,16 @@ mod tests {
             cfg,
             interval: Duration::from_secs(60),
         };
-        strat.on_tick().await?;
+        let summary = strat.on_tick().await?;
+        assert_eq!(
+            summary,
+            TickSummary {
+                due: 1,
+                submitted: 1,
+                failed: 0
+            },
+            "only the channel with an ended grace period, not yet overdue, is due"
+        );
 
         events
             .filter(|event| {
