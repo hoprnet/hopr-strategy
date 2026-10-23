@@ -474,10 +474,9 @@ impl PixStrategy {
     /// `<HoprPixSpec as PixSpec>::DepositAddress`; `hopr-lib/pix-bjj` is the default, so a consumer
     /// enabling only this feature already agrees.
     ///
-    /// `node_key` is the node's own chain keypair, and must be the node's: under the default
-    /// `shielding: direct` the pool spends the float by driving the node's Safe through its
-    /// permission module, whose `execTransactionFromModule` accepts no other signer. It is used
-    /// for nothing else, and no key is derived from or stored alongside it.
+    /// Unlike `build_non_anonymous`, no chain key is taken: under the default `shielding: direct`
+    /// the pool spends the float by having the node's Safe ERC-777-`send` it to the Curvy shield
+    /// router, and that transaction goes through the node's own chain API, which signs it.
     ///
     /// The pool needs one more thing the config cannot carry: a Blokli endpoint that exposes the
     /// Curvy deployment (`pool_cfg.blokli_url`). Under `submission: operator` it additionally
@@ -503,14 +502,13 @@ impl PixStrategy {
     ///     // `CurvyDepositPool` settles to `BjjPublicKey`, so this pairing is rejected here
     ///     // rather than failing on every event at runtime.
     ///     let _ = PixStrategy::new(PixStrategyConfig::default())
-    ///         .build_curvy::<_, Address>(node, hopr_api::ChainKeypair::random(), Default::default());
+    ///         .build_curvy::<_, Address>(node, Default::default());
     /// }
     /// ```
     #[cfg(feature = "strategy-pix-curvy")]
     pub fn build_curvy<N, A>(
         self,
         node: Arc<N>,
-        node_key: hopr_api::ChainKeypair,
         pool_cfg: crate::pix::pools::curvy::PoolConfig,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
@@ -526,7 +524,6 @@ impl PixStrategy {
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
         let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
             Arc::clone(&node),
-            node_key,
             pool_cfg,
         )?);
         let safe_address = node.identity().safe_address;
@@ -2817,7 +2814,6 @@ mod tests {
 
         let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
             node,
-            hopr_api::ChainKeypair::random(),
             crate::pix::pools::curvy::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
                 ..Default::default()
@@ -2825,36 +2821,6 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
-        Ok(())
-    }
-
-    /// Direct shielding signs `execTransactionFromModule` with the node key, which the module's
-    /// `nodeOnly` check accepts from the node alone — so a foreign key is refused at startup
-    /// rather than reverting every shield.
-    #[cfg(feature = "strategy-pix-curvy")]
-    #[test_log::test(tokio::test)]
-    async fn test_build_curvy_rejects_a_foreign_node_key_for_direct_shielding() -> anyhow::Result<()> {
-        use hopr_api::types::crypto::prelude::BjjPublicKey;
-
-        let (_cc, node, _pool) = entry_side(&[]).await?;
-        let state = tempfile::tempdir()?;
-        let cfg = || crate::pix::pools::curvy::PoolConfig {
-            relayer_url: Some("http://127.0.0.1:1/".parse().unwrap()),
-            state_path: Some(state.path().join("curvy.redb")),
-            ..Default::default()
-        };
-
-        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
-            Arc::clone(&node),
-            hopr_api::ChainKeypair::random(),
-            cfg(),
-        );
-        match result {
-            Err(StrategyError::InvalidConfiguration(message)) => assert!(message.contains("node key"), "{message}"),
-            other => panic!("expected a rejected node key, got {:?}", other.err()),
-        }
-
-        PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg())?;
         Ok(())
     }
 

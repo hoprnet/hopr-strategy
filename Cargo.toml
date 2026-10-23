@@ -223,3 +223,11 @@ zeroize              = "1.9.1"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
+
+# Until hoprnet/hopr-types#128, hoprnet/hopr-api#145, hoprnet/hopr-utilities#43 and hoprnet/hopr-impls#52
+# are released; replaced by version bumps before merge.
+[patch.crates-io]
+hopr-types = { git = "https://github.com/0xCurvy/hopr-types.git", branch = "lazar/shield-router" }
+hopr-api = { git = "https://github.com/0xCurvy/hopr-api.git", branch = "lazar/shield-router" }
+hopr-chain-connector = { git = "https://github.com/0xCurvy/hopr-impls.git", branch = "lazar/shield-router" }
+hopr-utilities = { git = "https://github.com/0xCurvy/hopr-utilities.git", branch = "lazar/shield-router" }
