@@ -1,8 +1,10 @@
 //! Default selector: the original `peer_score_for` / `should_close` scoring,
 //! plus the shared ticket-sink demotion (see
 //! [`partition_by_forwarding`](super::partition_by_forwarding)).  With
-//! `eligibility.demote_non_forwarding_peers` off it is byte-for-byte the
-//! pre-refactor pipeline.
+//! `eligibility.demote_non_forwarding_peers` off it reproduces the
+//! pre-refactor pipeline for candidates with ticket history; since
+//! hopr-strategy#84, a candidate with no ticket history scores on the edge
+//! signal alone rather than the pre-refactor pipeline's phantom-zero score.
 
 use std::time::Duration;
 
@@ -21,7 +23,9 @@ pub struct DefaultSelector;
 impl DefaultSelector {
     /// Composite quality score for a candidate peer.
     ///
-    /// Mirrors the original `ChannelLifecycleStrategyInner::peer_score_for`.
+    /// Mirrors the original `ChannelLifecycleStrategyInner::peer_score_for` for
+    /// candidates with ticket history; since hopr-strategy#84, a candidate with
+    /// no ticket history scores as the edge score alone.
     fn peer_score(candidate: &OpenCandidate, cfg: &super::super::ChannelLifecycleConfig) -> f64 {
         let edge_score = candidate.edge_info.quality_score();
         cfg.eligibility
@@ -30,7 +34,9 @@ impl DefaultSelector {
 
     /// Returns `true` when the channel should be closed.
     ///
-    /// Mirrors the original `ChannelLifecycleStrategyInner::should_close`.
+    /// Mirrors the original `ChannelLifecycleStrategyInner::should_close` for
+    /// candidates with ticket history; since hopr-strategy#84, a candidate with
+    /// no ticket history scores as the edge score alone.
     /// `quality_threshold` overrides `cfg.closure.close_below_quality_score`; pass
     /// `None` to use the config value.  `MultiObjectiveSelector` passes an adjusted
     /// value to enforce the hysteresis gap.
