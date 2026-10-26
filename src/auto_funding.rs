@@ -26,7 +26,7 @@ use hopr_api::{
     node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi},
     types::{
         internal::prelude::{ChannelDirection, ChannelEntry, ChannelId, ChannelStatus, ChannelStatusDiscriminants},
-        primitive::prelude::HoprBalance,
+        primitive::prelude::{HoprBalance, WxHOPR},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -223,7 +223,11 @@ where
         Ok(true)
     }
 
-    /// Returns the available safe balance, or zero if the safe is not registered.
+    /// Returns the available safe budget, or zero if the safe is not registered.
+    ///
+    /// The budget is the lesser of the safe's wxHOPR balance and its wxHOPR
+    /// allowance to the HoprChannels contract — a fund tx that clears a
+    /// balance-only check but exceeds the allowance still reverts on-chain.
     async fn safe_balance_budget(&self) -> crate::errors::Result<HoprBalance> {
         let me = *self.node.chain_api().me();
         let chain = self.node.chain_api().clone();
@@ -238,10 +242,27 @@ where
             return Ok(HoprBalance::zero());
         };
 
-        chain
+        let balance = chain
             .balance(safe.address)
             .await
-            .map_err(|e| StrategyError::Other(e.into()))
+            .map_err(|e| StrategyError::Other(e.into()))?;
+        let allowance = chain
+            .safe_allowance::<WxHOPR, _>(safe.address)
+            .await
+            .map_err(|e| StrategyError::Other(e.into()))?;
+
+        // Only warn once the allowance actually falls short of what a funding pass
+        // wants to spend; an allowance that merely trails ticket-redemption income
+        // (balance) but still covers `funding_amount` is not yet a problem.
+        if allowance < balance && allowance < self.cfg.funding_amount {
+            warn!(
+                %allowance, %balance, funding_amount = %self.cfg.funding_amount, safe = %safe.address,
+                "auto-funding: safe wxHOPR allowance to HoprChannels is too small to fund a channel; \
+                 increase the Safe's allowance to resume funding"
+            );
+        }
+
+        Ok(balance.min(allowance))
     }
 
     /// Periodic scan: fund any outgoing open channels below the threshold.

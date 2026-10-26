@@ -118,12 +118,23 @@ where
     // Helpers
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Returns the available safe balance, `Some(zero)` if the safe is not
+    /// Returns the available safe budget, `Some(zero)` if the safe is not
     /// registered, or `None` if the chain could not answer.
     ///
     /// `None` means *unknown*, not zero: only the passes that spend from the safe
     /// (fund, open) are skipped.  Reporting zero would make an unreachable chain
     /// look like an empty safe.
+    ///
+    /// The budget is the lesser of the safe's wxHOPR balance and its wxHOPR
+    /// allowance to the HoprChannels contract. A fund/open tx that clears a
+    /// balance-only check but exceeds the allowance still reverts on-chain,
+    /// so gating on both avoids retrying the same doomed transaction every tick.
+    ///
+    /// A tighter allowance than balance is logged at `debug!`, not `warn!`: it is
+    /// only a problem once it actually falls short of what a pass wants to spend,
+    /// and the fund/open passes already warn at that point ("safe cannot afford
+    /// ..."). Warning here unconditionally would fire every tick for any node
+    /// whose allowance simply trails its ticket-redemption income.
     pub(super) async fn safe_balance_budget(&self, deadline: Instant) -> Option<HoprBalance> {
         let me = *self.node.chain_api().me();
         let chain = self.node.chain_api().clone();
@@ -137,7 +148,24 @@ where
             return Some(HoprBalance::zero());
         };
 
-        self.read("safe_balance", deadline, chain.balance(safe.address)).await
+        let balance = self.read("safe_balance", deadline, chain.balance(safe.address)).await?;
+        let allowance = self
+            .read(
+                "safe_allowance",
+                deadline,
+                chain.safe_allowance::<WxHOPR, _>(safe.address),
+            )
+            .await?;
+
+        if allowance < balance {
+            debug!(
+                %allowance, %balance, safe = %safe.address,
+                "channel-lifecycle: safe wxHOPR allowance to HoprChannels is below its balance; \
+                 funding/opening is capped at the allowance until it is raised"
+            );
+        }
+
+        Some(balance.min(allowance))
     }
 
     /// Returns the chain's estimated transaction confirmation time, falling
