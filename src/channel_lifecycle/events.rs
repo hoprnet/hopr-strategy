@@ -71,11 +71,15 @@ where
             // task as the event loop, so an unbounded read here would stop the
             // strategy from draining events at all.
             match self.safe_balance_budget(self.read_deadline()).await {
-                Some(budget) if !funding.topup_balance.is_zero() && budget >= funding.topup_balance => {
+                Some(budget) if !funding.topup_balance.is_zero() && budget.spendable >= funding.topup_balance => {
                     self.try_fund_channel(&ch, funding.topup_balance);
                 }
                 Some(budget) => {
-                    tracing::debug!(%ch, %budget, "channel-lifecycle: event-driven funding skipped: safe too low");
+                    tracing::debug!(
+                        %ch,
+                        spendable = %budget.spendable,
+                        "channel-lifecycle: event-driven funding skipped: safe too low"
+                    );
                 }
                 None => {
                     tracing::debug!(%ch, "channel-lifecycle: event-driven funding skipped: safe balance unknown");
