@@ -117,6 +117,23 @@ pub struct EligibilityConfig {
     pub minimum_peer_outgoing_channels: usize,
 }
 
+impl EligibilityConfig {
+    /// Composite peer-quality score combining the edge score with the
+    /// normalised ticket-activity signal (hopr-strategy#84).  When
+    /// `ticket_score` is `None` — no redemption observed yet for this peer —
+    /// the score is the edge score alone, so a peer isn't held below
+    /// `peer_quality_weight` purely for lacking ticket history.  Once a
+    /// redemption is observed the full two-signal composite applies and can
+    /// score *below* the edge-only value — a borderline peer can fall under
+    /// `close_below_quality_score` right after its first redemption.
+    pub(crate) fn composite_quality_score(&self, edge_score: f64, ticket_score: Option<f64>) -> f64 {
+        match ticket_score {
+            Some(ticket_score) => self.peer_quality_weight * edge_score + self.ticket_activity_weight * ticket_score,
+            None => edge_score,
+        }
+    }
+}
+
 /// How the strategy converts a data-capacity [`ByteSize`] to a wxHOPR channel
 /// stake at runtime.
 ///

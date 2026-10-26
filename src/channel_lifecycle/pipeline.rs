@@ -546,8 +546,10 @@ where
             .map(|c| ConsolidationCandidate {
                 id: *c.channel.get_id(),
                 balance: c.channel.balance,
-                rank: self.cfg.eligibility.peer_quality_weight * c.edge_info.quality_score()
-                    + self.cfg.eligibility.ticket_activity_weight * c.ticket_score,
+                rank: self
+                    .cfg
+                    .eligibility
+                    .composite_quality_score(c.edge_info.quality_score(), c.ticket_score),
             })
             .collect();
 
@@ -985,9 +987,7 @@ where
                 let ticket_score = self
                     .peer_ticket_activity
                     .get(&ch.destination)
-                    .map(|v| *v as f64)
-                    .unwrap_or(0.0)
-                    / (max_activity as f64);
+                    .map(|v| *v as f64 / max_activity as f64);
                 CloseCandidate {
                     channel: **ch,
                     offchain_key,
@@ -1052,14 +1052,18 @@ where
                 // the source to `peer_addr_map` if that use-case is needed.
 
                 let edge_info = self.peer_edge_info(&offchain_key);
-                let ticket_delta = self.peer_ticket_activity.get(&chain_addr).map(|v| *v).unwrap_or(0);
-                let ticket_score = (ticket_delta as f64) / (max_activity as f64);
+                let ticket_score = self
+                    .peer_ticket_activity
+                    .get(&chain_addr)
+                    .map(|v| *v as f64 / max_activity as f64);
 
                 // Composite-score eligibility gate — same formula as today's
                 // `DefaultSelector`, kept here so the threshold acts as a hard
                 // filter that all selectors inherit.
-                let composite = self.cfg.eligibility.peer_quality_weight * edge_info.quality_score()
-                    + self.cfg.eligibility.ticket_activity_weight * ticket_score;
+                let composite = self
+                    .cfg
+                    .eligibility
+                    .composite_quality_score(edge_info.quality_score(), ticket_score);
                 if composite < self.cfg.eligibility.min_peer_quality_score {
                     return None;
                 }
@@ -1685,9 +1689,12 @@ where
                     LatencyBucket::VerySlow => 0.0,
                 };
                 let w = &mo_cfg.weights;
+                // Absent ticket data counts as zero here: this is telemetry, not
+                // an absolute-threshold decision, so it mirrors the multi-objective
+                // trust-score ranking rather than the eligibility-gate renormalization above.
                 let trust = w.trust_probe * c.edge_info.probe_score()
                     + w.trust_ack * c.edge_info.ack_score()
-                    + w.trust_ticket * c.ticket_score;
+                    + w.trust_ticket * c.ticket_score.unwrap_or(0.0);
                 let stake = ctx.stake_view.score(&c.addr);
                 let cell = BucketCell {
                     latency: LatencyBucket::from_latency(c.edge_info.average_latency),
@@ -2703,6 +2710,83 @@ mod tests {
         Ok(())
     }
 
+    /// hopr-strategy#84: a peer with no ticket-redemption history and an edge
+    /// score of 0.6 must still clear the open-eligibility gate. Pre-fix, the
+    /// composite was `0.6 * 0.6 = 0.36` (below the default 0.5 threshold), the
+    /// candidate was dropped before the open pass ever saw it, and the tick found
+    /// nothing to do — `Running`. Post-fix the composite is the edge score alone
+    /// (`0.6`), the candidate clears the gate, and the tick fails to afford it —
+    /// `Degraded` — exercising the exact code path
+    /// `state_is_degraded_when_the_open_pass_cannot_afford_a_new_channel` covers
+    /// at edge score 1.0, but at the boundary this fix actually moves.
+    #[tokio::test]
+    async fn state_is_degraded_for_no_ticket_history_peer_at_edge_only_threshold() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                true,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1),
+            )
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let alice_pk = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*ALICE).as_ref()]);
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(pseudo.as_ref())
+                .expect("alice offchain key")
+                .public()
+        };
+        let my_key = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[1u8; 32])
+                .expect("my key")
+                .public()
+        };
+
+        let network = StubNetworkView::default();
+        network.connect(PeerId::from(&alice_pk));
+
+        let graph = Arc::new(StubGraph::default());
+        // No `peer_ticket_activity` entry is seeded for Alice: she has no ticket
+        // history. 0.6 clears the default 0.5 gate only as an edge-only score.
+        graph.insert_edge(
+            my_key,
+            alice_pk,
+            StubEdge {
+                last_update: Duration::from_secs(1),
+                score: 0.6,
+            },
+        );
+
+        let cfg = ChannelLifecycleConfig {
+            population: PopulationConfig {
+                min_open_channels: 0,
+                target_open_channels: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain_graph_and_network(cfg, Arc::clone(&connector), graph, network);
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "a peer with no ticket history and edge score 0.6 must clear the open-eligibility gate"
+        );
+
+        Ok(())
+    }
+
     /// A freshly built strategy reports `Running` before any tick runs — the
     /// optimistic default the trait itself uses.
     #[tokio::test]
@@ -3474,7 +3558,7 @@ mod tests {
             addr: a,
             offchain_key: ok,
             edge_info: selector::PeerEdgeInfo::default(),
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
             subnet: selector::SubnetBucket::Unknown,
         };
         let candidates = vec![cand(*CHRIS), cand(*ALICE)];
@@ -4010,7 +4094,7 @@ mod tests {
             channel: ch,
             offchain_key: Some(alice_pk),
             edge_info: PeerEdgeInfo::default(),
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
 
         let ctx = SelectorContext {
@@ -4063,7 +4147,7 @@ mod tests {
             channel: ch,
             offchain_key: Some(alice_pk),
             edge_info: PeerEdgeInfo::default(),
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
         let ctx_no_data = SelectorContext {
             cfg: &cfg,
@@ -4089,7 +4173,7 @@ mod tests {
                 last_update: Duration::from_secs(1),
                 ..Default::default()
             },
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
         let ctx_with_data = SelectorContext {
             cfg: &cfg,
