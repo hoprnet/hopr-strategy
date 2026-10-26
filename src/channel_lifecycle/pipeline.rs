@@ -1726,7 +1726,7 @@ mod tests {
         PeerId,
         chain::{
             AccountSelector, ChainEvent, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations,
-            ChainWriteAccountOperations, ChannelSelector, HoprChainApi,
+            ChainReadSafeOperations, ChainWriteAccountOperations, ChannelSelector, HoprChainApi, SafeSelector,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2284,6 +2284,92 @@ mod tests {
             inner.state(),
             StrategyState::Degraded,
             "safe is short of the one top-up it wants to make"
+        );
+
+        Ok(())
+    }
+
+    /// Regression for hoprnet#8475: a safe can hold plenty of wxHOPR balance yet have
+    /// too small an allowance granted to the HoprChannels contract. A balance-only
+    /// affordability check would pass and dispatch a fund tx that then reverts
+    /// on-chain every tick, spamming "funding tx failed" warnings. The budget must be
+    /// capped at the allowance so the fund pass skips and reports `Degraded`, exactly
+    /// as it already does for an insufficient balance.
+    #[tokio::test]
+    async fn fund_pass_should_skip_and_degrade_when_the_safe_allowance_is_too_small() -> anyhow::Result<()> {
+        let initial_balance = HoprBalance::from(2_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(2_u32) // below threshold of 3
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        // Mirrors `BlokliTestStateBuilder::with_generated_accounts`'s own derivation
+        // of a generated safe address, so the allowance override below lands on
+        // BOB's actual safe rather than an unrelated address.
+        let bob_safe_address: Address = {
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*BOB).as_ref()]).hash();
+            Address::new(&pseudo.as_ref()[0..Address::SIZE])
+        };
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                // Balance alone is ample for the 3 wxHOPR topup...
+                HoprBalance::new_base(1000),
+            )
+            // ...but the allowance to HoprChannels is one wxHOPR short of it.
+            .with_safe_allowances([(bob_safe_address, HoprBalance::new_base(1))])
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        // Guards against the derivation above drifting from a future hopr-utilities
+        // release: if it ever stops matching, the allowance override silently lands
+        // on the wrong address and this test would otherwise pass for the wrong reason.
+        let registered_safe = connector
+            .safe_info(SafeSelector::NodeAddress(*BOB))
+            .await?
+            .context("BOB's safe must be registered")?;
+        assert_eq!(
+            registered_safe.address, bob_safe_address,
+            "derived safe address must match the one `with_generated_accounts` actually assigned to BOB"
+        );
+
+        let cfg = ChannelLifecycleConfig {
+            funding: FundingConfig {
+                lower_capacity_threshold: ByteSize::b(1),
+                topup_capacity: ByteSize::b(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        let channels: Vec<ChannelEntry> = connector
+            .stream_channels(ChannelSelector::default().with_source(*BOB))
+            .context("failed to stream channels for BOB")?
+            .collect()
+            .await;
+        assert!(
+            channels.iter().all(|c| c.balance == initial_balance),
+            "the underfunded channel must be left untouched when the allowance is too small; got {channels:?}"
+        );
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "safe allowance is short of the one top-up it wants to make"
         );
 
         Ok(())
