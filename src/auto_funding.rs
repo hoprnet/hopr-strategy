@@ -26,7 +26,7 @@ use hopr_api::{
     node::{ActionableEventDiscriminant, ActionableEventSource, HasChainApi},
     types::{
         internal::prelude::{ChannelDirection, ChannelEntry, ChannelId, ChannelStatus, ChannelStatusDiscriminants},
-        primitive::prelude::HoprBalance,
+        primitive::prelude::{HoprBalance, WxHOPR},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -223,7 +223,11 @@ where
         Ok(true)
     }
 
-    /// Returns the available safe balance, or zero if the safe is not registered.
+    /// Returns the available safe budget, or zero if the safe is not registered.
+    ///
+    /// The budget is the lesser of the safe's wxHOPR balance and its wxHOPR
+    /// allowance to the HoprChannels contract — a fund tx that clears a
+    /// balance-only check but exceeds the allowance still reverts on-chain.
     async fn safe_balance_budget(&self) -> crate::errors::Result<HoprBalance> {
         let me = *self.node.chain_api().me();
         let chain = self.node.chain_api().clone();
@@ -238,10 +242,27 @@ where
             return Ok(HoprBalance::zero());
         };
 
-        chain
+        let balance = chain
             .balance(safe.address)
             .await
-            .map_err(|e| StrategyError::Other(e.into()))
+            .map_err(|e| StrategyError::Other(e.into()))?;
+        let allowance = chain
+            .safe_allowance::<WxHOPR, _>(safe.address)
+            .await
+            .map_err(|e| StrategyError::Other(e.into()))?;
+
+        // Only warn once the allowance actually falls short of what a funding pass
+        // wants to spend; an allowance that merely trails ticket-redemption income
+        // (balance) but still covers `funding_amount` is not yet a problem.
+        if allowance < balance && allowance < self.cfg.funding_amount {
+            warn!(
+                %allowance, %balance, funding_amount = %self.cfg.funding_amount, safe = %safe.address,
+                "auto-funding: safe wxHOPR allowance to HoprChannels is too small to fund a channel; \
+                 increase the Safe's allowance to resume funding"
+            );
+        }
+
+        Ok(balance.min(allowance))
     }
 
     /// Periodic scan: fund any outgoing open channels below the threshold.
@@ -723,6 +744,113 @@ mod tests {
         assert!(
             no_funding_event.is_err(),
             "on_tick should skip funding when safe balance is below funding_amount"
+        );
+
+        Ok(())
+    }
+
+    /// Regression for hoprnet#8475: a safe can hold plenty of wxHOPR balance yet have
+    /// too small an allowance granted to the HoprChannels contract. A balance-only
+    /// affordability check would pass and dispatch a fund tx that then reverts
+    /// on-chain, spamming "failed to enqueue"/"funding transaction failed" warnings
+    /// every tick. The budget must be capped at the allowance so `on_tick` skips,
+    /// exactly as it already does for an insufficient balance.
+    #[test_log::test(tokio::test)]
+    async fn test_on_tick_skips_when_safe_allowance_below_funding_amount() -> anyhow::Result<()> {
+        let stake_limit = HoprBalance::from(7_u32);
+        let fund_amount = HoprBalance::from(5_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *CHRIS)
+            .amount(3)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        // Mirrors `BlokliTestStateBuilder::with_generated_accounts`'s own derivation
+        // of a generated safe address, so the allowance override below lands on
+        // BOB's actual safe rather than an unrelated address.
+        let bob_safe_address: Address = {
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*BOB).as_ref()]).hash();
+            Address::new(&pseudo.as_ref()[0..Address::SIZE])
+        };
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                false,
+                XDaiBalance::new_base(1),
+                // Balance alone is ample for the 5 wxHOPR funding_amount...
+                HoprBalance::new_base(1000),
+            )
+            // ...but the allowance to HoprChannels is below it.
+            .with_safe_allowances([(bob_safe_address, HoprBalance::from(1_u32))])
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let chain_connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        register_test_safe(&chain_connector, *BOB).await?;
+
+        // Guards against the derivation above drifting from a future hopr-utilities
+        // release: if it ever stops matching, the allowance override silently lands
+        // on the wrong address and this test would otherwise pass for the wrong reason.
+        let registered_safe = chain_connector
+            .safe_info(SafeSelector::NodeAddress(*BOB))
+            .await?
+            .context("BOB's safe must be registered")?;
+        assert_eq!(
+            registered_safe.address, bob_safe_address,
+            "derived safe address must match the one `with_generated_accounts` actually assigned to BOB"
+        );
+
+        let chain_connector = Arc::new(chain_connector);
+        let events = chain_connector.subscribe()?;
+
+        let cfg = AutoFundingStrategyConfig {
+            min_stake_threshold: stake_limit,
+            funding_amount: fund_amount,
+        };
+
+        let afs = AutoFundingStrategyInner {
+            cfg,
+            interval: std::time::Duration::from_secs(60),
+            node: Arc::new(ChainNode(Arc::clone(&chain_connector))),
+            in_flight: Arc::new(DashSet::new()),
+        };
+
+        // Pins down the actual fix directly: without it, this budget would be the
+        // 1000 wxHOPR balance, not the 1 wxHOPR allowance — and `on_tick` below
+        // would still show "no funding event" either way, because the dispatched
+        // tx reverts on-chain rather than succeeding, which is the exact spam this
+        // regression is about.
+        assert_eq!(
+            afs.safe_balance_budget().await?,
+            HoprBalance::from(1_u32),
+            "budget must be capped at the allowance, not the much larger balance"
+        );
+
+        afs.on_tick().await?;
+
+        assert!(
+            afs.in_flight.is_empty(),
+            "on_tick must not even attempt a doomed funding tx when the allowance is too small"
+        );
+
+        let no_funding_event = events
+            .filter(|event| {
+                futures::future::ready(
+                    matches!(event, ChainEvent::ChannelBalanceIncreased(c, amount) if c.get_id() == c1.get_id() && amount == &fund_amount),
+                )
+            })
+            .next()
+            .timeout(futures_time::time::Duration::from_secs(1))
+            .await;
+
+        assert!(
+            no_funding_event.is_err(),
+            "on_tick should skip funding when safe allowance is below funding_amount"
         );
 
         Ok(())
