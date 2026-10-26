@@ -14,6 +14,7 @@ ignore = [
   "RUSTSEC-2026-0249", # `smartstring` unmaintained; opentelemetry-prometheus-text-exporter 0.3.0 -> hopr-types. Requires that crate > 0.3.0.
   "RUSTSEC-2026-0253", # `lru` <0.18.2 use-after-free if a key's `Drop` panics in `pop()`; pinned at 0.16.4 by alloy-provider 2.1.1. 0.18.2 is semver-incompatible, so this needs an alloy bump.
   "RUSTSEC-2026-0258", # `h2` <0.4.16 unbounded empty DATA frames; reqwest 0.13.4 -> cynic -> blokli-client, and reqwest -> alloy-transport-http. Needs a cynic bump in blokli-client.
+  "RUSTSEC-2026-0387", # `crypto-bigint` 0.5.5 timing variability; elliptic-curve 0.13.8/ecdsa 0.16.9 -> k256 0.13.4 -> alloy-signer-local/alloy-signer -> alloy, which pins this older k256. The same advisory's other instance (crypto-bigint 0.7.5, via hopr-types' own k256 0.14.0) is fixed directly in this change by bumping crypto-bigint to 0.7.10. Needs an alloy bump for this one.
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
