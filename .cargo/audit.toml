@@ -1,0 +1,37 @@
+[advisories]
+ignore = [
+  "RUSTSEC-2026-0387", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0385", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0338", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0339", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0341", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0340", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0342", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0348", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0349", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0347", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0346", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0382", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0383", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0391", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0403", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0398", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0410", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2024-0388", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2024-0436", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0173", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0249", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0253", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0386", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0395", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0401", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0404", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0400", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0397", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0406", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0402", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0399", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0396", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2026-0405", # legacy compat/v4 dependency graph; coordinated upgrade required
+]
+informational_warnings = ["unmaintained"]
