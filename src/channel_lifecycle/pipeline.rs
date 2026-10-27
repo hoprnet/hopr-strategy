@@ -64,6 +64,22 @@ enum OpenAttempt {
     Underfunded,
 }
 
+/// Result of [`ChannelLifecycleStrategyInner::safe_balance_budget`]: the safe's two
+/// distinct numbers, kept separate so each feeds only the decision it governs.
+///
+/// `balance` answers "does the safe actually have the stake" — the scarcity question
+/// behind `stranded` and the consolidation pass's close-count math. `spendable` (the
+/// lesser of `balance` and the wxHOPR allowance to HoprChannels) answers "how much of
+/// that can a tx move right now" — the only number safe to pass to `try_fund_channel`
+/// or `try_open_channel`. A Safe with ample balance but a too-small allowance must
+/// never read as stranded: that would close channels to reclaim stake that was never
+/// actually scarce, over a problem an operator fixes by raising the allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SafeBudget {
+    pub(super) balance: HoprBalance,
+    pub(super) spendable: HoprBalance,
+}
+
 /// Publishes one tick's accumulated [`StrategyState`] exactly once, when this guard
 /// drops — whichever of `pipeline_inner`'s several exit points fires. A `self.set_state`
 /// call site duplicated (or, as happened before, omitted) at each early return is a
@@ -118,13 +134,26 @@ where
     // Helpers
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Returns the available safe balance, `Some(zero)` if the safe is not
+    /// Returns the safe's [`SafeBudget`], `Some(zero, zero)` if the safe is not
     /// registered, or `None` if the chain could not answer.
     ///
     /// `None` means *unknown*, not zero: only the passes that spend from the safe
     /// (fund, open) are skipped.  Reporting zero would make an unreachable chain
     /// look like an empty safe.
-    pub(super) async fn safe_balance_budget(&self, deadline: Instant) -> Option<HoprBalance> {
+    ///
+    /// `spendable` is the lesser of the safe's wxHOPR balance and its wxHOPR
+    /// allowance to the HoprChannels contract. A fund/open tx that clears a
+    /// balance-only check but exceeds the allowance still reverts on-chain,
+    /// so gating spend on both avoids retrying the same doomed transaction every
+    /// tick. `balance` is reported unmodified for callers (`stranded`, consolidation)
+    /// that reason about actual scarcity rather than what a single tx can move.
+    ///
+    /// A tighter allowance than balance is logged at `debug!`, not `warn!`: it is
+    /// only a problem once it actually falls short of what a pass wants to spend,
+    /// and the fund/open passes already warn at that point ("safe cannot afford
+    /// ..."). Warning here unconditionally would fire every tick for any node
+    /// whose allowance simply trails its ticket-redemption income.
+    pub(super) async fn safe_balance_budget(&self, deadline: Instant) -> Option<SafeBudget> {
         let me = *self.node.chain_api().me();
         let chain = self.node.chain_api().clone();
 
@@ -134,10 +163,33 @@ where
 
         let Some(safe) = safe else {
             debug!(%me, "channel-lifecycle: safe not registered");
-            return Some(HoprBalance::zero());
+            return Some(SafeBudget {
+                balance: HoprBalance::zero(),
+                spendable: HoprBalance::zero(),
+            });
         };
 
-        self.read("safe_balance", deadline, chain.balance(safe.address)).await
+        let balance = self.read("safe_balance", deadline, chain.balance(safe.address)).await?;
+        let allowance = self
+            .read(
+                "safe_allowance",
+                deadline,
+                chain.safe_allowance::<WxHOPR, _>(safe.address),
+            )
+            .await?;
+
+        if allowance < balance {
+            debug!(
+                %allowance, %balance, safe = %safe.address,
+                "channel-lifecycle: safe wxHOPR allowance to HoprChannels is below its balance; \
+                 funding/opening is capped at the allowance until it is raised"
+            );
+        }
+
+        Some(SafeBudget {
+            balance,
+            spendable: balance.min(allowance),
+        })
     }
 
     /// Returns the chain's estimated transaction confirmation time, falling
@@ -535,6 +587,7 @@ where
         face_value: HoprBalance,
         reclaiming: HoprBalance,
         startup_phase: StartupPhase,
+        safe_balance: HoprBalance,
         safe_remaining: &mut HoprBalance,
         state: &mut StatePublisher<'_, N>,
     ) {
@@ -559,8 +612,10 @@ where
             .map(|c| ConsolidationCandidate {
                 id: *c.channel.get_id(),
                 balance: c.channel.balance,
-                rank: self.cfg.eligibility.peer_quality_weight * c.edge_info.quality_score()
-                    + self.cfg.eligibility.ticket_activity_weight * c.ticket_score,
+                rank: self
+                    .cfg
+                    .eligibility
+                    .composite_quality_score(c.edge_info.quality_score(), c.ticket_score),
             })
             .collect();
 
@@ -575,8 +630,18 @@ where
         // rather than close a connected (but under-funded) channel out from under it.
         // `reclaiming` (stake from prior ticks' closures, not yet back in the Safe)
         // is counted in the pool so the pass does not over-close while they finalize.
+        //
+        // Sized against `safe_balance` (the Safe's actual wxHOPR, read at the top of
+        // this tick), not `*safe_remaining` (this tick's allowance-capped *spend*
+        // budget, already run down by whatever the fund pass dispatched above). A
+        // too-small allowance must never make this pass close channels to reclaim
+        // stake the Safe was never actually short of — that is an operator fix (raise
+        // the allowance), not a reason to retire relays. Using the tick-start balance
+        // as-is, without subtracting this tick's already-dispatched spends, only ever
+        // biases `achievable` up and `close_count` down: this pass may defer a close
+        // to a later, more accurately-sized tick, but it never over-closes.
         let closes_ranked: Vec<ChannelId> = if startup_phase == StartupPhase::Expired {
-            consolidation_closes(&underfunded, *safe_remaining, reclaiming, face_value)
+            consolidation_closes(&underfunded, safe_balance, reclaiming, face_value)
         } else {
             Vec::new()
         };
@@ -667,11 +732,16 @@ where
         // One budget for every read this tick makes, not one each: see `read`.
         let deadline = self.read_deadline();
 
-        // `safe_balance` is `None` when the chain could not answer: the fund and
+        // `safe_budget` is `None` when the chain could not answer: the fund and
         // open passes are skipped for this tick, close and finalize still run.
-        let (est_tx_time_val, safe_balance) =
+        let (est_tx_time_val, safe_budget) =
             futures::join!(self.est_tx_time(deadline), self.safe_balance_budget(deadline));
         let est_tx_secs = est_tx_time_val.as_secs_f64();
+        // `safe_balance` (actual scarcity, used by `stranded` and consolidation) and
+        // `safe_spendable` (allowance-capped, used to seed the per-tick spend budget
+        // below) are kept apart on purpose — see `SafeBudget`.
+        let safe_balance = safe_budget.map(|b| b.balance);
+        let safe_spendable = safe_budget.map(|b| b.spendable);
 
         // The channel list is the one input no pass can do without.
         let Some(all_channels) = self
@@ -816,8 +886,10 @@ where
 
         // The fund and open passes share this budget so opens cannot promise
         // stake the funding txs already staked in this same tick.  Zero when the
-        // safe balance is unknown, which keeps both passes from spending.
-        let mut safe_remaining = safe_balance.unwrap_or_else(HoprBalance::zero);
+        // safe balance is unknown, which keeps both passes from spending.  Seeded
+        // from `safe_spendable`, not `safe_balance`: this is what a dispatched tx
+        // can actually move, allowance included.
+        let mut safe_remaining = safe_spendable.unwrap_or_else(HoprBalance::zero);
 
         // Under-funded channels the fund pass declines to top up in the stranded
         // regime, handed to the consolidation pass (hopr-strategy#85). Only
@@ -998,9 +1070,7 @@ where
                 let ticket_score = self
                     .peer_ticket_activity
                     .get(&ch.destination)
-                    .map(|v| *v as f64)
-                    .unwrap_or(0.0)
-                    / (max_activity as f64);
+                    .map(|v| *v as f64 / max_activity as f64);
                 CloseCandidate {
                     channel: **ch,
                     offchain_key,
@@ -1065,14 +1135,18 @@ where
                 // the source to `peer_addr_map` if that use-case is needed.
 
                 let edge_info = self.peer_edge_info(&offchain_key);
-                let ticket_delta = self.peer_ticket_activity.get(&chain_addr).map(|v| *v).unwrap_or(0);
-                let ticket_score = (ticket_delta as f64) / (max_activity as f64);
+                let ticket_score = self
+                    .peer_ticket_activity
+                    .get(&chain_addr)
+                    .map(|v| *v as f64 / max_activity as f64);
 
                 // Composite-score eligibility gate — same formula as today's
                 // `DefaultSelector`, kept here so the threshold acts as a hard
                 // filter that all selectors inherit.
-                let composite = self.cfg.eligibility.peer_quality_weight * edge_info.quality_score()
-                    + self.cfg.eligibility.ticket_activity_weight * ticket_score;
+                let composite = self
+                    .cfg
+                    .eligibility
+                    .composite_quality_score(edge_info.quality_score(), ticket_score);
                 if composite < self.cfg.eligibility.min_peer_quality_score {
                     return None;
                 }
@@ -1297,7 +1371,7 @@ where
         // economics for `face_value` and a known safe balance; otherwise there is
         // nothing to size against and the channels wait for a tick that can read the
         // chain.
-        if let (Some(funding), Some(_)) = (funding, safe_balance) {
+        if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
             // Stake from closures already in flight (PendingToClose, or an open
             // channel whose close was initiated), not yet back in the Safe. Counted
             // in the pool so the pass does not over-close while they finalize.
@@ -1314,6 +1388,7 @@ where
                 funding.face_value,
                 reclaiming,
                 startup_phase,
+                safe_balance,
                 &mut safe_remaining,
                 &mut state,
             );
@@ -1698,9 +1773,12 @@ where
                     LatencyBucket::VerySlow => 0.0,
                 };
                 let w = &mo_cfg.weights;
+                // Absent ticket data counts as zero here: this is telemetry, not
+                // an absolute-threshold decision, so it mirrors the multi-objective
+                // trust-score ranking rather than the eligibility-gate renormalization above.
                 let trust = w.trust_probe * c.edge_info.probe_score()
                     + w.trust_ack * c.edge_info.ack_score()
-                    + w.trust_ticket * c.ticket_score;
+                    + w.trust_ticket * c.ticket_score.unwrap_or(0.0);
                 let stake = ctx.stake_view.score(&c.addr);
                 let cell = BucketCell {
                     latency: LatencyBucket::from_latency(c.edge_info.average_latency),
@@ -1739,7 +1817,7 @@ mod tests {
         PeerId,
         chain::{
             AccountSelector, ChainEvent, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations,
-            ChainWriteAccountOperations, ChannelSelector, HoprChainApi,
+            ChainReadSafeOperations, ChainWriteAccountOperations, ChannelSelector, HoprChainApi, SafeSelector,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2302,6 +2380,92 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for hoprnet#8475: a safe can hold plenty of wxHOPR balance yet have
+    /// too small an allowance granted to the HoprChannels contract. A balance-only
+    /// affordability check would pass and dispatch a fund tx that then reverts
+    /// on-chain every tick, spamming "funding tx failed" warnings. The budget must be
+    /// capped at the allowance so the fund pass skips and reports `Degraded`, exactly
+    /// as it already does for an insufficient balance.
+    #[tokio::test]
+    async fn fund_pass_should_skip_and_degrade_when_the_safe_allowance_is_too_small() -> anyhow::Result<()> {
+        let initial_balance = HoprBalance::from(2_u32);
+
+        let c1 = ChannelEntry::builder()
+            .between(*BOB, *ALICE)
+            .amount(2_u32) // below threshold of 3
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?;
+
+        // Mirrors `BlokliTestStateBuilder::with_generated_accounts`'s own derivation
+        // of a generated safe address, so the allowance override below lands on
+        // BOB's actual safe rather than an unrelated address.
+        let bob_safe_address: Address = {
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*BOB).as_ref()]).hash();
+            Address::new(&pseudo.as_ref()[0..Address::SIZE])
+        };
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                // Balance alone is ample for the 3 wxHOPR topup...
+                HoprBalance::new_base(1000),
+            )
+            // ...but the allowance to HoprChannels is one wxHOPR short of it.
+            .with_safe_allowances([(bob_safe_address, HoprBalance::new_base(1))])
+            .with_channels([c1])
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        // Guards against the derivation above drifting from a future hopr-utilities
+        // release: if it ever stops matching, the allowance override silently lands
+        // on the wrong address and this test would otherwise pass for the wrong reason.
+        let registered_safe = connector
+            .safe_info(SafeSelector::NodeAddress(*BOB))
+            .await?
+            .context("BOB's safe must be registered")?;
+        assert_eq!(
+            registered_safe.address, bob_safe_address,
+            "derived safe address must match the one `with_generated_accounts` actually assigned to BOB"
+        );
+
+        let cfg = ChannelLifecycleConfig {
+            funding: FundingConfig {
+                lower_capacity_threshold: ByteSize::b(1),
+                topup_capacity: ByteSize::b(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain(cfg, Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        let channels: Vec<ChannelEntry> = connector
+            .stream_channels(ChannelSelector::default().with_source(*BOB))
+            .context("failed to stream channels for BOB")?
+            .collect()
+            .await;
+        assert!(
+            channels.iter().all(|c| c.balance == initial_balance),
+            "the underfunded channel must be left untouched when the allowance is too small; got {channels:?}"
+        );
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "safe allowance is short of the one top-up it wants to make"
+        );
+
+        Ok(())
+    }
+
     /// A safe that cannot afford a full top-up but holds at least one winning-ticket
     /// face value must still fund a needy channel with the largest whole number of
     /// face values it can supply, keeping the channel issuing tickets rather than
@@ -2711,6 +2875,83 @@ mod tests {
             inner.state(),
             StrategyState::Degraded,
             "safe is short of the opening stake for the one eligible, connected peer"
+        );
+
+        Ok(())
+    }
+
+    /// hopr-strategy#84: a peer with no ticket-redemption history and an edge
+    /// score of 0.6 must still clear the open-eligibility gate. Pre-fix, the
+    /// composite was `0.6 * 0.6 = 0.36` (below the default 0.5 threshold), the
+    /// candidate was dropped before the open pass ever saw it, and the tick found
+    /// nothing to do — `Running`. Post-fix the composite is the edge score alone
+    /// (`0.6`), the candidate clears the gate, and the tick fails to afford it —
+    /// `Degraded` — exercising the exact code path
+    /// `state_is_degraded_when_the_open_pass_cannot_afford_a_new_channel` covers
+    /// at edge score 1.0, but at the boundary this fix actually moves.
+    #[tokio::test]
+    async fn state_is_degraded_for_no_ticket_history_peer_at_edge_only_threshold() -> anyhow::Result<()> {
+        let module_address: Address = [1; Address::SIZE].into();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                true,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1),
+            )
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let alice_pk = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*ALICE).as_ref()]);
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(pseudo.as_ref())
+                .expect("alice offchain key")
+                .public()
+        };
+        let my_key = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[1u8; 32])
+                .expect("my key")
+                .public()
+        };
+
+        let network = StubNetworkView::default();
+        network.connect(PeerId::from(&alice_pk));
+
+        let graph = Arc::new(StubGraph::default());
+        // No `peer_ticket_activity` entry is seeded for Alice: she has no ticket
+        // history. 0.6 clears the default 0.5 gate only as an edge-only score.
+        graph.insert_edge(
+            my_key,
+            alice_pk,
+            StubEdge {
+                last_update: Duration::from_secs(1),
+                score: 0.6,
+            },
+        );
+
+        let cfg = ChannelLifecycleConfig {
+            population: PopulationConfig {
+                min_open_channels: 0,
+                target_open_channels: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain_graph_and_network(cfg, Arc::clone(&connector), graph, network);
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.state(),
+            StrategyState::Degraded,
+            "a peer with no ticket history and edge score 0.6 must clear the open-eligibility gate"
         );
 
         Ok(())
@@ -3215,6 +3456,69 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for a review finding on hoprnet#8475's allowance fix: the
+    /// consolidation pass must size its close count against the Safe's actual
+    /// balance, not the allowance-capped spend budget. A Safe already stranded by
+    /// balance alone (5 wei against 7 channels needing ~3 wei each) correctly closes
+    /// 1 of 7 (`floor((5+14)/3) = 6` survive). An allowance tighter than that balance
+    /// (1 wei) must not inflate the close count: sizing the pool against the capped
+    /// budget instead would compute `floor((1+14)/3) = 5` survive, closing 2 — one
+    /// relay retired for no reason but an operator-fixable allowance, not an actual
+    /// shortage of stake.
+    #[tokio::test]
+    async fn consolidation_close_count_is_sized_by_balance_not_allowance() -> anyhow::Result<()> {
+        let count = 7_u8;
+        let stake = 2_u32;
+        let peers: Vec<Address> = (20..20 + count).map(|n| [n; Address::SIZE].into()).collect();
+        let mut account_refs: Vec<&Address> = vec![&*BOB];
+        account_refs.extend(peers.iter());
+
+        let channels = peers
+            .iter()
+            .map(|p| {
+                ChannelEntry::builder()
+                    .between(*BOB, *p)
+                    .amount(stake)
+                    .ticket_index(0)
+                    .status(ChannelStatus::Open)
+                    .epoch(0)
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Mirrors `BlokliTestStateBuilder::with_generated_accounts`'s own derivation
+        // of a generated safe address, so the allowance override below lands on
+        // BOB's actual safe rather than an unrelated address.
+        let bob_safe_address: Address = {
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*BOB).as_ref()]).hash();
+            Address::new(&pseudo.as_ref()[0..Address::SIZE])
+        };
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(&account_refs, true, XDaiBalance::new_base(1), HoprBalance::from(5_u32))
+            .with_ticket_price(HoprBalance::from(1_u32))
+            // Balance alone already makes this stranded; the allowance is tighter
+            // still, and must not be allowed to close more than the balance justifies.
+            .with_safe_allowances([(bob_safe_address, HoprBalance::from(1_u32))])
+            .with_channels(channels)
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            1,
+            "pool sized by the 5-wei balance (floor((5+14)/3) = 6 survive) must close exactly 1, not the 2 a \
+             1-wei-allowance-capped pool would compute"
+        );
+        Ok(())
+    }
+
     /// Healthy channels (`>= face value`) are never closed to consolidate, only
     /// under-funded ones are candidates. One channel at 5 wei (`>= 3`) alongside
     /// six at 2 wei, Safe empty: the pool over the six is 12, face value 3, so
@@ -3487,7 +3791,7 @@ mod tests {
             addr: a,
             offchain_key: ok,
             edge_info: selector::PeerEdgeInfo::default(),
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
             subnet: selector::SubnetBucket::Unknown,
         };
         let candidates = vec![cand(*CHRIS), cand(*ALICE)];
@@ -4023,7 +4327,7 @@ mod tests {
             channel: ch,
             offchain_key: Some(alice_pk),
             edge_info: PeerEdgeInfo::default(),
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
 
         let ctx = SelectorContext {
@@ -4076,7 +4380,7 @@ mod tests {
             channel: ch,
             offchain_key: Some(alice_pk),
             edge_info: PeerEdgeInfo::default(),
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
         let ctx_no_data = SelectorContext {
             cfg: &cfg,
@@ -4102,7 +4406,7 @@ mod tests {
                 last_update: Duration::from_secs(1),
                 ..Default::default()
             },
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
         let ctx_with_data = SelectorContext {
             cfg: &cfg,

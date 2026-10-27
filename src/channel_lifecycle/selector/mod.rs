@@ -127,8 +127,10 @@ pub struct OpenCandidate {
     pub addr: Address,
     pub offchain_key: OffchainPublicKey,
     pub edge_info: PeerEdgeInfo,
-    /// Normalised ticket-activity signal: `peer_ticket_count / max_activity` in `[0, 1]`.
-    pub ticket_score: f64,
+    /// Normalised ticket-activity signal: `peer_ticket_count / max_activity` in
+    /// `[0, 1]`.  `None` means no ticket redemption has been observed for this
+    /// peer yet (no entry in `peer_ticket_activity`), not a score of zero.
+    pub ticket_score: Option<f64>,
     /// Subnet bucket derived from the peer's multiaddresses.
     /// Used by the multi-objective selector for anonymity bucket placement.
     pub subnet: SubnetBucket,
@@ -141,8 +143,9 @@ pub struct CloseCandidate {
     /// `None` when the peer's offchain key cannot be resolved from the address map.
     pub offchain_key: Option<OffchainPublicKey>,
     pub edge_info: PeerEdgeInfo,
-    /// Normalised ticket-activity score, same scale as [`OpenCandidate::ticket_score`].
-    pub ticket_score: f64,
+    /// Normalised ticket-activity score, same scale and `None` meaning as
+    /// [`OpenCandidate::ticket_score`].
+    pub ticket_score: Option<f64>,
 }
 
 /// Snapshot of all information the selector needs for one pipeline tick.

@@ -52,18 +52,20 @@ impl MultiObjectiveSelector {
         }
     }
 
+    // Absent ticket data counts as zero here: this is relative ranking, never
+    // compared to an absolute threshold, unlike `EligibilityConfig::composite_quality_score`.
     fn trust_score_open(candidate: &OpenCandidate, cfg: &MultiObjectiveSelectorConfig) -> f64 {
         let w = &cfg.weights;
         w.trust_probe * candidate.edge_info.probe_score()
             + w.trust_ack * candidate.edge_info.ack_score()
-            + w.trust_ticket * candidate.ticket_score
+            + w.trust_ticket * candidate.ticket_score.unwrap_or(0.0)
     }
 
     fn trust_score_close(candidate: &CloseCandidate, cfg: &MultiObjectiveSelectorConfig) -> f64 {
         let w = &cfg.weights;
         w.trust_probe * candidate.edge_info.probe_score()
             + w.trust_ack * candidate.edge_info.ack_score()
-            + w.trust_ticket * candidate.ticket_score
+            + w.trust_ticket * candidate.ticket_score.unwrap_or(0.0)
     }
 
     fn final_score_open(
@@ -382,7 +384,7 @@ mod tests {
                 edge_score: Some(probe_rate),
                 last_update: Duration::from_secs(1),
             },
-            ticket_score,
+            ticket_score: Some(ticket_score),
             subnet: SubnetBucket::V4Prefix([subnet_id, 0, 0]),
         }
     }
@@ -399,7 +401,7 @@ mod tests {
                 edge_score: None,
                 last_update: Duration::from_secs(1),
             },
-            ticket_score: 0.5,
+            ticket_score: Some(0.5),
             subnet: SubnetBucket::V4Prefix([subnet_id, 0, 0]),
         }
     }
@@ -692,7 +694,7 @@ mod tests {
                 probe_success_rate: Some(0.0),
                 ack_rate: Some(0.0),
             },
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
 
         let mut mo_cfg = MultiObjectiveSelectorConfig::dispersed(); // k_floor=4
@@ -757,7 +759,7 @@ mod tests {
                 probe_success_rate: Some(0.9),
                 ack_rate: Some(0.9),
             },
-            ticket_score: 0.5,
+            ticket_score: Some(0.5),
         };
 
         let mut mo_cfg = MultiObjectiveSelectorConfig::dispersed(); // k_floor=4
@@ -867,7 +869,7 @@ mod tests {
                 probe_success_rate: Some(0.35),
                 ack_rate: Some(0.35),
             },
-            ticket_score: 0.35,
+            ticket_score: Some(0.35),
         };
 
         let sel = mk_selector(MultiObjectiveSelectorConfig::economical());
@@ -924,7 +926,7 @@ mod tests {
                 probe_success_rate: Some(0.1),
                 ack_rate: Some(0.1),
             },
-            ticket_score: 0.1,
+            ticket_score: Some(0.1),
         };
 
         let mut cfg = MultiObjectiveSelectorConfig::low_latency();
@@ -985,7 +987,7 @@ mod tests {
                 probe_success_rate: Some(0.0),
                 ack_rate: None,
             },
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
 
         // Put the channel in its own cell so k-floor is not the reason for the veto.
