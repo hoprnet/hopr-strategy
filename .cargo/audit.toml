@@ -1,37 +1,46 @@
 [advisories]
 ignore = [
-  "RUSTSEC-2024-0388", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2024-0436", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0173", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0249", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0253", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0338", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0339", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0340", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0341", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0342", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0346", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0347", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0348", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0349", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0382", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0383", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0385", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0386", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0387", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0391", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0395", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0396", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0397", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0398", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0399", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0400", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0401", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0402", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0403", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0404", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0405", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0406", # legacy compat/v4 dependency graph; coordinated upgrade required
-  "RUSTSEC-2026-0410", # legacy compat/v4 dependency graph; coordinated upgrade required
+  "RUSTSEC-2024-0388", # derivative; transitive dependency
+  "RUSTSEC-2024-0436", # paste; transitive dependency
+  "RUSTSEC-2026-0173", # proc-macro-error2; transitive proc-macro dependency
+  "RUSTSEC-2026-0249", # smartstring; transitive dependency
+  "RUSTSEC-2026-0253", # lru; transitive dependency
+  "RUSTSEC-2026-0386", # tokio; transitive async runtime dependency
+
+  # crypto-bigint 0.5.x and ctutils; transitive through the compat/v4 cryptography stack.
+  "RUSTSEC-2026-0385", # ctutils
+  "RUSTSEC-2026-0387", # crypto-bigint
+
+  # quinn-proto; transitive QUIC transport dependency.
+  "RUSTSEC-2026-0338", # quinn-proto
+  "RUSTSEC-2026-0339", # quinn-proto
+  "RUSTSEC-2026-0340", # quinn-proto
+  "RUSTSEC-2026-0341", # quinn-proto
+  "RUSTSEC-2026-0342", # quinn-proto
+
+  # rustls stack; transitive TLS dependency.
+  "RUSTSEC-2026-0346", # rustls
+  "RUSTSEC-2026-0347", # rustls
+  "RUSTSEC-2026-0348", # rustls
+  "RUSTSEC-2026-0349", # rustls
+  "RUSTSEC-2026-0382", # rustls-webpki
+  "RUSTSEC-2026-0383", # webpki-root-certs
+
+  # zstd 0.13 / zstd-safe 7.x; transitive compression dependency.
+  "RUSTSEC-2026-0391", # zstd
+  "RUSTSEC-2026-0395", # zstd-safe
+  "RUSTSEC-2026-0396", # zstd-safe
+  "RUSTSEC-2026-0397", # zstd-safe
+  "RUSTSEC-2026-0398", # zstd-safe
+  "RUSTSEC-2026-0399", # zstd-safe
+  "RUSTSEC-2026-0400", # zstd-safe
+  "RUSTSEC-2026-0401", # zstd-safe
+  "RUSTSEC-2026-0402", # zstd-safe
+  "RUSTSEC-2026-0403", # zstd-safe
+  "RUSTSEC-2026-0404", # zstd-safe
+  "RUSTSEC-2026-0405", # zstd-safe
+  "RUSTSEC-2026-0406", # zstd-safe
+  "RUSTSEC-2026-0410", # zstd-sys
 ]
+
 informational_warnings = ["unmaintained"]
