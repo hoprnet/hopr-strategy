@@ -102,6 +102,8 @@ use hopr_api::{
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use scrypt::{Params as ScryptParams, scrypt};
 
+use super::store::private_db::{PrivateDatabaseError, open_private_database};
+
 // Key = pseudonym (10 bytes) + ssa_index (4 bytes), which is exactly the
 // `PixAddressId` byte representation.
 const KEY_SIZE: usize = PixAddressId::SIZE;
@@ -187,6 +189,15 @@ pub enum PixRecoveryStoreError {
 impl From<redb::DatabaseError> for PixRecoveryStoreError {
     fn from(error: redb::DatabaseError) -> Self {
         Self::Database(error.into())
+    }
+}
+
+impl From<PrivateDatabaseError> for PixRecoveryStoreError {
+    fn from(error: PrivateDatabaseError) -> Self {
+        match error {
+            PrivateDatabaseError::Io(error) => Self::Io(error),
+            PrivateDatabaseError::Database(error) => Self::Database(error.into()),
+        }
     }
 }
 
@@ -310,7 +321,10 @@ impl PixRecoveryStore {
     /// A database created before the verifier existed has no verifier record; the first open
     /// writes one and adopts the password in use at that point.
     ///
-    /// Any missing parent directories of `path` are created.
+    /// Any missing parent directories of `path` are created. The database file itself is kept
+    /// at mode `0600` on Unix instead of the mode the process umask would yield, so the
+    /// ciphertext and password verifier are not exposed to other local users, or to the
+    /// offline scrypt search an exposed verifier would allow.
     ///
     /// # Examples
     ///
@@ -335,7 +349,7 @@ impl PixRecoveryStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Database::create(path.as_ref())?;
+        let db = open_private_database(path.as_ref())?;
 
         // Initialize or read the per-database scrypt salt, and ensure the key table exists.
         let salt: [u8; 16] = {
