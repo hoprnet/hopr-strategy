@@ -1,4 +1,10 @@
 //! ## Auto Funding Strategy
+//!
+//! Legacy strategy, superseded by `ChannelLifecycleStrategy` (feature
+//! `strategy-channel-lifecycle`), which manages opening, funding, closing and
+//! finalization together. Retained for existing consumers and configurations;
+//! new integrations should use the channel lifecycle strategy.
+//!
 //! Watches for balance-decrease events and periodically scans outgoing channels
 //! to re-stake any that have dropped below `min_stake_threshold` HOPR.
 //!

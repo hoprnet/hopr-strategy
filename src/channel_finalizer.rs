@@ -1,3 +1,10 @@
+//! ## Closure Finalizer Strategy
+//!
+//! Legacy strategy, superseded by `ChannelLifecycleStrategy` (feature
+//! `strategy-channel-lifecycle`), which manages opening, funding, closing and
+//! finalization together. Retained for existing consumers and configurations;
+//! new integrations should use the channel lifecycle strategy.
+
 use std::{
     fmt::{Debug, Display, Formatter},
     ops::Sub,
