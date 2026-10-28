@@ -40,10 +40,11 @@ use hopr_api::{
 
 use super::{
     CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
-    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
-    OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
+    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
+    CurvyWithdrawalOutcome, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
+    state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
     token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
 };
@@ -293,7 +294,7 @@ fn redb_state_recovers_complete_notes_for_withdrawal_after_restart() -> anyhow::
     let completion_cursor = CurvyEventCursor::from(&position(2));
 
     {
-        let state = RedbCurvyDepositState::open(&path)?;
+        let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         state.record_owned_candidate(&fixture.note_id, detected, &candidate_cursor)?;
         assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(candidate_cursor));
         assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
@@ -308,7 +309,7 @@ fn redb_state_recovers_complete_notes_for_withdrawal_after_restart() -> anyhow::
         assert_eq!(state.committed_amount(&id)?, amount);
     }
 
-    let reopened = RedbCurvyDepositState::open(&path)?;
+    let reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
     assert_eq!(reopened.cursor(CurvyEventKind::Committed)?, Some(completion_cursor));
     assert_eq!(reopened.committed_amount(&id)?, amount);
     let notes = reopened.committed_notes(&id)?;
@@ -318,10 +319,63 @@ fn redb_state_recovers_complete_notes_for_withdrawal_after_restart() -> anyhow::
     reopened.remove_spent_notes(&id, &[fixture.note_id])?;
     drop(reopened);
 
-    let spent_reopened = RedbCurvyDepositState::open(&path)?;
+    let spent_reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
     assert_eq!(spent_reopened.committed_amount(&id)?, HoprBalance::zero());
     assert!(spent_reopened.committed_notes(&id)?.is_empty());
     assert!(spent_reopened.owned_note_ids()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_pre_sealing_database_has_its_scan_secrets_sealed_on_open() -> anyhow::Result<()> {
+    use redb::{ReadableDatabase, TableHandle};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("curvy-pix.redb");
+    let id = pix_id(1);
+    let secret = scan_secret("05", "06")?;
+    let clear = secret.to_bytes().as_ref().to_vec();
+    {
+        // What a node wrote before the state file was sealed: the secret in the clear.
+        let db = redb::Database::create(&path)?;
+        let write = db.begin_write()?;
+        write
+            .open_table(LEGACY_SCAN_SECRETS_TABLE)?
+            .insert(id_bytes(&id), clear.clone())?;
+        write.commit()?;
+    }
+
+    let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+    let stored = state.scan_secret(&id)?.expect("the secret survived sealing");
+    assert_eq!(stored.view().secret_be().as_ref(), secret.view().secret_be().as_ref());
+    {
+        let db = state.shared_database();
+        let read = db.begin_read()?;
+        assert!(
+            !read
+                .list_tables()?
+                .any(|table| table.name() == LEGACY_SCAN_SECRETS_TABLE.name()),
+            "the clear table is gone"
+        );
+        let sealed = read
+            .open_table(SCAN_SECRETS_TABLE)?
+            .get(id_bytes(&id))?
+            .expect("sealed row")
+            .value();
+        assert_ne!(sealed, clear);
+        assert!(
+            !sealed.windows(clear.len()).any(|window| window == clear.as_slice()),
+            "the clear secret is not in the sealed row"
+        );
+    }
+    drop(state);
+
+    assert!(matches!(
+        RedbCurvyDepositState::open(&path, "not the password"),
+        Err(CurvyStateError::WrongPassword)
+    ));
+    let reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+    assert!(reopened.scan_secret(&id)?.is_some());
     Ok(())
 }
 
@@ -333,12 +387,12 @@ fn scan_secrets_survive_a_restart_and_are_removed_on_request() -> anyhow::Result
     let secret = scan_secret("05", "06")?;
 
     {
-        let state = RedbCurvyDepositState::open(&path)?;
+        let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         assert!(state.scan_secret(&id)?.is_none());
         state.store_scan_secret(&id, &secret)?;
     }
 
-    let reopened = RedbCurvyDepositState::open(&path)?;
+    let reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
     let stored = reopened.scan_secret(&id)?.expect("the secret was persisted");
     assert_eq!(stored.public(), secret.public());
     assert_eq!(stored.view().secret_be().as_ref(), secret.view().secret_be().as_ref());
@@ -350,7 +404,7 @@ fn scan_secrets_survive_a_restart_and_are_removed_on_request() -> anyhow::Result
 #[test]
 fn wiping_chain_state_leaves_an_empty_usable_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let fixture = owned_candidate(1)?;
     let detected = fixture
         .detector
@@ -380,7 +434,10 @@ fn wiping_chain_state_leaves_an_empty_usable_store() -> anyhow::Result<()> {
 #[test_log::test(tokio::test)]
 async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(2)?;
     let id = fixture.id;
     let address = fixture.address;
@@ -410,7 +467,10 @@ async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()>
 #[tokio::test]
 async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
@@ -422,7 +482,10 @@ async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Resu
 #[tokio::test]
 async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let mut fixture = owned_candidate(4)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
@@ -440,7 +503,10 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
 #[tokio::test]
 async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(2)?;
     let vault = ScriptedVault::registering(4);
     let tracker = CurvyLifecycleTracker::for_vault_token(VaultToken::from_table(vault.clone()), state.clone());
@@ -468,7 +534,10 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
 #[test]
 fn registering_an_address_requests_a_historical_lifecycle_pass() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
 
@@ -481,7 +550,10 @@ fn registering_an_address_requests_a_historical_lifecycle_pass() -> anyhow::Resu
 #[test]
 fn interrupted_historical_pass_remains_requested() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
 
@@ -502,7 +574,10 @@ fn interrupted_historical_pass_remains_requested() -> anyhow::Result<()> {
 #[test_log::test(tokio::test)]
 async fn late_registration_replays_pending_and_committed_history() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(2)?;
     let id = fixture.id;
     let address = fixture.address;
@@ -833,7 +908,7 @@ struct Harness {
 
 async fn harness(adapter: RecordingAdapter, tracking_time: Duration) -> anyhow::Result<Harness> {
     let dir = tempfile::tempdir()?;
-    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: tracking_time,
@@ -1478,7 +1553,7 @@ async fn replay_pool_watch_against_staging() -> anyhow::Result<()> {
     let owner = BjjPublicKey::try_from(owner_bytes.as_slice())?;
     let bytes: [u8; 10] = pseudonym.as_slice().try_into()?;
     let id = PixAddressId::new(&HoprPseudonym::from(bytes), NonZeroU32::new(index).expect("non-zero"));
-    let state = RedbCurvyDepositState::open(state_path)?;
+    let state = RedbCurvyDepositState::open(state_path, TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: Duration::from_secs(30),
@@ -1532,7 +1607,7 @@ async fn replay_detection_against_staging() -> anyhow::Result<()> {
     let owner = BjjPublicKey::try_from(owner_bytes.as_slice())?;
     let bytes: [u8; 10] = pseudonym.as_slice().try_into()?;
     let id = PixAddressId::new(&HoprPseudonym::from(bytes), NonZeroU32::new(index).expect("non-zero"));
-    let state = RedbCurvyDepositState::open(state_path)?;
+    let state = RedbCurvyDepositState::open(state_path, TEST_PASSWORD)?;
     println!(
         "state cursors: pending {:?} committed {:?}",
         state
@@ -1594,7 +1669,7 @@ async fn replay_detection_against_staging() -> anyhow::Result<()> {
 async fn staging_watcher_catches_up_on_gnosis() -> anyhow::Result<()> {
     use super::indexer::{CurvyIndexerClient, CurvyIndexerSource, HttpSyncApi};
     let dir = tempfile::tempdir()?;
-    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: Duration::from_secs(20),
@@ -1750,7 +1825,10 @@ fn invalid_watch_owners_cannot_hide_valid_notes() -> anyhow::Result<()> {
     assert_eq!(detected.deposit.id, fixture.id);
 
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("state.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("state.redb"),
+        TEST_PASSWORD,
+    )?);
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
     assert!(tracker.watch(pix_id(3), invalid, fixture.scan_secret, ten()).is_err());
     assert!(tracker.watched_allocations().is_empty());

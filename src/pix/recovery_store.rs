@@ -56,6 +56,10 @@
 //! index.  The key is deterministic (no randomness), so `contains()` and
 //! `insert()` work naturally.
 //!
+//! The scheme is `pix::store::sealed`'s, shared with the Curvy state store; this module
+//! fixes the tables, the verifier text and the slot layout that existing databases were written
+//! with.
+//!
 //! ## Threat model
 //!
 //! This protects against an attacker who obtains read-only access to the
@@ -85,30 +89,25 @@
 //! rather than being dropped.
 //!
 //! The store is only opened in the Exit role (when
-//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] and
-//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env`] are both set).
+//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_db_path`] is set), under the password
+//! [`crate::pix::strategy::PixStrategyConfig::pix_recovery_password`] resolves.
 
 use std::{path::Path, sync::Arc};
 
-use chacha20poly1305::{
-    ChaCha20Poly1305, Key, KeyInit, Nonce,
-    aead::{Aead, Payload},
-};
-use hopr_api::{
-    chain::PixDepositSecret,
-    node::PixAddressId,
-    types::{crypto_random::random_bytes, primitive::traits::BytesRepresentable},
-};
+use hopr_api::{chain::PixDepositSecret, node::PixAddressId, types::primitive::traits::BytesRepresentable};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use scrypt::{Params as ScryptParams, scrypt};
+
+use super::store::{
+    private_db::{PrivateDatabaseError, open_private_database},
+    sealed::{PasswordSlots, SEALED_32_SIZE, SealError, Sealer, UnlockError},
+};
 
 // Key = pseudonym (10 bytes) + ssa_index (4 bytes), which is exactly the
 // `PixAddressId` byte representation.
 const KEY_SIZE: usize = PixAddressId::SIZE;
 
 // Value = nonce (12 bytes) + ciphertext (32 + 16 tag)
-const NONCE_SIZE: usize = 12;
-const VALUE_SIZE: usize = NONCE_SIZE + 32 + 16;
+const VALUE_SIZE: usize = SEALED_32_SIZE;
 
 const PIX_RECOVERED_KEYS: TableDefinition<[u8; KEY_SIZE], [u8; VALUE_SIZE]> =
     TableDefinition::new("pix_recovered_keys");
@@ -128,6 +127,14 @@ const VERIFIER_PLAINTEXT: [u8; 32] = *b"hopr-pix-recovery-store-verifier";
 /// `NonZeroU32`. So the verifier ciphertext can never be relocated into an entry slot, nor an
 /// entry ciphertext into the verifier slot.
 const VERIFIER_AAD: [u8; KEY_SIZE] = [0u8; KEY_SIZE];
+
+/// Where this store keeps its salt and verifier; the layout every existing database has.
+const PASSWORD_SLOTS: PasswordSlots = PasswordSlots {
+    salt: PIX_KDF_SALT_TABLE,
+    verifier: PIX_KDF_VERIFIER_TABLE,
+    verifier_plaintext: VERIFIER_PLAINTEXT,
+    verifier_aad: &VERIFIER_AAD,
+};
 
 /// Persistent encrypted recovery key store backed by `redb`.
 ///
@@ -164,7 +171,7 @@ const VERIFIER_AAD: [u8; KEY_SIZE] = [0u8; KEY_SIZE];
 #[derive(Clone)]
 pub struct PixRecoveryStore {
     db: Arc<Database>,
-    encryption_key: [u8; 32],
+    sealer: Sealer,
 }
 
 /// Errors from the PIX recovery store.
@@ -184,9 +191,37 @@ pub enum PixRecoveryStoreError {
     WrongPassword,
 }
 
+impl From<UnlockError> for PixRecoveryStoreError {
+    fn from(error: UnlockError) -> Self {
+        match error {
+            UnlockError::Database(error) => Self::Database(error),
+            UnlockError::WrongPassword => Self::WrongPassword,
+            UnlockError::Seal(error) => error.into(),
+        }
+    }
+}
+
+impl From<SealError> for PixRecoveryStoreError {
+    fn from(error: SealError) -> Self {
+        match error {
+            SealError::Encryption => Self::Encryption,
+            SealError::Decryption => Self::Decryption,
+        }
+    }
+}
+
 impl From<redb::DatabaseError> for PixRecoveryStoreError {
     fn from(error: redb::DatabaseError) -> Self {
         Self::Database(error.into())
+    }
+}
+
+impl From<PrivateDatabaseError> for PixRecoveryStoreError {
+    fn from(error: PrivateDatabaseError) -> Self {
+        match error {
+            PrivateDatabaseError::Io(error) => Self::Io(error),
+            PrivateDatabaseError::Database(error) => Self::Database(error.into()),
+        }
     }
 }
 
@@ -234,71 +269,6 @@ fn decode_key(bytes: &[u8; KEY_SIZE]) -> Result<PixAddressId, PixRecoveryStoreEr
     PixAddressId::try_from(bytes.as_slice()).map_err(|error| PixRecoveryStoreError::CorruptKey(error.to_string()))
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
-    let mut key = [0u8; 32];
-
-    scrypt(password.as_bytes(), salt, &ScryptParams::RECOMMENDED, &mut key)
-        .expect("scrypt with 32-byte output must succeed");
-    key
-}
-
-// ── Encryption helpers ───────────────────────────────────────────────────────
-
-/// Encrypt `plaintext`, binding the result to `aad` — the database key the value is filed
-/// under. A value moved to a different key no longer authenticates, so relocating a stored
-/// ciphertext turns it into a decryption failure instead of another entry's secret.
-fn encrypt(
-    key: &[u8; 32],
-    aad: &[u8; KEY_SIZE],
-    plaintext: &[u8; 32],
-) -> Result<[u8; VALUE_SIZE], PixRecoveryStoreError> {
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
-    let nonce_bytes = random_bytes::<NONCE_SIZE>();
-    let nonce = Nonce::from(nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(
-            &nonce,
-            Payload {
-                msg: plaintext.as_ref(),
-                aad,
-            },
-        )
-        .map_err(|_| PixRecoveryStoreError::Encryption)?;
-
-    // ChaCha20Poly1305 output = plaintext_len + 16-byte tag = 48 bytes
-    let mut out = [0u8; VALUE_SIZE];
-    out[..NONCE_SIZE].copy_from_slice(&nonce_bytes);
-    out[NONCE_SIZE..].copy_from_slice(&ciphertext);
-    Ok(out)
-}
-
-/// Decrypt `stored`, which must have been encrypted under the same `aad`. `aad` is the
-/// database key the value was read from, so a value that has been moved between keys fails
-/// here rather than decrypting into the wrong entry's secret.
-fn decrypt(key: &[u8; 32], aad: &[u8; KEY_SIZE], stored: &[u8; VALUE_SIZE]) -> Result<[u8; 32], PixRecoveryStoreError> {
-    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
-    let nonce_arr: [u8; NONCE_SIZE] = stored[..NONCE_SIZE]
-        .try_into()
-        .map_err(|_| PixRecoveryStoreError::Decryption)?;
-    let nonce = Nonce::from(nonce_arr);
-
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            Payload {
-                msg: &stored[NONCE_SIZE..],
-                aad,
-            },
-        )
-        .map_err(|_| PixRecoveryStoreError::Decryption)?;
-
-    Ok(plaintext
-        .as_slice()
-        .try_into()
-        .expect("ChaCha20Poly1305 plaintext is 32 bytes"))
-}
-
 impl PixRecoveryStore {
     /// Open (or create) the `redb` database at `path` with encryption key derived from `password`.
     ///
@@ -310,7 +280,10 @@ impl PixRecoveryStore {
     /// A database created before the verifier existed has no verifier record; the first open
     /// writes one and adopts the password in use at that point.
     ///
-    /// Any missing parent directories of `path` are created.
+    /// Any missing parent directories of `path` are created. The database file itself is kept
+    /// at mode `0600` on Unix instead of the mode the process umask would yield, so the
+    /// ciphertext and password verifier are not exposed to other local users, or to the
+    /// offline scrypt search an exposed verifier would allow.
     ///
     /// # Examples
     ///
@@ -335,56 +308,17 @@ impl PixRecoveryStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Database::create(path.as_ref())?;
-
-        // Initialize or read the per-database scrypt salt, and ensure the key table exists.
-        let salt: [u8; 16] = {
-            let write_tx = db.begin_write()?;
-            let mut salt_table = write_tx.open_table(PIX_KDF_SALT_TABLE)?;
-            // Eagerly copy out the guard value so the AccessGuard drops before insert.
-            let existing_salt: Option<[u8; 16]> = salt_table.get(&0u8)?.map(|g| g.value());
-            let s = match existing_salt {
-                Some(s) => s,
-                None => {
-                    let buf = random_bytes::<16>();
-                    salt_table.insert(&0, buf)?;
-                    buf
-                }
-            };
-            drop(salt_table);
-            write_tx.open_table(PIX_RECOVERED_KEYS)?;
-            write_tx.commit()?;
-            s
-        };
-
-        let encryption_key = derive_key(password, &salt);
-
-        // Check the derived key against a stored, encrypted constant.
+        let db = open_private_database(path.as_ref())?;
+        let sealer = PASSWORD_SLOTS.unlock(&db, password)?;
         {
             let write_tx = db.begin_write()?;
-            {
-                let mut verifier_table = write_tx.open_table(PIX_KDF_VERIFIER_TABLE)?;
-                let existing: Option<[u8; VALUE_SIZE]> = verifier_table.get(&0u8)?.map(|g| g.value());
-                match existing {
-                    Some(stored) => {
-                        let plaintext = decrypt(&encryption_key, &VERIFIER_AAD, &stored)
-                            .map_err(|_| PixRecoveryStoreError::WrongPassword)?;
-                        if plaintext != VERIFIER_PLAINTEXT {
-                            return Err(PixRecoveryStoreError::WrongPassword);
-                        }
-                    }
-                    None => {
-                        let verifier = encrypt(&encryption_key, &VERIFIER_AAD, &VERIFIER_PLAINTEXT)?;
-                        verifier_table.insert(&0u8, verifier)?;
-                    }
-                }
-            }
+            write_tx.open_table(PIX_RECOVERED_KEYS)?;
             write_tx.commit()?;
         }
 
         Ok(Self {
             db: Arc::new(db),
-            encryption_key,
+            sealer,
         })
     }
 
@@ -449,8 +383,11 @@ impl PixRecoveryStore {
             if table.get(key)?.is_some() {
                 false
             } else {
-                let plaintext: [u8; 32] = secret.0.as_ref().try_into().expect("PixDepositSecret is 32 bytes");
-                let stored = encrypt(&self.encryption_key, &key, &plaintext)?;
+                let stored: [u8; VALUE_SIZE] = self
+                    .sealer
+                    .seal(&key, secret.0.as_ref())?
+                    .try_into()
+                    .map_err(|_| PixRecoveryStoreError::Encryption)?;
                 table.insert(key, stored)?;
                 true
             }
@@ -546,7 +483,11 @@ impl PixRecoveryStore {
             };
             // The table is typed `[u8; VALUE_SIZE]`, so the length is already guaranteed.
             let stored: [u8; VALUE_SIZE] = value_bytes.value();
-            let plaintext = match decrypt(&self.encryption_key, &key, &stored) {
+            let plaintext: [u8; 32] = match self
+                .sealer
+                .open(&key, &stored)
+                .and_then(|plaintext| plaintext.as_slice().try_into().map_err(|_| SealError::Decryption))
+            {
                 Ok(p) => p,
                 Err(_) => {
                     tracing::error!(?id, "failed to decrypt recovery store entry, skipping");
@@ -570,13 +511,55 @@ impl PixRecoveryStore {
 
 #[cfg(test)]
 mod tests {
+    /// Records written by the store before the sealing scheme moved to `pix::store::sealed`, so the
+    /// on-disk format (salt, verifier, entry layout and associated data) is pinned.
+    #[test]
+    fn test_opens_a_database_written_by_the_previous_layout() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("golden.db");
+        let key: [u8; KEY_SIZE] = hex!("0707070707070707070700000009");
+        {
+            let db = Database::create(&path)?;
+            let write = db.begin_write()?;
+            write
+                .open_table(PIX_KDF_SALT_TABLE)?
+                .insert(&0u8, hex!("884c3d5f9d720f206fff4296a93d0340"))?;
+            write.open_table(PIX_KDF_VERIFIER_TABLE)?.insert(
+                &0u8,
+                hex!(
+                    "e4557a8bcee6e6e69ae3857d8ae3d05db69d15b2116c4f1642786fa94ae04eee26b6091cde0d709197772d2574aee3b7905d816ceafc77b4f5f2fd9e"
+                ),
+            )?;
+            write.open_table(PIX_RECOVERED_KEYS)?.insert(
+                key,
+                hex!(
+                    "50b55b0fcdf1c2092c62363f25398ca79d3aab7693cbebd19eaac2ef5f12dc6f22346aff0daed1bf53d554df99b3dd7e748b7ba07e78d599efe0b356"
+                ),
+            )?;
+            write.commit()?;
+        }
+        assert!(matches!(
+            PixRecoveryStore::open(&path, "another password"),
+            Err(PixRecoveryStoreError::WrongPassword)
+        ));
+        let store = PixRecoveryStore::open(&path, "golden password")?;
+        let entries = store.iter()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(encode_key(&entries[0].0), key);
+        assert_eq!(entries[0].1.0.as_ref(), &[0xAB; 32]);
+        Ok(())
+    }
+
     use std::num::NonZeroU32;
 
     use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
 
+    use hex_literal::hex;
+
     use super::{
-        BytesRepresentable, KEY_SIZE, PIX_RECOVERED_KEYS, PixAddressId, PixDepositSecret, PixRecoveryStore,
-        PixRecoveryStoreError, ReadableDatabase, VALUE_SIZE, encode_key,
+        BytesRepresentable, Database, KEY_SIZE, PIX_KDF_SALT_TABLE, PIX_KDF_VERIFIER_TABLE, PIX_RECOVERED_KEYS,
+        PixAddressId, PixDepositSecret, PixRecoveryStore, PixRecoveryStoreError, ReadableDatabase, VALUE_SIZE,
+        encode_key,
     };
 
     const TEST_PASSWORD: &str = "test-password-for-unit-tests";

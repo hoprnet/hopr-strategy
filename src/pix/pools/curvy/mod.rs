@@ -87,6 +87,12 @@
 //! * A **state file** ([`CurvyDepositPoolConfig::state_path`]) that survives restarts: it holds the node's Curvy
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
+//! * The **PIX recovery password**, [`PixStrategyConfig::pix_recovery_password`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password)
+//!   or, failing that, the environment variable named by
+//!   [`PixStrategyConfig::pix_recovery_password_env`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env).
+//!   The identity and the scan secrets in the state file are sealed under it, so a copy of the file is not spending
+//!   authority over the float. It must be the same on every start: a different one is refused, and losing it loses
+//!   the identity that owns the float. See `state` for the scheme.
 //!
 //! ### Restarts and synchronization
 //!
@@ -800,16 +806,18 @@ where
     N: HasChainApi + Send + Sync + 'static,
 {
     /// Creates the production pool: a Blokli client from `cfg.blokli_url`, the state file from
-    /// `cfg.state_path`, the operator key from the environment, and the Safe as the shield's
-    /// funding source.
+    /// `cfg.state_path` sealed under `state_password` (the PIX recovery password, see
+    /// [`PixStrategyConfig::pix_recovery_password`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password)),
+    /// the operator key from the environment, and the Safe as the shield's funding source.
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
-    /// state file cannot be opened, an environment override does not parse, or direct shielding is
-    /// given a key that is not the node's.
+    /// state file cannot be opened or refuses the password, an environment override does not
+    /// parse, or direct shielding is given a key that is not the node's.
     pub fn new(
         node: Arc<N>,
         node_key: hopr_api::ChainKeypair,
         mut cfg: CurvyDepositPoolConfig,
+        state_password: &str,
     ) -> Result<Self, StrategyError> {
         // Environment overrides are applied before validation, so an override that contradicts
         // the file is caught here rather than at the first deposit.
@@ -872,7 +880,7 @@ where
             .state_path
             .clone()
             .unwrap_or_else(|| PathBuf::from(format!("curvy-pix-{}.redb", node.identity().node_address)));
-        let state = RedbCurvyDepositState::open(&state_path)
+        let state = RedbCurvyDepositState::open(&state_path, state_password)
             .map_err(|error| StrategyError::other(anyhow::anyhow!("{}: {error}", state_path.display())))?;
         let blokli = Arc::new(BlokliClient::new(cfg.blokli_url.clone(), BlokliClientConfig::default()));
         // One handle, shared by the bridge that stamps the id on notes and the tracker whose

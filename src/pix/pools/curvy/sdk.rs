@@ -74,9 +74,10 @@ use super::{
     detect::{bjj_point, scan_public_key_dec},
     indexer,
     relayer::{self, RelayClient},
-    state::{RedbCurvyDepositState, id_bytes},
+    state::{RedbCurvyDepositState, SPENDER_AAD, id_bytes},
     token::VaultToken,
 };
+use crate::pix::store::sealed::Sealer;
 
 const SDK_STATE_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_sdk_state");
 const SDK_STATE_KEY: u8 = 0;
@@ -573,8 +574,14 @@ struct StoredSpender {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SdkState {
+    /// The spender identity, sealed under the PIX recovery password: hex of what
+    /// [`RedbCurvySdkStore::set_spender`] produced. Read through [`RedbCurvySdkStore::spender`].
     #[serde(default)]
-    spender: Option<StoredSpender>,
+    sealed_spender: Option<String>,
+    /// Read only for the atomic migration of databases written while the identity was stored in
+    /// the clear; [`RedbCurvySdkStore::load`] seals it and the clear copy is never written again.
+    #[serde(default, rename = "spender", skip_serializing)]
+    legacy_spender: Option<StoredSpender>,
     funding: Vec<StoredNote>,
     /// Emitted notes that must be committed before their change can fund another allocation.
     pending: Vec<StoredNote>,
@@ -617,6 +624,7 @@ struct SdkState {
 
 struct RedbCurvySdkStore {
     db: Arc<redb::Database>,
+    sealer: Sealer,
 }
 
 impl RedbCurvySdkStore {
@@ -626,7 +634,39 @@ impl RedbCurvySdkStore {
         write.open_table(SDK_STATE_TABLE).map_err(db_error)?;
         write.open_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
         write.commit().map_err(db_error)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            sealer: state.sealer(),
+        })
+    }
+
+    /// The spender identity `state` carries, opened; `None` until one was generated.
+    fn spender(&self, state: &SdkState) -> Result<Option<StoredSpender>, RsSdkCurvyAdapterError> {
+        state
+            .sealed_spender
+            .as_deref()
+            .map(|sealed| {
+                let sealed = const_hex::decode(sealed).map_err(|error| {
+                    RsSdkCurvyAdapterError::InvalidValue(format!("sealed spender identity: {error}"))
+                })?;
+                let opened = self.sealer.open(SPENDER_AAD, &sealed).map_err(|error| {
+                    RsSdkCurvyAdapterError::InvalidValue(format!("sealed spender identity: {error}"))
+                })?;
+                serde_json::from_slice(&opened)
+                    .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("sealed spender identity: {error}")))
+            })
+            .transpose()
+    }
+
+    /// Seals `spender` into `state`; durable once `state` is saved.
+    fn set_spender(&self, state: &mut SdkState, spender: &StoredSpender) -> Result<(), RsSdkCurvyAdapterError> {
+        let encoded = serde_json::to_vec(spender).map_err(anyhow::Error::new)?;
+        let sealed = self
+            .sealer
+            .seal(SPENDER_AAD, &encoded)
+            .map_err(|error| RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("sealing the spender identity: {error}")))?;
+        state.sealed_spender = Some(const_hex::encode(sealed));
+        Ok(())
     }
 
     fn load(&self) -> Result<SdkState, RsSdkCurvyAdapterError> {
@@ -641,9 +681,19 @@ impl RedbCurvySdkStore {
                 .unwrap_or_default()
         };
         let legacy = std::mem::take(&mut state.legacy_allocations);
-        if !legacy.is_empty() {
-            // The records and removal of the old JSON history become durable together.
+        let legacy_spender = std::mem::take(&mut state.legacy_spender);
+        if let Some(spender) = &legacy_spender
+            && state.sealed_spender.is_none()
+        {
+            self.set_spender(&mut state, spender)?;
+        }
+        if !legacy.is_empty() || legacy_spender.is_some() {
+            // The records, the sealed identity and the removal of the clear copies become
+            // durable together.
             self.save_update(&state, &legacy, &[])?;
+            if legacy_spender.is_some() {
+                tracing::info!("sealed the Curvy spender identity of a pre-sealing state database");
+            }
         }
         Ok(state)
     }
@@ -918,14 +968,14 @@ where
         config.validate_signer()?;
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
-        let spender = match &persisted.spender {
+        let spender = match store.spender(&persisted)? {
             Some(spender) => Account::from_meta_keys(&full_width_key(&spender.k), &full_width_key(&spender.v))?,
             None => {
                 let (k, v, ..) =
                     stealth::new_meta().map_err(|error| RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{error}")))?;
                 let (k, v) = (full_width_key(&k), full_width_key(&v));
                 let spender = Account::from_meta_keys(&k, &v)?;
-                persisted.spender = Some(StoredSpender { k, v });
+                store.set_spender(&mut persisted, &StoredSpender { k, v })?;
                 store.save(&persisted)?;
                 tracing::info!("generated this node's Curvy spender identity");
                 spender
@@ -2516,7 +2566,7 @@ where
     fn reset_chain_state(&self) -> Result<(), Self::Error> {
         let mut state = self.state.lock();
         *state = SdkState {
-            spender: state.spender.clone(),
+            sealed_spender: state.sealed_spender.clone(),
             ..Default::default()
         };
         self.store.reset(&state)
@@ -2604,7 +2654,7 @@ mod tests {
         },
     };
 
-    use super::*;
+    use super::{super::state::TEST_PASSWORD, *};
     use crate::pix::pools::curvy::{
         OwnedCurvyDeposit,
         detect::{public_key_from_dec, spend_meta_key_dec, view_key_dec},
@@ -2639,11 +2689,14 @@ mod tests {
         // encodings that can omit leading zero bytes on a subsequent reload.
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
-        if persisted.spender.is_none() {
-            persisted.spender = Some(StoredSpender {
-                k: "01".repeat(32),
-                v: "02".repeat(32),
-            });
+        if store.spender(&persisted)?.is_none() {
+            store.set_spender(
+                &mut persisted,
+                &StoredSpender {
+                    k: "01".repeat(32),
+                    v: "02".repeat(32),
+                },
+            )?;
             store.save(&persisted)?;
         }
         let blokli = Arc::new(blokli_client::BlokliClient::new(url.clone(), Default::default()));
@@ -2832,7 +2885,7 @@ mod tests {
         let path = dir.path().join("state.redb");
         let mut expected = Vec::new();
         {
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let store = RedbCurvySdkStore::new(&state)?;
             let mut records = Vec::new();
             for (id, spend, view, amount) in [
@@ -2858,7 +2911,7 @@ mod tests {
             }
             store.save_update(&SdkState::default(), &records, &[])?;
         }
-        let state = RedbCurvyDepositState::open(&path)?;
+        let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         let store = RedbCurvySdkStore::new(&state)?;
         for (id, original, amount) in expected {
             let record = store.allocation(&id)?.unwrap();
@@ -2881,6 +2934,45 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_spender_identity_is_sealed_on_load_and_survives_reopening() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.redb");
+        let (k, v) = ("01".repeat(32), "02".repeat(32));
+        {
+            let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+            let store = RedbCurvySdkStore::new(&db)?;
+            // What a node wrote before the identity was sealed: the keys in the clear.
+            let mut legacy = serde_json::to_value(SdkState::default())?;
+            legacy["spender"] = serde_json::json!({ "k": k, "v": v });
+            let write = store.db.begin_write()?;
+            write
+                .open_table(SDK_STATE_TABLE)?
+                .insert(SDK_STATE_KEY, serde_json::to_vec(&legacy)?)?;
+            write.commit()?;
+
+            let loaded = store.load()?;
+            assert!(loaded.legacy_spender.is_none());
+            let spender = store.spender(&loaded)?.expect("the identity survived sealing");
+            assert_eq!((spender.k, spender.v), (k.clone(), v.clone()));
+            let read = store.db.begin_read()?;
+            let bytes = read.open_table(SDK_STATE_TABLE)?.get(SDK_STATE_KEY)?.unwrap().value();
+            let json = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+            assert!(json.get("spender").is_none(), "the clear copy is gone");
+            assert!(json.get("sealed_spender").is_some());
+            let text = String::from_utf8(bytes)?;
+            assert!(
+                !text.contains(&k) && !text.contains(&v),
+                "the keys are not on disk in the clear"
+            );
+        }
+        let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+        let store = RedbCurvySdkStore::new(&db)?;
+        let spender = store.spender(&store.load()?)?.expect("sealed identity reopens");
+        assert_eq!((spender.k, spender.v), (k, v));
+        Ok(())
+    }
+
+    #[test]
     fn allocation_history_migrates_atomically_and_survives_reopening() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.redb");
@@ -2888,7 +2980,7 @@ mod tests {
         completed.stage = StoredAllocationStage::Completed;
         let prepared = stored_fixture(8)?;
         {
-            let db = RedbCurvyDepositState::open(&path)?;
+            let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let store = RedbCurvySdkStore::new(&db)?;
             let mut legacy = serde_json::to_value(SdkState::default())?;
             legacy["allocations"] = serde_json::json!([completed, prepared]);
@@ -2909,7 +3001,7 @@ mod tests {
                     .is_none()
             );
         }
-        let db = RedbCurvyDepositState::open(&path)?;
+        let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         let store = RedbCurvySdkStore::new(&db)?;
         store.load()?;
         assert_eq!(store.allocation(&completed.id)?, Some(completed));
@@ -3534,13 +3626,15 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.redb");
-        let mut state = RedbCurvyDepositState::open(&path)?;
+        let mut state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         let database = Arc::new(parking_lot::Mutex::new(Some(state.shared_database())));
+        let sealer = state.sealer();
         let progress = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
         let notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let server = relayer::http_tests::Server::new({
             let database = database.clone();
+            let sealer = sealer.clone();
             let progress = progress.clone();
             let posts = posts.clone();
             let notes = notes.clone();
@@ -3552,6 +3646,7 @@ mod tests {
                     posts.fetch_add(1, Ordering::SeqCst);
                     let store = RedbCurvySdkStore {
                         db: database.lock().as_ref().unwrap().clone(),
+                        sealer: sealer.clone(),
                     };
                     let attempts = store.load().unwrap().relay_aggregations;
                     assert_eq!(attempts.len(), 2);
@@ -3606,7 +3701,7 @@ mod tests {
             *database.lock() = None;
             drop(adapter);
             drop(state);
-            state = RedbCurvyDepositState::open(&path)?;
+            state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             *database.lock() = Some(state.shared_database());
             adapter = test_adapter(&state, server.url.clone())?;
             adapter.config.relay_timeout = std::time::Duration::ZERO;
@@ -3725,14 +3820,16 @@ mod tests {
         for (winner, lost_replacement_response) in [(0, false), (1, false), (0, true), (1, true)] {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("state.redb");
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let database = Arc::new(parking_lot::Mutex::new(Some(state.shared_database())));
+            let sealer = state.sealer();
             let chain_notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let finalized = Arc::new(AtomicBool::new(false));
             let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let builds = AtomicUsize::new(0);
             let server = relayer::http_tests::Server::new({
                 let database = database.clone();
+                let sealer = sealer.clone();
                 let chain_notes = chain_notes.clone();
                 let finalized = finalized.clone();
                 let sent = sent.clone();
@@ -3757,6 +3854,7 @@ mod tests {
                             // Every candidate's private outputs are durable before sending its proof.
                             let store = RedbCurvySdkStore {
                                 db: database.lock().as_ref().unwrap().clone(),
+                                sealer: sealer.clone(),
                             };
                             let durable = store.load().unwrap();
                             assert_eq!(durable.relay_aggregations.len(), 2);
@@ -3825,7 +3923,7 @@ mod tests {
             *database.lock() = None;
             drop(adapter);
             drop(state);
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             *database.lock() = Some(state.shared_database());
             let adapter = test_adapter(&state, server.url.clone())?;
             finalized.store(true, Ordering::SeqCst);
@@ -4113,7 +4211,7 @@ mod tests {
             .await;
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("state.redb");
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let mut adapter = test_adapter(&state, server.url.clone())?;
             if failure == "timeout" {
                 adapter.config.relay_timeout = std::time::Duration::ZERO;
@@ -4140,7 +4238,7 @@ mod tests {
 
             // The restarted process loads every output before checking status or retransmitting.
             recovering.store(true, Ordering::SeqCst);
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let adapter = test_adapter(&state, server.url.clone())?;
             adapter.reconcile_relay_aggregation().await?;
             let recovered = adapter.store.load()?;
@@ -4170,12 +4268,16 @@ mod tests {
         let landed = Arc::new(AtomicBool::new(false));
         let server = relayer::http_tests::Server::new({
             let db = state.shared_database();
+            let sealer = state.sealer();
             let landed = landed.clone();
             move |path, _| {
                 if path == "/graphql" {
                     return Some(note_status_response(landed.load(Ordering::SeqCst)));
                 }
-                let store = RedbCurvySdkStore { db: db.clone() };
+                let store = RedbCurvySdkStore {
+                    db: db.clone(),
+                    sealer: sealer.clone(),
+                };
                 let pending = store.load().unwrap().relay_aggregations.into_iter().next().unwrap();
                 assert!(pending.attempted);
                 assert!(!pending.inputs.is_empty());
@@ -4720,10 +4822,13 @@ mod tests {
         let state = RedbCurvyDepositState::in_memory()?;
         let store = RedbCurvySdkStore::new(&state)?;
         let mut persisted = store.load()?;
-        persisted.spender = Some(StoredSpender {
-            k: "01".repeat(31),
-            v: "02".repeat(31),
-        });
+        store.set_spender(
+            &mut persisted,
+            &StoredSpender {
+                k: "01".repeat(31),
+                v: "02".repeat(31),
+            },
+        )?;
         store.save(&persisted)?;
 
         let adapter = test_adapter(&state, server.url.clone())?;
