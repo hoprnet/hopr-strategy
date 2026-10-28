@@ -103,6 +103,10 @@ pub struct AutoFundingStrategy {
 
 impl AutoFundingStrategy {
     /// Create a new builder with the given configuration.
+    #[deprecated(
+        since = "5.5.1",
+        note = "Use ChannelLifecycleStrategy (feature `strategy-channel-lifecycle`) instead."
+    )]
     pub fn new(cfg: AutoFundingStrategyConfig, interval: Duration) -> Self {
         if cfg.funding_amount.le(&cfg.min_stake_threshold) {
             warn!(
@@ -1320,6 +1324,7 @@ mod tests {
     /// Tests the public builder API: `AutoFundingStrategy::new(...).build(node)` must
     /// return a `Box<dyn Strategy + Send>` with the expected Display string.
     #[tokio::test]
+    #[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
     async fn test_build_returns_strategy_trait_object() -> anyhow::Result<()> {
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
@@ -1351,6 +1356,7 @@ mod tests {
     /// invoke, so a zero-amount config built a strategy that could never fund.
     /// `build` now enforces it and returns `InvalidConfiguration`, never panics.
     #[tokio::test]
+    #[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
     async fn build_should_reject_zero_funding_amount() -> anyhow::Result<()> {
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(

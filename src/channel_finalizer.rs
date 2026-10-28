@@ -74,6 +74,10 @@ pub struct ClosureFinalizerStrategy {
 
 impl ClosureFinalizerStrategy {
     /// Create a new builder with the given configuration.
+    #[deprecated(
+        since = "5.5.1",
+        note = "Use ChannelLifecycleStrategy (feature `strategy-channel-lifecycle`) instead."
+    )]
     pub fn new(cfg: ClosureFinalizerStrategyConfig, interval: Duration) -> Self {
         Self { cfg, interval }
     }
@@ -350,6 +354,7 @@ mod tests {
     /// Tests the public builder API: `ClosureFinalizerStrategy::new(...).build(node)` must
     /// return a `Box<dyn Strategy + Send>` with the expected Display string.
     #[tokio::test]
+    #[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
     async fn test_build_returns_strategy_trait_object() -> anyhow::Result<()> {
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
