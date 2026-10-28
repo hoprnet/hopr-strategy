@@ -56,6 +56,18 @@ use super::lifecycle::{CurvyIndexSource, PendingNotesPage};
 /// Largest page the indexer serves (`limit` is capped at 2000 server-side).
 const PAGE_SIZE: u32 = 2000;
 
+/// Most rows one collection read accepts, whatever the indexer claims to hold.
+///
+/// `/sync/meta` and every page carry server-supplied totals, and a whole-collection read
+/// paginates and preallocates against them. A hostile or broken indexer must not be able to turn
+/// a claimed count into a huge allocation or an open-ended chain of requests, so a read refuses a
+/// total past this cap up front, and the paging loop insists that every page before the last is
+/// full and that no page carries more rows than were asked for or than the total has room for.
+/// Together that bounds a read to `total / PAGE_SIZE + 1` requests and `total` rows. The cap is
+/// far above any deployment's real size; a snapshot of this many rows is already more than the
+/// SDK's in-memory tree rebuild should ever be handed.
+const MAX_COLLECTION_ROWS: u64 = 1 << 20;
+
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
@@ -382,51 +394,83 @@ impl<A: SyncApi> CurvyIndexerClient<A> {
         limit: u32,
         at: Option<&str>,
     ) -> Result<Page<T>, String> {
-        let mut query = format!("&fromIndex={from_index}&limit={}", limit.clamp(1, PAGE_SIZE));
+        let limit = limit.clamp(1, PAGE_SIZE);
+        let mut query = format!("&fromIndex={from_index}&limit={limit}");
         if let Some(at) = at {
             query.push_str(&format!("&at={at}"));
         }
-        self.get(path, &query).await
+        let page: Page<T> = self.get(path, &query).await?;
+        if page.items.len() > limit as usize {
+            return Err(format!(
+                "Curvy indexer {path} served {} rows for a limit of {limit}",
+                page.items.len()
+            ));
+        }
+        Ok(page)
     }
 
-    /// Every item of a positional collection at one checkpoint.
+    /// Every item of a positional collection at one checkpoint, `total` being the count
+    /// `/sync/meta` reported for it there.
     async fn all<T: serde::de::DeserializeOwned>(&self, path: &str, at: &str, total: u64) -> Result<Vec<T>, String> {
-        let mut items = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
-        let mut from = 0;
-        while from < total {
-            let page: Page<T> = self.page(path, from, PAGE_SIZE, Some(at)).await?;
-            if page.checkpoint != at {
-                return Err(format!("Curvy indexer {path} changed checkpoint mid-read"));
-            }
-            if page.items.is_empty() || page.next_index <= from {
-                return Err(format!("Curvy indexer {path} stopped advancing at {from} of {total}"));
-            }
-            from = page.next_index;
-            items.extend(page.items);
+        check_total(path, total)?;
+        let first: Page<T> = self.page(path, 0, PAGE_SIZE, Some(at)).await?;
+        if first.checkpoint != at || first.total != total {
+            return Err(format!(
+                "Curvy indexer {path} serves {} rows at {} but its meta says {total} at {at}",
+                first.total, first.checkpoint
+            ));
         }
-        Ok(items)
+        self.rest(path, first).await
     }
 
     /// All notes still pending at the latest finalized checkpoint, in announcement order.
     async fn pending_all(&self) -> Result<Vec<PendingRow>, String> {
         let first: Page<PendingRow> = self.page("/sync/pending", 0, PAGE_SIZE, None).await?;
-        if first.next_index >= first.total {
-            return Ok(first.items);
-        }
-        let mut from = first.next_index;
-        let mut rows = first.items;
-        while from < first.total {
-            let page: Page<PendingRow> = self
-                .page("/sync/pending", from, PAGE_SIZE, Some(&first.checkpoint))
-                .await?;
-            if page.checkpoint != first.checkpoint || page.items.is_empty() || page.next_index <= from {
-                return Err("Curvy pending snapshot changed checkpoint or stopped advancing".to_owned());
+        check_total("/sync/pending", first.total)?;
+        self.rest("/sync/pending", first).await
+    }
+
+    /// A whole collection from its first page on, pinned to that page's checkpoint and bounded by
+    /// its total (already known to be within [`MAX_COLLECTION_ROWS`]). Every page before the last
+    /// must be full and no page may carry the read past the total, so the server decides neither
+    /// how many requests this makes nor how many rows it keeps beyond what it was asked for.
+    async fn rest<T: serde::de::DeserializeOwned>(&self, path: &str, first: Page<T>) -> Result<Vec<T>, String> {
+        let at = first.checkpoint.clone();
+        let total = first.total;
+        let mut rows = Vec::with_capacity(usize::try_from(total.min(u64::from(PAGE_SIZE))).unwrap_or(0));
+        let mut from = 0;
+        let mut page = first;
+        loop {
+            if page.checkpoint != at || page.total != total {
+                return Err(format!("Curvy indexer {path} changed checkpoint or total mid-read"));
+            }
+            let served = page.items.len() as u64;
+            if (rows.len() as u64).saturating_add(served) > total {
+                return Err(format!(
+                    "Curvy indexer {path} served more than the {total} rows it claims to hold"
+                ));
+            }
+            rows.extend(page.items);
+            if page.next_index >= total {
+                return Ok(rows);
+            }
+            if served < u64::from(PAGE_SIZE) || page.next_index <= from {
+                return Err(format!("Curvy indexer {path} stopped advancing at {from} of {total}"));
             }
             from = page.next_index;
-            rows.extend(page.items);
+            page = self.page(path, from, PAGE_SIZE, Some(&at)).await?;
         }
-        Ok(rows)
     }
+}
+
+/// Refuses a server-claimed collection size the client will not page through or hold.
+fn check_total(path: &str, total: u64) -> Result<(), String> {
+    if total > MAX_COLLECTION_ROWS {
+        return Err(format!(
+            "Curvy indexer {path} claims {total} rows, more than the {MAX_COLLECTION_ROWS} this client reads"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +901,142 @@ mod tests {
         ));
         assert!(source.pending_notes(None, 1000).await.is_err());
         Ok(())
+    }
+
+    /// An indexer that lies about its size: it claims `total` rows and hands out `per_page` of
+    /// them per request (clamped to the total only when `honest`), counting the requests it gets.
+    struct LyingApi {
+        total: u64,
+        per_page: u64,
+        honest: bool,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LyingApi {
+        fn new(total: u64, per_page: u64, honest: bool) -> Self {
+            Self {
+                total,
+                per_page,
+                honest,
+                requests: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SyncApi for LyingApi {
+        async fn get_json(&self, query: &str) -> Result<serde_json::Value, String> {
+            self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let url = Url::parse(&format!("http://localhost{query}")).unwrap();
+            if url.path() == "/sync/meta" {
+                let mut meta = canned().0["/sync/meta"].clone();
+                meta["noteCount"] = serde_json::json!(self.total);
+                meta["nullifierCount"] = serde_json::json!(self.total);
+                return Ok(meta);
+            }
+            let params = url.query_pairs().collect::<HashMap<_, _>>();
+            let from = params["fromIndex"].parse::<u64>().unwrap();
+            let served = if self.honest {
+                self.per_page.min(self.total.saturating_sub(from))
+            } else {
+                self.per_page
+            };
+            let (key, rows) = match url.path() {
+                "/sync/pending" => {
+                    let template = canned().0["/sync/pending"]["notes"][0].clone();
+                    let rows = (from..from + served)
+                        .map(|index| {
+                            let mut row = template.clone();
+                            row["noteId"] = serde_json::json!(format!("0x{:064x}", index + 1));
+                            row
+                        })
+                        .collect::<Vec<_>>();
+                    ("notes", rows)
+                }
+                "/sync/nullifiers" => {
+                    let rows = (from..from + served)
+                        .map(|index| {
+                            serde_json::json!({
+                                "index": index, "nullifier": format!("0x{:064x}", index + 1),
+                                "blockNumber": 1, "txHash": "0x01",
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    ("nullifiers", rows)
+                }
+                other => return Err(format!("unexpected {other}")),
+            };
+            Ok(serde_json::json!({
+                "checkpoint": CHECKPOINT, "fromIndex": from, "nextIndex": from + served,
+                "total": self.total, key: rows,
+            }))
+        }
+    }
+
+    fn lying(api: LyingApi) -> (Arc<LyingApi>, CurvyIndexerSource<Arc<LyingApi>>) {
+        let api = Arc::new(api);
+        let source = CurvyIndexerSource(CurvyIndexerClient::new(api.clone(), Arc::new(42161u64)));
+        (api, source)
+    }
+
+    #[async_trait]
+    impl<A: SyncApi> SyncApi for Arc<A> {
+        async fn get_json(&self, path_and_query: &str) -> Result<serde_json::Value, String> {
+            (**self).get_json(path_and_query).await
+        }
+    }
+
+    #[tokio::test]
+    async fn honest_multi_page_collections_are_read_whole() -> anyhow::Result<()> {
+        let (api, source) = lying(LyingApi::new(2500, u64::from(PAGE_SIZE), true));
+        let last = format!("0x{:064x}", 2500);
+        assert!(source.nullifier_spent(last).await.map_err(anyhow::Error::msg)?);
+        assert_eq!(api.requests(), 3, "meta and two pages");
+        let beyond = format!("0x{:064x}", 2501);
+        assert!(!source.nullifier_spent(beyond).await.map_err(anyhow::Error::msg)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absurd_totals_are_refused_before_anything_is_allocated_or_paged() {
+        // `Vec::with_capacity` on this would abort the process; the read must not get there.
+        let (api, source) = lying(LyingApi::new(u64::MAX, 1, false));
+        assert!(source.nullifier_spent("0x01".to_owned()).await.is_err());
+        assert_eq!(api.requests(), 1, "meta only");
+        assert!(source.pending_notes(None, 100).await.is_err());
+        assert_eq!(api.requests(), 2, "the first pending page only");
+
+        let (api, source) = lying(LyingApi::new(MAX_COLLECTION_ROWS + 1, 1, false));
+        assert!(source.nullifier_spent("0x01".to_owned()).await.is_err());
+        assert_eq!(api.requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn short_pages_end_a_read_instead_of_dragging_it_out() {
+        // A page before the last that is not full would let the server dictate the request
+        // count; the read gives up on the first one.
+        let (api, source) = lying(LyingApi::new(10_000, 1, false));
+        assert!(source.nullifier_spent("0x01".to_owned()).await.is_err());
+        assert_eq!(api.requests(), 2, "meta and one page");
+        assert!(source.pending_notes(None, 100).await.is_err());
+        assert_eq!(api.requests(), 3, "one page");
+    }
+
+    #[tokio::test]
+    async fn pages_cannot_carry_more_than_asked_or_more_than_the_total() {
+        let (api, source) = lying(LyingApi::new(10_000, u64::from(PAGE_SIZE) + 1, false));
+        assert!(source.nullifier_spent("0x01".to_owned()).await.is_err());
+        assert_eq!(api.requests(), 2, "meta and one page");
+
+        let (api, source) = lying(LyingApi::new(5, 7, false));
+        assert!(source.nullifier_spent("0x01".to_owned()).await.is_err());
+        assert_eq!(api.requests(), 2, "meta and one page");
+        assert!(source.pending_notes(None, 100).await.is_err());
+        assert_eq!(api.requests(), 3, "one page");
     }
 
     #[tokio::test]
