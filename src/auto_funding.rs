@@ -230,7 +230,8 @@ where
         let channel_id = *channel.get_id();
 
         if !self.in_flight.insert(channel_id) {
-            // Counted in the tick summary; one line per tick per channel would repeat until it confirms.
+            // When called from `on_tick`, counted in the tick summary; one line per tick per
+            // channel would repeat until it confirms.
             trace!(%channel, "skipping channel with in-flight funding");
             return Ok(false);
         }

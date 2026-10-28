@@ -143,7 +143,8 @@ where
     <N as HasChainApi>::ChainApi:
         ChainReadChannelOperations + ChainWriteChannelOperations + Clone + Send + Sync + 'static,
 {
-    /// Submits the final close transaction for every outgoing channel whose grace period has ended.
+    /// Submits the final close transaction for every outgoing channel whose grace period has
+    /// ended and that has not been overdue for closure for more than `max_closure_overdue`.
     ///
     /// Logs one summary line for the tick and returns it.
     #[tracing::instrument(name = "closure_finalizer::tick", level = "debug", skip_all)]
