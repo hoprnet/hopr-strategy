@@ -407,15 +407,19 @@ where
             super::METRIC_CHANNEL_FUNDS.increment();
 
             match chain.fund_channel(&channel_id, topup).await {
-                Ok(confirmation) => match confirmation.await {
-                    Ok(_) => info!(
-                        %channel_id,
-                        destination = %channel.destination,
-                        %topup,
-                        "channel-lifecycle: channel funded"
-                    ),
-                    Err(e) => warn!(%channel_id, %e, "channel-lifecycle: funding tx failed"),
-                },
+                Ok(confirmation) => {
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| {
+                            info!(
+                                %channel_id,
+                                destination = %channel.destination,
+                                %topup,
+                                "channel-lifecycle: channel funded"
+                            )
+                        })
+                        .inspect_err(|e| warn!(%channel_id, %e, "channel-lifecycle: funding tx failed"));
+                }
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit funding tx"),
             }
         })
@@ -436,15 +440,19 @@ where
             super::METRIC_CHANNEL_CLOSES.increment();
 
             match chain.close_channel(&channel_id).await {
-                Ok(confirmation) => match confirmation.await {
-                    Ok(_) => info!(
-                        %channel_id,
-                        destination = %channel.destination,
-                        balance = %channel.balance,
-                        "channel-lifecycle: channel closure started"
-                    ),
-                    Err(e) => warn!(%channel_id, %e, "channel-lifecycle: close tx failed"),
-                },
+                Ok(confirmation) => {
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| {
+                            info!(
+                                %channel_id,
+                                destination = %channel.destination,
+                                balance = %channel.balance,
+                                "channel-lifecycle: channel closure started"
+                            )
+                        })
+                        .inspect_err(|e| warn!(%channel_id, %e, "channel-lifecycle: close tx failed"));
+                }
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit close tx"),
             }
         })
@@ -466,15 +474,19 @@ where
             super::METRIC_CHANNEL_FINALIZES.increment();
 
             match chain.close_channel(&channel_id).await {
-                Ok(confirmation) => match confirmation.await {
-                    Ok(_) => info!(
-                        %channel_id,
-                        destination = %channel.destination,
-                        balance = %channel.balance,
-                        "channel-lifecycle: channel closed"
-                    ),
-                    Err(e) => warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed"),
-                },
+                Ok(confirmation) => {
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| {
+                            info!(
+                                %channel_id,
+                                destination = %channel.destination,
+                                balance = %channel.balance,
+                                "channel-lifecycle: channel closed"
+                            )
+                        })
+                        .inspect_err(|e| warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed"));
+                }
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit finalize tx"),
             }
         })
@@ -547,10 +559,12 @@ where
             super::METRIC_CHANNEL_OPENS.increment();
 
             match chain.open_channel(&dest, amount).await {
-                Ok(confirmation) => match confirmation.await {
-                    Ok(_) => info!(destination = %dest, %amount, "channel-lifecycle: channel opened"),
-                    Err(e) => warn!(%dest, %e, "channel-lifecycle: open tx failed"),
-                },
+                Ok(confirmation) => {
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| info!(destination = %dest, %amount, "channel-lifecycle: channel opened"))
+                        .inspect_err(|e| warn!(%dest, %e, "channel-lifecycle: open tx failed"));
+                }
                 Err(e) => warn!(%dest, %e, "channel-lifecycle: failed to submit open tx"),
             }
         });
