@@ -92,7 +92,22 @@ pre-commit.lib.${system}.run {
     generate-metrics-docs = {
       enable = true;
       name = "METRICS.md must stay in sync with code";
-      entry = "bash .github/scripts/generate-metrics-docs.sh --fix";
+      entry = "${
+        pkgs.writeShellApplication {
+          name = "generate-metrics-docs";
+          runtimeInputs = with pkgs; [
+            bash
+            coreutils
+            gawk
+            git
+            gnugrep
+            gnused
+          ];
+          text = ''
+            exec bash .github/scripts/generate-metrics-docs.sh "$@"
+          '';
+        }
+      }/bin/generate-metrics-docs --fix";
       files = "(METRICS\\.md|\\.rs)$";
       pass_filenames = false;
       language = "system";
