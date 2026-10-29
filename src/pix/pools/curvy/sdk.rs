@@ -55,8 +55,8 @@ use curvy_core::{
     stealth,
 };
 use curvy_sdk::{
-    Account, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route, ScanRecipient, TxLedger,
-    ViewerIdentity,
+    Account, CircuitFamily, CircuitRef, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route,
+    ScanRecipient, TxLedger, ViewerIdentity,
 };
 use futures::future::BoxFuture;
 use hopr_api::{
@@ -84,8 +84,8 @@ const SDK_ALLOCATIONS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> 
     TableDefinition::new("curvy_pix_sdk_allocations");
 /// Verifier profile `(2, 9)`: nine regular outputs, one reserved for change.
 const MAX_ALLOCATIONS_PER_PROOF: usize = 7;
-/// The pending-commitment profile takes at most five note ids.
-const MAX_COMMITMENTS_PER_PROOF: usize = 5;
+/// The pending-commitment circuit's batch: the most note ids one commit proof takes.
+const MAX_COMMITMENTS_PER_PROOF: usize = curvy_sdk::MAX_COMMIT_NOTES;
 /// The PIX withdrawal profile takes at most ten notes.
 const MAX_WITHDRAWAL_INPUTS: usize = 10;
 /// An aggregation spends one or two committed input notes.
@@ -382,6 +382,8 @@ struct StoredRelayAggregation {
     aggregator: String,
     max_inputs: usize,
     proof: curvy_abi::curvy_types::Groth16Proof,
+    /// The calldata words the proof is bound to, sent as the relayer's `publicSignals`. The
+    /// relayer recomputes the proof's commitment from them, so it is not journalled.
     public_signals: Vec<String>,
     request_key: String,
     spend_key: String,
@@ -402,6 +404,10 @@ struct StoredRelayAggregation {
     last_status: Option<relayer::RelayStatus>,
     #[serde(default)]
     timeouts_without_progress: u8,
+    /// The circuit family version the proof was made for. Records written before circuit versions
+    /// load as `None`; the aggregator refuses their proofs.
+    #[serde(default)]
+    circuit: Option<CircuitRef>,
 }
 
 impl StoredRelayAggregation {
@@ -1372,7 +1378,12 @@ where
             }
             if !ids.is_empty() {
                 let entries = client
-                    .commit(&ids, &self.config.operator_private_key, self.config.route)
+                    .commit(
+                        &ids,
+                        CircuitFamily::Pix,
+                        &self.config.operator_private_key,
+                        self.config.route,
+                    )
                     .await?;
                 for entry in &entries {
                     tracing::info!(tx = %entry.tx_hash, notes = ids.len(), "committed pending Curvy notes");
@@ -1498,6 +1509,7 @@ where
             rebuild: false,
             last_status: None,
             timeouts_without_progress: 0,
+            circuit: Some(request.circuit),
         });
         self.store.save_update(&next, allocations, &[])?;
         *current = next;
@@ -1719,6 +1731,13 @@ where
                 }
                 return self.finish_relay_aggregation(Some(winner));
             }
+            // A proof made before circuit versions is refused by the aggregator. One never posted is
+            // proved again rather than replayed; one already posted is left to the relayer's verdict,
+            // since it may have landed before the upgrade.
+            if pending.circuit.is_none() && !pending.attempted && !pending.rebuild {
+                pending.rebuild = true;
+                self.save_relay_attempt(attempts.len() - 1, pending.clone())?;
+            }
             if pending.rebuild {
                 if attempts.len() >= MAX_RELAY_AGGREGATION_ATTEMPTS {
                     return Err(RsSdkCurvyAdapterError::RelayAttemptLimit);
@@ -1763,6 +1782,13 @@ where
             let submission = if let Some(known) = known {
                 known
             } else {
+                // The relayer does not hold it, and a proof without a circuit version cannot be
+                // posted again: prove it again.
+                let Some(circuit) = pending.circuit else {
+                    pending.rebuild = true;
+                    self.save_relay_attempt(index, pending)?;
+                    continue;
+                };
                 let was_attempted = pending.attempted;
                 pending.attempted = true;
                 self.save_relay_attempt(index, pending.clone())?;
@@ -1771,6 +1797,7 @@ where
                         curvy_abi::RelayAction::Aggregation,
                         pending.chain_id,
                         pending.max_inputs,
+                        circuit,
                         &pending.proof,
                         &pending.public_signals,
                         &pending.request_key,
@@ -2102,6 +2129,7 @@ where
         chain_id: u64,
         action: curvy_abi::RelayAction,
         max_inputs: usize,
+        circuit: CircuitRef,
         proof: &curvy_abi::curvy_types::Groth16Proof,
         public_signals: &[String],
         request_key: &str,
@@ -2114,6 +2142,7 @@ where
                 action,
                 chain_id,
                 max_inputs,
+                circuit,
                 proof,
                 public_signals,
                 request_key,
@@ -2321,11 +2350,15 @@ where
     /// [`MAX_NOTE_SELECTION_STEPS`], because a deposit address holds a handful of notes and an
     /// unbounded subset-sum over a pathological one is not worth stalling a sweep for. When
     /// nothing exact is found, the greedy prefix is still what the error reports.
+    ///
+    /// Zero-amount notes are left out: the withdrawal refuses them as inputs, and the scan stores
+    /// none, but a store written before it may hold some.
     fn select_notes(
         notes: Vec<CommittedCurvyNote>,
         amount: Option<HoprBalance>,
     ) -> Result<Vec<OwnedNote>, RsSdkCurvyAdapterError> {
         let mut notes = notes.iter().map(Self::owned_note).collect::<Result<Vec<_>, _>>()?;
+        notes.retain(|note| note.amount != Fr::from(0u8));
         let Some(target) = amount else {
             return Ok(notes);
         };
@@ -2388,6 +2421,7 @@ where
                         endpoints.chain_id,
                         curvy_abi::RelayAction::Withdrawal,
                         request.max_inputs,
+                        request.circuit,
                         &request.proof,
                         &request.public_signals,
                         &request.request_key,
@@ -3036,6 +3070,8 @@ mod tests {
         let request = curvy_sdk::PixAggregationRequest {
             proof: relayer::http_tests::proof(),
             public_signals: vec!["1".to_owned()],
+            commitment: "0".to_owned(),
+            circuit: relayer::http_tests::PIX_1,
             max_inputs: 2,
             allocations: vec![Adapter::owned_note(&fixture(7))?],
             change: Adapter::owned_note(&fixture(13))?,
@@ -3196,6 +3232,8 @@ mod tests {
         let request = curvy_sdk::PixAggregationRequest {
             proof: relayer::http_tests::proof(),
             public_signals: vec!["1".to_owned()],
+            commitment: "0".to_owned(),
+            circuit: relayer::http_tests::PIX_1,
             max_inputs: 2,
             allocations: vec![allocated.clone()],
             change: change.clone(),
@@ -3265,6 +3303,8 @@ mod tests {
         let request = curvy_sdk::PixAggregationRequest {
             proof: relayer::http_tests::proof(),
             public_signals: vec![attempts.len().to_string()],
+            commitment: "0".to_owned(),
+            circuit: relayer::http_tests::PIX_1,
             max_inputs: previous.max_inputs,
             allocations: vec![emitted[0].clone()],
             change,
@@ -3393,6 +3433,66 @@ mod tests {
                 assert_eq!(completed.stage, StoredAllocationStage::Completed);
                 assert!(notes.lock().contains(&adapter.store.load()?.funding[0]));
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_proof_without_a_circuit_version_is_proved_again() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Never posted, and posted but unknown to the relayer: neither is posted again.
+        for attempted in [false, true] {
+            let state = RedbCurvyDepositState::in_memory()?;
+            let store = RedbCurvySdkStore::new(&state)?;
+            let notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let posts = Arc::new(AtomicUsize::new(0));
+            let server = relayer::http_tests::Server::new({
+                let notes = notes.clone();
+                let posts = posts.clone();
+                move |path, body| {
+                    if path == "/graphql" {
+                        return Some(recovery_chain_response(&body, &notes.lock(), true));
+                    }
+                    if path.starts_with("/relay/intent/") {
+                        assert!(attempted);
+                        return Some((404, serde_json::json!({"error":"not found"})));
+                    }
+                    assert_eq!(path, "/relay/submit");
+                    assert_eq!(posts.fetch_add(1, Ordering::SeqCst), 0);
+                    let attempts = store.load().unwrap().relay_aggregations;
+                    // Only the replacement is posted.
+                    assert_eq!(attempts.len(), 2);
+                    assert!(attempts[0].attempted == attempted && attempts[0].rebuild);
+                    assert_eq!(attempts[1].circuit, Some(relayer::http_tests::PIX_1));
+                    assert_eq!(body["requestKey"], attempts[1].request_key);
+                    assert_eq!(body["circuitFamily"], "pix");
+                    *notes.lock() = attempts[1].emitted.clone();
+                    Some((
+                        200,
+                        serde_json::json!({"requestId":"versioned", "status":"included", "transactionHash":"0xabc"}),
+                    ))
+                }
+            })
+            .await;
+            let adapter = test_adapter(&state, server.url.clone())?;
+            prepare_recovery_fixture(&adapter)?;
+            {
+                let mut current = adapter.state.lock();
+                current.relay_aggregations[0].circuit = None;
+                current.relay_aggregations[0].attempted = attempted;
+                adapter.store.save(&current)?;
+            }
+            let builds = AtomicUsize::new(0);
+            let outcome = adapter
+                .reconcile_relay_aggregation_with(|| async {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    prepare_replacement_fixture(&adapter)
+                })
+                .await?
+                .unwrap();
+            assert_eq!(builds.load(Ordering::SeqCst), 1);
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
+            assert_eq!(outcome.request_id.as_deref(), Some("versioned"));
         }
         Ok(())
     }
@@ -4048,6 +4148,7 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("transaction_hash");
         legacy.as_object_mut().unwrap().remove("last_status");
         legacy.as_object_mut().unwrap().remove("timeouts_without_progress");
+        legacy.as_object_mut().unwrap().remove("circuit");
         encoded["relay_aggregation"] = legacy;
         let write = adapter.store.db.begin_write()?;
         write
@@ -4061,6 +4162,7 @@ mod tests {
             adapter.state.lock().relay_aggregations[0].change
         );
         assert!(!recovered.relay_aggregations[0].rebuild);
+        assert!(recovered.relay_aggregations[0].circuit.is_none());
         assert_eq!(recovered.relay_aggregations[0].timeouts_without_progress, 0);
         assert!(recovered.relay_aggregations[0].last_status.is_none());
         adapter.store.save(&recovered)?;
@@ -4730,6 +4832,29 @@ mod tests {
         let (big_k, big_v) = short_key_identity()?;
         assert_eq!(adapter.spender.big_k, big_k);
         assert_eq!(adapter.spender.big_v, big_v);
+        Ok(())
+    }
+
+    #[test]
+    fn withdrawals_leave_out_zero_amount_notes() -> anyhow::Result<()> {
+        let amounts = |selected: Vec<OwnedNote>| {
+            selected
+                .iter()
+                .map(|note| u128::try_from(fr_to_biguint(&note.amount)).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            amounts(Adapter::select_notes(vec![fixture(7), fixture(0)], None)?),
+            vec![7]
+        );
+        assert!(Adapter::select_notes(vec![fixture(0)], None)?.is_empty());
+        assert_eq!(
+            amounts(Adapter::select_notes(
+                vec![fixture(0), fixture(5), fixture(7)],
+                Some(HoprBalance::from(U256::from(5_u8)))
+            )?),
+            vec![5]
+        );
         Ok(())
     }
 
