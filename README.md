@@ -19,6 +19,11 @@ Each strategy is gated behind its own Cargo feature, so a consumer compiles only
 
 `MultiStrategy` runs any combination of them concurrently, and accepts strategies defined outside this crate.
 
+Auto funding and Closure finalizer are legacy strategies superseded by Channel lifecycle (`strategy-channel-lifecycle`). They remain
+available for existing consumers and configurations. New integrations should use Channel lifecycle, which also manages channel opening and
+retirement; migration requires reviewing its funding, population and closure settings rather than renaming a strategy entry. Run one owner
+for outgoing-channel funding and finalization: replace the legacy strategies when enabling Channel lifecycle.
+
 ### PIX deposit pools
 
 The PIX strategy drives a `DepositPool`, which must settle to the same deposit-address scheme the node's PIX spec produces. Each pool ships
