@@ -71,9 +71,9 @@ impl RsCoreCurvyNoteDetector {
 
     /// Decides whether `candidate` belongs to one of the `watched_allocations`.
     ///
-    /// Returns the complete witness note on a match, `Ok(None)` when the note is not ours, and an
-    /// error only when the *public* event is malformed — which the caller quarantines rather than
-    /// retries, since the event will not change.
+    /// Returns the complete witness note on a match, `Ok(None)` when the note is not ours or pays
+    /// nothing (a zero amount), and an error only when the *public* event is malformed — which the
+    /// caller quarantines rather than retries, since the event will not change.
     pub(super) fn detect_owned_note(
         &self,
         candidate: &CurvyPendingNote,
@@ -144,6 +144,16 @@ impl RsCoreCurvyNoteDetector {
             );
             if note.id() == note_id.into_inner() {
                 let amount = U256::from_big_endian(&fr_to_biguint(&amount.into_inner()).to_bytes_be());
+                // A zero-amount note pays nothing, and a sweep refuses one as an input: recorded, it
+                // would block every sweep of the allocation. Honest Entries never send one.
+                if HoprBalance::from(amount).is_zero() {
+                    tracing::warn!(
+                        allocation = ?id,
+                        note_id = %candidate.note_id.0,
+                        "ignoring a zero-amount Curvy note sent to a PIX allocation"
+                    );
+                    return Ok(None);
+                }
                 return Ok(Some(DetectedCurvyNote {
                     deposit: OwnedCurvyDeposit {
                         id: *id,

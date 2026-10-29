@@ -7,7 +7,10 @@
 //!
 //! ### The shape of a submission
 //!
-//! `POST /relay/submit` takes proof, public signals, and two derived keys. It answers immediately
+//! `POST /relay/submit` takes the proof, the circuit family version it was made for, its calldata
+//! words, and two derived keys. The words travel
+//! in the `publicSignals` field: they are what the circuits exposed as public signals before the
+//! calldata binding, and the relayer recomputes the proof's commitment to them. It answers immediately
 //! with a `requestId` rather than a transaction hash, because the submission is queued: the
 //! relayer's worker claims it, submits it, and the status walks `queued → submitting → submitted
 //! → included → finalized`. [`RelayClient::await_inclusion`] polls that to `included`, which is
@@ -519,12 +522,34 @@ impl RelayClient {
     /// [`await_inclusion`](Self::await_inclusion) to wait for it to land. A `409` on the spend key
     /// resolves to the in-flight submission rather than an error: the notes are being spent
     /// exactly once, which is the outcome we wanted.
+    ///
+    /// ```no_run
+    /// # use hopr_strategy::pix::pools::curvy::relayer::{RelayClient, RelayError};
+    /// # async fn relay(client: &RelayClient, request: &curvy_sdk::PixWithdrawalRequest) -> Result<(), RelayError> {
+    /// let submission = client
+    ///     .submit(
+    ///         curvy_abi::RelayAction::Withdrawal,
+    ///         100, // EVM chain id: Gnosis
+    ///         request.max_inputs,
+    ///         request.circuit, // the circuit family version the proof was made for
+    ///         &request.proof,
+    ///         &request.public_signals,
+    ///         &request.request_key,
+    ///         &request.spend_key,
+    ///         "6f1c2a7e-0b9d-4e53-9a41-2d8c5b7f3e10", // the journalled intent id
+    ///     )
+    ///     .await?;
+    /// # let _ = submission;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub async fn submit(
         &self,
         action: curvy_abi::RelayAction,
         chain_id: u64,
         max_inputs: usize,
+        circuit: curvy_abi::curvy_types::CircuitRef,
         proof: &curvy_abi::curvy_types::Groth16Proof,
         public_signals: &[String],
         request_key: &str,
@@ -537,6 +562,8 @@ impl RelayClient {
             // The EVM chain id, not an indexer's internal network row.
             "networkId": chain_id,
             "maxInputs": max_inputs,
+            "circuitFamily": circuit.family.as_str(),
+            "circuitVersion": circuit.version,
             "proof": { "a": proof.a, "b": proof.b, "c": proof.c },
             "publicSignals": public_signals,
             "requestKey": request_key,
@@ -1015,6 +1042,38 @@ pub(super) mod http_tests {
         serde_json::from_value(serde_json::json!({"a":["1","2"],"b":[["3","4"],["5","6"]],"c":["7","8"]})).unwrap()
     }
 
+    pub const PIX_1: curvy_abi::curvy_types::CircuitRef = curvy_abi::curvy_types::CircuitRef {
+        family: curvy_abi::curvy_types::CircuitFamily::Pix,
+        version: 1,
+    };
+
+    #[tokio::test]
+    async fn submissions_name_their_circuit_version() -> anyhow::Result<()> {
+        let server = Server::new(|path, body| {
+            assert_eq!(path, "/relay/submit");
+            assert_eq!(body["circuitFamily"], "pix");
+            assert_eq!(body["circuitVersion"], 1);
+            Some((200, serde_json::json!({"requestId":"queued", "status":"queued"})))
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let submission = client
+            .submit(
+                curvy_abi::RelayAction::Withdrawal,
+                100,
+                10,
+                PIX_1,
+                &proof(),
+                &[],
+                "request",
+                "spend",
+                "intent",
+            )
+            .await?;
+        assert_eq!(submission.request_id, "queued");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn status_errors_separate_lost_requests_from_access_and_transient_failures() -> anyhow::Result<()> {
         for code in [400, 401, 403, 404, 408, 410, 429, 503] {
@@ -1087,6 +1146,7 @@ pub(super) mod http_tests {
                     curvy_abi::RelayAction::Aggregation,
                     100,
                     2,
+                    PIX_1,
                     &proof(),
                     &[],
                     "request",
@@ -1116,6 +1176,7 @@ pub(super) mod http_tests {
                     curvy_abi::RelayAction::Aggregation,
                     100,
                     2,
+                    PIX_1,
                     &proof(),
                     &[],
                     "request",
