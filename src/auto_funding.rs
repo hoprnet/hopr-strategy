@@ -1,4 +1,10 @@
 //! ## Auto Funding Strategy
+//!
+//! Legacy strategy, superseded by `ChannelLifecycleStrategy` (feature
+//! `strategy-channel-lifecycle`), which manages opening, funding, closing and
+//! finalization together. Retained for existing consumers and configurations;
+//! new integrations should use the channel lifecycle strategy.
+//!
 //! Watches for balance-decrease events and periodically scans outgoing channels
 //! to re-stake any that have dropped below `min_stake_threshold` HOPR.
 //!
@@ -31,7 +37,7 @@ use hopr_api::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, trace, warn};
 use validator::{Validate, ValidationError};
 
 use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
@@ -97,6 +103,10 @@ pub struct AutoFundingStrategy {
 
 impl AutoFundingStrategy {
     /// Create a new builder with the given configuration.
+    #[deprecated(
+        since = "5.5.1",
+        note = "Use ChannelLifecycleStrategy (feature `strategy-channel-lifecycle`) instead."
+    )]
     pub fn new(cfg: AutoFundingStrategyConfig, interval: Duration) -> Self {
         if cfg.funding_amount.le(&cfg.min_stake_threshold) {
             warn!(
@@ -149,6 +159,58 @@ impl AutoFundingStrategy {
     }
 }
 
+/// What one auto-funding tick found and did, logged as one line per tick (#7918).
+///
+/// Every channel counted in `below_threshold` is counted in exactly one of the four outcomes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TickSummary {
+    /// Open outgoing channels looked at.
+    scanned: usize,
+    /// Of those, the ones with a stake at or below the threshold.
+    below_threshold: usize,
+    /// Funding transactions started in this tick.
+    funding_started: usize,
+    /// Below the threshold, but an earlier funding transaction is still in flight.
+    in_flight: usize,
+    /// Below the threshold, but the Safe cannot cover another funding.
+    unaffordable: usize,
+    /// Funding could not be started.
+    failed: usize,
+}
+
+impl TickSummary {
+    /// Whether the tick did something or was stopped from doing something. A quiet tick is only
+    /// logged at debug.
+    fn is_notable(&self) -> bool {
+        self.funding_started > 0 || self.unaffordable > 0 || self.failed > 0
+    }
+
+    fn log(&self, safe_balance: HoprBalance, funding_amount: HoprBalance, threshold: HoprBalance) {
+        if self.is_notable() {
+            info!(
+                scanned = self.scanned,
+                below_threshold = self.below_threshold,
+                funding_started = self.funding_started,
+                in_flight = self.in_flight,
+                unaffordable = self.unaffordable,
+                failed = self.failed,
+                %safe_balance,
+                %funding_amount,
+                %threshold,
+                "auto-funding tick"
+            );
+        } else {
+            debug!(
+                scanned = self.scanned,
+                below_threshold = self.below_threshold,
+                in_flight = self.in_flight,
+                %safe_balance,
+                "auto-funding tick"
+            );
+        }
+    }
+}
+
 /// Private generic runner — constructed by [`AutoFundingStrategy::build`].
 struct AutoFundingStrategyInner<N: HasChainApi> {
     node: Arc<N>,
@@ -178,11 +240,13 @@ where
         let channel_id = *channel.get_id();
 
         if !self.in_flight.insert(channel_id) {
-            debug!(%channel, "skipping channel with in-flight funding");
+            // When called from `on_tick`, counted in the tick summary; one line per tick per
+            // channel would repeat until it confirms.
+            trace!(%channel, "skipping channel with in-flight funding");
             return Ok(false);
         }
 
-        info!(
+        debug!(
             %channel,
             balance = %channel.balance,
             threshold = %self.cfg.min_stake_threshold,
@@ -192,14 +256,15 @@ where
         let chain = self.node.chain_api().clone();
         let funding_amount = self.cfg.funding_amount;
         let in_flight = Arc::clone(&self.in_flight);
+        let destination = channel.destination;
 
-        hopr_utils::runtime::prelude::spawn(async move {
+        let funding = async move {
             match chain.fund_channel(&channel_id, funding_amount).await {
                 Ok(confirmation) => {
                     #[cfg(all(feature = "telemetry", not(test)))]
                     METRIC_COUNT_AUTO_FUNDINGS.increment();
 
-                    info!(%channel_id, %funding_amount, "issued re-staking of channel");
+                    info!(%channel_id, %destination, %funding_amount, "issued re-staking of channel");
 
                     if let Err(e) = confirmation.await {
                         warn!(%channel_id, error = %e, "funding transaction failed");
@@ -218,7 +283,9 @@ where
                     METRIC_COUNT_AUTO_FUNDING_FAILURES.increment();
                 }
             }
-        });
+        };
+        // The transaction outlives the tick, but its lines still belong to the tick that started it.
+        hopr_utils::runtime::prelude::spawn(funding.instrument(tracing::Span::current()));
 
         Ok(true)
     }
@@ -266,16 +333,14 @@ where
     }
 
     /// Periodic scan: fund any outgoing open channels below the threshold.
-    async fn on_tick(&self) -> crate::errors::Result<()> {
-        let mut safe_balance_budget = self.safe_balance_budget().await?;
-        if safe_balance_budget < self.cfg.funding_amount {
-            debug!(
-                %safe_balance_budget,
-                funding_amount = %self.cfg.funding_amount,
-                "auto-funding on_tick skipped: safe balance below funding amount"
-            );
-            return Ok(());
-        }
+    ///
+    /// Logs one summary line for the tick and returns it. The channels are scanned even when the Safe
+    /// cannot afford a funding, so the summary says how many channels are waiting for it.
+    #[tracing::instrument(name = "auto_funding::tick", level = "debug", skip_all)]
+    async fn on_tick(&self) -> crate::errors::Result<TickSummary> {
+        let safe_balance = self.safe_balance_budget().await?;
+        let mut safe_balance_budget = safe_balance;
+        let mut summary = TickSummary::default();
 
         let me = *self.node.chain_api().me();
         let mut channels = self
@@ -289,15 +354,30 @@ where
             .map_err(|e| StrategyError::Other(e.into()))?;
 
         while let Some(channel) = channels.next().await {
+            summary.scanned += 1;
             if channel.balance.le(&self.cfg.min_stake_threshold) {
+                summary.below_threshold += 1;
+                if self.in_flight.contains(channel.get_id()) {
+                    trace!(%channel, "skipping channel with in-flight funding");
+                    summary.in_flight += 1;
+                    continue;
+                }
                 if safe_balance_budget < self.cfg.funding_amount {
-                    break;
+                    summary.unaffordable += 1;
+                    continue;
                 }
 
                 match self.try_fund_channel(&channel) {
-                    Ok(true) => safe_balance_budget -= self.cfg.funding_amount,
-                    Ok(false) => {}
-                    Err(e) => warn!(%channel, error = %e, "on_tick: failed to fund channel"),
+                    Ok(true) => {
+                        safe_balance_budget -= self.cfg.funding_amount;
+                        summary.funding_started += 1;
+                    }
+                    // Only when it went in flight between the check above and now.
+                    Ok(false) => summary.in_flight += 1,
+                    Err(e) => {
+                        warn!(%channel, error = %e, "on_tick: failed to fund channel");
+                        summary.failed += 1;
+                    }
                 }
             } else {
                 // Channel above threshold; clear any stale in-flight entry.
@@ -305,8 +385,8 @@ where
             }
         }
 
-        debug!("auto-funding on_tick scan complete");
-        Ok(())
+        summary.log(safe_balance, self.cfg.funding_amount, self.cfg.min_stake_threshold);
+        Ok(summary)
     }
 }
 
@@ -673,7 +753,16 @@ mod tests {
             in_flight: Arc::new(DashSet::new()),
         };
 
-        afs.on_tick().await?;
+        let summary = afs.on_tick().await?;
+        assert_eq!(
+            summary,
+            TickSummary {
+                scanned: 2,
+                below_threshold: 1,
+                funding_started: 1,
+                ..Default::default()
+            }
+        );
 
         events
             .filter(|event| {
@@ -729,7 +818,17 @@ mod tests {
             in_flight: Arc::new(DashSet::new()),
         };
 
-        afs.on_tick().await?;
+        let summary = afs.on_tick().await?;
+        assert_eq!(
+            summary,
+            TickSummary {
+                scanned: 1,
+                below_threshold: 1,
+                unaffordable: 1,
+                ..Default::default()
+            },
+            "the channel waiting for the Safe must show in the summary"
+        );
 
         let no_funding_event = events
             .filter(|event| {
@@ -912,7 +1011,17 @@ mod tests {
             in_flight: Arc::new(DashSet::new()),
         };
 
-        afs.on_tick().await?;
+        let summary = afs.on_tick().await?;
+        assert_eq!(
+            summary,
+            TickSummary {
+                scanned: 3,
+                below_threshold: 3,
+                funding_started: 2,
+                unaffordable: 1,
+                ..Default::default()
+            }
+        );
 
         let mut funding_events = events.filter(|event| {
             futures::future::ready(matches!(
@@ -1109,7 +1218,16 @@ mod tests {
 
         assert!(afs.in_flight.contains(c1.get_id()), "channel should be in-flight");
 
-        afs.on_tick().await?;
+        let summary = afs.on_tick().await?;
+        assert_eq!(
+            summary,
+            TickSummary {
+                scanned: 1,
+                below_threshold: 1,
+                in_flight: 1,
+                ..Default::default()
+            }
+        );
 
         assert_eq!(afs.in_flight.len(), 1, "in-flight set should still have one entry");
         assert!(afs.in_flight.contains(c1.get_id()), "channel should still be in-flight");
@@ -1206,6 +1324,7 @@ mod tests {
     /// Tests the public builder API: `AutoFundingStrategy::new(...).build(node)` must
     /// return a `Box<dyn Strategy + Send>` with the expected Display string.
     #[tokio::test]
+    #[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
     async fn test_build_returns_strategy_trait_object() -> anyhow::Result<()> {
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
@@ -1237,6 +1356,7 @@ mod tests {
     /// invoke, so a zero-amount config built a strategy that could never fund.
     /// `build` now enforces it and returns `InvalidConfiguration`, never panics.
     #[tokio::test]
+    #[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
     async fn build_should_reject_zero_funding_amount() -> anyhow::Result<()> {
         let blokli_sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
