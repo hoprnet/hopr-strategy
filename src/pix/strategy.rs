@@ -697,6 +697,12 @@ struct SpendLedger {
     entries: std::collections::VecDeque<SpendEntry>,
     /// Source of [`SpendEntry::seq`]. Only ever incremented while creating entries.
     seq: u64,
+    /// Reservations already refunded.
+    ///
+    /// A folded entry answers for several reservations, so a count on the entry cannot tell a
+    /// repeated refund of one from a refund of a different one. This set can, which keeps a
+    /// second release from subtracting the same amount twice. Pruned whenever entries expire.
+    refunded: std::collections::HashSet<u64>,
 }
 
 impl SpendLedger {
@@ -707,6 +713,19 @@ impl SpendLedger {
                 break;
             }
             self.entries.pop_front();
+        }
+
+        // A refunded reservation whose entry has expired is no longer needed.
+        if !self.refunded.is_empty() {
+            let expired: Vec<u64> = self
+                .refunded
+                .iter()
+                .copied()
+                .filter(|seq| !self.entries.iter().any(|entry| entry.contains(*seq)))
+                .collect();
+            for seq in expired {
+                self.refunded.remove(&seq);
+            }
         }
 
         self.entries
@@ -754,6 +773,9 @@ impl SpendLedger {
     /// expired reservation can no longer be matched to an unrelated live entry, so a slow deposit
     /// failing after the window rolled does not refund someone else's spend.
     fn release(&mut self, entry: SpendEntry) {
+        if !self.refunded.insert(entry.seqs.0) {
+            return; // already refunded once
+        }
         if let Some(stored) = self.entries.iter_mut().find(|stored| stored.contains(entry.seqs.0)) {
             stored.amount -= entry.amount;
         }
@@ -3123,6 +3145,9 @@ mod tests {
 
         // The folded entry's range was absorbed by its successor, so this subtracts its amount
         // rather than zeroing the survivor — zeroing would refund the survivor's own 7 as well.
+        ledger.release(folded);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(committed - 7));
+        // And releasing it again must not subtract a second time.
         ledger.release(folded);
         assert_eq!(ledger.spent(window, now), HoprBalance::new_base(committed - 7));
     }
