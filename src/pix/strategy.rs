@@ -224,10 +224,14 @@ pub struct PixStrategyConfig {
     /// the window rolls forward.
     ///
     /// A deposit whose flush fails for an error that provably moved no funds — a malformed
-    /// payload, or the plain pool's affordability gate — hands its amount back, so a streak of
-    /// failures does not lock the node out until the window rolls. An ambiguous failure keeps it,
-    /// because a transfer reported as failed may still have landed. See
-    /// [`StrategyError::moved_no_funds`].
+    /// payload, the plain pool's affordability gate, or a drained Curvy pool — hands its amount
+    /// back, so a streak of failures does not lock the node out until the window rolls. An
+    /// ambiguous failure keeps it, because a transfer reported as failed may still have landed.
+    /// See [`StrategyError::moved_no_funds`].
+    ///
+    /// The flip side is that those failures no longer use up the cap, so it no longer bounds how
+    /// often they recur: a peer that keeps sending deposits which fail that way costs pool and SDK
+    /// work on every attempt, however many arrive within one window.
     ///
     /// The ledger behind it is in memory, so a restart forgives the window. It bounds a burst,
     /// not lifetime spend; `plain::NonAnonymousDepositPoolConfig::min_safe_hopr_reserve`
