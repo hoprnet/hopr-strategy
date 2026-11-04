@@ -1322,6 +1322,24 @@ fn only_fund_free_failures_release_the_spend_budget() {
         "an ambiguous chunk stays ambiguous per item"
     );
 
+    // The other direction is what catches a `curvy_clone` that stringifies: a fund-free chunk
+    // error must still be fund-free per item, or a batched drain never refunds.
+    for fund_free in [
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into()),
+        super::CurvyDepositPoolError::Adapter(
+            RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+                "fee-collector identity does not own the aggregator's feeNotePublicKey"
+            ))
+            .into(),
+        ),
+    ] {
+        let fan_out: StrategyError = fund_free.into();
+        assert!(
+            super::clone_error(&fan_out).moved_no_funds(),
+            "a fund-free chunk error must stay fund-free per item"
+        );
+    }
+
     // `CriteriaNotSatisfied` is not fund-free for any pool: it is a generic refusal whose timing
     // is up to the pool.
     assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
