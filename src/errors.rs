@@ -60,6 +60,49 @@ impl StrategyError {
         cfg.validate()
             .map_err(|e| StrategyError::InvalidConfiguration(e.to_string()))
     }
+
+    /// Whether a failed deposit carrying this error provably moved no funds.
+    ///
+    /// The PIX strategy reserves each deposit against
+    /// [`max_spend_per_window`](crate::pix::strategy::PixStrategyConfig::max_spend_per_window)
+    /// before it settles, and hands the reservation back only when the pool says the failure
+    /// cannot have spent anything. That distinction matters because a pool retries internally and
+    /// re-reads the destination balance precisely because a transfer reported as failed may still
+    /// have landed — so an ambiguous outcome must stay counted, and this answers `false` for
+    /// anything but a refusal that provably precedes settlement.
+    ///
+    /// The concrete cases:
+    ///
+    /// - [`Self::GeneralError`] `InvalidInput` — a payload the pool refused before submitting. The other `GeneralError`
+    ///   variants carry no such guarantee and stay counted.
+    /// - [`Self::Other`] wrapping an error a pool classifies as fund-free; see `pix::pools`. This is how a pool says so
+    ///   for an error whose class it can only decide itself, such as the plain pool's retrying affordability gate.
+    ///
+    /// [`Self::CriteriaNotSatisfied`] is deliberately **not** here. It is a plain "the criteria
+    /// were not met", and the pools raise it in both directions: the plain pool from its
+    /// pre-transfer gate, the Curvy pool for "no committed funding note", which `allocate_all`
+    /// can report for a later chunk *after* an earlier one was submitted.
+    ///
+    /// ```
+    /// # use hopr_strategy::errors::StrategyError;
+    /// use hopr_api::types::primitive::prelude::GeneralError;
+    ///
+    /// // A malformed payload is refused before anything is submitted.
+    /// assert!(StrategyError::GeneralError(GeneralError::InvalidInput).moved_no_funds());
+    /// // Ambiguous, so it stays counted by default.
+    /// assert!(!StrategyError::GeneralError(GeneralError::NonSpecificError("boom".into())).moved_no_funds());
+    /// assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
+    /// assert!(!StrategyError::other(anyhow::anyhow!("boom")).moved_no_funds());
+    /// ```
+    pub fn moved_no_funds(&self) -> bool {
+        match self {
+            Self::GeneralError(GeneralError::InvalidInput) => true,
+            // A pool that classifies its own errors puts them behind `Other`; ask it.
+            #[cfg(feature = "strategy-pix")]
+            Self::Other(error) => crate::pix::pools::error_moved_no_funds(error),
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StrategyError>;
