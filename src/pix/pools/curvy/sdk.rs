@@ -289,7 +289,7 @@ pub enum RsSdkCurvyAdapterError {
     /// the call moved no funds.
     ///
     /// `out_of_funding` keeps the exhaustion meaning of a tagged [`Self::NoFunding`], so a pool
-    /// running dry is still recognisable by [`is_out_of_funding`] after an earlier chunk
+    /// running dry is still recognisable by [`super::is_out_of_funding`] after an earlier chunk
     /// submitted.
     #[error("Curvy allocation failed after an earlier chunk was submitted: {source}")]
     AfterSubmission {
