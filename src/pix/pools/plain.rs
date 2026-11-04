@@ -137,6 +137,17 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
 ///
 /// Both halves are checked, because [`ByteDepositData`] is a pair and either half can disagree:
 ///
+/// The pool's own failure, so it can say whether funds may have moved.
+///
+/// The affordability gate runs before `deposit_once` sends a transfer, but a retry can reach it
+/// after an earlier attempt's transaction landed: `backon` reports only the last attempt's error.
+/// `after_attempt` records that, so only a gate refusal with no prior attempt is fund-free.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PlainDepositError {
+    #[error("the Safe cannot cover the deposit and its reserve, so nothing was sent")]
+    Unaffordable { after_attempt: bool },
+}
+
 /// - A payload that is not the marker means the Entry sent deposit data this pool cannot read — the two ends disagree
 ///   about which pool is running, the same class of failure as a wrong curve.
 /// - A payload filed under another allocation means the pool is being asked to settle against `id` using data that
@@ -153,18 +164,6 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
 /// Compared with `==` rather than [`ConstantTimeEq`]: the expected value is a public constant, so
 /// there is no secret for a timing side channel to leak, and a constant-time comparison here would
 /// only suggest to a reader that there is one.
-/// The pool's own failure, so it can say whether funds may have moved.
-///
-/// The affordability gate runs before `deposit_once` sends a transfer, but a retry can reach it
-/// after an earlier attempt's transaction landed: `backon` reports only the last attempt's error.
-/// Naming it lets [`crate::errors::StrategyError::moved_no_funds`] classify it without the
-/// strategy having to know which pool is running.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum PlainDepositError {
-    #[error("the Safe cannot cover the deposit and its reserve, so nothing was sent")]
-    Unaffordable,
-}
-
 fn check_deposit_payload(id: &PixAddressId, data: &ByteDepositData) -> Result<(), StrategyError> {
     if data.id() != id {
         tracing::error!(
@@ -731,6 +730,9 @@ async fn deposit_once(
     cfg: &NonAnonymousDepositPoolConfig,
     dest_addr: Address,
     amount: HoprBalance,
+    // Set once this call is about to send the transfer. A retry reuses it, so a later gate
+    // refusal knows an earlier attempt may already have landed.
+    after_attempt: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), StrategyError> {
     let current: HoprBalance = node
         .chain_api()
@@ -760,9 +762,12 @@ async fn deposit_once(
             available = %payer_hopr,
             "insufficient wxHOPR in the Safe to fund the deposit"
         );
-        return Err(StrategyError::other(PlainDepositError::Unaffordable));
+        return Err(StrategyError::other(PlainDepositError::Unaffordable {
+            after_attempt: after_attempt.load(std::sync::atomic::Ordering::Relaxed),
+        }));
     }
 
+    after_attempt.store(true, std::sync::atomic::Ordering::Relaxed);
     node.chain_api()
         .withdraw(amount, &dest_addr)
         .and_then(identity)
@@ -997,7 +1002,8 @@ where
         let (node, cfg) = (&self.node, &self.cfg);
         let id = *id;
 
-        (move || deposit_once(Arc::clone(node), cfg, dest_addr, amount))
+        let after_attempt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (move || deposit_once(Arc::clone(node), cfg, dest_addr, amount, Arc::clone(&after_attempt)))
             .retry(retry_policy(self.cfg.max_deposit_retries))
             .sleep(backon::FuturesTimerSleeper)
             .notify(move |error, dur| {
@@ -1544,11 +1550,13 @@ mod tests {
         let result = f.deposit(HoprBalance::new_base(25)).await;
 
         // Typed rather than `CriteriaNotSatisfied`, so the strategy can tell a pre-transfer
-        // refusal — which provably moved nothing — from an ambiguous failure.
+        // refusal — which provably moved nothing — from an ambiguous failure. No attempt was
+        // made here, so it is fund-free.
         assert!(matches!(
             result,
             Err(StrategyError::Other(ref error))
-                if error.downcast_ref::<PlainDepositError>().is_some_and(|e| matches!(e, PlainDepositError::Unaffordable))
+                if error.downcast_ref::<PlainDepositError>()
+                    == Some(&PlainDepositError::Unaffordable { after_attempt: false })
         ));
         assert!(
             f.hopr(f.dest_addr).await?.is_zero(),
@@ -1558,6 +1566,65 @@ mod tests {
             f.hopr(f.safe_addr).await?,
             HoprBalance::new_base(10),
             "and must not spend anything either"
+        );
+        Ok(())
+    }
+
+    /// An attempt that reaches the transfer marks the shared flag, so a later gate refusal in the
+    /// same retry budget is not fund-free.
+    ///
+    /// `backon` reports only the last attempt's error, which is why the pool carries this flag
+    /// from one attempt to the next instead of classifying each error on its own.
+    #[test_log::test(tokio::test)]
+    async fn an_attempt_that_reaches_the_transfer_marks_the_retry() -> anyhow::Result<()> {
+        // A Safe that covers the deposit but not the reserve, so the gate refuses it.
+        let f = fixture(
+            Balances {
+                safe_hopr: HoprBalance::new_base(10),
+                ..Default::default()
+            },
+            cfg(),
+        )
+        .await?;
+        let amount = HoprBalance::new_base(10);
+
+        // First attempt with no reserve: it is affordable, so the flag is set before the transfer.
+        // A destination already at the amount short-circuits as funded without a transfer, which
+        // would set the flag misleadingly — so this uses one it does not yet hold enough for.
+        let affordable = NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::zero(),
+            ..cfg()
+        };
+        let attempts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let node = f.pool.node.clone();
+        super::deposit_once(
+            Arc::clone(&node),
+            &affordable,
+            f.dest_addr,
+            amount,
+            Arc::clone(&attempts),
+        )
+        .await?;
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            "reaching the transfer must set the flag"
+        );
+
+        // A retry that now trips the reserve reports the attempt, so no refund follows. `amount`
+        // is doubled so the destination is still short and the gate is actually reached.
+        let refused = NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(5),
+            ..cfg()
+        };
+        let error = super::deposit_once(Arc::clone(&node), &refused, f.dest_addr, amount * 2u32, attempts)
+            .await
+            .expect_err("the reserve refuses it");
+        let StrategyError::Other(inner) = error else {
+            anyhow::bail!("expected a typed refusal, got {error}");
+        };
+        assert_eq!(
+            inner.downcast_ref::<PlainDepositError>(),
+            Some(&PlainDepositError::Unaffordable { after_attempt: true })
         );
         Ok(())
     }
@@ -1584,7 +1651,8 @@ mod tests {
         assert!(matches!(
             refused.deposit(amount).await,
             Err(StrategyError::Other(ref error))
-                if error.downcast_ref::<PlainDepositError>().is_some_and(|e| matches!(e, PlainDepositError::Unaffordable))
+                if error.downcast_ref::<PlainDepositError>()
+                    == Some(&PlainDepositError::Unaffordable { after_attempt: false })
         ));
         assert!(refused.hopr(refused.dest_addr).await?.is_zero());
 

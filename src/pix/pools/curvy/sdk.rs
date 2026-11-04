@@ -281,7 +281,11 @@ pub enum RsSdkCurvyAdapterError {
     /// `after_submission` is set when an earlier chunk of the same call already submitted an
     /// aggregation, so this refusal does not prove the whole call moved no funds.
     #[error("the private pool has no committed note large enough to fund {required} wei")]
-    NoFunding { required: u128, after_submission: bool },
+    NoFunding { required: u128 },
+    /// A failure raised after an aggregation in the same call was submitted, so it does not prove
+    /// the call moved no funds.
+    #[error("Curvy allocation failed after an earlier chunk was submitted: {0}")]
+    AfterSubmission(anyhow::Error),
     #[error("the requested withdrawal is {requested}, but only {available} is stored")]
     InsufficientNotes { requested: u128, available: u128 },
     #[error(
@@ -735,6 +739,23 @@ fn stealth_identity(keys: &relayer::CurvyPublicKeys, who: &str) -> Result<Identi
         big_v: keys.view_public_key.clone(),
         bjj_pub: (coordinate(x, "x")?, coordinate(y, "y")?),
     })
+}
+
+/// Marks an otherwise fund-free-looking error as following a submission in the same call.
+///
+/// An error that is already unambiguously not fund-free is left alone, so its own variant still
+/// tells the caller what happened.
+pub(crate) fn tag_after_submission(error: RsSdkCurvyAdapterError) -> RsSdkCurvyAdapterError {
+    let fund_free_looking = match &error {
+        RsSdkCurvyAdapterError::NoFunding { .. } => true,
+        RsSdkCurvyAdapterError::Sdk(inner) => super::is_pre_submission_refusal(&inner.to_string()),
+        _ => false,
+    };
+    if fund_free_looking {
+        RsSdkCurvyAdapterError::AfterSubmission(anyhow::anyhow!("{error}"))
+    } else {
+        error
+    }
 }
 
 fn relay_error(error: relayer::RelayError) -> RsSdkCurvyAdapterError {
@@ -2165,12 +2186,17 @@ where
     ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         let (client, endpoints) = self.client().await?;
-        self.reconcile_relay_aggregation().await?;
+        // Reconciliation resumes an aggregation an earlier run may have broadcast, and a rebuild
+        // re-proves one it may still land. Whatever the error, it is not a pre-submission
+        // refusal, so it is tagged as such rather than read as fund-free.
+        self.reconcile_relay_aggregation().await.map_err(tag_after_submission)?;
         let ambiguous = self.state.lock().ambiguous_allocation;
         if ambiguous && !self.reconcile_ambiguous_allocation().await? {
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
-        self.reconcile_operator_aggregation().await?;
+        self.reconcile_operator_aggregation()
+            .await
+            .map_err(tag_after_submission)?;
         let deposits = {
             // Every journal has been reconciled above, so a prepared record none of them names
             // was never submitted: its preparation was interrupted before the attempt was
@@ -2213,8 +2239,29 @@ where
         };
         let mut receipts = self.recover_pending().await?;
         // Whether any aggregation has been submitted (or reconciled) ahead of the current chunk.
+        // Once true, no later error proves the call moved no funds: a chunk it follows may land.
         let mut submitted = !receipts.is_empty();
         for chunk in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF) {
+            let chunk_result = self.allocate_chunk(client, endpoints, chunk).await;
+            // A failure here may follow an aggregation a previous chunk (or this one, before the
+            // failure) already submitted, so it does not prove the call moved no funds.
+            let chunk_result =
+                chunk_result.map_err(|error| if submitted { tag_after_submission(error) } else { error });
+            submitted = true;
+            receipts.extend(chunk_result?);
+        }
+        Ok(receipts)
+    }
+
+    /// Allocates one chunk, the body of [`Self::allocate_all`]'s loop.
+    async fn allocate_chunk(
+        &self,
+        client: &CurvyClient,
+        endpoints: &CurvyChainEndpoints,
+        chunk: &[(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)],
+    ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        let mut receipts = Vec::new();
+        {
             // A relayed aggregation carries a gas-reimbursement note for the relayer's operator;
             // a self-submitted one pays its own gas and carries none.
             let relay_fee = match (self.config.submission, self.relay.as_ref()) {
@@ -2269,10 +2316,7 @@ where
                         })
                     })?;
                     if available < minimum {
-                        return Err(RsSdkCurvyAdapterError::NoFunding {
-                            required: minimum,
-                            after_submission: submitted,
-                        });
+                        return Err(RsSdkCurvyAdapterError::NoFunding { required: minimum });
                     }
                     selected
                 }
@@ -2301,8 +2345,6 @@ where
                         .await?,
                 );
             }
-            // From here on a later chunk's failure can follow work this one already submitted.
-            submitted = true;
             receipts.extend(self.recover_pending().await?);
         }
         Ok(receipts)

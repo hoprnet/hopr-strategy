@@ -39,7 +39,7 @@ pub(crate) fn error_moved_no_funds(error: &anyhow::Error) -> bool {
     }
     #[cfg(feature = "strategy-pix-test")]
     if let Some(plain) = error.downcast_ref::<plain::PlainDepositError>() {
-        return matches!(plain, plain::PlainDepositError::Unaffordable);
+        return matches!(plain, plain::PlainDepositError::Unaffordable { after_attempt: false });
     }
     let _ = error;
     false

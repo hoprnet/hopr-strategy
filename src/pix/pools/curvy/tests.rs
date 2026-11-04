@@ -1278,13 +1278,7 @@ fn only_fund_free_failures_release_the_spend_budget() {
     use super::sdk::RsSdkCurvyAdapterError;
 
     // Nothing was allocated: the input notes could not cover the request.
-    let no_funding = super::CurvyDepositPoolError::Adapter(
-        RsSdkCurvyAdapterError::NoFunding {
-            required: 10,
-            after_submission: false,
-        }
-        .into(),
-    );
+    let no_funding = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
     assert!(no_funding.moved_no_funds());
 
     // A batch item rejected for naming another allocation never joined `allocate`.
@@ -1332,28 +1326,26 @@ fn only_fund_free_failures_release_the_spend_budget() {
     // submitted an earlier chunk before a later one finds no funding note.
     assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
 
-    // And `NoFunding` is only fund-free when no submission preceded it in the same call.
-    let after_no_funding: StrategyError = super::CurvyDepositPoolError::Adapter(
-        RsSdkCurvyAdapterError::NoFunding {
-            required: 10,
-            after_submission: true,
-        }
+    // A failure raised after an earlier chunk was submitted is tagged, so it is never fund-free
+    // even when the underlying error is a pre-submission refusal.
+    let after_submission: StrategyError = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::AfterSubmission(anyhow::anyhow!(
+            "the private pool has no committed note large enough to fund 10 wei"
+        ))
         .into(),
     )
     .into();
     assert!(
-        !super::allocation_moved_no_funds(&after_no_funding),
+        !after_submission.moved_no_funds(),
         "an earlier chunk may have moved funds"
     );
-    let before_no_funding: StrategyError = super::CurvyDepositPoolError::Adapter(
-        RsSdkCurvyAdapterError::NoFunding {
-            required: 10,
-            after_submission: false,
-        }
-        .into(),
-    )
-    .into();
-    assert!(super::allocation_moved_no_funds(&before_no_funding));
+
+    // The tag is applied only to errors that would otherwise look fund-free; an already
+    // ambiguous error keeps its own variant.
+    let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 1 });
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission(_)));
+    let untouched = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::AmbiguousAllocation);
+    assert!(matches!(untouched, RsSdkCurvyAdapterError::AmbiguousAllocation));
 }
 
 #[test]

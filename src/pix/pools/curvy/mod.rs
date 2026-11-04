@@ -646,16 +646,11 @@ impl CurvyDepositPoolError {
     /// a safety limit.
     pub fn moved_no_funds(&self) -> bool {
         match self {
-            // Both are refusals made before this item's aggregation could be submitted. They are
-            // only fund-free for the *call*, though: `NoFunding` after an earlier chunk gave up
-            // funding for nothing, and a rebuild re-proves an aggregation an earlier attempt may
-            // already have broadcast. [`allocation_moved_no_funds`] additionally requires that no
-            // submission preceded the error.
+            // Both are refusals made before this item's aggregation could be submitted. A
+            // failure raised after an earlier chunk was submitted arrives as
+            // `AfterSubmission`, so it is not mistaken for one of these.
             Self::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
-                Some(sdk::RsSdkCurvyAdapterError::NoFunding {
-                    after_submission: false,
-                    ..
-                }) => true,
+                Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. }) => true,
                 Some(sdk::RsSdkCurvyAdapterError::Sdk(error)) => is_pre_submission_refusal(&error.to_string()),
                 _ => false,
             },
@@ -706,15 +701,11 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
         // Rebuilt from its own type, not its Display string: `moved_no_funds` downcasts, so a
         // string would erase the classification and a fund-free batch would never refund.
         CurvyDepositPoolError::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
-            Some(sdk::RsSdkCurvyAdapterError::NoFunding {
-                required,
-                after_submission,
-            }) => CurvyDepositPoolError::Adapter(
-                sdk::RsSdkCurvyAdapterError::NoFunding {
-                    required: *required,
-                    after_submission: *after_submission,
-                }
-                .into(),
+            Some(sdk::RsSdkCurvyAdapterError::NoFunding { required }) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::NoFunding { required: *required }.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::AfterSubmission(inner)) => CurvyDepositPoolError::Adapter(
+                sdk::RsSdkCurvyAdapterError::AfterSubmission(anyhow::anyhow!("{inner}")).into(),
             ),
             Some(sdk::RsSdkCurvyAdapterError::Sdk(inner)) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{inner}")).into())
@@ -731,7 +722,7 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
 /// local validation in `build_pix_aggregation`: nothing is signed, no nonce is spent and no
 /// attempt is journalled. Anything not listed stays ambiguous, so a submitted-but-lost outcome
 /// stays counted.
-fn is_pre_submission_refusal(message: &str) -> bool {
+pub(crate) fn is_pre_submission_refusal(message: &str) -> bool {
     message.contains("fee-collector identity does not own the aggregator's feeNotePublicKey")
         || message.contains("PIX aggregation requires")
         || message.contains("PIX allocation amounts must be non-zero")
@@ -740,36 +731,6 @@ fn is_pre_submission_refusal(message: &str) -> bool {
         || message.contains("PIX aggregation inputs must")
         || message.contains("PIX relayer note must carry a non-zero gas reimbursement")
         || message.contains("PIX relayer owner must differ from the funding account")
-}
-
-/// Whether an allocation-call failure proves the whole call moved no funds.
-///
-/// [`CurvyDepositPoolError::moved_no_funds`] answers per item; the call can fail on a later chunk
-/// or during a rebuild after an earlier submission, and then no item may be refunded.
-pub fn allocation_moved_no_funds(error: &StrategyError) -> bool {
-    if let StrategyError::Other(error) = error
-        && let Some(curvy) = error.downcast_ref::<CurvyDepositPoolError>()
-    {
-        return curvy.moved_no_funds() && !curvy.submission_proceeded();
-    }
-    error.moved_no_funds()
-}
-
-impl CurvyDepositPoolError {
-    /// Whether the failure is known to follow a submission in the same call.
-    fn submission_proceeded(&self) -> bool {
-        matches!(
-            self,
-            Self::Adapter(error)
-                if matches!(
-                    error.downcast_ref::<sdk::RsSdkCurvyAdapterError>(),
-                    Some(sdk::RsSdkCurvyAdapterError::NoFunding {
-                        after_submission: true,
-                        ..
-                    })
-                )
-        )
-    }
 }
 
 impl From<CurvyDepositPoolError> for StrategyError {
@@ -1362,12 +1323,13 @@ where
                     // Out of shielded funds is the expected end of a run, not a fault: the
                     // strategy's budget usually gets there first, and either way the kill switch
                     // ends the Session.
-                    return Err(if message.contains("no committed note large enough") {
+                    if message.contains("no committed note large enough") {
                         tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
-                        StrategyError::CriteriaNotSatisfied
-                    } else {
-                        StrategyError::other(CurvyDepositPoolError::Adapter(error.into()))
-                    });
+                    }
+                    // Kept typed rather than collapsed to `CriteriaNotSatisfied`: the strategy
+                    // refunds a deposit only on a class that provably moved no funds, and an
+                    // out-of-funding failure does exactly that.
+                    return Err(StrategyError::other(CurvyDepositPoolError::Adapter(error.into())));
                 }
             }
         }

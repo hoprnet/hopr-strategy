@@ -670,13 +670,22 @@ type BufferedDeposit<D, K> = (
 
 /// One reservation against [`PixStrategyConfig::max_spend_per_window`].
 ///
-/// `at` is when it was committed (and expires), `amount` is what it reserved, and `seq`
-/// identifies the ledger entry a refund belongs to — timestamps and amounts can repeat.
+/// `at` is when it was committed (and expires), `amount` is what it reserved, and
+/// `seqs` is the inclusive range of reservations folded into this entry. A refund names a single
+/// `seq` and is applied only when some live entry's range contains it, so it can never touch
+/// another deposit's amount.
 #[derive(Clone, Copy, Debug)]
 struct SpendEntry {
     at: std::time::Instant,
     amount: HoprBalance,
-    seq: u64,
+    /// Inclusive range of the reservations this entry accounts for; a single one until folded.
+    seqs: (u64, u64),
+}
+
+impl SpendEntry {
+    fn contains(&self, seq: u64) -> bool {
+        (self.seqs.0..=self.seqs.1).contains(&seq)
+    }
 }
 
 /// The rolling ledger behind [`PixStrategyConfig::max_spend_per_window`].
@@ -714,7 +723,7 @@ impl SpendLedger {
         let entry = SpendEntry {
             at: now,
             amount,
-            seq: self.seq,
+            seqs: (self.seq, self.seq),
         };
         self.seq = self.seq.wrapping_add(1);
         self.entries.push_back(entry);
@@ -723,37 +732,30 @@ impl SpendLedger {
         // *newer* timestamp, so it is counted for longer than it strictly should be — the
         // conservative direction for a cap.
         //
-        // A folded entry's `seq` is lost, so a refund for it subtracts from the survivor instead,
-        // by amount. See [`Self::release`].
+        // A folded entry's `seq` is absorbed by its successor, which then answers refunds for
+        // every reservation it covers. See [`Self::release`].
         if self.entries.len() > SPEND_LEDGER_CAPACITY
             && let Some(oldest) = self.entries.pop_front()
             && let Some(next) = self.entries.front_mut()
         {
             next.amount += oldest.amount;
+            next.seqs = (oldest.seqs.0.min(next.seqs.0), oldest.seqs.1.max(next.seqs.1));
         }
         entry
     }
 
     /// Hands `entry`'s reserved amount back to the window.
     ///
-    /// Only sound for a provably fund-free failure. An expired entry is left alone — it is no
-    /// longer counted — and counting is the safe direction.
+    /// Only sound for a provably fund-free failure. Subtraction rather than zeroing: an entry may
+    /// hold older reservations folded into it, and zeroing would refund those too.
     ///
-    /// Subtraction rather than zeroing: an entry may hold older reservations folded into it, and
-    /// zeroing would refund those too. When the `seq` is gone because the entry was itself folded
-    /// into a survivor, the same amount is subtracted from that survivor, which keeps every other
-    /// reservation counted.
+    /// The refund is applied only when a live entry's `seq` range contains this reservation. An
+    /// expired entry, or one whose range was folded away, is left alone — and crucially, an
+    /// expired reservation can no longer be matched to an unrelated live entry, so a slow deposit
+    /// failing after the window rolled does not refund someone else's spend.
     fn release(&mut self, entry: SpendEntry) {
-        if let Some(stored) = self.entries.iter_mut().find(|stored| stored.seq == entry.seq) {
+        if let Some(stored) = self.entries.iter_mut().find(|stored| stored.contains(entry.seqs.0)) {
             stored.amount -= entry.amount;
-            return;
-        }
-        if let Some(survivor) = self
-            .entries
-            .iter_mut()
-            .find(|stored| stored.at >= entry.at && stored.amount >= entry.amount)
-        {
-            survivor.amount -= entry.amount;
         }
     }
 }
@@ -1330,7 +1332,7 @@ async fn flush_deposit_batch<D, K>(
                 // that actually settled are recorded as processed. `BatchOutcomes` carries the
                 // id in each outcome, so a partially failed batch no longer marks its failures
                 // done — the duplicate guard would otherwise drop the retry a peer resends.
-                for ((_, dest_addr, ..), _) in deposits.iter().zip(&spends) {
+                for (_, dest_addr, ..) in &deposits {
                     in_flight_destinations.invalidate(dest_addr);
                 }
 
@@ -1341,7 +1343,7 @@ async fn flush_deposit_batch<D, K>(
                 let outcomes_len = outcomes.len();
                 let positional = outcomes_len == count;
                 let mut everything_failed_fund_free = true;
-                let mut failed_at: Vec<Option<usize>> = vec![None; count];
+                let mut failed_at = vec![false; count];
                 let mut settled: std::collections::HashSet<PixAddressId> = std::collections::HashSet::new();
                 for (index, outcome) in outcomes.into_iter().enumerate() {
                     match outcome {
@@ -1354,7 +1356,7 @@ async fn flush_deposit_batch<D, K>(
                             let error: StrategyError = error.into();
                             everything_failed_fund_free &= batch_refundable(&error);
                             if positional {
-                                failed_at[index] = Some(index);
+                                failed_at[index] = true;
                             }
                             tracing::error!(%error, "deposit within the batch failed");
                         }
@@ -1367,14 +1369,14 @@ async fn flush_deposit_batch<D, K>(
                 if everything_failed_fund_free {
                     if positional {
                         for (index, spend) in spends.iter().enumerate() {
-                            if failed_at[index].is_some() {
+                            if failed_at[index] {
                                 let (id, _, amount, _) = &deposits[index];
                                 refund(spend_ledger.as_ref(), *spend, id, *amount);
                             }
                         }
                     } else if outcomes_accounted_for(&deposits, &settled, outcomes_len) {
-                        // Fewer outcomes than deposits, so a failed item is the one with no
-                        // success echo; its position cannot be recovered.
+                        // Fewer outcomes than deposits, so which item failed cannot be recovered
+                        // from position; it is taken to be the one with no success echo.
                         for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
                             if !settled.contains(id) {
                                 refund(spend_ledger.as_ref(), *spend, id, *amount);
@@ -1416,10 +1418,6 @@ async fn flush_deposit_batch<D, K>(
 /// A batch is one pool call, so a Curvy call that failed after an earlier chunk was submitted
 /// refunds nothing even if the error itself looks fund-free. Only Curvy has that notion.
 fn batch_refundable(error: &StrategyError) -> bool {
-    #[cfg(feature = "strategy-pix-curvy")]
-    if !crate::pix::pools::curvy::allocation_moved_no_funds(error) {
-        return false;
-    }
     error.moved_no_funds()
 }
 
@@ -3079,7 +3077,10 @@ mod tests {
         assert!(!StrategyError::other(anyhow::anyhow!("lost confirmation")).moved_no_funds());
 
         // A pool that classifies its own error is believed.
-        assert!(StrategyError::other(crate::pix::pools::plain::PlainDepositError::Unaffordable).moved_no_funds());
+        assert!(
+            StrategyError::other(crate::pix::pools::plain::PlainDepositError::Unaffordable { after_attempt: false })
+                .moved_no_funds()
+        );
     }
 
     /// The ledger's own contract: a release zeroes only the entry it names, and an expired entry
@@ -3126,10 +3127,50 @@ mod tests {
             "folding preserves the total"
         );
 
-        // The folded entry's `seq` is gone, so this subtracts its amount from the survivor
-        // rather than zeroing it — zeroing would refund the successor's own 7 as well.
+        // The folded entry's range was absorbed by its successor, so this subtracts its amount
+        // rather than zeroing the survivor — zeroing would refund the survivor's own 7 as well.
         ledger.release(folded);
         assert_eq!(ledger.spent(window, now), HoprBalance::new_base(committed - 7));
+    }
+
+    /// Releasing an expired reservation must not touch a live one.
+    ///
+    /// A slow deposit that outlives the window and then fails fund-free must refund nothing: its
+    /// entry is gone, and a by-amount fallback would subtract from whatever live reservation
+    /// happened to be there.
+    #[test]
+    fn test_release_of_an_expired_reservation_leaves_live_ones_alone() {
+        let window = StdDuration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        let mut ledger = SpendLedger::default();
+        let slow = ledger.commit(HoprBalance::new_base(30), start);
+
+        // The slow deposit ages out, and a live one is committed afterwards.
+        let later = start + StdDuration::from_secs(50);
+        assert_eq!(ledger.spent(window, later), HoprBalance::zero());
+        let live = HoprBalance::new_base(10);
+        ledger.commit(live, later);
+
+        // Releasing the expired reservation must leave the live one counted.
+        ledger.release(slow);
+        assert_eq!(ledger.spent(window, later), live);
+    }
+
+    /// A retry that lands and is then refused by the gate must not refund: an earlier attempt
+    /// already moved funds.
+    ///
+    /// `backon` reports only the last attempt's error, so the pool records that it reached the
+    /// transfer (`after_attempt`) and the strategy treats a refusal carrying that as ambiguous.
+    #[test]
+    fn test_gate_refusal_after_an_attempt_is_not_fund_free() {
+        let before = crate::pix::pools::plain::PlainDepositError::Unaffordable { after_attempt: false };
+        let after = crate::pix::pools::plain::PlainDepositError::Unaffordable { after_attempt: true };
+        assert!(StrategyError::other(before).moved_no_funds());
+        assert!(
+            !StrategyError::other(after).moved_no_funds(),
+            "an earlier attempt may have landed"
+        );
     }
 
     /// A pool scripted per item, so each failure's class is attributed exactly.
@@ -3168,7 +3209,16 @@ mod tests {
             _: HoprBalance,
             _: Self::PoolDepositData,
         ) -> std::result::Result<Self::Receipt, StrategyError> {
-            Ok(())
+            // Follow the script, so a single-item flush exercises a real failure rather than
+            // always succeeding.
+            let script = self.script.lock().first().copied().unwrap_or((true, false));
+            match script {
+                (_, false) => Ok(()),
+                (true, true) => Err(StrategyError::GeneralError(
+                    hopr_api::types::primitive::prelude::GeneralError::InvalidInput,
+                )),
+                (false, true) => Err(StrategyError::other(ScriptedFailure)),
+            }
         }
 
         async fn deposit_funds_to_multiple(
