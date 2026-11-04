@@ -3023,10 +3023,12 @@ mod tests {
         let spend = ledger.lock().commit(amount, std::time::Instant::now());
         batch.push((id, address, amount, data, spend));
 
+        // A one-item batch takes the single-deposit path, which follows `script`; `raw_outcomes`
+        // only drives `deposit_funds_to_multiple`, so an empty script here would just succeed.
         let pool = Arc::new(ScriptedBatchPool {
-            script: parking_lot::Mutex::new(Vec::new()),
+            script: parking_lot::Mutex::new(vec![(false, true)]),
             whole_batch_fails: false,
-            raw_outcomes: Some(vec![RawOutcome::AmbiguousFailure]),
+            raw_outcomes: None,
         });
         flush_deposit_batch::<_, EthDepositKey>(
             pool,
@@ -3192,7 +3194,6 @@ mod tests {
     enum RawOutcome {
         Success(PixAddressId),
         FundFreeFailure,
-        AmbiguousFailure,
     }
 
     #[async_trait::async_trait]
@@ -3239,7 +3240,6 @@ mod tests {
                         RawOutcome::FundFreeFailure => Err(StrategyError::GeneralError(
                             hopr_api::types::primitive::prelude::GeneralError::InvalidInput,
                         )),
-                        RawOutcome::AmbiguousFailure => Err(StrategyError::other(ScriptedFailure)),
                     })
                     .collect());
             }
