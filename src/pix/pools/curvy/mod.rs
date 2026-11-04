@@ -713,7 +713,9 @@ impl CurvyDepositPoolError {
 ///     RsSdkCurvyAdapterError::NoFunding { required: 10 }.into(),
 /// ));
 /// assert!(hopr_strategy::pix::pools::curvy::is_out_of_funding(&drained));
-/// assert!(!hopr_strategy::pix::pools::curvy::is_out_of_funding(&StrategyError::CriteriaNotSatisfied));
+/// assert!(!hopr_strategy::pix::pools::curvy::is_out_of_funding(
+///     &StrategyError::CriteriaNotSatisfied
+/// ));
 /// ```
 pub fn is_out_of_funding(error: &StrategyError) -> bool {
     match error {
