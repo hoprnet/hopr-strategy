@@ -646,12 +646,16 @@ impl CurvyDepositPoolError {
     /// a safety limit.
     pub fn moved_no_funds(&self) -> bool {
         match self {
-            // `NoFunding` is raised while selecting input notes, before the aggregation exists.
-            // A proof the SDK refused to build — validation inside `build_pix_aggregation`, such
-            // as gnosis/gnosis_vpn#713's `feeNotePublicKey` mismatch — never reached submission
-            // either, and leaves no journalled attempt behind.
+            // Both are refusals made before this item's aggregation could be submitted. They are
+            // only fund-free for the *call*, though: `NoFunding` after an earlier chunk gave up
+            // funding for nothing, and a rebuild re-proves an aggregation an earlier attempt may
+            // already have broadcast. [`allocation_moved_no_funds`] additionally requires that no
+            // submission preceded the error.
             Self::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
-                Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. }) => true,
+                Some(sdk::RsSdkCurvyAdapterError::NoFunding {
+                    after_submission: false,
+                    ..
+                }) => true,
                 Some(sdk::RsSdkCurvyAdapterError::Sdk(error)) => is_pre_submission_refusal(&error.to_string()),
                 _ => false,
             },
@@ -699,7 +703,24 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
                 actual: *actual,
             }
         }
-        CurvyDepositPoolError::Adapter(error) => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{error}")),
+        // Rebuilt from its own type, not its Display string: `moved_no_funds` downcasts, so a
+        // string would erase the classification and a fund-free batch would never refund.
+        CurvyDepositPoolError::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
+            Some(sdk::RsSdkCurvyAdapterError::NoFunding {
+                required,
+                after_submission,
+            }) => CurvyDepositPoolError::Adapter(
+                sdk::RsSdkCurvyAdapterError::NoFunding {
+                    required: *required,
+                    after_submission: *after_submission,
+                }
+                .into(),
+            ),
+            Some(sdk::RsSdkCurvyAdapterError::Sdk(inner)) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{inner}")).into())
+            }
+            _ => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{error}")),
+        },
         other => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{other}")),
     }
 }
@@ -719,6 +740,36 @@ fn is_pre_submission_refusal(message: &str) -> bool {
         || message.contains("PIX aggregation inputs must")
         || message.contains("PIX relayer note must carry a non-zero gas reimbursement")
         || message.contains("PIX relayer owner must differ from the funding account")
+}
+
+/// Whether an allocation-call failure proves the whole call moved no funds.
+///
+/// [`CurvyDepositPoolError::moved_no_funds`] answers per item; the call can fail on a later chunk
+/// or during a rebuild after an earlier submission, and then no item may be refunded.
+pub fn allocation_moved_no_funds(error: &StrategyError) -> bool {
+    if let StrategyError::Other(error) = error
+        && let Some(curvy) = error.downcast_ref::<CurvyDepositPoolError>()
+    {
+        return curvy.moved_no_funds() && !curvy.submission_proceeded();
+    }
+    error.moved_no_funds()
+}
+
+impl CurvyDepositPoolError {
+    /// Whether the failure is known to follow a submission in the same call.
+    fn submission_proceeded(&self) -> bool {
+        matches!(
+            self,
+            Self::Adapter(error)
+                if matches!(
+                    error.downcast_ref::<sdk::RsSdkCurvyAdapterError>(),
+                    Some(sdk::RsSdkCurvyAdapterError::NoFunding {
+                        after_submission: true,
+                        ..
+                    })
+                )
+        )
+    }
 }
 
 impl From<CurvyDepositPoolError> for StrategyError {

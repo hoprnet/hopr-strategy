@@ -29,10 +29,17 @@ pub mod plain;
 /// for an [`Other`](crate::errors::StrategyError::Other) carrying one of this module's error
 /// types. Kept here rather than on `StrategyError` itself so the error enum stays pool-agnostic
 /// and the two pools' classifications live next to the pools.
+///
+/// The downcasts are tried in turn: neither bundled error is ever produced above the other, so at
+/// most one matches.
 pub(crate) fn error_moved_no_funds(error: &anyhow::Error) -> bool {
     #[cfg(feature = "strategy-pix-curvy")]
     if let Some(curvy) = error.downcast_ref::<curvy::CurvyDepositPoolError>() {
         return curvy.moved_no_funds();
+    }
+    #[cfg(feature = "strategy-pix-test")]
+    if let Some(plain) = error.downcast_ref::<plain::PlainDepositError>() {
+        return matches!(plain, plain::PlainDepositError::Unaffordable);
     }
     let _ = error;
     false

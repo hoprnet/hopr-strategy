@@ -278,8 +278,10 @@ pub enum RsSdkCurvyAdapterError {
     IncompleteRelayRecovery,
     #[error("invalid Curvy adapter value: {0}")]
     InvalidValue(String),
+    /// `after_submission` is set when an earlier chunk of the same call already submitted an
+    /// aggregation, so this refusal does not prove the whole call moved no funds.
     #[error("the private pool has no committed note large enough to fund {required} wei")]
-    NoFunding { required: u128 },
+    NoFunding { required: u128, after_submission: bool },
     #[error("the requested withdrawal is {requested}, but only {available} is stored")]
     InsufficientNotes { requested: u128, available: u128 },
     #[error(
@@ -2210,6 +2212,8 @@ where
             pending
         };
         let mut receipts = self.recover_pending().await?;
+        // Whether any aggregation has been submitted (or reconciled) ahead of the current chunk.
+        let mut submitted = !receipts.is_empty();
         for chunk in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF) {
             // A relayed aggregation carries a gas-reimbursement note for the relayer's operator;
             // a self-submitted one pays its own gas and carries none.
@@ -2265,7 +2269,10 @@ where
                         })
                     })?;
                     if available < minimum {
-                        return Err(RsSdkCurvyAdapterError::NoFunding { required: minimum });
+                        return Err(RsSdkCurvyAdapterError::NoFunding {
+                            required: minimum,
+                            after_submission: submitted,
+                        });
                     }
                     selected
                 }
@@ -2294,6 +2301,8 @@ where
                         .await?,
                 );
             }
+            // From here on a later chunk's failure can follow work this one already submitted.
+            submitted = true;
             receipts.extend(self.recover_pending().await?);
         }
         Ok(receipts)

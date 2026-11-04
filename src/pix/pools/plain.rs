@@ -153,6 +153,18 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
 /// Compared with `==` rather than [`ConstantTimeEq`]: the expected value is a public constant, so
 /// there is no secret for a timing side channel to leak, and a constant-time comparison here would
 /// only suggest to a reader that there is one.
+/// The pool's own failure, so it can say whether funds may have moved.
+///
+/// The affordability gate runs before `deposit_once` sends a transfer, but a retry can reach it
+/// after an earlier attempt's transaction landed: `backon` reports only the last attempt's error.
+/// Naming it lets [`crate::errors::StrategyError::moved_no_funds`] classify it without the
+/// strategy having to know which pool is running.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PlainDepositError {
+    #[error("the Safe cannot cover the deposit and its reserve, so nothing was sent")]
+    Unaffordable,
+}
+
 fn check_deposit_payload(id: &PixAddressId, data: &ByteDepositData) -> Result<(), StrategyError> {
     if data.id() != id {
         tracing::error!(
@@ -748,7 +760,7 @@ async fn deposit_once(
             available = %payer_hopr,
             "insufficient wxHOPR in the Safe to fund the deposit"
         );
-        return Err(StrategyError::CriteriaNotSatisfied);
+        return Err(StrategyError::other(PlainDepositError::Unaffordable));
     }
 
     node.chain_api()
@@ -1170,7 +1182,10 @@ mod tests {
         },
     };
 
-    use super::{DEPOSIT_MARKER_PAYLOAD, EthDepositKey, NonAnonymousDepositPool, NonAnonymousDepositPoolConfig};
+    use super::{
+        DEPOSIT_MARKER_PAYLOAD, EthDepositKey, NonAnonymousDepositPool, NonAnonymousDepositPoolConfig,
+        PlainDepositError,
+    };
     use crate::{
         errors::StrategyError,
         pix::ByteDepositData,
@@ -1528,7 +1543,13 @@ mod tests {
 
         let result = f.deposit(HoprBalance::new_base(25)).await;
 
-        assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)));
+        // Typed rather than `CriteriaNotSatisfied`, so the strategy can tell a pre-transfer
+        // refusal — which provably moved nothing — from an ambiguous failure.
+        assert!(matches!(
+            result,
+            Err(StrategyError::Other(ref error))
+                if error.downcast_ref::<PlainDepositError>().is_some_and(|e| matches!(e, PlainDepositError::Unaffordable))
+        ));
         assert!(
             f.hopr(f.dest_addr).await?.is_zero(),
             "a refused deposit must not move anything"
@@ -1562,7 +1583,8 @@ mod tests {
 
         assert!(matches!(
             refused.deposit(amount).await,
-            Err(StrategyError::CriteriaNotSatisfied)
+            Err(StrategyError::Other(ref error))
+                if error.downcast_ref::<PlainDepositError>().is_some_and(|e| matches!(e, PlainDepositError::Unaffordable))
         ));
         assert!(refused.hopr(refused.dest_addr).await?.is_zero());
 
