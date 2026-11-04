@@ -1522,8 +1522,9 @@ where
             outcomes[index] = Some(match &result {
                 Ok(()) => Ok((id, ())),
                 // One allocation call fails for the whole chunk, so every item carries the same
-                // failure. A classified one is rebuilt from its own error type rather than
-                // stringified, so `moved_no_funds` still finds it.
+                // failure. `clone_error` rebuilds `NoFunding` and the SDK variants from their own
+                // types, so `moved_no_funds` still finds a fund-free refusal; anything else is
+                // stringified and degrades to ambiguous.
                 Err(error) => Err(clone_error(error)),
             });
         }

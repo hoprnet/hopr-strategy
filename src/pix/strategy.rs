@@ -2913,8 +2913,8 @@ mod tests {
     /// This is the `max_spend_per_window` half of gnosis/gnosis_vpn#713: nine failed 0.66 wxHOPR
     /// deposits drove `spent` to 5.94 of a 6 wxHOPR budget and the tenth was refused for the rest
     /// of the 24 h window, even though the funds never left. The failing deposits here are refused
-    /// by `min_safe_hopr_reserve`, which `deposit_once` checks before it submits a transfer, and
-    /// reports as a `PlainDepositError::Unaffordable` that `moved_no_funds` treats as fund-free.
+    /// by `min_safe_hopr_reserve`, which `deposit_once` checks before it submits a transfer and
+    /// reports as `PlainDepositError::Unaffordable`; `moved_no_funds` treats that as fund-free.
     #[test_log::test(tokio::test)]
     async fn test_failed_deposits_release_their_spend_reservation() -> anyhow::Result<()> {
         let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
