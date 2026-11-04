@@ -2239,7 +2239,7 @@ where
         self.reconcile_operator_aggregation()
             .await
             .map_err(tag_after_submission)?;
-        let deposits = {
+        let (deposits, completed_earlier) = {
             // Every journal has been reconciled above, so a prepared record none of them names
             // was never submitted: its preparation was interrupted before the attempt was
             // journalled. It is prepared again rather than blocking the allocation for good.
@@ -2260,13 +2260,17 @@ where
                     .collect::<std::collections::HashSet<_>>()
             };
             let mut pending = Vec::new();
+            let mut completed_earlier = false;
             for (id, address, scan_key, amount) in deposits {
                 if let Some(existing) = self.store.allocation(&id_bytes(id))? {
                     if !existing.matches(address, *scan_key, *amount) {
                         return Err(RsSdkCurvyAdapterError::ConflictingAllocation);
                     }
                     match existing.stage {
-                        StoredAllocationStage::Completed => continue,
+                        StoredAllocationStage::Completed => {
+                            completed_earlier = true;
+                            continue;
+                        }
                         StoredAllocationStage::Prepared if journalled.contains(&existing.id) => {
                             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
                         }
@@ -2277,12 +2281,17 @@ where
                 }
                 pending.push((*id, *address, *scan_key, *amount));
             }
-            pending
+            (pending, completed_earlier)
         };
         let mut receipts = self.recover_pending().await?;
         // Whether any aggregation has been submitted (or reconciled) ahead of the current chunk.
         // Once true, no later error proves the call moved no funds: a chunk it follows may land.
-        let mut submitted = !receipts.is_empty();
+        //
+        // A deposit that is already `Completed` counts as well. `allocate` re-runs the whole batch
+        // after tree lag, so this can be the retry of a call whose first chunk landed; its
+        // deposits are skipped here, but the caller fans a failure out to every deposit it handed
+        // in, and would refund theirs.
+        let mut submitted = !receipts.is_empty() || completed_earlier;
         for chunk in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF) {
             let chunk_result = self.allocate_chunk(client, endpoints, chunk).await;
             // A failure here may follow an aggregation a previous chunk (or this one, before the
@@ -3286,6 +3295,69 @@ mod tests {
             adapter.allocate_all(&changed).await,
             Err(RsSdkCurvyAdapterError::ConflictingAllocation)
         ));
+        Ok(())
+    }
+
+    /// The state `allocate` retries into after tree lag: an earlier attempt's first chunk landed,
+    /// so its deposits are `Completed`, and the rest of the batch then fails a fund-free check.
+    ///
+    /// The caller fans that one error out to every deposit it handed in, the landed ones
+    /// included, so it must not read as fund-free.
+    #[tokio::test]
+    async fn a_failure_after_a_landed_chunk_is_not_fund_free() -> anyhow::Result<()> {
+        // Prices an allocation at exactly its total, with no fees and no per-token gas, so an
+        // empty funding store fails with `NoFunding`.
+        let server = relayer::http_tests::Server::new(|path, body| {
+            if path != "/graphql" || !body["query"].as_str().unwrap_or_default().contains("curvyVaultFees") {
+                return Some((
+                    500,
+                    serde_json::json!({ "error": format!("unexpected request to {path}") }),
+                ));
+            }
+            Some((
+                200,
+                serde_json::json!({ "data": {
+                    "curvyVaultFees": { "__typename": "CurvyVaultFees", "depositFee": "0", "withdrawalFee": "0" },
+                    "curvyAggregatorFees": {
+                        "__typename": "CurvyAggregatorFees",
+                        "protocolFeePerThousand": "0",
+                        "commitmentFeeRoot": "0x01",
+                        "feeNotePublicKey": ["1", "2"],
+                    },
+                    "curvyVaultTokenCount": { "__typename": "CurvyVaultTokenCount", "count": "0" },
+                }}),
+            ))
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let key = scan_key("07", "0b")?;
+        let deposit = |note: &CommittedCurvyNote| (note.deposit.id, note.deposit.address, key, note.deposit.amount);
+        let (landed, rest) = (fixture(7), fixture(8));
+
+        // With nothing completed, the drain is a plain `NoFunding`, which is fund-free.
+        let error = adapter.allocate_all(&[deposit(&rest)]).await.unwrap_err();
+        assert!(matches!(error, RsSdkCurvyAdapterError::NoFunding { .. }), "{error}");
+
+        let mut record = StoredAllocation::new(landed.deposit.id, &landed.deposit.address, key, landed.deposit.amount)?;
+        record.stage = StoredAllocationStage::Completed;
+        adapter.store.save_update(&adapter.state.lock(), &[record], &[])?;
+
+        let error = adapter
+            .allocate_all(&[deposit(&landed), deposit(&rest)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RsSdkCurvyAdapterError::AfterSubmission {
+                    out_of_funding: true,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(!crate::pix::pools::curvy::CurvyDepositPoolError::Adapter(error.into()).moved_no_funds());
         Ok(())
     }
 
