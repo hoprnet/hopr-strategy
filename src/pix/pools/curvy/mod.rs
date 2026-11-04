@@ -1483,7 +1483,15 @@ where
                 Err(error) => return Err(CurvyDepositPoolError::Adapter(error.into()).into()),
             }
         };
-        self.remove_spent_notes_retry(id, &outcome.spent_note_ids)?;
+        // A zero-amount note is never withdrawn, so it leaves the store with the sweep.
+        let mut removed = outcome.spent_note_ids;
+        removed.extend(
+            notes
+                .iter()
+                .filter(|note| note.deposit.amount.is_zero())
+                .map(|note| format!("{:#066x}", U256::from_be_bytes(fr_to_be_32(&note.note.id())))),
+        );
+        self.remove_spent_notes_retry(id, &removed)?;
         // Best effort: the secret is useless once the allocation is swept, but a leftover one
         // costs nothing but bytes.
         if let Err(error) = self.tracker.state.remove_scan_secret(id) {
