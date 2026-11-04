@@ -1383,8 +1383,10 @@ async fn flush_deposit_batch<D, K>(
                         }
                     }
                 }
-                let deposited = settled.len() as u64;
-                let unaccounted = count - settled.len();
+                // Successes are distinct ids, but a pool may echo one that is not in the batch;
+                // clamp so the counters cannot underflow and no refund keys off a foreign id.
+                let deposited = settled.len().min(count) as u64;
+                let unaccounted = count - deposited as usize;
 
                 // Refund only when every failure is provably fund-free (one ambiguous failure
                 // means the window cannot tell which reservation moved money), each unaccounted
