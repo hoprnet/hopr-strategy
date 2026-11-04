@@ -691,14 +691,16 @@ impl CurvyDepositPoolError {
     /// assert!(drained.is_out_of_funding());
     /// ```
     pub fn is_out_of_funding(&self) -> bool {
-        matches!(
-            self,
-            Self::Adapter(error)
-                if matches!(
-                    error.downcast_ref::<sdk::RsSdkCurvyAdapterError>(),
-                    Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. })
-                )
-        )
+        let Self::Adapter(error) = self else {
+            return false;
+        };
+        match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
+            Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. }) => true,
+            // A drain that followed an earlier chunk keeps its meaning through the tag, so it is
+            // still recognisable as exhaustion even though it is no longer refundable.
+            Some(sdk::RsSdkCurvyAdapterError::AfterSubmission { out_of_funding, .. }) => *out_of_funding,
+            _ => false,
+        }
     }
 }
 
@@ -758,9 +760,15 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
             Some(sdk::RsSdkCurvyAdapterError::NoFunding { required }) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::NoFunding { required: *required }.into())
             }
-            Some(sdk::RsSdkCurvyAdapterError::AfterSubmission(inner)) => CurvyDepositPoolError::Adapter(
-                sdk::RsSdkCurvyAdapterError::AfterSubmission(anyhow::anyhow!("{inner}")).into(),
-            ),
+            Some(sdk::RsSdkCurvyAdapterError::AfterSubmission { source, out_of_funding }) => {
+                CurvyDepositPoolError::Adapter(
+                    sdk::RsSdkCurvyAdapterError::AfterSubmission {
+                        source: anyhow::anyhow!("{source}"),
+                        out_of_funding: *out_of_funding,
+                    }
+                    .into(),
+                )
+            }
             Some(sdk::RsSdkCurvyAdapterError::Sdk(inner)) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{inner}")).into())
             }

@@ -1347,9 +1347,10 @@ fn only_fund_free_failures_release_the_spend_budget() {
     // A failure raised after an earlier chunk was submitted is tagged, so it is never fund-free
     // even when the underlying error is a pre-submission refusal.
     let after_submission: StrategyError = super::CurvyDepositPoolError::Adapter(
-        RsSdkCurvyAdapterError::AfterSubmission(anyhow::anyhow!(
-            "the private pool has no committed note large enough to fund 10 wei"
-        ))
+        RsSdkCurvyAdapterError::AfterSubmission {
+            source: anyhow::anyhow!("the private pool has no committed note large enough to fund 10 wei"),
+            out_of_funding: true,
+        }
         .into(),
     )
     .into();
@@ -1361,16 +1362,40 @@ fn only_fund_free_failures_release_the_spend_budget() {
     // The tag is applied only to errors that would otherwise look fund-free; an already
     // ambiguous error keeps its own variant.
     let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 1 });
-    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission(_)));
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission { .. }));
     // A rebuild inside the first chunk re-proves an aggregation that may already be POSTed, so
     // its SDK-side refusal must be tagged too.
     let rebuilt = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
         "fee-collector identity does not own the aggregator's feeNotePublicKey"
     )));
-    assert!(matches!(rebuilt, RsSdkCurvyAdapterError::AfterSubmission(_)));
+    assert!(matches!(rebuilt, RsSdkCurvyAdapterError::AfterSubmission { .. }));
     assert!(!super::CurvyDepositPoolError::Adapter(rebuilt.into()).moved_no_funds());
     let untouched = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::AmbiguousAllocation);
     assert!(matches!(untouched, RsSdkCurvyAdapterError::AmbiguousAllocation));
+}
+
+/// A drain that follows an earlier chunk stays detectable as exhaustion, even though the tag
+/// makes it no longer refundable.
+#[test]
+fn a_tagged_drain_is_still_out_of_funding() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 10 });
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    let error: StrategyError = super::CurvyDepositPoolError::Adapter(tagged.into()).into();
+
+    assert!(
+        super::is_out_of_funding(&error),
+        "a later-chunk drain is still exhaustion"
+    );
+    assert!(!error.moved_no_funds(), "but an earlier chunk may have moved funds");
+
+    // The same tag on a fee-key refusal is not exhaustion.
+    let not_drained = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+        "fee-collector identity does not own the aggregator's feeNotePublicKey"
+    )));
+    let error: StrategyError = super::CurvyDepositPoolError::Adapter(not_drained.into()).into();
+    assert!(!super::is_out_of_funding(&error));
 }
 
 /// Exhaustion is a narrower signal than "fund-free": a consumer must not read a fee-key

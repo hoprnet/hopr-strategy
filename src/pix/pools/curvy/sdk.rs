@@ -278,14 +278,24 @@ pub enum RsSdkCurvyAdapterError {
     IncompleteRelayRecovery,
     #[error("invalid Curvy adapter value: {0}")]
     InvalidValue(String),
-    /// `after_submission` is set when an earlier chunk of the same call already submitted an
-    /// aggregation, so this refusal does not prove the whole call moved no funds.
+    /// No committed note can fund the request.
+    ///
+    /// Raised before this item's aggregation is built, so it proves that item moved no funds.
+    /// When an earlier chunk of the same call already submitted one, [`Self::AfterSubmission`] is
+    /// used instead, because then the *call* moved funds even though this item did not.
     #[error("the private pool has no committed note large enough to fund {required} wei")]
     NoFunding { required: u128 },
     /// A failure raised after an aggregation in the same call was submitted, so it does not prove
     /// the call moved no funds.
-    #[error("Curvy allocation failed after an earlier chunk was submitted: {0}")]
-    AfterSubmission(anyhow::Error),
+    ///
+    /// `out_of_funding` keeps the exhaustion meaning of a tagged [`Self::NoFunding`], so a pool
+    /// running dry is still recognisable by [`is_out_of_funding`] after an earlier chunk
+    /// submitted.
+    #[error("Curvy allocation failed after an earlier chunk was submitted: {source}")]
+    AfterSubmission {
+        source: anyhow::Error,
+        out_of_funding: bool,
+    },
     #[error("the requested withdrawal is {requested}, but only {available} is stored")]
     InsufficientNotes { requested: u128, available: u128 },
     #[error(
@@ -746,13 +756,16 @@ fn stealth_identity(keys: &relayer::CurvyPublicKeys, who: &str) -> Result<Identi
 /// An error that is already unambiguously not fund-free is left alone, so its own variant still
 /// tells the caller what happened.
 pub(crate) fn tag_after_submission(error: RsSdkCurvyAdapterError) -> RsSdkCurvyAdapterError {
-    let fund_free_looking = match &error {
-        RsSdkCurvyAdapterError::NoFunding { .. } => true,
-        RsSdkCurvyAdapterError::Sdk(inner) => super::is_pre_submission_refusal(&inner.to_string()),
-        _ => false,
+    let (fund_free_looking, out_of_funding) = match &error {
+        RsSdkCurvyAdapterError::NoFunding { .. } => (true, true),
+        RsSdkCurvyAdapterError::Sdk(inner) => (super::is_pre_submission_refusal(&inner.to_string()), false),
+        _ => (false, false),
     };
     if fund_free_looking {
-        RsSdkCurvyAdapterError::AfterSubmission(anyhow::anyhow!("{error}"))
+        RsSdkCurvyAdapterError::AfterSubmission {
+            source: anyhow::anyhow!("{error}"),
+            out_of_funding,
+        }
     } else {
         error
     }

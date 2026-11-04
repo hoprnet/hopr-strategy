@@ -1358,53 +1358,45 @@ async fn flush_deposit_batch<D, K>(
                     in_flight_destinations.invalidate(dest_addr);
                 }
 
-                let mut deposited = 0u64;
                 // `BatchOutcomes` identifies an item only on success — the `Err` arm carries no
-                // id. A pool that returns one outcome per deposit is read positionally; one that
-                // returns fewer is correlated by elimination, since the order is then unstated.
+                // id — and the trait does not promise the outcomes keep the input order, so a
+                // failed item is never located by position. It is identified by elimination: a
+                // deposit with no success echo, once exactly one failure can be paired with it.
                 let outcomes_len = outcomes.len();
-                let positional = outcomes_len == count;
                 let mut everything_failed_fund_free = true;
-                let mut failed_at = vec![false; count];
+                let mut duplicate_success = false;
+                let mut failures = 0usize;
                 let mut settled: std::collections::HashSet<PixAddressId> = std::collections::HashSet::new();
-                for (index, outcome) in outcomes.into_iter().enumerate() {
+                for outcome in outcomes {
                     match outcome {
                         Ok((id, _receipt)) => {
+                            // A repeated or foreign id would otherwise inflate the success count
+                            // and let an unaccounted deposit pass the check below.
+                            duplicate_success |= !settled.insert(id);
                             processed_deposits.insert(id, ());
-                            settled.insert(id);
-                            deposited += 1;
                         }
                         Err(error) => {
                             let error: StrategyError = error.into();
+                            failures += 1;
                             everything_failed_fund_free &= error.moved_no_funds();
-                            if positional {
-                                failed_at[index] = true;
-                            }
                             tracing::error!(%error, "deposit within the batch failed");
                         }
                     }
                 }
+                let deposited = settled.len() as u64;
+                let unaccounted = count - settled.len();
 
-                // Refund only when every failure is provably fund-free: one ambiguous failure
-                // means the window cannot tell which reservation moved money, so the safe
-                // direction is to count them all.
-                if everything_failed_fund_free {
-                    if positional {
-                        for (index, spend) in spends.iter().enumerate() {
-                            if failed_at[index] {
-                                let (id, _, amount, _) = &deposits[index];
-                                refund(spend_ledger.as_ref(), *spend, id, *amount);
-                            }
-                        }
-                    } else if outcomes_accounted_for(&deposits, &settled, outcomes_len) {
-                        // Not one outcome per deposit, so a failure's position is not its deposit's:
-                        // the item with no success echo is taken to be the failed one. This needs
-                        // at least as many outcomes as deposits, so a pool that returns *fewer*
-                        // refunds nothing — its unaccounted items have an unknown fate.
-                        for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
-                            if !settled.contains(id) {
-                                refund(spend_ledger.as_ref(), *spend, id, *amount);
-                            }
+                // Refund only when every failure is provably fund-free (one ambiguous failure
+                // means the window cannot tell which reservation moved money), each unaccounted
+                // deposit can be paired with exactly one failure, and no success id repeated.
+                if everything_failed_fund_free
+                    && !duplicate_success
+                    && outcomes_len == settled.len() + failures
+                    && failures == unaccounted
+                {
+                    for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
+                        if !settled.contains(id) {
+                            refund(spend_ledger.as_ref(), *spend, id, *amount);
                         }
                     }
                 }
@@ -1449,22 +1441,6 @@ fn refund(ledger: &parking_lot::Mutex<SpendLedger>, spend: SpendEntry, id: &PixA
         %amount,
         "deposit moved no funds; its spend reservation is released"
     );
-}
-
-/// Whether a non-positional `BatchOutcomes` accounts for every deposit.
-///
-/// Only then can the items with no success echo be called failures: `deposits` that are neither
-/// echoed nor covered by a failure outcome have an unknown fate and must stay counted.
-fn outcomes_accounted_for<P, E>(
-    deposits: &[(PixAddressId, P, HoprBalance, E)],
-    settled: &std::collections::HashSet<PixAddressId>,
-    outcomes: usize,
-) -> bool {
-    // Each success accounts for one deposit and each failure for another, so there must be at
-    // least one outcome per deposit. Combined with the caller's "not exactly one per deposit"
-    // test, this branch is reached only when a pool returns *more* outcomes than deposits.
-    let unaccounted = deposits.iter().filter(|(id, ..)| !settled.contains(id)).count();
-    outcomes >= settled.len() + unaccounted
 }
 
 /// Sweep one drained buffer through the pool. The withdrawal counterpart of
@@ -3052,6 +3028,7 @@ mod tests {
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(false, true)]),
             whole_batch_fails: false,
+            raw_outcomes: None,
         });
         flush_deposit_batch::<_, EthDepositKey>(
             pool,
@@ -3202,6 +3179,9 @@ mod tests {
         script: parking_lot::Mutex<Vec<(bool, bool)>>,
         /// Return one error for the whole batch, shaped like the Curvy chunk failure.
         whole_batch_fails: bool,
+        /// When set, return exactly this instead of running the script, so a test can shape
+        /// outcomes a well-behaved pool would not produce (a repeated id, say).
+        raw_outcomes: Option<Vec<(Option<PixAddressId>, bool)>>,
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -3244,6 +3224,16 @@ mod tests {
             &self,
             deposits: &[(PixAddressId, Address, HoprBalance, Self::PoolDepositData)],
         ) -> Result<Vec<std::result::Result<(PixAddressId, Self::Receipt), Self::Error>>, Self::Error> {
+            if let Some(raw) = self.raw_outcomes.clone() {
+                return Ok(raw
+                    .into_iter()
+                    .map(|(id, fails)| match (id, fails) {
+                        (Some(id), false) => Ok((id, ())),
+                        (_, true) => Err(StrategyError::other(ScriptedFailure)),
+                        (None, false) => Err(StrategyError::other(ScriptedFailure)),
+                    })
+                    .collect());
+            }
             let script = self.script.lock().clone();
             if self.whole_batch_fails {
                 // The first item's class applies to all, as one chunk failure does.
@@ -3335,6 +3325,7 @@ mod tests {
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(true, false), (true, true)]),
             whole_batch_fails: false,
+            raw_outcomes: None,
         });
         flush_deposit_batch::<_, EthDepositKey>(
             pool.clone(),
@@ -3370,6 +3361,7 @@ mod tests {
             let pool = Arc::new(ScriptedBatchPool {
                 script: parking_lot::Mutex::new(vec![(fund_free, true)]),
                 whole_batch_fails: true,
+                raw_outcomes: None,
             });
             flush_deposit_batch::<_, EthDepositKey>(
                 pool,
@@ -3390,6 +3382,48 @@ mod tests {
         Ok(())
     }
 
+    /// A pool that repeats a success id must not have an unaccounted deposit refunded.
+    ///
+    /// The duplicate inflates the success count; without the distinct-id check, the item with no
+    /// real outcome would be paired with the duplicate and refunded while its fate is unknown.
+    #[test_log::test(tokio::test)]
+    async fn test_duplicate_success_ids_refund_nothing() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        // Two deposits, but the pool echoes the first id twice and never mentions the second.
+        let ids: Vec<PixAddressId> = batch.iter().map(|(id, ..)| *id).collect();
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(Vec::new()),
+            whole_batch_fails: false,
+            raw_outcomes: Some(vec![
+                (Some(ids[0]), false),
+                (Some(ids[0]), false),
+                (Some(ids[0]), false),
+            ]),
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20),
+            "nothing may be refunded when a success id repeats"
+        );
+        Ok(())
+    }
+
     /// A short `BatchOutcomes` leaves items unaccounted for, so nothing is refunded.
     #[test_log::test(tokio::test)]
     async fn test_short_batch_outcomes_refund_nothing() -> anyhow::Result<()> {
@@ -3404,6 +3438,7 @@ mod tests {
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(true, true)]),
             whole_batch_fails: false,
+            raw_outcomes: None,
         });
         flush_deposit_batch::<_, EthDepositKey>(
             pool.clone(),
