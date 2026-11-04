@@ -41,7 +41,7 @@ use hopr_api::{
 use super::{
     CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
     CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
-    OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
+    DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
     token::{VaultToken, VaultTokenTable},
@@ -269,6 +269,20 @@ fn detector_skips_notes_of_another_token() -> anyhow::Result<()> {
             .detect_owned_note(&fixture.note, &[(fixture.id, fixture.address, fixture.scan_secret)])?
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn detector_ignores_zero_amount_notes() -> anyhow::Result<()> {
+    // Sealed correctly to the allocation, so everything but the amount would make it ours: the
+    // sweep refuses zero-amount inputs, and a recorded one would block the allocation's sweep.
+    let fixture = owned_candidate(1)?;
+    let (zero, _) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 0, 4, "5", 2)?;
+    let watched = [(fixture.id, fixture.address, fixture.scan_secret.clone())];
+
+    assert!(fixture.detector.detect_owned_note(&zero, &watched)?.is_none());
+    // The same allocation still finds its real note.
+    assert!(fixture.detector.detect_owned_note(&fixture.note, &watched)?.is_some());
     Ok(())
 }
 
@@ -777,8 +791,10 @@ impl CurvySdkAdapter for RecordingAdapter {
             .iter()
             .fold(HoprBalance::zero(), |total, note| total + note.deposit.amount);
         Ok(CurvyWithdrawalOutcome {
+            // Like the SDK adapter, zero-amount notes are left out of the withdrawal.
             spent_note_ids: notes
                 .iter()
+                .filter(|note| !note.deposit.amount.is_zero())
                 .map(|note| {
                     format!(
                         "0x{:064x}",
@@ -949,6 +965,58 @@ async fn sweeping_an_allocation_with_nothing_committed_keeps_the_key() -> anyhow
         .await;
     assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)), "{result:?}");
     assert!(harness.adapter.withdrawals.lock().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sweep_removes_zero_amount_notes_from_the_store() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let address = *owner.public();
+    let data = pool.generate_deposit_data(&id).await?;
+    let (pending, note_id) = pending_note_for(data.scan_key(), &address, 10, 4, "13", 5)?;
+    harness.index.pending.lock().push(pending);
+    let notification = pool.notify_deposit(id, address, ten())?;
+    harness.index.committed.lock().push(completion(&note_id, 6));
+    *harness.index.head.lock() = (8, 1);
+    notification.await?;
+
+    // A zero-amount note, as a store written before the scan skipped them holds.
+    let zero = KnownOwner::new(
+        bjj_point(&address).map_err(anyhow::Error::msg)?,
+        Bn254Fr::from_fr(curvy_core::Fr::from(9_u8)),
+    )
+    .note(
+        curvy_core::Fr::from(0_u8),
+        curvy_core::Fr::from(4_u8),
+        (curvy_core::Fr::from(1_u8), curvy_core::Fr::from(2_u8)),
+        curvy_core::Fr::from(3_u8),
+    );
+    let zero_id = format!(
+        "0x{:064x}",
+        U256::from_be_bytes(curvy_core::field::fr_to_be_32(&zero.id()))
+    );
+    pool.state().record_owned_candidate(
+        &zero_id,
+        DetectedCurvyNote {
+            deposit: OwnedCurvyDeposit {
+                id,
+                address,
+                amount: HoprBalance::zero(),
+            },
+            note: zero,
+        },
+        &CurvyEventCursor::from(&position(9)),
+    )?;
+    pool.state()
+        .record_completion(&zero_id, 8, &CurvyEventCursor::from(&position(10)))?;
+    assert_eq!(pool.state().committed_notes(&id)?.len(), 2);
+
+    pool.withdraw_deposit(&id, &owner, Address::from(SAFE), None).await?;
+    assert!(pool.state().committed_notes(&id)?.is_empty());
+    assert!(pool.state().owned_note_ids()?.is_empty());
     Ok(())
 }
 
