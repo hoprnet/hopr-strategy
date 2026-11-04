@@ -223,6 +223,12 @@ pub struct PixStrategyConfig {
     /// [`StrategyError::CriteriaNotSatisfied`] and the event is dropped; it is not re-tried when
     /// the window rolls forward.
     ///
+    /// A deposit whose flush fails for an error that provably moved no funds — a local refusal
+    /// such as an unaffordable or malformed deposit — hands its amount back, so a streak of
+    /// failures does not lock the node out until the window rolls. An ambiguous failure keeps it,
+    /// because a transfer reported as failed may still have landed. See
+    /// [`StrategyError::moved_no_funds`].
+    ///
     /// The ledger behind it is in memory, so a restart forgives the window. It bounds a burst,
     /// not lifetime spend; `plain::NonAnonymousDepositPoolConfig::min_safe_hopr_reserve`
     /// is the balance floor that survives restarts.
@@ -462,7 +468,8 @@ impl PixStrategy {
         let safe_address = node.identity().safe_address;
 
         // The key is named rather than inferred: it is the choice this builder exists to make.
-        self.build_with_pool::<_, _, crate::pix::pools::plain::PoolKeypair>(pool, node, safe_address)
+        // The plain pool's `CriteriaNotSatisfied` is its pre-transfer affordability gate.
+        self.build_with_pool_assuming::<_, _, crate::pix::pools::plain::PoolKeypair>(pool, node, safe_address, true)
     }
 
     /// Build with the [`CurvyDepositPool`](crate::pix::pools::curvy::CurvyDepositPool), settling to
@@ -531,7 +538,9 @@ impl PixStrategy {
         )?);
         let safe_address = node.identity().safe_address;
 
-        self.build_with_pool::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address)
+        // Curvy can report `CriteriaNotSatisfied` after submitting an earlier chunk, so it stays
+        // counted; its fund-free failures arrive as `GeneralError` through the pool classifier.
+        self.build_with_pool_assuming::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address, false)
     }
 
     /// Build with a Curvy pool the consumer constructed itself, settling to Baby JubJub
@@ -553,7 +562,9 @@ impl PixStrategy {
     {
         let safe_address = node.identity().safe_address;
 
-        self.build_with_pool::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address)
+        // Curvy can report `CriteriaNotSatisfied` after submitting an earlier chunk, so it stays
+        // counted; its fund-free failures arrive as `GeneralError` through the pool classifier.
+        self.build_with_pool_assuming::<_, _, crate::pix::pools::curvy::PoolKeypair>(pool, node, safe_address, false)
     }
 
     /// Build with an arbitrary [`DepositPool`] implementation.
@@ -566,6 +577,38 @@ impl PixStrategy {
         pool: D,
         node: Arc<N>,
         safe_address: Address,
+    ) -> Result<Box<dyn StrategyTrait + Send>>
+    where
+        D: DepositPool<K> + Clone + Send + Sync + 'static,
+        K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
+        K::Public: Into<PixDepositAddress>
+            + TryFrom<PixDepositAddress>
+            + Eq
+            + std::hash::Hash
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        D::Error: Into<StrategyError>,
+        N: ActionableEventSource + Send + Sync + 'static,
+    {
+        // A supplied pool is assumed conservative: its `CriteriaNotSatisfied` might follow
+        // submission, so it stays counted. The bundled builders state otherwise explicitly.
+        self.build_with_pool_assuming(pool, node, safe_address, false)
+    }
+
+    /// [`Self::build_with_pool`], with the pool's refund classification stated.
+    ///
+    /// `satisfied_is_pre_submission` says the pool raises `CriteriaNotSatisfied` only before
+    /// submitting anything — true of the plain pool, false of Curvy. See
+    /// [`StrategyError::moved_no_funds`].
+    fn build_with_pool_assuming<D, N, K>(
+        self,
+        pool: D,
+        node: Arc<N>,
+        safe_address: Address,
+        satisfied_is_pre_submission: bool,
     ) -> Result<Box<dyn StrategyTrait + Send>>
     where
         D: DepositPool<K> + Clone + Send + Sync + 'static,
@@ -611,7 +654,8 @@ impl PixStrategy {
                 .build(),
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
-            spend_ledger: std::collections::VecDeque::new(),
+            spend_ledger: Arc::new(parking_lot::Mutex::new(SpendLedger::default())),
+            satisfied_is_pre_submission,
             detach_flushes: false,
         }))
     }
@@ -647,16 +691,98 @@ fn open_recovery_store(
 // ---------------------------------------------------------------------------
 
 /// One buffered deposit, which is exactly
-/// [`DepositPool::deposit_funds_to_multiple`]'s slice element.
+/// [`DepositPool::deposit_funds_to_multiple`]'s slice element plus the ledger entry that reserves
+/// its amount against the rolling spend window.
 ///
 /// Named so that the buffer and the batch argument cannot drift apart: a flush passes the buffer
 /// to the pool directly, with no projection in between for a field to go missing from.
+///
+/// The ledger entry is carried alongside so a provably fund-free failure can refund it.
 type BufferedDeposit<D, K> = (
     PixAddressId,
     <K as Keypair>::Public,
     HoprBalance,
     <D as DepositPool<K>>::PoolDepositData,
+    SpendEntry,
 );
+
+/// One reservation against [`PixStrategyConfig::max_spend_per_window`].
+///
+/// `at` is when it was committed (and expires), `amount` is what it reserved, and `seq`
+/// identifies the ledger entry a refund belongs to — timestamps and amounts can repeat.
+#[derive(Clone, Copy, Debug)]
+struct SpendEntry {
+    at: std::time::Instant,
+    amount: HoprBalance,
+    seq: u64,
+}
+
+/// The rolling ledger behind [`PixStrategyConfig::max_spend_per_window`].
+///
+/// Oldest first; entries expire by age and coalesce once there are more than
+/// [`SPEND_LEDGER_CAPACITY`] of them.
+#[derive(Debug, Default)]
+struct SpendLedger {
+    entries: std::collections::VecDeque<SpendEntry>,
+    /// Source of [`SpendEntry::seq`]. Only ever incremented while creating entries.
+    seq: u64,
+}
+
+impl SpendLedger {
+    /// Drops entries that have aged out of `window` and returns what is still committed.
+    fn spent(&mut self, window: Duration, now: std::time::Instant) -> HoprBalance {
+        while let Some(entry) = self.entries.front() {
+            if now.duration_since(entry.at) < window {
+                break;
+            }
+            self.entries.pop_front();
+        }
+
+        self.entries
+            .iter()
+            .fold(HoprBalance::zero(), |total, entry| total + entry.amount)
+    }
+
+    /// Records `amount` against the window and returns the reservation.
+    ///
+    /// Committed before settlement, because a transfer reported as failed may still have landed;
+    /// a confirmed-only ledger could under-count real spend. The reservation is therefore
+    /// released only on a provably fund-free failure — see [`Self::release`].
+    fn commit(&mut self, amount: HoprBalance, now: std::time::Instant) -> SpendEntry {
+        let entry = SpendEntry {
+            at: now,
+            amount,
+            seq: self.seq,
+        };
+        self.seq = self.seq.wrapping_add(1);
+        self.entries.push_back(entry);
+
+        // Fold the oldest entry into its successor. The merged amount then expires with the
+        // *newer* timestamp, so it is counted for longer than it strictly should be — the
+        // conservative direction for a cap.
+        //
+        // A folded entry's `seq` is lost, so a refund for it misses and stays counted. That only
+        // happens at `SPEND_LEDGER_CAPACITY` entries — far above the handful a flush holds — so it
+        // errs towards counting, which is the safe direction.
+        if self.entries.len() > SPEND_LEDGER_CAPACITY
+            && let Some(oldest) = self.entries.pop_front()
+            && let Some(next) = self.entries.front_mut()
+        {
+            next.amount += oldest.amount;
+        }
+        entry
+    }
+
+    /// Hands `entry`'s reserved amount back to the window.
+    ///
+    /// Only sound for a provably fund-free failure. An expired or folded entry is left alone:
+    /// it is no longer counted, or cannot be identified, and counting is the safe direction.
+    fn release(&mut self, entry: SpendEntry) {
+        if let Some(stored) = self.entries.iter_mut().find(|stored| stored.seq == entry.seq) {
+            stored.amount = HoprBalance::zero();
+        }
+    }
+}
 
 /// The generic PIX strategy runner.
 struct PixStrategyInner<D, N, K>
@@ -686,8 +812,14 @@ where
     /// Debounced withdrawal buffer.
     withdrawal_buffer: Vec<(PixAddressId, PixDepositSecret)>,
     /// Rolling record of deposits committed within [`PixStrategyConfig::spend_window`], oldest
-    /// first. Entries are appended when a deposit is accepted into the buffer and expire by age.
-    spend_ledger: std::collections::VecDeque<(std::time::Instant, HoprBalance)>,
+    /// first. `Arc<Mutex<_>>` because a detached flush learns the outcome in a spawned task and
+    /// has to refund the same ledger the event loop reads.
+    spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
+    /// Whether a `CriteriaNotSatisfied` from this pool is a pre-submission refusal.
+    ///
+    /// True for the plain pool, whose gate runs before any transfer; false for Curvy, which can
+    /// report it after submitting an earlier chunk. See [`StrategyError::moved_no_funds`].
+    satisfied_is_pre_submission: bool,
     /// Whether a zero buffer period flushes on a task instead of awaiting inline.
     ///
     /// Set by [`StrategyTrait::run`] and false otherwise, because it is a statement about who is
@@ -742,7 +874,10 @@ where
                 .build(),
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
-            spend_ledger: std::collections::VecDeque::new(),
+            spend_ledger: Arc::new(parking_lot::Mutex::new(SpendLedger::default())),
+            // Every test here drives the plain pool, whose `CriteriaNotSatisfied` is its
+            // pre-transfer affordability gate.
+            satisfied_is_pre_submission: true,
             detach_flushes: false,
         }
     }
@@ -768,43 +903,16 @@ where
         + 'static,
     D::Error: Into<StrategyError>,
 {
-    /// Drops ledger entries that have aged out of the window and returns what is still committed.
-    ///
-    /// Called on every deposit event, so eviction keeps pace with arrivals without a timer.
+    /// What deposits committed in the current window add up to, refunds and expiries included.
     fn spent_in_window(&mut self) -> HoprBalance {
-        let (window, now) = (self.cfg.spend_window, std::time::Instant::now());
-
-        while let Some((at, _)) = self.spend_ledger.front() {
-            if now.duration_since(*at) < window {
-                break;
-            }
-            self.spend_ledger.pop_front();
-        }
-
         self.spend_ledger
-            .iter()
-            .fold(HoprBalance::zero(), |total, (_, amount)| total + *amount)
+            .lock()
+            .spent(self.cfg.spend_window, std::time::Instant::now())
     }
 
-    /// Records `amount` against the window.
-    ///
-    /// Committed at the moment a deposit is accepted into the buffer rather than after it
-    /// settles, and never refunded on failure: `deposit_funds_to` retries internally and
-    /// re-reads the destination balance precisely because a transfer reported as failed may
-    /// still have landed. A ledger that only counted confirmed spend could therefore under-count
-    /// real ones, which is the wrong direction for a safety limit to err in.
-    fn commit_spend(&mut self, amount: HoprBalance) {
-        self.spend_ledger.push_back((std::time::Instant::now(), amount));
-
-        // Fold the oldest entry into its successor. The merged amount then expires with the
-        // *newer* timestamp, so it is counted for longer than it strictly should be — the
-        // conservative direction for a cap.
-        if self.spend_ledger.len() > SPEND_LEDGER_CAPACITY
-            && let Some((_, oldest)) = self.spend_ledger.pop_front()
-            && let Some((_, next)) = self.spend_ledger.front_mut()
-        {
-            *next += oldest;
-        }
+    /// Records `amount` against the window and returns the reservation. See [`SpendLedger::commit`].
+    fn commit_spend(&mut self, amount: HoprBalance) -> SpendEntry {
+        self.spend_ledger.lock().commit(amount, std::time::Instant::now())
     }
 
     /// Validate and buffer a PIX event for batched execution.
@@ -910,9 +1018,9 @@ where
 
                 self.in_flight_destinations.insert(dest_addr.clone(), ());
 
-                self.commit_spend(target_deposit);
+                let spend = self.commit_spend(target_deposit);
                 self.deposit_buffer
-                    .push((new_deposit_address.id, dest_addr, target_deposit, deposit_data));
+                    .push((new_deposit_address.id, dest_addr, target_deposit, deposit_data, spend));
 
                 tracing::info!(%target_deposit, "deposit buffered, pending flush");
 
@@ -1099,6 +1207,8 @@ where
             self.pool.clone(),
             self.processed_deposits.clone(),
             self.in_flight_destinations.clone(),
+            Arc::clone(&self.spend_ledger),
+            self.satisfied_is_pre_submission,
             batch,
         )
         .await;
@@ -1122,9 +1232,19 @@ where
         let pool = self.pool.clone();
         let processed_deposits = self.processed_deposits.clone();
         let in_flight_destinations = self.in_flight_destinations.clone();
+        let spend_ledger = Arc::clone(&self.spend_ledger);
+        let satisfied_is_pre_submission = self.satisfied_is_pre_submission;
 
         hopr_utils::runtime::prelude::spawn(async move {
-            flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, batch).await;
+            flush_deposit_batch::<D, K>(
+                pool,
+                processed_deposits,
+                in_flight_destinations,
+                spend_ledger,
+                satisfied_is_pre_submission,
+                batch,
+            )
+            .await;
         });
     }
 
@@ -1185,6 +1305,8 @@ async fn flush_deposit_batch<D, K>(
     pool: D,
     processed_deposits: Cache<PixAddressId, ()>,
     in_flight_destinations: Cache<K::Public, ()>,
+    spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
+    satisfied_is_pre_submission: bool,
     batch: Vec<BufferedDeposit<D, K>>,
 ) where
     // `Send + Sync + 'static` beyond what the work itself needs, so the future is spawnable. The
@@ -1208,7 +1330,7 @@ async fn flush_deposit_batch<D, K>(
     }
 
     if count == 1 {
-        let (id, dest_addr, amount, deposit_data) = batch.into_iter().next().unwrap();
+        let (id, dest_addr, amount, deposit_data, spend) = batch.into_iter().next().unwrap();
         let result = pool
             .deposit_funds_to(&id, &dest_addr, amount, deposit_data)
             .await
@@ -1224,15 +1346,25 @@ async fn flush_deposit_batch<D, K>(
             }
             Err(error) => {
                 in_flight_destinations.invalidate(&dest_addr);
+                // A failure the pool can prove moved no funds hands its budget back, so a streak
+                // of them cannot exhaust the window and lock the node out of PIX until it rolls.
+                if refundable(&error, satisfied_is_pre_submission) {
+                    refund(spend_ledger.as_ref(), spend, &id, amount);
+                }
                 tracing::error!(%error, ?id, "single deposit flush failed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 METRIC_PIX_DEPOSITS_FAILED.increment();
             }
         }
     } else {
-        // The buffer is already the argument: see `deposit_buffer`.
+        // The buffer is already the argument: see `deposit_buffer`. The pool's slice element is
+        // the first four fields; the ledger entry travels separately for the refunds below.
+        let request: Vec<_> = batch
+            .iter()
+            .map(|(id, dest_addr, amount, deposit_data, _)| (*id, dest_addr.clone(), *amount, deposit_data.clone()))
+            .collect();
         let result = pool
-            .deposit_funds_to_multiple(&batch)
+            .deposit_funds_to_multiple(&request)
             .await
             .map_err(Into::<StrategyError>::into);
 
@@ -1247,15 +1379,34 @@ async fn flush_deposit_batch<D, K>(
                 }
 
                 let mut deposited = 0u64;
+                // `BatchOutcomes` identifies an item only on success — the `Err` arm carries no
+                // id — so a failed item is correlated to its batch entry by elimination, below.
+                let mut settled: std::collections::HashSet<PixAddressId> = std::collections::HashSet::new();
+                let mut everything_failed_fund_free = true;
+                let accounted_for = outcomes.len() == count;
                 for outcome in outcomes {
                     match outcome {
                         Ok((id, _receipt)) => {
                             processed_deposits.insert(id, ());
+                            settled.insert(id);
                             deposited += 1;
                         }
                         Err(error) => {
                             let error: StrategyError = error.into();
+                            everything_failed_fund_free &= refundable(&error, satisfied_is_pre_submission);
                             tracing::error!(%error, "deposit within the batch failed");
+                        }
+                    }
+                }
+
+                // Every item with no success outcome failed, and `BatchOutcomes` may return fewer
+                // entries than deposits. Refund only when every item is accounted for and every
+                // failure is provably fund-free: one ambiguous failure means the window cannot
+                // tell which reservation moved money, so the safe direction is to count them all.
+                if everything_failed_fund_free && accounted_for {
+                    for (id, _, amount, _, spend) in &batch {
+                        if !settled.contains(id) {
+                            refund(spend_ledger.as_ref(), *spend, id, *amount);
                         }
                     }
                 }
@@ -1273,12 +1424,45 @@ async fn flush_deposit_batch<D, K>(
                 for (_, dest_addr, ..) in &batch {
                     in_flight_destinations.invalidate(dest_addr);
                 }
+                // A pool-wide failure is one error for every item, so a fund-free class refunds
+                // them all. An ambiguous one refunds none, exactly as for the single path.
+                if refundable(&error, satisfied_is_pre_submission) {
+                    for (id, _, amount, _, spend) in &batch {
+                        refund(spend_ledger.as_ref(), *spend, id, *amount);
+                    }
+                }
                 tracing::error!(%error, count, "batch deposit flush failed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
             }
         }
     }
+}
+
+/// Whether a failed deposit's error lets it refund under this pool's classification.
+///
+/// A `CriteriaNotSatisfied` counts only when the pool has stated it is pre-submission; every
+/// other class is decided by [`StrategyError::moved_no_funds`].
+fn refundable(error: &StrategyError, satisfied_is_pre_submission: bool) -> bool {
+    if satisfied_is_pre_submission {
+        error.moved_no_funds_pre_satisfied()
+    } else {
+        error.moved_no_funds()
+    }
+}
+
+/// Hands a failed deposit's spend reservation back to the window.
+///
+/// A free function so the flush paths can call it from inside a spawned task without borrowing
+/// the strategy. `id` and `amount` are only logged: the reservation is identified by
+/// [`SpendEntry::seq`], so a stale copy cannot refund an unrelated deposit.
+fn refund(ledger: &parking_lot::Mutex<SpendLedger>, spend: SpendEntry, id: &PixAddressId, amount: HoprBalance) {
+    ledger.lock().release(spend);
+    tracing::info!(
+        ?id,
+        %amount,
+        "deposit moved no funds; its spend reservation is released"
+    );
 }
 
 /// Sweep one drained buffer through the pool. The withdrawal counterpart of
@@ -1717,11 +1901,12 @@ mod tests {
     };
     use tokio::time::timeout;
 
-    use super::{PixStrategy, PixStrategyConfig, PixStrategyInner};
+    use super::{PixStrategy, PixStrategyConfig, PixStrategyInner, SpendLedger, flush_deposit_batch, refundable};
     use crate::{
         errors::StrategyError,
         pix::{
             ByteDepositData,
+            pools::plain::EthDepositKey,
             pools::plain::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPool},
             recovery_store::PixRecoveryStore,
         },
@@ -2716,6 +2901,425 @@ mod tests {
         // Would fail if the refusal above had charged the window.
         s.on_pix_event(new_deposit(ordinary, 50)).await?;
         assert_eq!(hopr_balance(&*cc, ordinary).await?, HoprBalance::new_base(50));
+        Ok(())
+    }
+
+    /// A deposit that fails for a reason that provably moved no funds hands its budget back, so a
+    /// streak of such failures cannot exhaust the window.
+    ///
+    /// This is the `max_spend_per_window` half of gnosis/gnosis_vpn#713: nine failed 0.66 wxHOPR
+    /// deposits drove `spent` to 5.94 of a 6 wxHOPR budget and the tenth was refused for the rest
+    /// of the 24 h window, even though the funds never left. The failing deposits here are refused
+    /// by `min_safe_hopr_reserve`, which `deposit_once` checks before it submits a transfer — a
+    /// `CriteriaNotSatisfied`, which `moved_no_funds` treats as fund-free.
+    #[test_log::test(tokio::test)]
+    async fn test_failed_deposits_release_their_spend_reservation() -> anyhow::Result<()> {
+        let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, _pool) = entry_side(&[first, second]).await?;
+
+        // A Safe that cannot cover even a 20 wxHOPR deposit plus its reserve, so every flush
+        // fails at the pool's pre-check without sending anything.
+        let pool_cfg = crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(1000),
+            max_deposit_retries: 0,
+            ..pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero())
+        };
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg,
+            Arc::clone(&cc).client(),
+        ));
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::new_base(50), StdDuration::from_secs(3600)),
+            *BOB,
+            None,
+        );
+
+        // Two failures of 30 each would be 60 against a 50 budget if neither reservation were
+        // released; the second is only accepted because the first refunded.
+        for address in [first, second] {
+            s.on_pix_event(new_deposit(address, 30)).await?;
+            assert!(
+                hopr_balance(&*cc, address).await?.is_zero(),
+                "the pool refuses every deposit, so nothing may have been funded"
+            );
+        }
+
+        assert_eq!(
+            s.spent_in_window(),
+            HoprBalance::zero(),
+            "both failed deposits must have released their reservations"
+        );
+        Ok(())
+    }
+
+    /// The reported symptom, end to end: a failure streak must not lock the node out of PIX.
+    ///
+    /// Nine refusals of 7 each would fill a 60 wxHOPR budget on their own; the deposit after them
+    /// is only accepted because each refusal released its reservation.
+    #[test_log::test(tokio::test)]
+    async fn test_a_failure_streak_does_not_exhaust_the_spend_budget() -> anyhow::Result<()> {
+        let addresses: Vec<Address> = (0..10u8).map(|i| [0x60 + i; 20].into()).collect();
+        let (cc, node, _pool) = entry_side(&addresses).await?;
+
+        let pool_cfg = crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(1000),
+            max_deposit_retries: 0,
+            ..pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero())
+        };
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg,
+            Arc::clone(&cc).client(),
+        ));
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::new_base(60), StdDuration::from_secs(24 * 3600)),
+            *BOB,
+            None,
+        );
+
+        // Nine failures of 7 = 63, past the budget if any were left counted.
+        for address in &addresses[..9] {
+            s.on_pix_event(new_deposit(*address, 7)).await?;
+        }
+        assert_eq!(s.spent_in_window(), HoprBalance::zero());
+
+        // The tenth is accepted: a refusal would have returned `Err` above.
+        s.on_pix_event(new_deposit(addresses[9], 7)).await?;
+        Ok(())
+    }
+
+    /// The same, for a batch flush: a pool-wide fund-free failure refunds every item in it.
+    #[test_log::test(tokio::test)]
+    async fn test_failed_batch_releases_every_spend_reservation() -> anyhow::Result<()> {
+        let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, _pool) = entry_side(&[first, second]).await?;
+
+        let pool_cfg = crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(1000),
+            max_deposit_retries: 0,
+            ..pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero())
+        };
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg,
+            Arc::clone(&cc).client(),
+        ));
+        // The budget covers both deposits, so neither is refused before a flush can fail.
+        let mut cfg = spend_cfg(HoprBalance::new_base(60), StdDuration::from_secs(3600));
+        // Buffered, so both events land in one flush and take the batch path.
+        cfg.deposit_buffer_period = StdDuration::from_secs(60);
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        s.on_pix_event(new_deposit(first, 30)).await?;
+        s.on_pix_event(new_deposit(second, 30)).await?;
+        assert_eq!(s.deposit_buffer.len(), 2, "both events must wait for the same flush");
+        s.flush_deposits().await;
+
+        assert!(
+            hopr_balance(&*cc, first).await?.is_zero() && hopr_balance(&*cc, second).await?.is_zero(),
+            "the pool refuses every deposit, so nothing may have been funded"
+        );
+        assert_eq!(
+            s.spent_in_window(),
+            HoprBalance::zero(),
+            "a fund-free batch failure must release every reservation in it"
+        );
+        Ok(())
+    }
+
+    /// An ambiguous failure keeps its reservation: a transfer reported as failed may still have
+    /// landed, so the window stays counted. This is the case the conservative default exists for.
+    #[test_log::test(tokio::test)]
+    async fn test_ambiguous_failure_keeps_its_spend_reservation() -> anyhow::Result<()> {
+        let (.., node, pool) = entry_side(&[[0x42u8; 20].into()]).await?;
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::new_base(50), StdDuration::from_secs(3600)),
+            *BOB,
+            None,
+        );
+
+        let amount = HoprBalance::new_base(30);
+        let _entry = s.commit_spend(amount);
+        assert_eq!(s.spent_in_window(), amount);
+        assert!(!StrategyError::other(anyhow::anyhow!("lost confirmation")).moved_no_funds());
+        // The flush only releases an entry when the error says it may; nothing does here.
+        assert_eq!(s.spent_in_window(), amount, "an ambiguous failure must stay counted");
+        Ok(())
+    }
+
+    /// `CriteriaNotSatisfied` is refundable only for a pool that declares it pre-submission.
+    ///
+    /// The Curvy pool raises it after `allocate_all` may already have submitted an earlier chunk,
+    /// so a Curvy-shaped failure must stay counted even though the plain pool's identical variant
+    /// refunds.
+    #[test]
+    fn test_criteria_not_satisfied_refunds_only_when_the_pool_says_it_is_pre_submission() {
+        let error = StrategyError::CriteriaNotSatisfied;
+        assert!(refundable(&error, true), "the plain pool's gate precedes any transfer");
+        assert!(!refundable(&error, false), "a Curvy chunk may follow a submitted one");
+
+        // Every other class is decided by `moved_no_funds`, whatever the pool declared.
+        let opaque = StrategyError::other(anyhow::anyhow!("lost confirmation"));
+        assert!(!refundable(&opaque, true));
+        assert!(!refundable(&opaque, false));
+        let payload = StrategyError::GeneralError(hopr_api::types::primitive::prelude::GeneralError::InvalidInput);
+        assert!(refundable(&payload, true));
+        assert!(refundable(&payload, false));
+    }
+
+    /// The ledger's own contract: a release zeroes only the entry it names, and an expired entry
+    /// is dropped rather than refunded.
+    #[test]
+    fn test_spend_ledger_releases_only_the_named_entry() {
+        let window = StdDuration::from_secs(3600);
+        let now = std::time::Instant::now();
+        let mut ledger = SpendLedger::default();
+
+        let first = ledger.commit(HoprBalance::new_base(10), now);
+        ledger.commit(HoprBalance::new_base(20), now);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(30));
+
+        ledger.release(first);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(20));
+
+        // Releasing the same entry twice is harmless, and leaves the other one counted.
+        ledger.release(first);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(20));
+
+        // Once the window passes, an expired entry contributes nothing even unreleased.
+        let later = now + StdDuration::from_secs(3601);
+        assert_eq!(ledger.spent(window, later), HoprBalance::zero());
+    }
+
+    /// A pool scripted per item, so each failure's class is attributed exactly.
+    ///
+    /// `whole_batch_fails` reproduces the Curvy contract: one allocation call for the chunk, so
+    /// every item gets the same error. Otherwise each item is independent, as for the plain pool's
+    /// default `join_all` fan-out.
+    struct ScriptedBatchPool {
+        /// Per item: `(fund_free, fails)`. A short vector returns fewer outcomes than deposits.
+        script: parking_lot::Mutex<Vec<(bool, bool)>>,
+        /// Return one error for the whole batch, shaped like the Curvy chunk failure.
+        whole_batch_fails: bool,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("scripted failure")]
+    struct ScriptedFailure;
+
+    #[async_trait::async_trait]
+    impl hopr_api::chain::DepositPool<EthDepositKey> for ScriptedBatchPool {
+        type Error = StrategyError;
+        type PoolDepositData = ByteDepositData;
+        type Receipt = ();
+
+        async fn generate_deposit_data(
+            &self,
+            id: &PixAddressId,
+        ) -> std::result::Result<Self::PoolDepositData, StrategyError> {
+            Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
+        }
+
+        async fn deposit_funds_to(
+            &self,
+            _: &PixAddressId,
+            _: &Address,
+            _: HoprBalance,
+            _: Self::PoolDepositData,
+        ) -> std::result::Result<Self::Receipt, StrategyError> {
+            Ok(())
+        }
+
+        async fn deposit_funds_to_multiple(
+            &self,
+            deposits: &[(PixAddressId, Address, HoprBalance, Self::PoolDepositData)],
+        ) -> Result<Vec<std::result::Result<(PixAddressId, Self::Receipt), Self::Error>>, Self::Error> {
+            let script = self.script.lock().clone();
+            if self.whole_batch_fails {
+                // The first item's class applies to all, as one chunk failure does.
+                let fund_free = script.first().map(|(fund_free, _)| *fund_free).unwrap_or(true);
+                return Ok(deposits
+                    .iter()
+                    .map(|(id, ..)| {
+                        Err(if fund_free {
+                            StrategyError::GeneralError(hopr_api::types::primitive::prelude::GeneralError::InvalidInput)
+                        } else {
+                            StrategyError::other(ScriptedFailure)
+                        })
+                        .map(|_: ()| (*id, ()))
+                    })
+                    .collect());
+            }
+            let mut outcomes = Vec::new();
+            for ((id, ..), (fund_free, fails)) in deposits.iter().zip(script) {
+                if fails {
+                    outcomes.push(if fund_free {
+                        Err(StrategyError::CriteriaNotSatisfied)
+                    } else {
+                        Err(StrategyError::other(ScriptedFailure))
+                    });
+                } else {
+                    outcomes.push(Ok((*id, ())));
+                }
+            }
+            Ok(outcomes)
+        }
+
+        fn notify_deposit(
+            &self,
+            _: PixAddressId,
+            _: Address,
+            _: HoprBalance,
+        ) -> std::result::Result<hopr_api::chain::DepositNotification<'static, Address, Self::Error>, Self::Error>
+        {
+            Err(StrategyError::CriteriaNotSatisfied)
+        }
+
+        async fn withdraw_deposit(
+            &self,
+            _: &PixAddressId,
+            _: &EthDepositKey,
+            _: Address,
+            _: Option<HoprBalance>,
+        ) -> std::result::Result<Self::Receipt, StrategyError> {
+            Ok(())
+        }
+
+        async fn pool_transfer(
+            &self,
+            _: &PixAddressId,
+            _: &EthDepositKey,
+            _: &PixAddressId,
+            _: Address,
+            _: Self::PoolDepositData,
+            _: Option<HoprBalance>,
+        ) -> std::result::Result<Self::Receipt, StrategyError> {
+            Ok(())
+        }
+    }
+
+    /// Projects one event's flush input without a live pool.
+    fn buffered(address: Address, amount: HoprBalance) -> (PixAddressId, Address, HoprBalance, ByteDepositData) {
+        let id = pix_id(1);
+        (id, address, amount, ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD))
+    }
+
+    /// Batch refunds are attributed per item: a fund-free item among successful ones still
+    /// refunds, and one ambiguous failure stops every refund in the batch.
+    #[test_log::test(tokio::test)]
+    async fn test_batch_refunds_only_when_every_failure_is_fund_free() -> anyhow::Result<()> {
+        let first: Address = [0x42u8; 20].into();
+        let second: Address = [0x43u8; 20].into();
+
+        // Attempt 1: one settles, one fails fund-free. Only the failure's amount comes back.
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [first, second] {
+            let amount = HoprBalance::new_base(10);
+            let (id, address, amount, data) = buffered(address, amount);
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(vec![(true, false), (true, true)]),
+            whole_batch_fails: false,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool.clone(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            true,
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(10),
+            "the settled item stays counted and the fund-free failure is refunded"
+        );
+        Ok(())
+    }
+
+    /// The Curvy batch shape: one error for the whole chunk, fanned out to every item.
+    ///
+    /// A fund-free chunk failure refunds all items; an ambiguous one refunds none.
+    #[test_log::test(tokio::test)]
+    async fn test_a_whole_batch_failure_refunds_every_item_or_none() -> anyhow::Result<()> {
+        for (fund_free, expected_spent) in [(true, HoprBalance::zero()), (false, HoprBalance::new_base(20))] {
+            let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+            let mut batch = Vec::new();
+            for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+                let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+                let spend = ledger.lock().commit(amount, std::time::Instant::now());
+                batch.push((id, address, amount, data, spend));
+            }
+            let pool = Arc::new(ScriptedBatchPool {
+                script: parking_lot::Mutex::new(vec![(fund_free, true)]),
+                whole_batch_fails: true,
+            });
+            flush_deposit_batch::<_, EthDepositKey>(
+                pool,
+                moka::sync::Cache::builder().max_capacity(1).build(),
+                moka::sync::Cache::builder().max_capacity(1).build(),
+                Arc::clone(&ledger),
+                true,
+                batch,
+            )
+            .await;
+            assert_eq!(
+                ledger
+                    .lock()
+                    .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+                expected_spent,
+                "fund_free={fund_free}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A short `BatchOutcomes` leaves items unaccounted for, so nothing is refunded.
+    #[test_log::test(tokio::test)]
+    async fn test_short_batch_outcomes_refund_nothing() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        // Two deposits, one outcome: the other item's fate is unknown.
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(vec![(true, true)]),
+            whole_batch_fails: false,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool.clone(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            true,
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20)
+        );
         Ok(())
     }
 

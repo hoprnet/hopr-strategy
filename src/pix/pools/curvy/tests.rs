@@ -1271,6 +1271,62 @@ async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The strategy refunds a failed deposit's spend budget only on a fund-free class, so this
+/// classifier has to be right in both directions.
+#[test]
+fn only_fund_free_failures_release_the_spend_budget() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    // Nothing was allocated: the input notes could not cover the request.
+    let no_funding = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
+    assert!(no_funding.moved_no_funds());
+
+    // A batch item rejected for naming another allocation never joined `allocate`.
+    let mismatched = super::CurvyDepositPoolError::MismatchedDepositData {
+        expected: pix_id(1),
+        actual: pix_id(2),
+    };
+    assert!(mismatched.moved_no_funds());
+
+    // The reported Curvy failure: local validation, refused before any proof was submitted.
+    let fee_owner = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+            "fee-collector identity does not own the aggregator's feeNotePublicKey; the resulting fee note would \
+             violate the circuit's owner constraint"
+        ))
+        .into(),
+    );
+    assert!(fee_owner.moved_no_funds());
+
+    // A submitted aggregation may still land, so its failure stays counted.
+    let ambiguous = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+    );
+    assert!(!ambiguous.moved_no_funds());
+
+    // The class survives the conversion into `StrategyError`, which is what the flush sees.
+    let error: StrategyError = no_funding.into();
+    assert!(error.moved_no_funds(), "{error}");
+    let error: StrategyError = super::CurvyDepositPoolError::WatcherStopped.into();
+    assert!(!error.moved_no_funds(), "{error}");
+
+    // The batch path fans one chunk error out to every item; it must reach each item with the
+    // class intact rather than collapsed to a variant that always reads fund-free.
+    let fan_out: StrategyError = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+    )
+    .into();
+    let per_item = super::clone_error(&fan_out);
+    assert!(
+        !per_item.moved_no_funds(),
+        "an ambiguous chunk stays ambiguous per item"
+    );
+
+    // A `CriteriaNotSatisfied` from this pool is *not* fund-free: `allocate_all` may already have
+    // submitted an earlier chunk before a later one finds no funding note.
+    assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
+}
+
 #[test]
 fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
     use super::{relayer::RelayError, sdk::RsSdkCurvyAdapterError};

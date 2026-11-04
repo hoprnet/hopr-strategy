@@ -638,6 +638,89 @@ pub enum CurvyDepositPoolError {
     UnsupportedPoolTransfer,
 }
 
+impl CurvyDepositPoolError {
+    /// Whether this error proves the failed deposit moved no funds.
+    ///
+    /// See [`StrategyError::moved_no_funds`] for the contract. The bar is deliberately high:
+    /// a `false` here costs one window of budget, a wrong `true` under-counts real spend against
+    /// a safety limit.
+    pub fn moved_no_funds(&self) -> bool {
+        match self {
+            // `NoFunding` is raised while selecting input notes, before the aggregation exists.
+            // A proof the SDK refused to build — validation inside `build_pix_aggregation`, such
+            // as gnosis/gnosis_vpn#713's `feeNotePublicKey` mismatch — never reached submission
+            // either, and leaves no journalled attempt behind.
+            Self::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
+                Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. }) => true,
+                Some(sdk::RsSdkCurvyAdapterError::Sdk(error)) => is_pre_submission_refusal(&error.to_string()),
+                _ => false,
+            },
+            // A batch item rejected for naming another allocation never joined `allocate`.
+            Self::MismatchedDepositData { .. } => true,
+            // Everything else is ambiguous: `Adapter` usually wraps a submitted aggregation whose
+            // outcome was lost, and the rest leave the allocation in a state a later retry can
+            // still spend.
+            Self::State(_)
+            | Self::InvalidReconstructedSecret(_)
+            | Self::MissingScanSecret(_)
+            | Self::WatcherStopped
+            | Self::ReconciliationPending
+            | Self::Indexer(_)
+            | Self::DepositTimeout
+            | Self::ScanIdentity(_)
+            | Self::UnsupportedPoolTransfer => false,
+        }
+    }
+}
+
+/// Reproduces a pool-level error for one batch item, keeping the class a refund keys on.
+///
+/// `StrategyError` is not `Clone`. The two variants `allocate` can return are `CriteriaNotSatisfied`
+/// and `Other(CurvyDepositPoolError)`, so those are rebuilt faithfully and anything else is
+/// stringified — which degrades to "ambiguous", the safe direction.
+fn clone_error(error: &StrategyError) -> StrategyError {
+    match error {
+        StrategyError::CriteriaNotSatisfied => StrategyError::CriteriaNotSatisfied,
+        StrategyError::Other(error) => match error.downcast_ref::<CurvyDepositPoolError>() {
+            Some(curvy) => curvy_clone(curvy).into(),
+            None => StrategyError::other(anyhow::anyhow!("{error}")),
+        },
+        other => StrategyError::other(anyhow::anyhow!("{other}")),
+    }
+}
+
+/// Rebuilds a [`CurvyDepositPoolError`]. Only the variants that can reach a batch outcome are
+/// reproduced; the rest become an opaque `Adapter` error, which is ambiguous.
+fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
+    match error {
+        CurvyDepositPoolError::MismatchedDepositData { expected, actual } => {
+            CurvyDepositPoolError::MismatchedDepositData {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        CurvyDepositPoolError::Adapter(error) => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{error}")),
+        other => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{other}")),
+    }
+}
+
+/// Whether an SDK error is a refusal the SDK raised *before* submitting an aggregation.
+///
+/// Matched on text because the SDK reports these as opaque `anyhow` messages. All of them are
+/// local validation in `build_pix_aggregation`: nothing is signed, no nonce is spent and no
+/// attempt is journalled. Anything not listed stays ambiguous, so a submitted-but-lost outcome
+/// stays counted.
+fn is_pre_submission_refusal(message: &str) -> bool {
+    message.contains("fee-collector identity does not own the aggregator's feeNotePublicKey")
+        || message.contains("PIX aggregation requires")
+        || message.contains("PIX allocation amounts must be non-zero")
+        || message.contains("PIX allocation owner must differ from the funding account")
+        || message.contains("PIX aggregation input is not owned by the funding account")
+        || message.contains("PIX aggregation inputs must")
+        || message.contains("PIX relayer note must carry a non-zero gas reimbursement")
+        || message.contains("PIX relayer owner must differ from the funding account")
+}
+
 impl From<CurvyDepositPoolError> for StrategyError {
     fn from(error: CurvyDepositPoolError) -> Self {
         StrategyError::other(error)
@@ -1186,8 +1269,8 @@ where
         // batch-prover, on its own schedule, and the SDK's tree — read from a finalized
         // checkpoint when the notes come from Curvy's indexer — follows later still. A deposit
         // that arrives in that window is not a failure, it is early: wait for the tree, within
-        // the same budget discovery gets, rather than fail the flush. The strategy's spend
-        // ledger is never refunded (by design), so failing here would burn the budget on a race.
+        // the same budget discovery gets, rather than fail the flush. Failing here would burn the
+        // deposit's spend budget on a race.
         let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
         let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
         let mut waited = 0u32;
@@ -1371,8 +1454,10 @@ where
         for (index, (id, ..)) in valid {
             outcomes[index] = Some(match &result {
                 Ok(()) => Ok((id, ())),
-                Err(StrategyError::CriteriaNotSatisfied) => Err(StrategyError::CriteriaNotSatisfied),
-                Err(error) => Err(StrategyError::other(anyhow::anyhow!("{error}"))),
+                // One allocation call fails for the whole chunk, so every item carries the same
+                // failure. A classified one is rebuilt from its own error type rather than
+                // stringified, so `moved_no_funds` still finds it.
+                Err(error) => Err(clone_error(error)),
             });
         }
         Ok(outcomes
