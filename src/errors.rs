@@ -73,11 +73,10 @@ impl StrategyError {
     ///
     /// The concrete cases:
     ///
-    /// - [`Self::GeneralError`] `InvalidInput` — a payload the pool refused before submitting.
-    ///   The other `GeneralError` variants carry no such guarantee and stay counted.
-    /// - [`Self::Other`] wrapping an error a pool classifies as fund-free; see `pix::pools`. This
-    ///   is how a pool says so for an error whose class it can only decide itself, such as the
-    ///   plain pool's retrying affordability gate.
+    /// - [`Self::GeneralError`] `InvalidInput` — a payload the pool refused before submitting. The other `GeneralError`
+    ///   variants carry no such guarantee and stay counted.
+    /// - [`Self::Other`] wrapping an error a pool classifies as fund-free; see `pix::pools`. This is how a pool says so
+    ///   for an error whose class it can only decide itself, such as the plain pool's retrying affordability gate.
     ///
     /// [`Self::CriteriaNotSatisfied`] is deliberately **not** here. It is a plain "the criteria
     /// were not met", and the pools raise it in both directions: the plain pool from its

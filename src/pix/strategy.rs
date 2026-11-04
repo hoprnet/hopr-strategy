@@ -1888,8 +1888,7 @@ mod tests {
         errors::StrategyError,
         pix::{
             ByteDepositData,
-            pools::plain::EthDepositKey,
-            pools::plain::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPool},
+            pools::plain::{DEPOSIT_MARKER_PAYLOAD, EthDepositKey, NonAnonymousDepositPool},
             recovery_store::PixRecoveryStore,
         },
         testing::{BlokliTestClient, BlokliTestStateBuilder, FullStateEmulator, TestChainConnector},
