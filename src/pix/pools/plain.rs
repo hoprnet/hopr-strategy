@@ -453,8 +453,9 @@ pub struct NonAnonymousDepositPoolConfig {
     /// something else too, such as channel stakes.
     ///
     /// The affordability check it participates in runs either way: a deposit the Safe cannot
-    /// cover is refused with [`StrategyError::CriteriaNotSatisfied`] instead of being submitted
-    /// and reverted.
+    /// cover is refused with a pool-specific error wrapped in [`StrategyError::Other`] instead of
+    /// being submitted and reverted. [`StrategyError::moved_no_funds`] reports that refusal as
+    /// fund-free unless an earlier retry of the same deposit already reached the transfer.
     #[default(HoprBalance::zero())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "HoprBalance::zero")]
