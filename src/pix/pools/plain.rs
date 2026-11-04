@@ -133,10 +133,6 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
     payload
 };
 
-/// Rejects deposit data that is not [`DEPOSIT_MARKER_PAYLOAD`] filed under `id`.
-///
-/// Both halves are checked, because [`ByteDepositData`] is a pair and either half can disagree:
-///
 /// The pool's own failure, so it can say whether funds may have moved.
 ///
 /// The affordability gate runs before `deposit_once` sends a transfer, but a retry can reach it
@@ -148,6 +144,10 @@ pub(crate) enum PlainDepositError {
     Unaffordable { after_attempt: bool },
 }
 
+/// Rejects deposit data that is not [`DEPOSIT_MARKER_PAYLOAD`] filed under `id`.
+///
+/// Both halves are checked, because [`ByteDepositData`] is a pair and either half can disagree:
+///
 /// - A payload that is not the marker means the Entry sent deposit data this pool cannot read — the two ends disagree
 ///   about which pool is running, the same class of failure as a wrong curve.
 /// - A payload filed under another allocation means the pool is being asked to settle against `id` using data that

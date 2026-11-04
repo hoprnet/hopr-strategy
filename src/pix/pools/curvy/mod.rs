@@ -429,8 +429,10 @@ pub struct CurvyDepositPoolConfig {
     /// wxHOPR shielded from the Safe into the private pool on the first deposit, gross of the
     /// deployment's shield fees. Default: 100 wxHOPR. Overridden by [`INITIAL_FUNDING_ENV`].
     ///
-    /// Deposits are allocated out of this until it runs out, at which point they fail with
-    /// [`StrategyError::CriteriaNotSatisfied`]; the pool does not top itself up.
+    /// Deposits are allocated out of this until it runs out, at which point they fail with an
+    /// error whose [`StrategyError::moved_no_funds`] is `true`; the pool does not top itself up.
+    /// (Before 6.0.2 this surfaced as [`StrategyError::CriteriaNotSatisfied`], so a consumer
+    /// detecting exhaustion by that variant must switch to `moved_no_funds`.)
     #[default(default_initial_funding())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_initial_funding")]
@@ -674,9 +676,9 @@ impl CurvyDepositPoolError {
 
 /// Reproduces a pool-level error for one batch item, keeping the class a refund keys on.
 ///
-/// `StrategyError` is not `Clone`. The two variants `allocate` can return are `CriteriaNotSatisfied`
-/// and `Other(CurvyDepositPoolError)`, so those are rebuilt faithfully and anything else is
-/// stringified — which degrades to "ambiguous", the safe direction.
+/// `StrategyError` is not `Clone`. `allocate` returns `Other(CurvyDepositPoolError)`, which is
+/// rebuilt faithfully; anything else is stringified, which degrades to "ambiguous" — the safe
+/// direction for a refund.
 fn clone_error(error: &StrategyError) -> StrategyError {
     match error {
         StrategyError::CriteriaNotSatisfied => StrategyError::CriteriaNotSatisfied,
@@ -1329,6 +1331,11 @@ where
                     // Kept typed rather than collapsed to `CriteriaNotSatisfied`: the strategy
                     // refunds a deposit only on a class that provably moved no funds, and an
                     // out-of-funding failure does exactly that.
+                    //
+                    // Behaviour change: a drained pool used to surface `CriteriaNotSatisfied`, so
+                    // a consumer matching on that to detect exhaustion must now use
+                    // `StrategyError::moved_no_funds` (or match the wrapped
+                    // `CurvyDepositPoolError::Adapter(..)`).
                     return Err(StrategyError::other(CurvyDepositPoolError::Adapter(error.into())));
                 }
             }

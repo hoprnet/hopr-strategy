@@ -1354,7 +1354,7 @@ async fn flush_deposit_batch<D, K>(
                         }
                         Err(error) => {
                             let error: StrategyError = error.into();
-                            everything_failed_fund_free &= batch_refundable(&error);
+                            everything_failed_fund_free &= error.moved_no_funds();
                             if positional {
                                 failed_at[index] = true;
                             }
@@ -1376,7 +1376,9 @@ async fn flush_deposit_batch<D, K>(
                         }
                     } else if outcomes_accounted_for(&deposits, &settled, outcomes_len) {
                         // Fewer outcomes than deposits, so which item failed cannot be recovered
-                        // from position; it is taken to be the one with no success echo.
+                        // from position; it is taken to be the one with no success echo. (No
+                        // bundled pool returns fewer outcomes than deposits for a batch, so this
+                        // branch is the contract's guard rather than a live path.)
                         for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
                             if !settled.contains(id) {
                                 refund(spend_ledger.as_ref(), *spend, id, *amount);
@@ -1400,7 +1402,7 @@ async fn flush_deposit_batch<D, K>(
                 }
                 // A pool-wide failure is one error for every item, so a fund-free class refunds
                 // them all. An ambiguous one refunds none, exactly as for the single path.
-                if batch_refundable(&error) {
+                if error.moved_no_funds() {
                     for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
                         refund(spend_ledger.as_ref(), *spend, id, *amount);
                     }
@@ -1411,14 +1413,6 @@ async fn flush_deposit_batch<D, K>(
             }
         }
     }
-}
-
-/// Whether a batch failure proves the whole call moved no funds.
-///
-/// A batch is one pool call, so a Curvy call that failed after an earlier chunk was submitted
-/// refunds nothing even if the error itself looks fund-free. Only Curvy has that notion.
-fn batch_refundable(error: &StrategyError) -> bool {
-    error.moved_no_funds()
 }
 
 /// Hands a failed deposit's spend reservation back to the window.
@@ -2897,8 +2891,8 @@ mod tests {
     /// This is the `max_spend_per_window` half of gnosis/gnosis_vpn#713: nine failed 0.66 wxHOPR
     /// deposits drove `spent` to 5.94 of a 6 wxHOPR budget and the tenth was refused for the rest
     /// of the 24 h window, even though the funds never left. The failing deposits here are refused
-    /// by `min_safe_hopr_reserve`, which `deposit_once` checks before it submits a transfer — a
-    /// `CriteriaNotSatisfied`, which `moved_no_funds` treats as fund-free.
+    /// by `min_safe_hopr_reserve`, which `deposit_once` checks before it submits a transfer, and
+    /// reports as a `PlainDepositError::Unaffordable` that `moved_no_funds` treats as fund-free.
     #[test_log::test(tokio::test)]
     async fn test_failed_deposits_release_their_spend_reservation() -> anyhow::Result<()> {
         let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
@@ -3059,8 +3053,8 @@ mod tests {
     /// Only a refusal that provably precedes settlement is refundable.
     ///
     /// `CriteriaNotSatisfied` is ambiguous — the plain pool's gate is pre-transfer, but Curvy
-    /// raises it after `allocate_all` may have submitted an earlier chunk — so it stays counted.
-    /// The plain pool states its own gate through a typed error instead.
+    /// could raise it after `allocate_all` submitted an earlier chunk — so it stays counted. Each
+    /// pool states its own fund-free failures through a typed error instead.
     #[test]
     fn test_only_provably_fund_free_errors_refund() {
         use hopr_api::types::primitive::prelude::GeneralError;

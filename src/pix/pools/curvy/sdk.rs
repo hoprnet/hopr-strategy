@@ -2337,8 +2337,12 @@ where
                 .await?;
             if self.config.submission == CurvySubmission::Relayer {
                 self.prepare_relay_aggregation(&request, endpoints, &funding_notes, &allocation_records)?;
-                // Errors retain the exact request and its outputs.
-                self.reconcile_relay_aggregation().await?;
+                // Past this point the aggregation may have been POSTed: a rebuild inside the
+                // reconcile re-proves it and can refuse on a rotated fee key or a re-quoted fee,
+                // which looks fund-free but is not. Errors retain the exact request and outputs.
+                // The outcome carries the ledger; a failed rebuild is tagged by the caller's
+                // per-chunk rule, so nothing else is needed here.
+                self.reconcile_relay_aggregation().await.map_err(tag_after_submission)?;
             } else {
                 receipts.extend(
                     self.submit_operator_aggregation(client, endpoints, request, &funding_notes, &allocation_records)

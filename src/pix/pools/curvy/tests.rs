@@ -1322,7 +1322,7 @@ fn only_fund_free_failures_release_the_spend_budget() {
         "an ambiguous chunk stays ambiguous per item"
     );
 
-    // A `CriteriaNotSatisfied` from this pool is *not* fund-free: `allocate_all` may already have
+    // `CriteriaNotSatisfied` is not fund-free for this pool either: `allocate_all` may have
     // submitted an earlier chunk before a later one finds no funding note.
     assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
 
@@ -1344,6 +1344,13 @@ fn only_fund_free_failures_release_the_spend_budget() {
     // ambiguous error keeps its own variant.
     let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 1 });
     assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission(_)));
+    // A rebuild inside the first chunk re-proves an aggregation that may already be POSTed, so
+    // its SDK-side refusal must be tagged too.
+    let rebuilt = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+        "fee-collector identity does not own the aggregator's feeNotePublicKey"
+    )));
+    assert!(matches!(rebuilt, RsSdkCurvyAdapterError::AfterSubmission(_)));
+    assert!(!super::CurvyDepositPoolError::Adapter(rebuilt.into()).moved_no_funds());
     let untouched = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::AmbiguousAllocation);
     assert!(matches!(untouched, RsSdkCurvyAdapterError::AmbiguousAllocation));
 }
