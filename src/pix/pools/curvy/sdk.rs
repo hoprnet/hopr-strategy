@@ -3361,6 +3361,132 @@ mod tests {
         Ok(())
     }
 
+    /// `is_pre_submission_refusal` recognises the SDK's validation failures by their text, so each
+    /// one is produced here from the SDK in use. A reworded message fails this test rather than
+    /// silently turning a fund-free failure into a counted one.
+    ///
+    /// Every case trips one local check in `build_pix_aggregation`, before it reads the tree; the
+    /// fee-key mismatch comes from `fee_note`, which `build_pix_aggregation` calls once proving.
+    #[tokio::test]
+    async fn the_sdk_pre_submission_refusals_are_still_recognised() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|path, _| {
+            Some((
+                500,
+                serde_json::json!({ "error": format!("validation reached {path}") }),
+            ))
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let (client, _) = adapter.client().await?;
+        let spender = &adapter.spender;
+        let own = spender.identity();
+
+        // A valid input and allocation; each case below breaks exactly one thing.
+        let mut input = Adapter::owned_note(&fixture(100))?;
+        input.owner_pub = spender.bjj_pub;
+        input.token = Fr::from(4u64);
+        let mut recipient = StoredAllocation::recipient(&fixture(7).deposit.address, scan_key("07", "0b")?)?;
+        recipient.owner_pub = (Fr::from(5u64), Fr::from(6u64));
+        let allocation = (recipient.clone(), 7u128);
+
+        let zero_input = OwnedNote {
+            amount: Fr::from(0u64),
+            ..input.clone()
+        };
+        let other_token = OwnedNote {
+            token: Fr::from(9u64),
+            ..input.clone()
+        };
+        let foreign_input = OwnedNote {
+            owner_pub: (Fr::from(5u64), Fr::from(6u64)),
+            ..input.clone()
+        };
+        let to_self = (
+            curvy_sdk::account::ScanRecipient::new(recipient.viewer.clone(), spender.bjj_pub),
+            7u128,
+        );
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Vec<OwnedNote>, Vec<_>, Option<(&Identity, u128)>)> = vec![
+            (
+                "PIX aggregation requires one or two",
+                vec![],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX aggregation requires between one and",
+                vec![input.clone()],
+                vec![],
+                None,
+            ),
+            (
+                "PIX relayer note must carry a non-zero gas reimbursement",
+                vec![input.clone()],
+                vec![allocation.clone()],
+                Some((&own, 0)),
+            ),
+            (
+                "PIX aggregation inputs must have non-zero amounts",
+                vec![zero_input],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX aggregation inputs must use one token",
+                vec![input.clone(), other_token],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX aggregation input is not owned by the funding account",
+                vec![foreign_input],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX allocation amounts must be non-zero",
+                vec![input.clone()],
+                vec![(recipient.clone(), 0)],
+                None,
+            ),
+            (
+                "PIX allocation owner must differ from the funding account",
+                vec![input.clone()],
+                vec![to_self],
+                None,
+            ),
+            (
+                "PIX relayer owner must differ from the funding account",
+                vec![input.clone()],
+                vec![allocation.clone()],
+                Some((&own, 1)),
+            ),
+        ];
+        for (expected, inputs, allocations, relayer) in cases {
+            let message = client
+                .build_pix_aggregation(spender, &inputs, &allocations, relayer, None)
+                .await
+                .expect_err(expected)
+                .to_string();
+            assert!(message.contains(expected), "expected {expected:?}, got {message:?}");
+            assert!(super::super::is_pre_submission_refusal(&message), "{message:?}");
+        }
+
+        let message = curvy_sdk::send::fee_note(
+            Some(&own),
+            (Fr::from(5u64), Fr::from(6u64)),
+            Fr::from(1u64),
+            input.token,
+            b"seed",
+        )
+        .expect_err("a fee note sealed to the wrong collector")
+        .to_string();
+        assert!(super::super::is_pre_submission_refusal(&message), "{message:?}");
+        Ok(())
+    }
+
     fn prepare_recovery_fixture(adapter: &Adapter) -> anyhow::Result<(StoredAllocation, StoredNote)> {
         let record = stored_fixture(7)?;
         let mut input = Adapter::owned_note(&fixture(100))?;
