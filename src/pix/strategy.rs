@@ -1375,10 +1375,10 @@ async fn flush_deposit_batch<D, K>(
                             }
                         }
                     } else if outcomes_accounted_for(&deposits, &settled, outcomes_len) {
-                        // Fewer outcomes than deposits, so which item failed cannot be recovered
-                        // from position; it is taken to be the one with no success echo. (No
-                        // bundled pool returns fewer outcomes than deposits for a batch, so this
-                        // branch is the contract's guard rather than a live path.)
+                        // Not one outcome per deposit, so a failure's position is not its deposit's:
+                        // the item with no success echo is taken to be the failed one. This needs
+                        // at least as many outcomes as deposits, so a pool that returns *fewer*
+                        // refunds nothing — its unaccounted items have an unknown fate.
                         for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
                             if !settled.contains(id) {
                                 refund(spend_ledger.as_ref(), *spend, id, *amount);
@@ -1438,8 +1438,9 @@ fn outcomes_accounted_for<P, E>(
     settled: &std::collections::HashSet<PixAddressId>,
     outcomes: usize,
 ) -> bool {
-    // Every deposit with no success echo must be covered by a failure outcome, so there have to
-    // be at least that many outcomes.
+    // Each success accounts for one deposit and each failure for another, so there must be at
+    // least one outcome per deposit. Combined with the caller's "not exactly one per deposit"
+    // test, this branch is reached only when a pool returns *more* outcomes than deposits.
     let unaccounted = deposits.iter().filter(|(id, ..)| !settled.contains(id)).count();
     outcomes >= settled.len() + unaccounted
 }

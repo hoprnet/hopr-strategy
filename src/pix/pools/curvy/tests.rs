@@ -1322,8 +1322,8 @@ fn only_fund_free_failures_release_the_spend_budget() {
         "an ambiguous chunk stays ambiguous per item"
     );
 
-    // `CriteriaNotSatisfied` is not fund-free for this pool either: `allocate_all` may have
-    // submitted an earlier chunk before a later one finds no funding note.
+    // `CriteriaNotSatisfied` is not fund-free for any pool: it is a generic refusal whose timing
+    // is up to the pool.
     assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
 
     // A failure raised after an earlier chunk was submitted is tagged, so it is never fund-free
@@ -1353,6 +1353,34 @@ fn only_fund_free_failures_release_the_spend_budget() {
     assert!(!super::CurvyDepositPoolError::Adapter(rebuilt.into()).moved_no_funds());
     let untouched = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::AmbiguousAllocation);
     assert!(matches!(untouched, RsSdkCurvyAdapterError::AmbiguousAllocation));
+}
+
+/// Exhaustion is a narrower signal than "fund-free": a consumer must not read a fee-key
+/// misconfiguration as a drained pool.
+#[test]
+fn only_no_funding_is_reported_as_out_of_funding() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    let drained = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
+    assert!(drained.is_out_of_funding());
+    assert!(super::is_out_of_funding(&StrategyError::other(
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into())
+    )));
+
+    // Fund-free, but not exhaustion.
+    let fee_key = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+            "fee-collector identity does not own the aggregator's feeNotePublicKey"
+        ))
+        .into(),
+    );
+    assert!(fee_key.moved_no_funds());
+    assert!(!fee_key.is_out_of_funding());
+    assert!(!super::is_out_of_funding(&StrategyError::other(fee_key)));
+
+    let payload = StrategyError::GeneralError(hopr_api::types::primitive::prelude::GeneralError::InvalidInput);
+    assert!(payload.moved_no_funds());
+    assert!(!super::is_out_of_funding(&payload));
 }
 
 #[test]

@@ -430,9 +430,12 @@ pub struct CurvyDepositPoolConfig {
     /// deployment's shield fees. Default: 100 wxHOPR. Overridden by [`INITIAL_FUNDING_ENV`].
     ///
     /// Deposits are allocated out of this until it runs out, at which point they fail with an
-    /// error whose [`StrategyError::moved_no_funds`] is `true`; the pool does not top itself up.
-    /// (Before 6.0.2 this surfaced as [`StrategyError::CriteriaNotSatisfied`], so a consumer
-    /// detecting exhaustion by that variant must switch to `moved_no_funds`.)
+    /// error that [`is_out_of_funding`] recognises; the pool does not top itself up.
+    ///
+    /// This surfaced as [`StrategyError::CriteriaNotSatisfied`] before, so a consumer detecting
+    /// exhaustion by that variant must switch to [`is_out_of_funding`]. Note that
+    /// [`StrategyError::moved_no_funds`] is *not* the signal: it is also true for a malformed
+    /// payload and for pre-submission refusals such as a fee-collector mismatch.
     #[default(default_initial_funding())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_initial_funding")]
@@ -671,6 +674,53 @@ impl CurvyDepositPoolError {
             | Self::ScanIdentity(_)
             | Self::UnsupportedPoolTransfer => false,
         }
+    }
+
+    /// Whether this error means the shielded pool has no funding left to allocate from.
+    ///
+    /// Distinct from [`Self::moved_no_funds`], which is also true for a malformed payload or a
+    /// pre-submission refusal such as a fee-collector mismatch. A consumer watching for
+    /// exhaustion — the expected end of a run — should ask this rather than treat every
+    /// fund-free failure as one.
+    ///
+    /// ```
+    /// # use hopr_strategy::pix::pools::curvy::CurvyDepositPoolError;
+    /// let drained = CurvyDepositPoolError::Adapter(
+    ///     hopr_strategy::pix::pools::curvy::RsSdkCurvyAdapterError::NoFunding { required: 10 }.into(),
+    /// );
+    /// assert!(drained.is_out_of_funding());
+    /// ```
+    pub fn is_out_of_funding(&self) -> bool {
+        matches!(
+            self,
+            Self::Adapter(error)
+                if matches!(
+                    error.downcast_ref::<sdk::RsSdkCurvyAdapterError>(),
+                    Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. })
+                )
+        )
+    }
+}
+
+/// Whether a failed allocation means the pool has no funding left, for a caller holding a
+/// [`StrategyError`].
+///
+/// [`CurvyDepositPoolError::is_out_of_funding`] on the wrapped error; anything else is `false`.
+/// ```
+/// # use hopr_strategy::errors::StrategyError;
+/// # use hopr_strategy::pix::pools::curvy::{CurvyDepositPoolError, RsSdkCurvyAdapterError};
+/// let drained = StrategyError::other(CurvyDepositPoolError::Adapter(
+///     RsSdkCurvyAdapterError::NoFunding { required: 10 }.into(),
+/// ));
+/// assert!(hopr_strategy::pix::pools::curvy::is_out_of_funding(&drained));
+/// assert!(!hopr_strategy::pix::pools::curvy::is_out_of_funding(&StrategyError::CriteriaNotSatisfied));
+/// ```
+pub fn is_out_of_funding(error: &StrategyError) -> bool {
+    match error {
+        StrategyError::Other(error) => error
+            .downcast_ref::<CurvyDepositPoolError>()
+            .is_some_and(CurvyDepositPoolError::is_out_of_funding),
+        _ => false,
     }
 }
 
@@ -1321,22 +1371,17 @@ where
                     tokio::time::sleep(poll).await;
                 }
                 Err(error) => {
-                    let message = error.to_string();
+                    let error = CurvyDepositPoolError::Adapter(error.into());
                     // Out of shielded funds is the expected end of a run, not a fault: the
                     // strategy's budget usually gets there first, and either way the kill switch
                     // ends the Session.
-                    if message.contains("no committed note large enough") {
+                    if error.is_out_of_funding() {
                         tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
                     }
-                    // Kept typed rather than collapsed to `CriteriaNotSatisfied`: the strategy
-                    // refunds a deposit only on a class that provably moved no funds, and an
-                    // out-of-funding failure does exactly that.
-                    //
-                    // Behaviour change: a drained pool used to surface `CriteriaNotSatisfied`, so
-                    // a consumer matching on that to detect exhaustion must now use
-                    // `StrategyError::moved_no_funds` (or match the wrapped
-                    // `CurvyDepositPoolError::Adapter(..)`).
-                    return Err(StrategyError::other(CurvyDepositPoolError::Adapter(error.into())));
+                    // Kept typed rather than collapsed to `CriteriaNotSatisfied`, so
+                    // `is_out_of_funding` can tell exhaustion from any other fund-free failure
+                    // and the strategy can refund it.
+                    return Err(StrategyError::other(error));
                 }
             }
         }
