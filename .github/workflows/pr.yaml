@@ -141,9 +141,13 @@ jobs:
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   # ── Shared tests (unit) ─────────────────────────────────────────────────────
+  # Stage 2: tests run after the stage 1 checks are green. `semver-checks` skips
+  # outside pull requests, and a skipped need would skip this job too, so
+  # `!failure()` lets a skip through and still stops on a failed need.
   tests:
     name: Test
-    needs: changes
+    needs: [changes, checks, semver-checks]
+    if: ${{ !cancelled() && !failure() }}
     permissions:
       contents: read
       id-token: write # Codecov OIDC upload in the coverage jobs
@@ -161,9 +165,11 @@ jobs:
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   # ── Build: library ─────────────────────────────────────────────────────────
+  # Stage 3: builds run after stages 1 and 2 are green (same skip rule).
   build-library:
     name: Library ${{ matrix.architecture }}
-    needs: changes
+    needs: [changes, checks, semver-checks, tests]
+    if: ${{ !cancelled() && !failure() }}
     strategy:
       fail-fast: false
       matrix:
