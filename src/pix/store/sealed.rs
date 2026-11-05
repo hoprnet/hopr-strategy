@@ -33,8 +33,14 @@
 //! Protects against an attacker who obtains read access to the database file: a backup, an
 //! exfiltrated copy, a stolen disk. Without the password they cannot derive the key, and
 //! without the key they cannot open any value. It does **not** protect against an attacker who
-//! also has the password — which lives in the node's environment, readable by the same user and
-//! by root through `/proc/<pid>/environ` — or who can execute code as the node process.
+//! also has the password — which lives in the node's environment or configuration file,
+//! readable by the same user and by root through `/proc/<pid>/environ` — or who can execute
+//! code as the node process.
+//!
+//! Nor does it reach back in time. A database that held a secret in the clear before it was
+//! sealed keeps that copy in its freed pages — redb is copy-on-write and does not zero them —
+//! until they happen to be reused, and every backup taken before the migration holds it
+//! outright.
 
 use std::fmt;
 

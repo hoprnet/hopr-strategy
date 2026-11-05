@@ -22,6 +22,12 @@
 //! spending authority over the pool's float. A database written before sealing existed is
 //! sealed in place on its next open.
 //!
+//! Sealing in place does not erase what was there. redb is copy-on-write and leaves freed pages
+//! as they were, so a migrated file can still carry the clear scan secrets and spender identity
+//! in its free space, and every copy of it taken before the migration carries them outright —
+//! the password protects neither. For such a file the sealing only covers what is written from
+//! now on: treat its earlier copies, and the file itself, as exposing the secrets it held.
+//!
 //! [`generate_deposit_data`]: hopr_api::chain::DepositPool::generate_deposit_data
 //! [`notify_deposit`]: hopr_api::chain::DepositPool::notify_deposit
 
@@ -430,7 +436,8 @@ impl RedbCurvyDepositState {
     }
 
     /// Moves every scan secret a pre-sealing database kept in the clear into the sealed table,
-    /// and drops the clear table, in one transaction.
+    /// and drops the clear table, in one transaction. Dropping the table frees its pages without
+    /// overwriting them; see the module docs for what that leaves in the file.
     fn seal_legacy_scan_secrets(&self) -> Result<(), CurvyStateError> {
         let write = self.db.begin_write().map_err(state_db_error)?;
         let moved = {

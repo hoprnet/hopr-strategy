@@ -711,7 +711,8 @@ impl RedbCurvySdkStore {
         }
         if !legacy.is_empty() || legacy_spender.is_some() {
             // The records, the sealed identity and the removal of the clear copies become
-            // durable together.
+            // durable together. "Removal" from the live state only: the pages the clear
+            // identity sat in are freed, not overwritten (see the `state` module docs).
             self.save_update(&state, &legacy, &[])?;
             if legacy_spender.is_some() {
                 tracing::info!("sealed the Curvy spender identity of a pre-sealing state database");
