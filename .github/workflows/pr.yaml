@@ -17,9 +17,8 @@ on:
       - ready_for_review
 permissions:
   contents: read
-  id-token: write # zizmor: ignore[excessive-permissions]
 concurrency:
-  group: ${{ github.event.pull_request.head.ref || github.ref_name }}-pr
+  group: ${{ github.event.pull_request.number || github.ref }}-pr
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +45,8 @@ jobs:
             refactor
             perf
             test
+            ci
+            revert
           requireScope: false
           ignoreLabels: |
             bot
@@ -81,15 +82,57 @@ jobs:
           if [[ "$HEAD_REPO" != "$BASE_REPO" ]]; then
             gh pr edit "$PR_NUMBER" --add-label "external"
           fi
+  # Gate jobs through inputs on the reusable workflows, not with a caller-level
+  # `if:`: an input-skipped inner job still reports its required check name as
+  # skipped (green), a skipped caller job does not. Merge-queue runs always
+  # run everything.
+  changes:
+    name: Detect changes
+    runs-on: depot-ubuntu-24.04-2
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+      lockfile: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lockfile == 'true' }}
+    steps:
+      - name: Filter changed paths
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            rust:
+              - "src/**"
+              - "tests/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "rust-toolchain.toml"
+              - "rustfmt.toml"
+              - ".cargo/**"
+              - "justfile"
+              - "deno.json"
+              - "codecov.yml"
+              - "flake.nix"
+              - "flake.lock"
+              - "nix/**"
+              - ".github/workflows/**"
+            lockfile:
+              - "Cargo.toml"
+              - "Cargo.lock"
   # ── Shared checks (lint, pre-commit, audit) ─────────────────────────────────
   checks:
     name: Check
+    needs: changes
     uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
       lint_command: "nix develop --command just quick"
       audit_command: "nix run -L .#audit"
       deps: true
+      # Format and pre-commit cover every file type and always run.
+      lint: ${{ needs.changes.outputs.rust == 'true' }}
+      audit: ${{ needs.changes.outputs.lockfile == 'true' }}
       runner_small: depot-ubuntu-24.04-2
       runner_large: depot-ubuntu-24.04-4
     secrets:
@@ -97,15 +140,19 @@ jobs:
   # ── Shared tests (unit) ─────────────────────────────────────────────────────
   tests:
     name: Test
+    needs: changes
+    permissions:
+      contents: read
+      id-token: write # Codecov OIDC upload in the coverage jobs
     uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-tests-v6.1.1
     with:
       source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
       enable_unit_tests: false
-      enable_unit_coverage: true
+      enable_unit_coverage: ${{ needs.changes.outputs.rust == 'true' }}
       unit_coverage_command: "nix build -L .#coverage -o coverage.lcov"
-      enable_integration_tests: true
+      enable_integration_tests: ${{ needs.changes.outputs.rust == 'true' }}
       integration_test_command: "nix build -L .#integration-tests"
-      enable_integration_coverage: true
+      enable_integration_coverage: ${{ needs.changes.outputs.rust == 'true' }}
       integration_coverage_command: "nix build -L .#coverage-integration -o coverage.lcov"
       test_timeout: 30
     secrets:
@@ -113,6 +160,7 @@ jobs:
   # ── Build: library ─────────────────────────────────────────────────────────
   build-library:
     name: Library ${{ matrix.architecture }}
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
@@ -138,6 +186,32 @@ jobs:
       build_command: "nix build -L .#lib-hopr-strategy-${{ matrix.architecture }}"
       package_name: hopr-strategy
       runner: ${{ matrix.runner }}
-      enabled: ${{ matrix.required_label == '' || contains(github.event.pull_request.labels.*.name, matrix.required_label) }}
+      enabled: ${{ needs.changes.outputs.rust == 'true' && (matrix.required_label == '' || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, matrix.required_label)) }}
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  # Single aggregate merge gate: green only if every other job in this run
+  # succeeded. Mark THIS one as the required check in the branch ruleset.
+  # `if: always()` runs it even when a dependency fails; alls-green then reds
+  # the gate on any non-success (a failed job, or a skip that is not allowed).
+  merge-gate:
+    name: Merge gate
+    if: always()
+    needs:
+      - validate-pr-title
+      - label
+      - changes
+      - checks
+      - tests
+      - build-library
+    runs-on: depot-ubuntu-24.04-2
+    permissions: {}
+    steps:
+      - name: Require all jobs to pass
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
+          # validate-pr-title and label run on pull_request only. `tests` and
+          # `build-library` are input-gated on `changes.outputs.rust`; when every
+          # inner job of the reusable workflow skips, the caller job reports
+          # skipped as well. Their skip is allowed only for a non-Rust change.
+          allowed-skips: ${{ needs.changes.outputs.rust == 'true' && 'validate-pr-title, label' || 'validate-pr-title, label, tests, build-library' }}
