@@ -54,6 +54,8 @@ jobs:
   label:
     name: Add labels
     if: github.event_name == 'pull_request'
+    # Fork PRs get a read-only token and cannot write labels; stay green so the gate passes.
+    continue-on-error: true
     runs-on: depot-ubuntu-24.04-2
     permissions:
       contents: read
