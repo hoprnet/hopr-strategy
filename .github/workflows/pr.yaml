@@ -117,6 +117,7 @@ jobs:
               - "codecov.yml"
               - "flake.nix"
               - "flake.lock"
+              - "deny.toml"
               - "nix/**"
               - ".github/workflows/**"
             lockfile:
@@ -191,6 +192,23 @@ jobs:
       enabled: ${{ needs.changes.outputs.rust == 'true' && (matrix.required_label == '' || github.event_name == 'merge_group' || contains(github.event.pull_request.labels.*.name, matrix.required_label)) }}
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  # Public API against the last crates.io release. Pull requests only: the
+  # baseline is a published version, so a merge-queue run adds nothing.
+  semver-checks:
+    name: Semver
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check semver
+        uses: hoprnet/hopr-workflows/actions/nix-action@ff4c0b7afc400ee6cf217841dc576f8a1289bcc0 # nix-action-v1.2.1
+        with:
+          source_branch: ${{ github.event.pull_request.head.sha }}
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          command: "nix run -L .#semver-checks"
   # Single aggregate merge gate: green only if every other job in this run
   # succeeded. Mark THIS one as the required check in the branch ruleset.
   # `if: always()` runs it even when a dependency fails; alls-green then reds
@@ -212,8 +230,9 @@ jobs:
         uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
-          # validate-pr-title and label run on pull_request only. `tests` and
+          # validate-pr-title and label run on pull_request only. `semver-checks`
+          # skips outside pull requests and for a non-Rust change. `tests` and
           # `build-library` are input-gated on `changes.outputs.rust`; when every
           # inner job of the reusable workflow skips, the caller job reports
           # skipped as well. Their skip is allowed only for a non-Rust change.
-          allowed-skips: ${{ needs.changes.outputs.rust == 'true' && 'validate-pr-title, label' || 'validate-pr-title, label, tests, build-library' }}
+          allowed-skips: ${{ format('validate-pr-title, label{0}{1}', (github.event_name != 'pull_request' || needs.changes.outputs.rust != 'true') && ', semver-checks' || '', needs.changes.outputs.rust != 'true' && ', tests, build-library' || '') }}
