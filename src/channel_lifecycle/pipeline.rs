@@ -28,7 +28,7 @@ use hopr_api::{
         primitive::prelude::{Address, HoprBalance, WxHOPR},
     },
 };
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, info, warn};
 
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
@@ -380,13 +380,15 @@ where
         }
 
         let leases = Arc::clone(leases);
-        hopr_utils::runtime::prelude::spawn(async move {
+        let action = async move {
             submit().await;
             // Released however it went.  A confirmation resolves only once the
             // state it wrote is readable, so the next pass sees that state
             // rather than repeating the operation.
             leases.release_owned(&key, holder);
-        });
+        };
+        // The transaction outlives the tick, but its lines keep the `tick` of the pass that started it.
+        hopr_utils::runtime::prelude::spawn(action.instrument(tracing::Span::current()));
 
         true
     }
@@ -406,9 +408,17 @@ where
 
             match chain.fund_channel(&channel_id, topup).await {
                 Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%channel_id, %e, "channel-lifecycle: funding tx failed");
-                    }
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| {
+                            info!(
+                                %channel_id,
+                                destination = %channel.destination,
+                                %topup,
+                                "channel-lifecycle: channel funded"
+                            )
+                        })
+                        .inspect_err(|e| warn!(%channel_id, %e, "channel-lifecycle: funding tx failed"));
                 }
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit funding tx"),
             }
@@ -431,9 +441,17 @@ where
 
             match chain.close_channel(&channel_id).await {
                 Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%channel_id, %e, "channel-lifecycle: close tx failed");
-                    }
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| {
+                            info!(
+                                %channel_id,
+                                destination = %channel.destination,
+                                balance = %channel.balance,
+                                "channel-lifecycle: channel closure started"
+                            )
+                        })
+                        .inspect_err(|e| warn!(%channel_id, %e, "channel-lifecycle: close tx failed"));
                 }
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit close tx"),
             }
@@ -457,9 +475,17 @@ where
 
             match chain.close_channel(&channel_id).await {
                 Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed");
-                    }
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| {
+                            info!(
+                                %channel_id,
+                                destination = %channel.destination,
+                                balance = %channel.balance,
+                                "channel-lifecycle: channel closed"
+                            )
+                        })
+                        .inspect_err(|e| warn!(%channel_id, %e, "channel-lifecycle: finalize tx failed"));
                 }
                 Err(e) => warn!(%channel_id, %e, "channel-lifecycle: failed to submit finalize tx"),
             }
@@ -534,9 +560,10 @@ where
 
             match chain.open_channel(&dest, amount).await {
                 Ok(confirmation) => {
-                    if let Err(e) = confirmation.await {
-                        warn!(%dest, %e, "channel-lifecycle: open tx failed");
-                    }
+                    let _ = confirmation
+                        .await
+                        .inspect(|_| info!(destination = %dest, %amount, "channel-lifecycle: channel opened"))
+                        .inspect_err(|e| warn!(%dest, %e, "channel-lifecycle: open tx failed"));
                 }
                 Err(e) => warn!(%dest, %e, "channel-lifecycle: failed to submit open tx"),
             }

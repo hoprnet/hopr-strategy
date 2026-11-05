@@ -41,7 +41,7 @@ use hopr_api::{
 use super::{
     CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
     CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
-    CurvyWithdrawalOutcome, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
+    CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
     state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
@@ -270,6 +270,20 @@ fn detector_skips_notes_of_another_token() -> anyhow::Result<()> {
             .detect_owned_note(&fixture.note, &[(fixture.id, fixture.address, fixture.scan_secret)])?
             .is_none()
     );
+    Ok(())
+}
+
+#[test]
+fn detector_ignores_zero_amount_notes() -> anyhow::Result<()> {
+    // Sealed correctly to the allocation, so everything but the amount would make it ours: the
+    // sweep refuses zero-amount inputs, and a recorded one would block the allocation's sweep.
+    let fixture = owned_candidate(1)?;
+    let (zero, _) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 0, 4, "5", 2)?;
+    let watched = [(fixture.id, fixture.address, fixture.scan_secret.clone())];
+
+    assert!(fixture.detector.detect_owned_note(&zero, &watched)?.is_none());
+    // The same allocation still finds its real note.
+    assert!(fixture.detector.detect_owned_note(&fixture.note, &watched)?.is_some());
     Ok(())
 }
 
@@ -852,8 +866,10 @@ impl CurvySdkAdapter for RecordingAdapter {
             .iter()
             .fold(HoprBalance::zero(), |total, note| total + note.deposit.amount);
         Ok(CurvyWithdrawalOutcome {
+            // Like the SDK adapter, zero-amount notes are left out of the withdrawal.
             spent_note_ids: notes
                 .iter()
+                .filter(|note| !note.deposit.amount.is_zero())
                 .map(|note| {
                     format!(
                         "0x{:064x}",
@@ -1024,6 +1040,58 @@ async fn sweeping_an_allocation_with_nothing_committed_keeps_the_key() -> anyhow
         .await;
     assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)), "{result:?}");
     assert!(harness.adapter.withdrawals.lock().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sweep_removes_zero_amount_notes_from_the_store() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let address = *owner.public();
+    let data = pool.generate_deposit_data(&id).await?;
+    let (pending, note_id) = pending_note_for(data.scan_key(), &address, 10, 4, "13", 5)?;
+    harness.index.pending.lock().push(pending);
+    let notification = pool.notify_deposit(id, address, ten())?;
+    harness.index.committed.lock().push(completion(&note_id, 6));
+    *harness.index.head.lock() = (8, 1);
+    notification.await?;
+
+    // A zero-amount note, as a store written before the scan skipped them holds.
+    let zero = KnownOwner::new(
+        bjj_point(&address).map_err(anyhow::Error::msg)?,
+        Bn254Fr::from_fr(curvy_core::Fr::from(9_u8)),
+    )
+    .note(
+        curvy_core::Fr::from(0_u8),
+        curvy_core::Fr::from(4_u8),
+        (curvy_core::Fr::from(1_u8), curvy_core::Fr::from(2_u8)),
+        curvy_core::Fr::from(3_u8),
+    );
+    let zero_id = format!(
+        "0x{:064x}",
+        U256::from_be_bytes(curvy_core::field::fr_to_be_32(&zero.id()))
+    );
+    pool.state().record_owned_candidate(
+        &zero_id,
+        DetectedCurvyNote {
+            deposit: OwnedCurvyDeposit {
+                id,
+                address,
+                amount: HoprBalance::zero(),
+            },
+            note: zero,
+        },
+        &CurvyEventCursor::from(&position(9)),
+    )?;
+    pool.state()
+        .record_completion(&zero_id, 8, &CurvyEventCursor::from(&position(10)))?;
+    assert_eq!(pool.state().committed_notes(&id)?.len(), 2);
+
+    pool.withdraw_deposit(&id, &owner, Address::from(SAFE), None).await?;
+    assert!(pool.state().committed_notes(&id)?.is_empty());
+    assert!(pool.state().owned_note_ids()?.is_empty());
     Ok(())
 }
 
@@ -1344,6 +1412,161 @@ async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
     let error = RsSdkCurvyAdapterError::from(unreachable.paymaster(100).await.unwrap_err());
     assert!(super::is_retryable_lag(&error.to_string()), "{error}");
     Ok(())
+}
+
+/// The strategy refunds a failed deposit's spend budget only on a fund-free class, so this
+/// classifier has to be right in both directions.
+#[test]
+fn only_fund_free_failures_release_the_spend_budget() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    // Nothing was allocated: the input notes could not cover the request.
+    let no_funding = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
+    assert!(no_funding.moved_no_funds());
+
+    // A batch item rejected for naming another allocation never joined `allocate`.
+    let mismatched = super::CurvyDepositPoolError::MismatchedDepositData {
+        expected: pix_id(1),
+        actual: pix_id(2),
+    };
+    assert!(mismatched.moved_no_funds());
+
+    // The reported Curvy failure: local validation, refused before any proof was submitted.
+    let fee_owner = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+            "fee-collector identity does not own the aggregator's feeNotePublicKey; the resulting fee note would \
+             violate the circuit's owner constraint"
+        ))
+        .into(),
+    );
+    assert!(fee_owner.moved_no_funds());
+
+    // A submitted aggregation may still land, so its failure stays counted.
+    let ambiguous = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+    );
+    assert!(!ambiguous.moved_no_funds());
+
+    // The class survives the conversion into `StrategyError`, which is what the flush sees.
+    let error: StrategyError = no_funding.into();
+    assert!(error.moved_no_funds(), "{error}");
+    let error: StrategyError = super::CurvyDepositPoolError::WatcherStopped.into();
+    assert!(!error.moved_no_funds(), "{error}");
+
+    // The batch path fans one chunk error out to every item; it must reach each item with the
+    // class intact rather than collapsed to a variant that always reads fund-free.
+    let fan_out: StrategyError = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+    )
+    .into();
+    let per_item = super::clone_error(&fan_out);
+    assert!(
+        !per_item.moved_no_funds(),
+        "an ambiguous chunk stays ambiguous per item"
+    );
+
+    // The other direction is what catches a `curvy_clone` that stringifies: a fund-free chunk
+    // error must still be fund-free per item, or a batched drain never refunds.
+    for fund_free in [
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into()),
+        super::CurvyDepositPoolError::Adapter(
+            RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+                "fee-collector identity does not own the aggregator's feeNotePublicKey"
+            ))
+            .into(),
+        ),
+    ] {
+        let fan_out: StrategyError = fund_free.into();
+        assert!(
+            super::clone_error(&fan_out).moved_no_funds(),
+            "a fund-free chunk error must stay fund-free per item"
+        );
+    }
+
+    // `CriteriaNotSatisfied` is not fund-free for any pool: it is a generic refusal whose timing
+    // is up to the pool.
+    assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
+
+    // A failure raised after an earlier chunk was submitted is tagged, so it is never fund-free
+    // even when the underlying error is a pre-submission refusal.
+    let after_submission: StrategyError = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::AfterSubmission {
+            source: anyhow::anyhow!("the private pool has no committed note large enough to fund 10 wei"),
+            out_of_funding: true,
+        }
+        .into(),
+    )
+    .into();
+    assert!(
+        !after_submission.moved_no_funds(),
+        "an earlier chunk may have moved funds"
+    );
+
+    // The tag is applied only to errors that would otherwise look fund-free; an already
+    // ambiguous error keeps its own variant.
+    let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 1 });
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    // A rebuild inside the first chunk re-proves an aggregation that may already be POSTed, so
+    // its SDK-side refusal must be tagged too.
+    let rebuilt = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+        "fee-collector identity does not own the aggregator's feeNotePublicKey"
+    )));
+    assert!(matches!(rebuilt, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    assert!(!super::CurvyDepositPoolError::Adapter(rebuilt.into()).moved_no_funds());
+    let untouched = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::AmbiguousAllocation);
+    assert!(matches!(untouched, RsSdkCurvyAdapterError::AmbiguousAllocation));
+}
+
+/// A drain that follows an earlier chunk stays detectable as exhaustion, even though the tag
+/// makes it no longer refundable.
+#[test]
+fn a_tagged_drain_is_still_out_of_funding() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 10 });
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    let error: StrategyError = super::CurvyDepositPoolError::Adapter(tagged.into()).into();
+
+    assert!(
+        super::is_out_of_funding(&error),
+        "a later-chunk drain is still exhaustion"
+    );
+    assert!(!error.moved_no_funds(), "but an earlier chunk may have moved funds");
+
+    // The same tag on a fee-key refusal is not exhaustion.
+    let not_drained = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+        "fee-collector identity does not own the aggregator's feeNotePublicKey"
+    )));
+    let error: StrategyError = super::CurvyDepositPoolError::Adapter(not_drained.into()).into();
+    assert!(!super::is_out_of_funding(&error));
+}
+
+/// Exhaustion is a narrower signal than "fund-free": a consumer must not read a fee-key
+/// misconfiguration as a drained pool.
+#[test]
+fn only_no_funding_is_reported_as_out_of_funding() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    let drained = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
+    assert!(drained.is_out_of_funding());
+    assert!(super::is_out_of_funding(&StrategyError::other(
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into())
+    )));
+
+    // Fund-free, but not exhaustion.
+    let fee_key = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+            "fee-collector identity does not own the aggregator's feeNotePublicKey"
+        ))
+        .into(),
+    );
+    assert!(fee_key.moved_no_funds());
+    assert!(!fee_key.is_out_of_funding());
+    assert!(!super::is_out_of_funding(&StrategyError::other(fee_key)));
+
+    let payload = StrategyError::GeneralError(hopr_api::types::primitive::prelude::GeneralError::InvalidInput);
+    assert!(payload.moved_no_funds());
+    assert!(!super::is_out_of_funding(&payload));
 }
 
 #[test]

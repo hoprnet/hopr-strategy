@@ -17,6 +17,7 @@ use rstest::rstest;
 /// Happy path: the periodic scan tops up an outgoing channel whose balance is
 /// at or below `min_stake_threshold`, when the safe can afford the funding round.
 #[rstest]
+#[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
 #[test_log::test(tokio::test)]
 async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();
@@ -63,6 +64,7 @@ async fn tops_up_underfunded_channel(fixture: IntegrationFixture) -> Result<()> 
 /// periodic scan must skip funding even though the channel is under threshold
 /// (see [`on_tick`](hopr_strategy::auto_funding) early-return).
 #[rstest]
+#[allow(deprecated)] // Intentionally tests the legacy constructor until its removal.
 #[test_log::test(tokio::test)]
 async fn skips_funding_when_safe_below_funding_amount(fixture: IntegrationFixture) -> Result<()> {
     let timeouts = fixture.timeouts();

@@ -436,8 +436,13 @@ pub struct CurvyDepositPoolConfig {
     /// wxHOPR shielded from the Safe into the private pool on the first deposit, gross of the
     /// deployment's shield fees. Default: 100 wxHOPR. Overridden by [`INITIAL_FUNDING_ENV`].
     ///
-    /// Deposits are allocated out of this until it runs out, at which point they fail with
-    /// [`StrategyError::CriteriaNotSatisfied`]; the pool does not top itself up.
+    /// Deposits are allocated out of this until it runs out, at which point they fail with an
+    /// error that [`is_out_of_funding`] recognises; the pool does not top itself up.
+    ///
+    /// This surfaced as [`StrategyError::CriteriaNotSatisfied`] before, so a consumer detecting
+    /// exhaustion by that variant must switch to [`is_out_of_funding`]. Note that
+    /// [`StrategyError::moved_no_funds`] is *not* the signal: it is also true for a malformed
+    /// payload and for pre-submission refusals such as a fee-collector mismatch.
     #[default(default_initial_funding())]
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "default_initial_funding")]
@@ -643,6 +648,158 @@ pub enum CurvyDepositPoolError {
         "Curvy pool-to-pool transfer is not supported; PIX settlement withdraws reconstructed deposits to the Safe"
     )]
     UnsupportedPoolTransfer,
+}
+
+impl CurvyDepositPoolError {
+    /// Whether this error proves the failed deposit moved no funds.
+    ///
+    /// See [`StrategyError::moved_no_funds`] for the contract. The bar is deliberately high:
+    /// a `false` here costs one window of budget, a wrong `true` under-counts real spend against
+    /// a safety limit.
+    pub fn moved_no_funds(&self) -> bool {
+        match self {
+            // Both are refusals made before this item's aggregation could be submitted. A
+            // failure raised after an earlier chunk was submitted arrives as
+            // `AfterSubmission`, so it is not mistaken for one of these.
+            Self::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
+                Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. }) => true,
+                Some(sdk::RsSdkCurvyAdapterError::Sdk(error)) => is_pre_submission_refusal(&error.to_string()),
+                _ => false,
+            },
+            // A batch item rejected for naming another allocation never joined `allocate`.
+            Self::MismatchedDepositData { .. } => true,
+            // Everything else is ambiguous: `Adapter` usually wraps a submitted aggregation whose
+            // outcome was lost, and the rest leave the allocation in a state a later retry can
+            // still spend.
+            Self::State(_)
+            | Self::InvalidReconstructedSecret(_)
+            | Self::MissingScanSecret(_)
+            | Self::WatcherStopped
+            | Self::ReconciliationPending
+            | Self::Indexer(_)
+            | Self::DepositTimeout
+            | Self::ScanIdentity(_)
+            | Self::UnsupportedPoolTransfer => false,
+        }
+    }
+
+    /// Whether this error means the shielded pool has no funding left to allocate from.
+    ///
+    /// Distinct from [`Self::moved_no_funds`], which is also true for a malformed payload or a
+    /// pre-submission refusal such as a fee-collector mismatch. A consumer watching for
+    /// exhaustion — the expected end of a run — should ask this rather than treat every
+    /// fund-free failure as one.
+    ///
+    /// ```
+    /// # use hopr_strategy::pix::pools::curvy::CurvyDepositPoolError;
+    /// let drained = CurvyDepositPoolError::Adapter(
+    ///     hopr_strategy::pix::pools::curvy::RsSdkCurvyAdapterError::NoFunding { required: 10 }.into(),
+    /// );
+    /// assert!(drained.is_out_of_funding());
+    /// ```
+    pub fn is_out_of_funding(&self) -> bool {
+        let Self::Adapter(error) = self else {
+            return false;
+        };
+        match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
+            Some(sdk::RsSdkCurvyAdapterError::NoFunding { .. }) => true,
+            // A drain that followed an earlier chunk keeps its meaning through the tag, so it is
+            // still recognisable as exhaustion even though it is no longer refundable.
+            Some(sdk::RsSdkCurvyAdapterError::AfterSubmission { out_of_funding, .. }) => *out_of_funding,
+            _ => false,
+        }
+    }
+}
+
+/// Whether a failed allocation means the pool has no funding left, for a caller holding a
+/// [`StrategyError`].
+///
+/// [`CurvyDepositPoolError::is_out_of_funding`] on the wrapped error; anything else is `false`.
+/// ```
+/// # use hopr_strategy::errors::StrategyError;
+/// # use hopr_strategy::pix::pools::curvy::{CurvyDepositPoolError, RsSdkCurvyAdapterError};
+/// let drained = StrategyError::other(CurvyDepositPoolError::Adapter(
+///     RsSdkCurvyAdapterError::NoFunding { required: 10 }.into(),
+/// ));
+/// assert!(hopr_strategy::pix::pools::curvy::is_out_of_funding(&drained));
+/// assert!(!hopr_strategy::pix::pools::curvy::is_out_of_funding(
+///     &StrategyError::CriteriaNotSatisfied
+/// ));
+/// ```
+pub fn is_out_of_funding(error: &StrategyError) -> bool {
+    match error {
+        StrategyError::Other(error) => error
+            .downcast_ref::<CurvyDepositPoolError>()
+            .is_some_and(CurvyDepositPoolError::is_out_of_funding),
+        _ => false,
+    }
+}
+
+/// Reproduces a pool-level error for one batch item, keeping the class a refund keys on.
+///
+/// `StrategyError` is not `Clone`. `allocate` returns `Other(CurvyDepositPoolError)`, which is
+/// rebuilt faithfully; anything else is stringified, which degrades to "ambiguous" — the safe
+/// direction for a refund.
+fn clone_error(error: &StrategyError) -> StrategyError {
+    match error {
+        StrategyError::CriteriaNotSatisfied => StrategyError::CriteriaNotSatisfied,
+        StrategyError::Other(error) => match error.downcast_ref::<CurvyDepositPoolError>() {
+            Some(curvy) => curvy_clone(curvy).into(),
+            None => StrategyError::other(anyhow::anyhow!("{error}")),
+        },
+        other => StrategyError::other(anyhow::anyhow!("{other}")),
+    }
+}
+
+/// Rebuilds a [`CurvyDepositPoolError`]. Only the variants that can reach a batch outcome are
+/// reproduced; the rest become an opaque `Adapter` error, which is ambiguous.
+fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
+    match error {
+        CurvyDepositPoolError::MismatchedDepositData { expected, actual } => {
+            CurvyDepositPoolError::MismatchedDepositData {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        // Rebuilt from its own type, not its Display string: `moved_no_funds` downcasts, so a
+        // string would erase the classification and a fund-free batch would never refund.
+        CurvyDepositPoolError::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
+            Some(sdk::RsSdkCurvyAdapterError::NoFunding { required }) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::NoFunding { required: *required }.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::AfterSubmission { source, out_of_funding }) => {
+                CurvyDepositPoolError::Adapter(
+                    sdk::RsSdkCurvyAdapterError::AfterSubmission {
+                        source: anyhow::anyhow!("{source}"),
+                        out_of_funding: *out_of_funding,
+                    }
+                    .into(),
+                )
+            }
+            Some(sdk::RsSdkCurvyAdapterError::Sdk(inner)) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{inner}")).into())
+            }
+            _ => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{error}")),
+        },
+        other => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{other}")),
+    }
+}
+
+/// Whether an SDK error is a refusal the SDK raised *before* submitting an aggregation.
+///
+/// Matched on text because the SDK reports these as opaque `anyhow` messages. All of them are
+/// local validation in `build_pix_aggregation`: nothing is signed, no nonce is spent and no
+/// attempt is journalled. Anything not listed stays ambiguous, so a submitted-but-lost outcome
+/// stays counted.
+pub(crate) fn is_pre_submission_refusal(message: &str) -> bool {
+    message.contains("fee-collector identity does not own the aggregator's feeNotePublicKey")
+        || message.contains("PIX aggregation requires")
+        || message.contains("PIX allocation amounts must be non-zero")
+        || message.contains("PIX allocation owner must differ from the funding account")
+        || message.contains("PIX aggregation input is not owned by the funding account")
+        || message.contains("PIX aggregation inputs must")
+        || message.contains("PIX relayer note must carry a non-zero gas reimbursement")
+        || message.contains("PIX relayer owner must differ from the funding account")
 }
 
 impl From<CurvyDepositPoolError> for StrategyError {
@@ -1195,8 +1352,8 @@ where
         // batch-prover, on its own schedule, and the SDK's tree — read from a finalized
         // checkpoint when the notes come from Curvy's indexer — follows later still. A deposit
         // that arrives in that window is not a failure, it is early: wait for the tree, within
-        // the same budget discovery gets, rather than fail the flush. The strategy's spend
-        // ledger is never refunded (by design), so failing here would burn the budget on a race.
+        // the same budget discovery gets, rather than fail the flush. Failing here would burn the
+        // deposit's spend budget on a race.
         let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
         let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
         let mut waited = 0u32;
@@ -1233,16 +1390,17 @@ where
                     tokio::time::sleep(poll).await;
                 }
                 Err(error) => {
-                    let message = error.to_string();
+                    let error = CurvyDepositPoolError::Adapter(error.into());
                     // Out of shielded funds is the expected end of a run, not a fault: the
                     // strategy's budget usually gets there first, and either way the kill switch
                     // ends the Session.
-                    return Err(if message.contains("no committed note large enough") {
+                    if error.is_out_of_funding() {
                         tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
-                        StrategyError::CriteriaNotSatisfied
-                    } else {
-                        StrategyError::other(CurvyDepositPoolError::Adapter(error.into()))
-                    });
+                    }
+                    // Kept typed rather than collapsed to `CriteriaNotSatisfied`, so
+                    // `is_out_of_funding` can tell exhaustion from any other fund-free failure
+                    // and the strategy can refund it.
+                    return Err(StrategyError::other(error));
                 }
             }
         }
@@ -1380,8 +1538,11 @@ where
         for (index, (id, ..)) in valid {
             outcomes[index] = Some(match &result {
                 Ok(()) => Ok((id, ())),
-                Err(StrategyError::CriteriaNotSatisfied) => Err(StrategyError::CriteriaNotSatisfied),
-                Err(error) => Err(StrategyError::other(anyhow::anyhow!("{error}"))),
+                // One allocation call fails for the whole chunk, so every item carries the same
+                // failure. `clone_error` rebuilds `NoFunding` and the SDK variants from their own
+                // types, so `moved_no_funds` still finds a fund-free refusal; anything else is
+                // stringified and degrades to ambiguous.
+                Err(error) => Err(clone_error(error)),
             });
         }
         Ok(outcomes
@@ -1492,7 +1653,15 @@ where
                 Err(error) => return Err(CurvyDepositPoolError::Adapter(error.into()).into()),
             }
         };
-        self.remove_spent_notes_retry(id, &outcome.spent_note_ids)?;
+        // A zero-amount note is never withdrawn, so it leaves the store with the sweep.
+        let mut removed = outcome.spent_note_ids;
+        removed.extend(
+            notes
+                .iter()
+                .filter(|note| note.deposit.amount.is_zero())
+                .map(|note| format!("{:#066x}", U256::from_be_bytes(fr_to_be_32(&note.note.id())))),
+        );
+        self.remove_spent_notes_retry(id, &removed)?;
         // Best effort: the secret is useless once the allocation is swept, but a leftover one
         // costs nothing but bytes.
         if let Err(error) = self.tracker.state.remove_scan_secret(id) {
