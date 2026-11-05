@@ -61,9 +61,9 @@ state file that survives restarts, and the **PIX recovery password**: the strate
 environment variable named by `pix_recovery_password_env`) must be set, because the state file's spender identity and scan secrets are
 sealed under it. Use the same password on every start — the file refuses any other — and do not lose it: the sealed identity owns the pool's
 shielded float, and without the password there is no way to spend it. A state file written before sealing is sealed on its next open, but
-the clear copies survive in its free pages and in every earlier backup, so treat those as exposed. Under `submission: relayer` it also needs a relayer URL, and **no EVM
-key of its own**; under `submission: operator` it needs the Curvy operator's key in the environment (`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by
-default). See the `pix::pools::curvy` module documentation.
+the clear copies survive in its free pages and in every earlier backup, so treat those as exposed. Under `submission: relayer` it also needs
+a relayer URL, and **no EVM key of its own**; under `submission: operator` it needs the Curvy operator's key in the environment
+(`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by default). See the `pix::pools::curvy` module documentation.
 
 Enabling `strategy-pix` alone gives the engine without a pool, for a consumer supplying its own.
 
