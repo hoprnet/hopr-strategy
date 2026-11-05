@@ -87,12 +87,13 @@
 //! * A **state file** ([`CurvyDepositPoolConfig::state_path`]) that survives restarts: it holds the node's Curvy
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
-//! * The **PIX recovery password**, [`PixStrategyConfig::pix_recovery_password`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password)
-//!   or, failing that, the environment variable named by
+//! * The **PIX recovery password**,
+//!   [`PixStrategyConfig::pix_recovery_password`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password) or,
+//!   failing that, the environment variable named by
 //!   [`PixStrategyConfig::pix_recovery_password_env`](crate::pix::strategy::PixStrategyConfig::pix_recovery_password_env).
 //!   The identity and the scan secrets in the state file are sealed under it, so a copy of the file is not spending
-//!   authority over the float. It must be the same on every start: a different one is refused, and losing it loses
-//!   the identity that owns the float. See `state` for the scheme.
+//!   authority over the float. It must be the same on every start: a different one is refused, and losing it loses the
+//!   identity that owns the float. See `state` for the scheme.
 //!
 //! ### Restarts and synchronization
 //!

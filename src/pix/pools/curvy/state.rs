@@ -311,7 +311,10 @@ fn session_note_range(id: &PixAddressId) -> ([u8; OWNED_NOTE_KEY_SIZE], [u8; OWN
 /// }
 ///
 /// let dir = tempfile::tempdir()?;
-/// resume_from(&RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), "correct horse battery")?)?;
+/// resume_from(&RedbCurvyDepositState::open(
+///     dir.path().join("curvy-pix.redb"),
+///     "correct horse battery",
+/// )?)?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub trait CurvyDepositState: Send + Sync + 'static {

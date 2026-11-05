@@ -552,9 +552,8 @@ mod tests {
 
     use std::num::NonZeroU32;
 
-    use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
-
     use hex_literal::hex;
+    use hopr_api::types::{crypto_random::Randomizable, internal::prelude::HoprPseudonym};
 
     use super::{
         BytesRepresentable, Database, KEY_SIZE, PIX_KDF_SALT_TABLE, PIX_KDF_VERIFIER_TABLE, PIX_RECOVERED_KEYS,
