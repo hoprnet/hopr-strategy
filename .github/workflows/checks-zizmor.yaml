@@ -12,11 +12,9 @@ on:
   merge_group:
     types: [checks_requested]
 concurrency:
-  group: ${{ github.event.pull_request.head.ref || github.ref_name }}-zizmor
+  group: ${{ github.event.pull_request.number || github.ref }}-zizmor
   cancel-in-progress: true
-permissions:
-  contents: read
-  security-events: write
+permissions: {}
 jobs:
   zizmor:
     uses: hoprnet/hopr-workflows/.github/workflows/checks-zizmor.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-zizmor-v1.1.1

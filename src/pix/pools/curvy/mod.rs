@@ -233,7 +233,7 @@ pub enum CurvyNoteSource {
     /// Curvy's shared indexer for the deployment (`/sync` on the gateway named by
     /// [`CurvyDepositPoolConfig::curvy_indexer_url`]). Ready as soon as that service is; useful
     /// when the node's Blokli has not indexed Curvy, or is still catching up. See
-    /// [`indexer`](self::indexer).
+    /// [`indexer`].
     CurvyIndexer,
 }
 

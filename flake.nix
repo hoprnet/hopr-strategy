@@ -31,7 +31,7 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v1.3.0";
+    nix-lib.url = "github:hoprnet/nix-lib/v2.1.1";
 
     # Rust build system
     crane.url = "github:ipetkov/crane";
@@ -40,6 +40,7 @@
     # Development tools and quality assurance
     pre-commit.url = "github:cachix/git-hooks.nix";
     flake-root.url = "github:srid/flake-root";
+    treefmt-nix.url = "github:numtide/treefmt-nix";
 
     # Input dependency optimization
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
@@ -47,7 +48,15 @@
     nix-lib.inputs.nixpkgs.follows = "nixpkgs";
     nix-lib.inputs.crane.follows = "crane";
     nix-lib.inputs.rust-overlay.follows = "rust-overlay";
+    # One unstable/treefmt/flake-parts revision for the whole flake. Left
+    # unfollowed, `nix flake update nix-lib` moves nix-lib's private nixpkgs-unstable,
+    # which supplies cargo-llvm-cov to the dev shell, to a revision missing from the
+    # binary cache.
+    nix-lib.inputs.nixpkgs-unstable.follows = "nixpkgs-unstable";
+    nix-lib.inputs.treefmt-nix.follows = "treefmt-nix";
+    nix-lib.inputs.flake-parts.follows = "flake-parts";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -140,6 +149,7 @@
           hoprStrategyPackages = import ./nix/packages/hopr-strategy.nix {
             inherit
               lib
+              pkgs
               builders
               sources
               hoprStrategyCrateInfo
@@ -159,8 +169,8 @@
                 ;
             };
 
-            # Cacheable equivalent of `just quick`: formatting, Clippy, and
-            # cargo check. linkFarm makes each validation an explicit input so
+            # Cacheable equivalent of `just quick`: formatting, Clippy,
+            # cargo check, cargo-deny, rustdoc and doctests. linkFarm makes each validation an explicit input so
             # Cachix can restore their independent outputs.
             quick = pkgs.linkFarm "quick" [
               {
@@ -175,12 +185,25 @@
                 name = "check";
                 path = hoprStrategyPackages.check;
               }
+              {
+                name = "deny";
+                path = hoprStrategyPackages.deny;
+              }
+              {
+                name = "doc";
+                path = hoprStrategyPackages.doc;
+              }
+              {
+                name = "test-doc";
+                path = hoprStrategyPackages.test-doc;
+              }
             ];
           };
 
           utilityApps = {
             update-github-labels = nixLib.mkUpdateGithubLabelsApp;
             audit = nixLib.mkAuditApp { };
+            semver-checks = nixLib.mkSemverChecksApp { rustToolchain = stableToolchain; };
             check = nixLib.mkCheckApp { inherit system; };
             test = {
               type = "app";
