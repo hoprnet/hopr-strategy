@@ -49,7 +49,7 @@
 //!                                                (eligible to reopen)
 //! ```
 //!
-//! In-flight states are tracked off-chain as [`ActionLeases`], keyed by
+//! In-flight states are tracked off-chain as `ActionLeases`, keyed by
 //! `ChannelId` (fund / close / finalize) or peer `Address` (open).  The on-chain
 //! `ChannelStatus` plus those leases together drive transitions.
 //!
