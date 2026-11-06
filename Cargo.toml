@@ -19,7 +19,9 @@ crate-type = ["rlib"]
 [features]
 default       = ["runtime-tokio"]
 runtime-tokio = ["hopr-utils/runtime-tokio"]
-telemetry     = ["hopr-api/types-telemetry"]
+## Serialization support for diagnostic strategy state snapshots.
+serde     = []
+telemetry = ["hopr-api/types-telemetry"]
 ## Exposes `crate::testing` node adapters to downstream test crates.
 testing = ["hopr-utils/testing-blokli"]
 ## Strategy features — each enables one strategy implementation.
