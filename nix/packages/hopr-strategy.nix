@@ -5,6 +5,7 @@
 
 {
   lib,
+  pkgs,
   builders,
   sources,
   hoprStrategyCrateInfo,
@@ -77,6 +78,42 @@ in
   check = checkDerivation;
 
   clippy = clippyDerivation;
+
+  doc = builders.local.callPackage nixLib.mkRustLibrary (localArgs // { runDoc = true; });
+
+  # Bans, licenses and sources from deny.toml. Advisories need network and run in `nix run .#audit`.
+  deny = builders.local.callPackage nixLib.mkRustLibrary (localArgs // { runDeny = true; });
+
+  # All test targets of the library (no `--lib`); the integration crate has its own package.
+  test =
+    (builders.local.callPackage nixLib.mkRustLibrary (
+      localArgs
+      // {
+        src = sources.test;
+        runTests = true;
+        extraNativeBuildInputs = [ pkgs.cargo-nextest ];
+      }
+    )).overrideAttrs
+      (_: {
+        checkPhase = ''
+          cargo nextest run --all-features --no-fail-fast
+        '';
+      });
+
+  # nextest does not run doctests
+  test-doc =
+    (builders.local.callPackage nixLib.mkRustLibrary (
+      localArgs
+      // {
+        src = sources.test;
+        runTests = true;
+      }
+    )).overrideAttrs
+      (_: {
+        checkPhase = ''
+          cargo test --doc --all-features
+        '';
+      });
 
   integration-tests = builders.local.callPackage nixLib.mkRustPackage (
     (mkHoprStrategyBuildArgs {

@@ -333,7 +333,7 @@ fn validate_sizing_mode(mode: &CapacitySizingMode) -> Result<(), validator::Vali
 /// ```
 ///
 /// Hop count is not configurable: every stake is sized for
-/// [`ASSUMED_HOPS`], the protocol's maximum path length.
+/// `ASSUMED_HOPS`, the protocol's maximum path length.
 ///
 /// With `ticket_price = 0.001 wxHOPR` and `win_prob = 0.001` the default
 /// `Deterministic` mode resolves `initial_capacity` to:
@@ -2259,7 +2259,7 @@ impl SelectorProfile {
     }
 }
 
-/// Top-level configuration for [`ChannelLifecycleStrategy`].
+/// Top-level configuration for [`ChannelLifecycleStrategy`](crate::channel_lifecycle::ChannelLifecycleStrategy).
 ///
 /// Every field, at every nesting level, has a default, so any subset
 /// deserializes and `{}` equals [`ChannelLifecycleConfig::default`]. Unknown keys
