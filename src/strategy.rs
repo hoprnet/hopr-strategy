@@ -151,7 +151,7 @@ pub trait Strategy: Display + Send {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StrategyStateSnapshot {
     /// Strategy display name. Names need not be unique.
-    pub name: String,
+    pub name: &str,
     /// Observed operational state.
     pub state: StrategyState,
 }
