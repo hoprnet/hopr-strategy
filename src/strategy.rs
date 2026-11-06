@@ -61,17 +61,9 @@ use crate::errors::Result;
 /// ```
 #[atomic_enum::atomic_enum]
 #[derive(
-    strum::Display,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    num_enum::IntoPrimitive,
-    num_enum::TryFromPrimitive,
-    serde::Serialize,
-    serde::Deserialize,
+    strum::Display, PartialEq, Eq, PartialOrd, Ord, Default, num_enum::IntoPrimitive, num_enum::TryFromPrimitive,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrategyState {
     /// Operating normally: everything the strategy currently needs to do, it can do.
@@ -148,10 +140,11 @@ pub trait Strategy: Display + Send {
 }
 
 /// One strategy's operational state at the time a snapshot was taken.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct StrategyStateSnapshot {
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StrategyStateSnapshot<'a> {
     /// Strategy display name. Names need not be unique.
-    pub name: &str,
+    pub name: &'a str,
     /// Observed operational state.
     pub state: StrategyState,
 }
@@ -168,11 +161,11 @@ pub struct StrategyStateObserver {
 
 impl StrategyStateObserver {
     /// Read the current states in construction order, preserving duplicate names.
-    pub fn snapshot(&self) -> Vec<StrategyStateSnapshot> {
+    pub fn snapshot(&self) -> Vec<StrategyStateSnapshot<'_>> {
         self.states
             .iter()
             .map(|(name, state)| StrategyStateSnapshot {
-                name: name.clone(),
+                name: name.as_str(),
                 state: state.load(std::sync::atomic::Ordering::Relaxed),
             })
             .collect()
@@ -390,6 +383,7 @@ mod tests {
         let snapshot = observer.snapshot();
         assert_eq!(snapshot[0].state, StrategyState::Degraded);
         assert_eq!(snapshot[1].state, StrategyState::Running);
+        #[cfg(feature = "serde")]
         assert_eq!(
             serde_json::to_value(&snapshot).unwrap(),
             serde_json::json!([
