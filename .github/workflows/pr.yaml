@@ -227,6 +227,7 @@ jobs:
       - label
       - changes
       - checks
+      - semver-checks
       - tests
       - build-library
     runs-on: depot-ubuntu-24.04-2
