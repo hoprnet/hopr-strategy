@@ -23,7 +23,8 @@
   # - flake-root: Utilities for finding flake root directory
   #
   # Input optimization strategy:
-  # All inputs follow nixpkgs where possible to reduce closure size and improve caching.
+  # nixpkgs, nixpkgs-unstable, rust-overlay and crane follow nix-lib, so every hoprnet flake on
+  # the same nix-lib release shares one set of revisions; the other inputs follow nixpkgs.
   inputs = {
     # Core Nix ecosystem dependencies
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -95,6 +96,7 @@
           pkgs = import nixpkgs {
             inherit system overlays;
           };
+          pkgsUnstable = import nixpkgs-unstable { inherit system; };
 
           # Platform information
           buildPlatform = pkgs.stdenv.buildPlatform;
@@ -286,7 +288,8 @@
               gh
               cargo-insta
               cargo-machete
-              cargo-release
+              # From unstable: cargo-release 1.1.7 needs rustc 1.97, release-26.05 ships 1.95.
+              pkgsUnstable.cargo-release
               cargo-shear
               yq
             ];
@@ -315,7 +318,7 @@
               treefmtPrograms = pkgs.lib.attrValues config.treefmt.build.programs;
               extraPackages = with pkgs; [
                 cargo-machete
-                cargo-release
+                pkgsUnstable.cargo-release
                 cargo-shear
                 zizmor
               ];
