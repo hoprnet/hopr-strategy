@@ -31,7 +31,8 @@
     # HOPR Nix Library (provides flake-utils and reusable build functions)
     nix-lib.url = "github:hoprnet/nix-lib/v2.1.7";
     # nix-lib anchors the heavy pins (nixpkgs, nixpkgs-unstable, rust-overlay, crane) so every
-    # hoprnet flake on the same nix-lib release shares them. Bump with `nix flake update nix-lib`.
+    # hoprnet flake on the same nix-lib release shares them. To bump them, point nix-lib.url at
+    # the new release tag, then run `nix flake update nix-lib`.
     nixpkgs.follows = "nix-lib/nixpkgs";
     nixpkgs-unstable.follows = "nix-lib/nixpkgs-unstable";
 
