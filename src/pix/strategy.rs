@@ -3062,6 +3062,7 @@ mod tests {
         // only drives `deposit_funds_to_multiple`, so an empty script here would just succeed.
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(false, true)]),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
         });
@@ -3214,6 +3215,8 @@ mod tests {
         script: parking_lot::Mutex<Vec<(bool, bool)>>,
         /// Return one error for the whole batch, shaped like the Curvy chunk failure.
         whole_batch_fails: bool,
+        /// Return a single `Err` for the whole call, so the pool-wide failure arm runs.
+        whole_call_fails: bool,
         /// When set, return exactly this instead of running the script, so a test can shape
         /// outcomes a well-behaved pool would not produce (a repeated id, say). Each entry is
         /// either a success id or a failure class.
@@ -3267,6 +3270,9 @@ mod tests {
             &self,
             deposits: &[(PixAddressId, Address, HoprBalance, Self::PoolDepositData)],
         ) -> Result<Vec<std::result::Result<(PixAddressId, Self::Receipt), Self::Error>>, Self::Error> {
+            if self.whole_call_fails {
+                return Err(StrategyError::other(ScriptedFailure));
+            }
             if let Some(raw) = self.raw_outcomes.clone() {
                 return Ok(raw
                     .into_iter()
@@ -3383,6 +3389,7 @@ mod tests {
         }
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(true, false), (true, true)]),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
         });
@@ -3419,6 +3426,7 @@ mod tests {
             }
             let pool = Arc::new(ScriptedBatchPool {
                 script: parking_lot::Mutex::new(vec![(fund_free, true)]),
+                whole_call_fails: false,
                 whole_batch_fails: true,
                 raw_outcomes: None,
             });
@@ -3441,6 +3449,42 @@ mod tests {
         Ok(())
     }
 
+    /// A pool-wide failure is one error for the whole call, not one per item; an opaque one
+    /// refunds nothing.
+    #[test_log::test(tokio::test)]
+    async fn test_a_whole_call_failure_keeps_every_reservation() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: true,
+            whole_batch_fails: false,
+            raw_outcomes: None,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20),
+            "an opaque pool-wide failure refunds nothing"
+        );
+        Ok(())
+    }
+
     /// A pool that repeats a success id must not have an unaccounted deposit refunded.
     ///
     /// The batch is `[A, B]` and the pool answers `[Ok(A), Ok(A), Err(fund-free)]`. Only A is
@@ -3458,6 +3502,7 @@ mod tests {
         let ids: Vec<PixAddressId> = batch.iter().map(|(id, ..)| *id).collect();
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: Some(vec![
                 RawOutcome::Success(ids[0]),
@@ -3499,6 +3544,7 @@ mod tests {
         let foreign = pix_id(1);
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: Some(vec![RawOutcome::Success(foreign), RawOutcome::FundFreeFailure]),
         });
@@ -3533,6 +3579,7 @@ mod tests {
         // Two deposits, one outcome: the other item's fate is unknown.
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(true, true)]),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
         });
