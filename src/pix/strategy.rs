@@ -72,6 +72,11 @@ lazy_static::lazy_static! {
             "hopr_strategy_pix_deposits_failed_total",
             "Count of SSA deposits that failed after exhausting retries",
         ).unwrap();
+    static ref METRIC_PIX_DEPOSITS_PENDING: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_deposits_pending_total",
+            "Count of SSA deposits deferred until an earlier Curvy allocation is reconciled",
+        ).unwrap();
     static ref METRIC_PIX_DEPOSIT_DATA: hopr_api::types::telemetry::MultiCounter =
         hopr_api::types::telemetry::MultiCounter::new(
             "hopr_strategy_pix_deposit_data_total",
@@ -1331,9 +1336,21 @@ async fn flush_deposit_batch<D, K>(
                 if error.moved_no_funds() {
                     refund(spend_ledger.as_ref(), spend, &id, amount);
                 }
-                tracing::error!(%error, ?id, "single deposit flush failed");
-                #[cfg(all(feature = "telemetry", not(test)))]
-                METRIC_PIX_DEPOSITS_FAILED.increment();
+                if error.is_reconciliation_pending() {
+                    // Nothing about this deposit failed: the pool waits for an earlier allocation
+                    // to reconcile, and the Exit re-requests the deposit data afterwards.
+                    tracing::warn!(
+                        %error,
+                        ?id,
+                        "deposit flush deferred until an earlier Curvy allocation is reconciled"
+                    );
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_PIX_DEPOSITS_PENDING.increment();
+                } else {
+                    tracing::error!(%error, ?id, "single deposit flush failed");
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_PIX_DEPOSITS_FAILED.increment();
+                }
             }
         }
     } else {
@@ -1367,6 +1384,7 @@ async fn flush_deposit_batch<D, K>(
                 let batch_ids: std::collections::HashSet<PixAddressId> = deposits.iter().map(|(id, ..)| *id).collect();
                 let mut everything_failed_fund_free = true;
                 let mut failures = 0usize;
+                let mut pending = 0usize;
                 // Only ids that are in the batch and appear once: a repeated or foreign id would
                 // otherwise inflate the success count and let an unaccounted deposit pass below.
                 let mut settled: std::collections::HashSet<PixAddressId> = std::collections::HashSet::new();
@@ -1383,7 +1401,15 @@ async fn flush_deposit_batch<D, K>(
                             let error: StrategyError = error.into();
                             failures += 1;
                             everything_failed_fund_free &= error.moved_no_funds();
-                            tracing::error!(%error, "deposit within the batch failed");
+                            if error.is_reconciliation_pending() {
+                                pending += 1;
+                                tracing::warn!(
+                                    %error,
+                                    "deposit within the batch deferred until an earlier Curvy allocation is reconciled"
+                                );
+                            } else {
+                                tracing::error!(%error, "deposit within the batch failed");
+                            }
                         }
                     }
                 }
@@ -1403,11 +1429,15 @@ async fn flush_deposit_batch<D, K>(
                     }
                 }
 
-                tracing::info!(count, deposited, "batch deposit flushed");
+                tracing::info!(count, deposited, pending, "batch deposit flushed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 {
                     METRIC_PIX_DEPOSITS.increment_by(deposited);
-                    METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64 - deposited);
+                    // A deferred item did not fail; everything else that did not settle did.
+                    let deferred = pending as u64;
+                    METRIC_PIX_DEPOSITS_FAILED
+                        .increment_by((count as u64).saturating_sub(deposited).saturating_sub(deferred));
+                    METRIC_PIX_DEPOSITS_PENDING.increment_by(deferred);
                 }
             }
             // The batch itself could not be attempted, as distinct from its items failing
@@ -1423,9 +1453,19 @@ async fn flush_deposit_batch<D, K>(
                         refund(spend_ledger.as_ref(), *spend, id, *amount);
                     }
                 }
-                tracing::error!(%error, count, "batch deposit flush failed");
-                #[cfg(all(feature = "telemetry", not(test)))]
-                METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
+                if error.is_reconciliation_pending() {
+                    tracing::warn!(
+                        %error,
+                        count,
+                        "batch deposit flush deferred until an earlier Curvy allocation is reconciled"
+                    );
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_PIX_DEPOSITS_PENDING.increment_by(count as u64);
+                } else {
+                    tracing::error!(%error, count, "batch deposit flush failed");
+                    #[cfg(all(feature = "telemetry", not(test)))]
+                    METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
+                }
             }
         }
     }

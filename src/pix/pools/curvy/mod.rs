@@ -676,6 +676,30 @@ impl CurvyDepositPoolError {
         }
     }
 
+    /// Whether this error only means an earlier Curvy operation still has to be reconciled.
+    ///
+    /// Nothing about this deposit failed: the pool refuses to start another aggregation until the
+    /// previous one's outcome is known, and a later flush goes through once it is. A consumer
+    /// counting failed deposits must not count this one, and the spend reservation stays because
+    /// the earlier allocation may still have moved funds.
+    pub(crate) fn is_reconciliation_pending(&self) -> bool {
+        match self {
+            // The recovery state is not confirmed by the endpoint yet.
+            Self::ReconciliationPending => true,
+            Self::Adapter(error) => matches!(
+                error.downcast_ref::<sdk::RsSdkCurvyAdapterError>(),
+                Some(
+                    sdk::RsSdkCurvyAdapterError::AmbiguousAllocation
+                        | sdk::RsSdkCurvyAdapterError::RelayAttemptLimit
+                        | sdk::RsSdkCurvyAdapterError::RelayFinalityPending
+                        | sdk::RsSdkCurvyAdapterError::RelayFinalityUnavailable(_)
+                        | sdk::RsSdkCurvyAdapterError::ShieldInProgress
+                )
+            ),
+            _ => false,
+        }
+    }
+
     /// Whether this error means the shielded pool has no funding left to allocate from.
     ///
     /// Distinct from [`Self::moved_no_funds`], which is also true for a malformed payload or a

@@ -1339,6 +1339,48 @@ async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A flush blocked on an earlier allocation's unknown outcome did not fail; it must not be
+/// counted as a failed deposit, and the spend reservation stays because that allocation may
+/// have moved funds.
+#[test]
+fn only_a_reconciliation_block_is_a_pending_deposit() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    for pending in [
+        super::CurvyDepositPoolError::ReconciliationPending,
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::AmbiguousAllocation.into()),
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::RelayAttemptLimit.into()),
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::RelayFinalityPending.into()),
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::RelayFinalityUnavailable("rpc".into()).into()),
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::ShieldInProgress.into()),
+    ] {
+        assert!(pending.is_reconciliation_pending(), "{pending}");
+        // The class survives the conversion into `StrategyError`, which is what the flush sees.
+        let error: StrategyError = pending.into();
+        assert!(error.is_reconciliation_pending(), "{error}");
+        assert!(!error.moved_no_funds(), "the earlier allocation may have moved funds");
+    }
+
+    // Everything that says this deposit itself went wrong is a failure, not a wait.
+    for failed in [
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into()),
+        super::CurvyDepositPoolError::Adapter(
+            RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+        ),
+        super::CurvyDepositPoolError::Adapter(
+            RsSdkCurvyAdapterError::AfterSubmission {
+                source: anyhow::anyhow!("boom"),
+                out_of_funding: false,
+            }
+            .into(),
+        ),
+        super::CurvyDepositPoolError::WatcherStopped,
+    ] {
+        assert!(!failed.is_reconciliation_pending(), "{failed}");
+    }
+    assert!(!StrategyError::CriteriaNotSatisfied.is_reconciliation_pending());
+}
+
 /// The strategy refunds a failed deposit's spend budget only on a fund-free class, so this
 /// classifier has to be right in both directions.
 #[test]

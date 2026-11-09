@@ -103,6 +103,19 @@ impl StrategyError {
             _ => false,
         }
     }
+
+    /// Whether a failed deposit only waits for an earlier pool operation to be reconciled.
+    ///
+    /// Nothing about the deposit itself failed: the pool refused to start another aggregation
+    /// until the previous one's outcome is known, and a later flush goes through once it is. A
+    /// consumer counting failed deposits must not count this one; it is pending, not failed.
+    pub(crate) fn is_reconciliation_pending(&self) -> bool {
+        match self {
+            #[cfg(feature = "strategy-pix")]
+            Self::Other(error) => crate::pix::pools::error_is_reconciliation_pending(error),
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StrategyError>;
