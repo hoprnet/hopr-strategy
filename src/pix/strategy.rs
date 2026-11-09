@@ -1281,6 +1281,27 @@ where
     }
 }
 
+/// Log a failed deposit flush and count it: a wait for reconciliation is pending, not failed.
+///
+/// The pool answers [`StrategyError::is_reconciliation_pending`] when it refused to start another
+/// aggregation until an earlier operation's outcome is known; nothing about this deposit failed.
+fn report_deposit_flush_failure(error: &StrategyError, id: Option<&PixAddressId>, count: u64) {
+    if error.is_reconciliation_pending() {
+        tracing::warn!(
+            %error,
+            ?id,
+            count,
+            "deposit flush deferred until an earlier Curvy operation is reconciled"
+        );
+        #[cfg(all(feature = "telemetry", not(test)))]
+        METRIC_PIX_DEPOSITS_PENDING.increment_by(count);
+    } else {
+        tracing::error!(%error, ?id, count, "deposit flush failed");
+        #[cfg(all(feature = "telemetry", not(test)))]
+        METRIC_PIX_DEPOSITS_FAILED.increment_by(count);
+    }
+}
+
 /// Deposit one drained buffer through the pool.
 ///
 /// A free function so that both the awaiting and the detached caller share one body: the loop
@@ -1336,21 +1357,9 @@ async fn flush_deposit_batch<D, K>(
                 if error.moved_no_funds() {
                     refund(spend_ledger.as_ref(), spend, &id, amount);
                 }
-                if error.is_reconciliation_pending() {
-                    // Nothing about this deposit failed: the pool waits for an earlier operation
-                    // to reconcile, and the Exit re-requests the deposit data afterwards.
-                    tracing::warn!(
-                        %error,
-                        ?id,
-                        "deposit flush deferred until an earlier Curvy operation is reconciled"
-                    );
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS_PENDING.increment();
-                } else {
-                    tracing::error!(%error, ?id, "single deposit flush failed");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS_FAILED.increment();
-                }
+                // Nothing about a pending deposit failed: the pool waits for an earlier operation
+                // to reconcile, and the Exit re-requests the deposit data afterwards.
+                report_deposit_flush_failure(&error, Some(&id), 1);
             }
         }
     } else {
@@ -1401,15 +1410,8 @@ async fn flush_deposit_batch<D, K>(
                             let error: StrategyError = error.into();
                             failures += 1;
                             everything_failed_fund_free &= error.moved_no_funds();
-                            if error.is_reconciliation_pending() {
-                                pending += 1;
-                                tracing::warn!(
-                                    %error,
-                                    "deposit within the batch deferred until an earlier Curvy operation is reconciled"
-                                );
-                            } else {
-                                tracing::error!(%error, "deposit within the batch failed");
-                            }
+                            pending += usize::from(error.is_reconciliation_pending());
+                            report_deposit_flush_failure(&error, None, 1);
                         }
                     }
                 }
@@ -1453,19 +1455,7 @@ async fn flush_deposit_batch<D, K>(
                         refund(spend_ledger.as_ref(), *spend, id, *amount);
                     }
                 }
-                if error.is_reconciliation_pending() {
-                    tracing::warn!(
-                        %error,
-                        count,
-                        "batch deposit flush deferred until an earlier Curvy operation is reconciled"
-                    );
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS_PENDING.increment_by(count as u64);
-                } else {
-                    tracing::error!(%error, count, "batch deposit flush failed");
-                    #[cfg(all(feature = "telemetry", not(test)))]
-                    METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
-                }
+                report_deposit_flush_failure(&error, None, count as u64);
             }
         }
     }
@@ -1923,6 +1913,7 @@ mod tests {
 
     use super::{
         PixStrategy, PixStrategyConfig, PixStrategyInner, SPEND_LEDGER_CAPACITY, SpendLedger, flush_deposit_batch,
+        report_deposit_flush_failure,
     };
     use crate::{
         errors::StrategyError,
@@ -3357,6 +3348,21 @@ mod tests {
     fn buffered(address: Address, amount: HoprBalance) -> (PixAddressId, Address, HoprBalance, ByteDepositData) {
         let id = pix_id(1);
         (id, address, amount, ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD))
+    }
+
+    /// A flush blocked on an earlier operation is reported as pending, not as a failed deposit.
+    #[cfg(feature = "strategy-pix-curvy")]
+    #[test]
+    fn a_pending_flush_failure_is_reported_as_pending() {
+        use crate::pix::pools::curvy::CurvyDepositPoolError;
+
+        let pending: StrategyError = CurvyDepositPoolError::ReconciliationPending.into();
+        assert!(pending.is_reconciliation_pending());
+        report_deposit_flush_failure(&pending, Some(&pix_id(1)), 1);
+
+        let failed = StrategyError::other(ScriptedFailure);
+        assert!(!failed.is_reconciliation_pending());
+        report_deposit_flush_failure(&failed, None, 2);
     }
 
     /// Batch refunds are attributed per item: a fund-free item among successful ones still
