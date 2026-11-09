@@ -778,8 +778,9 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
                 actual: *actual,
             }
         }
-        // Rebuilt from its own type, not its Display string: `moved_no_funds` downcasts, so a
-        // string would erase the classification and a fund-free batch would never refund.
+        // Rebuilt from its own type, not its Display string: `moved_no_funds` and
+        // `is_reconciliation_pending` downcast, so a string would erase the classification and a
+        // fund-free batch would never refund, nor a pending one be counted as pending.
         CurvyDepositPoolError::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
             Some(sdk::RsSdkCurvyAdapterError::NoFunding { required }) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::NoFunding { required: *required }.into())
@@ -796,8 +797,26 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
             Some(sdk::RsSdkCurvyAdapterError::Sdk(inner)) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{inner}")).into())
             }
+            // The pending classes travel per item too, or a batched flush reports the wait as a
+            // failed deposit.
+            Some(sdk::RsSdkCurvyAdapterError::AmbiguousAllocation) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::AmbiguousAllocation.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::RelayAttemptLimit) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::RelayAttemptLimit.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::RelayFinalityPending) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::RelayFinalityPending.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::RelayFinalityUnavailable(reason)) => CurvyDepositPoolError::Adapter(
+                sdk::RsSdkCurvyAdapterError::RelayFinalityUnavailable(reason.clone()).into(),
+            ),
+            Some(sdk::RsSdkCurvyAdapterError::ShieldInProgress) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::ShieldInProgress.into())
+            }
             _ => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{error}")),
         },
+        CurvyDepositPoolError::ReconciliationPending => CurvyDepositPoolError::ReconciliationPending,
         other => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{other}")),
     }
 }

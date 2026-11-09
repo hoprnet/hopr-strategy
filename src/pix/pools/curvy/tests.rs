@@ -1359,6 +1359,12 @@ fn only_a_reconciliation_block_is_a_pending_deposit() {
         let error: StrategyError = pending.into();
         assert!(error.is_reconciliation_pending(), "{error}");
         assert!(!error.moved_no_funds(), "the earlier operation may have moved funds");
+        // And it survives the per-item fan-out a failed batch uses, or the batch counts it as
+        // failed rather than pending.
+        assert!(
+            super::clone_error(&error).is_reconciliation_pending(),
+            "a pending chunk error must stay pending per item"
+        );
     }
 
     // Everything that says this deposit itself went wrong is a failure, not a wait.
