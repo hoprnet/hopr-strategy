@@ -75,7 +75,7 @@ lazy_static::lazy_static! {
     static ref METRIC_PIX_DEPOSITS_PENDING: hopr_api::types::telemetry::SimpleCounter =
         hopr_api::types::telemetry::SimpleCounter::new(
             "hopr_strategy_pix_deposits_pending_total",
-            "Count of SSA deposits deferred until an earlier Curvy allocation is reconciled",
+            "Count of SSA deposits deferred until an earlier Curvy operation is reconciled",
         ).unwrap();
     static ref METRIC_PIX_DEPOSIT_DATA: hopr_api::types::telemetry::MultiCounter =
         hopr_api::types::telemetry::MultiCounter::new(
@@ -1337,12 +1337,12 @@ async fn flush_deposit_batch<D, K>(
                     refund(spend_ledger.as_ref(), spend, &id, amount);
                 }
                 if error.is_reconciliation_pending() {
-                    // Nothing about this deposit failed: the pool waits for an earlier allocation
+                    // Nothing about this deposit failed: the pool waits for an earlier operation
                     // to reconcile, and the Exit re-requests the deposit data afterwards.
                     tracing::warn!(
                         %error,
                         ?id,
-                        "deposit flush deferred until an earlier Curvy allocation is reconciled"
+                        "deposit flush deferred until an earlier Curvy operation is reconciled"
                     );
                     #[cfg(all(feature = "telemetry", not(test)))]
                     METRIC_PIX_DEPOSITS_PENDING.increment();
@@ -1405,7 +1405,7 @@ async fn flush_deposit_batch<D, K>(
                                 pending += 1;
                                 tracing::warn!(
                                     %error,
-                                    "deposit within the batch deferred until an earlier Curvy allocation is reconciled"
+                                    "deposit within the batch deferred until an earlier Curvy operation is reconciled"
                                 );
                             } else {
                                 tracing::error!(%error, "deposit within the batch failed");
@@ -1457,7 +1457,7 @@ async fn flush_deposit_batch<D, K>(
                     tracing::warn!(
                         %error,
                         count,
-                        "batch deposit flush deferred until an earlier Curvy allocation is reconciled"
+                        "batch deposit flush deferred until an earlier Curvy operation is reconciled"
                     );
                     #[cfg(all(feature = "telemetry", not(test)))]
                     METRIC_PIX_DEPOSITS_PENDING.increment_by(count as u64);

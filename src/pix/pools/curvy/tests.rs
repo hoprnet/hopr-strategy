@@ -1339,8 +1339,8 @@ async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A flush blocked on an earlier allocation's unknown outcome did not fail; it must not be
-/// counted as a failed deposit, and the spend reservation stays because that allocation may
+/// A flush blocked on an earlier operation's unknown outcome did not fail; it must not be
+/// counted as a failed deposit, and the spend reservation stays because that operation may
 /// have moved funds.
 #[test]
 fn only_a_reconciliation_block_is_a_pending_deposit() {
@@ -1358,7 +1358,7 @@ fn only_a_reconciliation_block_is_a_pending_deposit() {
         // The class survives the conversion into `StrategyError`, which is what the flush sees.
         let error: StrategyError = pending.into();
         assert!(error.is_reconciliation_pending(), "{error}");
-        assert!(!error.moved_no_funds(), "the earlier allocation may have moved funds");
+        assert!(!error.moved_no_funds(), "the earlier operation may have moved funds");
     }
 
     // Everything that says this deposit itself went wrong is a failure, not a wait.

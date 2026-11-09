@@ -681,7 +681,7 @@ impl CurvyDepositPoolError {
     /// Nothing about this deposit failed: the pool refuses to start another aggregation until the
     /// previous one's outcome is known, and a later flush goes through once it is. A consumer
     /// counting failed deposits must not count this one, and the spend reservation stays because
-    /// the earlier allocation may still have moved funds.
+    /// the earlier operation may still have moved funds.
     pub(crate) fn is_reconciliation_pending(&self) -> bool {
         match self {
             // The recovery state is not confirmed by the endpoint yet.
