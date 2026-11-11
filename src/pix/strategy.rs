@@ -3965,10 +3965,8 @@ mod tests {
         };
 
         // The state file is sealed under the PIX recovery password, so the field is required...
-        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
-            Arc::clone(&node),
-            cfg(),
-        );
+        let result =
+            PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(Arc::clone(&node), cfg());
         match result {
             Err(StrategyError::InvalidConfiguration(message)) => {
                 assert!(message.contains("pix_recovery_password_env"), "{message}")

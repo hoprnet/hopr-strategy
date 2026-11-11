@@ -10,70 +10,13 @@
 use std::fmt::{Debug, Display, Formatter};
 
 use futures::StreamExt as _;
+/// Shared component health types, retained under their strategy-specific names.
+///
+/// States default to `Running` and are ordered by increasing severity.
+pub use hopr_api::{AtomicComponentState as AtomicStrategyState, ComponentState as StrategyState};
 use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
 
 use crate::errors::Result;
-
-/// Externally observable operational state of a running [`Strategy`].
-///
-/// Shared across every strategy in this crate — implementing [`Strategy::state`] is
-/// optional, and any strategy can report a real state through it, though today only
-/// `channel_lifecycle` does. Deliberately strategy-agnostic: what makes a given
-/// strategy `Degraded` or `Failed`, and whether it recovers on its own, is up to that
-/// strategy to define and document at its own implementation.
-///
-/// Implementations that track no health signal of their own do not need to implement
-/// [`Strategy::state`] at all — the trait's default reports `Running`, so "nothing to
-/// say" reads as healthy rather than as a status an operator has to interpret.
-///
-/// Declared in increasing order of severity, so comparing two observations keeps the
-/// worse one:
-///
-/// ```
-/// use hopr_strategy::strategy::StrategyState;
-///
-/// assert_eq!(StrategyState::default(), StrategyState::Running);
-/// assert!(StrategyState::Running < StrategyState::Degraded);
-/// assert!(StrategyState::Degraded < StrategyState::Failed);
-/// assert_eq!(
-///     StrategyState::Running.max(StrategyState::Degraded),
-///     StrategyState::Degraded
-/// );
-/// ```
-///
-/// `#[atomic_enum]` generates [`AtomicStrategyState`], a lock-free wrapper a strategy
-/// can store this small `Copy` value in instead of behind a mutex — see
-/// `channel_lifecycle`'s `ChannelLifecycleStrategyInner::state` field for the pattern.
-///
-/// `IntoPrimitive`/`TryFromPrimitive` separately give `From<StrategyState> for u8` and
-/// `TryFrom<u8> for StrategyState` for callers that need the raw discriminant — the
-/// latter rejecting any byte that isn't one of this enum's own discriminants, rather
-/// than silently mapping it to a variant. `strum::Display` renders each variant as its
-/// name:
-///
-/// ```
-/// use hopr_strategy::strategy::StrategyState;
-///
-/// assert_eq!(u8::from(StrategyState::Degraded), 1);
-/// assert_eq!(StrategyState::try_from(1), Ok(StrategyState::Degraded));
-/// assert!(StrategyState::try_from(99).is_err());
-/// assert_eq!(StrategyState::Degraded.to_string(), "Degraded");
-/// ```
-#[atomic_enum::atomic_enum]
-#[derive(
-    strum::Display, PartialEq, Eq, PartialOrd, Ord, Default, num_enum::IntoPrimitive, num_enum::TryFromPrimitive,
-)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[repr(u8)]
-pub enum StrategyState {
-    /// Operating normally: everything the strategy currently needs to do, it can do.
-    #[default]
-    Running = 0,
-    /// Can still do some of what it needs to, but not all of it.
-    Degraded = 1,
-    /// Cannot currently do any of what it needs to.
-    Failed = 2,
-}
 
 /// A strategy that runs until cancelled or a fatal error occurs.
 ///
@@ -172,71 +115,8 @@ impl StrategyStateObserver {
     }
 }
 
-/// Optional diagnostic state collection shared by components and their callers.
-///
-/// Defined here rather than taken from `hopr-api`, whose `StateDump` lives in the
-/// `component` module this crate does not build against (see [`StrategyState`]).
-/// The contract is the upstream one: implementations keep their snapshot models
-/// private; callers receive an owned, opaque Serde value whose schema is defined by
-/// the implementation. Collection errors describe diagnostics availability,
-/// independently of operational state.
-///
-/// Generic over `&T`, `Box<T>` and `Arc<T>` through blanket impls, so callers can
-/// delegate through a reference the way the upstream trait's `auto_impl` does.
 #[cfg(feature = "serde")]
-pub trait StateDump: Send + Sync {
-    /// Diagnostic collection error; this does not assign an operational failure state.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Collect an owned snapshot without exposing its concrete type.
-    fn dump(
-        &self,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
-    > + Send;
-}
-
-#[cfg(feature = "serde")]
-impl<T: StateDump + ?Sized> StateDump for &T {
-    type Error = T::Error;
-
-    fn dump(
-        &self,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
-    > + Send {
-        T::dump(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<T: StateDump + ?Sized> StateDump for Box<T> {
-    type Error = T::Error;
-
-    fn dump(
-        &self,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
-    > + Send {
-        T::dump(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<T: StateDump + ?Sized> StateDump for std::sync::Arc<T> {
-    type Error = T::Error;
-
-    fn dump(
-        &self,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
-    > + Send {
-        T::dump(self)
-    }
-}
-
-#[cfg(feature = "serde")]
-impl StateDump for StrategyStateObserver {
+impl hopr_api::StateDump for StrategyStateObserver {
     type Error = std::convert::Infallible;
 
     /// Collect owned names and live states without consuming observations.
@@ -471,7 +351,7 @@ mod tests {
         assert_eq!(observer.snapshot()[0].state, StrategyState::Running);
         #[cfg(feature = "serde")]
         {
-            use crate::strategy::StateDump;
+            use hopr_api::StateDump;
             let dump = observer.dump().await.unwrap();
             assert_eq!(serde_json::to_value(dump).unwrap()[0]["state"], "Running");
         }
@@ -490,7 +370,7 @@ mod tests {
         );
         #[cfg(feature = "serde")]
         {
-            use crate::strategy::StateDump;
+            use hopr_api::StateDump;
             assert_eq!(
                 serde_json::to_value(observer.dump().await.unwrap()).unwrap(),
                 serde_json::to_value(&snapshot).unwrap()
@@ -502,7 +382,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[tokio::test]
     async fn state_dump_is_owned_non_consuming_and_preserves_entries() -> anyhow::Result<()> {
-        use crate::strategy::StateDump;
+        use hopr_api::StateDump;
 
         // Generic collectors can move both the future and the owned result between tasks.
         fn send<T: Send>(value: T) -> T {
