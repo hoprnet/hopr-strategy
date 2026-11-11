@@ -63,6 +63,7 @@ use crate::errors::Result;
 #[derive(
     strum::Display, PartialEq, Eq, PartialOrd, Ord, Default, num_enum::IntoPrimitive, num_enum::TryFromPrimitive,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum StrategyState {
     /// Operating normally: everything the strategy currently needs to do, it can do.
@@ -138,6 +139,130 @@ pub trait Strategy: Display + Send {
     }
 }
 
+/// One strategy's operational state at the time a snapshot was taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StrategyStateSnapshot<'a> {
+    /// Strategy display name. Names need not be unique.
+    pub name: &'a str,
+    /// Observed operational state.
+    pub state: StrategyState,
+}
+
+/// Live observer retained independently of the running strategies.
+///
+/// Clone this before moving a [`MultiStrategy`] into its task, then call
+/// [`snapshot`](Self::snapshot) when building a diagnostic dump. Each state is read
+/// independently; the snapshot is not an atomic observation across strategies.
+#[derive(Clone)]
+pub struct StrategyStateObserver {
+    states: Vec<(String, std::sync::Arc<AtomicStrategyState>)>,
+}
+
+impl StrategyStateObserver {
+    /// Read the current states in construction order, preserving duplicate names.
+    pub fn snapshot(&self) -> Vec<StrategyStateSnapshot<'_>> {
+        self.states
+            .iter()
+            .map(|(name, state)| StrategyStateSnapshot {
+                name: name.as_str(),
+                state: state.load(std::sync::atomic::Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+/// Optional diagnostic state collection shared by components and their callers.
+///
+/// Defined here rather than taken from `hopr-api`, whose `StateDump` lives in the
+/// `component` module this crate does not build against (see [`StrategyState`]).
+/// The contract is the upstream one: implementations keep their snapshot models
+/// private; callers receive an owned, opaque Serde value whose schema is defined by
+/// the implementation. Collection errors describe diagnostics availability,
+/// independently of operational state.
+///
+/// Generic over `&T`, `Box<T>` and `Arc<T>` through blanket impls, so callers can
+/// delegate through a reference the way the upstream trait's `auto_impl` does.
+#[cfg(feature = "serde")]
+pub trait StateDump: Send + Sync {
+    /// Diagnostic collection error; this does not assign an operational failure state.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Collect an owned snapshot without exposing its concrete type.
+    fn dump(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
+    > + Send;
+}
+
+#[cfg(feature = "serde")]
+impl<T: StateDump + ?Sized> StateDump for &T {
+    type Error = T::Error;
+
+    fn dump(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
+    > + Send {
+        T::dump(self)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T: StateDump + ?Sized> StateDump for Box<T> {
+    type Error = T::Error;
+
+    fn dump(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
+    > + Send {
+        T::dump(self)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T: StateDump + ?Sized> StateDump for std::sync::Arc<T> {
+    type Error = T::Error;
+
+    fn dump(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error>,
+    > + Send {
+        T::dump(self)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl StateDump for StrategyStateObserver {
+    type Error = std::convert::Infallible;
+
+    /// Collect owned names and live states without consuming observations.
+    ///
+    /// Entries preserve construction order and duplicate names. Each state is read
+    /// independently; polling does not change operational state.
+    async fn dump(
+        &self,
+    ) -> std::result::Result<impl serde::Serialize + serde::de::DeserializeOwned + Send + 'static, Self::Error> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Snapshot {
+            name: String,
+            state: StrategyState,
+        }
+
+        Ok(self
+            .states
+            .iter()
+            .map(|(name, state)| Snapshot {
+                name: name.clone(),
+                state: state.load(std::sync::atomic::Ordering::Relaxed),
+            })
+            .collect::<Vec<_>>())
+    }
+}
+
 /// Runs a group of sub-strategies concurrently, each in its own async task.
 ///
 /// `MultiStrategy` is strategy-kind-agnostic: it only knows about
@@ -145,6 +270,7 @@ pub trait Strategy: Display + Send {
 /// ones defined outside this crate — can be composed here.
 pub struct MultiStrategy {
     strategies: Vec<Box<dyn Strategy + Send>>,
+    state_observer: StrategyStateObserver,
 }
 
 impl MultiStrategy {
@@ -154,7 +280,16 @@ impl MultiStrategy {
     /// care about the concrete types. Pass an empty `strategies` vec to get a passive
     /// strategy that blocks forever.
     pub fn new(strategies: Vec<Box<dyn Strategy + Send>>) -> Self {
-        Self { strategies }
+        let states = strategies.iter().map(|s| (s.to_string(), s.state_handle())).collect();
+        Self {
+            strategies,
+            state_observer: StrategyStateObserver { states },
+        }
+    }
+
+    /// Obtain a live observer that remains usable after this strategy is spawned.
+    pub fn state_observer(&self) -> StrategyStateObserver {
+        self.state_observer.clone()
     }
 }
 
@@ -308,6 +443,91 @@ mod tests {
         let result =
             futures_time::future::FutureExt::timeout(ms.run(), futures_time::time::Duration::from_millis(50)).await;
         assert!(result.is_err(), "empty MultiStrategy should block (timeout expected)");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_survives_run_and_tracks_live_handles() {
+        struct Observed(std::sync::Arc<AtomicStrategyState>);
+        impl Display for Observed {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                write!(f, "observed")
+            }
+        }
+        #[async_trait::async_trait]
+        impl Strategy for Observed {
+            async fn run(&mut self) -> Result<()> {
+                self.0
+                    .store(StrategyState::Degraded, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+
+            fn state_handle(&self) -> std::sync::Arc<AtomicStrategyState> {
+                self.0.clone()
+            }
+        }
+        let state = std::sync::Arc::new(AtomicStrategyState::new(StrategyState::Running));
+        let mut strategy = MultiStrategy::new(vec![Box::new(Observed(state)), Box::new(OkStrategy)]);
+        let observer = strategy.state_observer();
+        assert_eq!(observer.snapshot()[0].state, StrategyState::Running);
+        #[cfg(feature = "serde")]
+        {
+            use crate::strategy::StateDump;
+            let dump = observer.dump().await.unwrap();
+            assert_eq!(serde_json::to_value(dump).unwrap()[0]["state"], "Running");
+        }
+        strategy.run().await.unwrap();
+        drop(strategy);
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot[0].state, StrategyState::Degraded);
+        assert_eq!(snapshot[1].state, StrategyState::Running);
+        #[cfg(feature = "serde")]
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap(),
+            serde_json::json!([
+                {"name": "observed", "state": "Degraded"},
+                {"name": "ok", "state": "Running"}
+            ])
+        );
+        #[cfg(feature = "serde")]
+        {
+            use crate::strategy::StateDump;
+            assert_eq!(
+                serde_json::to_value(observer.dump().await.unwrap()).unwrap(),
+                serde_json::to_value(&snapshot).unwrap()
+            );
+        }
+        assert!(MultiStrategy::new(vec![]).state_observer().snapshot().is_empty());
+    }
+
+    #[cfg(feature = "serde")]
+    #[tokio::test]
+    async fn state_dump_is_owned_non_consuming_and_preserves_entries() -> anyhow::Result<()> {
+        use crate::strategy::StateDump;
+
+        // Generic collectors can move both the future and the owned result between tasks.
+        fn send<T: Send>(value: T) -> T {
+            value
+        }
+        async fn collect(source: &impl StateDump) -> anyhow::Result<impl serde::Serialize + Send + 'static> {
+            Ok(send(source.dump()).await?)
+        }
+
+        let mut strategy = MultiStrategy::new(vec![Box::new(OkStrategy), Box::new(OkStrategy)]);
+        let observer = strategy.state_observer();
+        strategy.run().await?;
+        drop(strategy);
+        let dump = collect(&observer).await?;
+        let repeated = collect(&observer).await?;
+        drop(observer);
+        let expected = serde_json::json!([
+            {"name": "ok", "state": "Running"},
+            {"name": "ok", "state": "Running"}
+        ]);
+        assert_eq!(serde_json::to_value(dump)?, expected);
+        assert_eq!(serde_json::to_value(repeated)?, expected);
+        let empty = MultiStrategy::new(vec![]).state_observer();
+        assert_eq!(serde_json::to_value(empty.dump().await?)?, serde_json::json!([]));
+        Ok(())
     }
 
     #[test]

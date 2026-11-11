@@ -1,0 +1,31 @@
+# cargo-deny policy. Run by the `deny` flake check (bans, licenses, sources).
+# Advisories are covered by `nix run .#audit`, which needs network access.
+
+[graph]
+all-features = true
+
+[licenses]
+# This crate is GPL-3.0-only, so GPL-3.0 dependencies are compatible.
+allow = [
+  "Apache-2.0 WITH LLVM-exception",
+  "Apache-2.0",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "GPL-3.0",
+  "GPL-3.0-only",
+  "ISC",
+  "LGPL-2.1-or-later",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[sources]
+unknown-git      = "deny"
+unknown-registry = "deny"

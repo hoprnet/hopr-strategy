@@ -231,6 +231,16 @@ pub struct PixStrategyConfig {
     /// [`StrategyError::CriteriaNotSatisfied`] and the event is dropped; it is not re-tried when
     /// the window rolls forward.
     ///
+    /// A deposit whose flush fails for an error that provably moved no funds — a malformed
+    /// payload, the plain pool's affordability gate, or a drained Curvy pool — hands its amount
+    /// back, so a streak of failures does not lock the node out until the window rolls. An
+    /// ambiguous failure keeps it, because a transfer reported as failed may still have landed.
+    /// See [`StrategyError::moved_no_funds`].
+    ///
+    /// The flip side is that those failures no longer use up the cap, so it no longer bounds how
+    /// often they recur: a peer that keeps sending deposits which fail that way costs pool and SDK
+    /// work on every attempt, however many arrive within one window.
+    ///
     /// The ledger behind it is in memory, so a restart forgives the window. It bounds a burst,
     /// not lifetime spend; `plain::NonAnonymousDepositPoolConfig::min_safe_hopr_reserve`
     /// is the balance floor that survives restarts.
@@ -254,7 +264,18 @@ pub struct PixStrategyConfig {
     /// the recovered key — the only means of moving those funds — is lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_db_path: Option<std::path::PathBuf>,
-    /// Environment variable for the recovery store encryption password.
+    /// The password the PIX secrets on disk are sealed under: the recovery store, and the Curvy
+    /// pool's state file (its spender identity and scan secrets). Required when
+    /// [`Self::pix_recovery_db_path`] is set, and always by the Curvy pool. The same password on
+    /// every start: both files refuse any other.
+    ///
+    /// Never serialized back out, and printed redacted, so the configuration can be dumped and
+    /// logged without exposing it. [`Self::pix_recovery_password_env`] is the alternative for a
+    /// deployment that would rather not write it into the configuration file.
+    #[serde(default, skip_serializing)]
+    pub pix_recovery_password: Option<PixRecoveryPassword>,
+    /// Name of an environment variable to read the password from when
+    /// [`Self::pix_recovery_password`] is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_password_env: Option<String>,
     /// How long to wait for additional deposit events before flushing the batch.
@@ -572,9 +593,13 @@ impl PixStrategy {
 
         // `Arc` for the same reason as in `build_non_anonymous`; the pool itself is deliberately
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
+        let state_password = self
+            .cfg
+            .pix_recovery_password("the Curvy pool's state file is sealed under it")?;
         let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
             Arc::clone(&node),
             pool_cfg,
+            &state_password,
         )?);
         let safe_address = node.identity().safe_address;
 
@@ -633,10 +658,7 @@ impl PixStrategy {
         // calling it, so `spend_window`'s constraint would have been decorative.
         StrategyError::validate_config(&self.cfg)?;
 
-        let recovery_store = open_recovery_store(
-            self.cfg.pix_recovery_db_path.as_ref(),
-            self.cfg.pix_recovery_password_env.as_ref(),
-        )?;
+        let recovery_store = open_recovery_store(&self.cfg)?;
 
         Ok(Box::new(PixStrategyInner {
             pool,
@@ -658,35 +680,98 @@ impl PixStrategy {
                 .build(),
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
-            spend_ledger: std::collections::VecDeque::new(),
+            spend_ledger: Arc::new(parking_lot::Mutex::new(SpendLedger::default())),
             detach_flushes: false,
             funding_gate: Arc::new(futures::lock::Mutex::new(())),
         }))
     }
 }
 
-fn open_recovery_store(
-    db_path: Option<&std::path::PathBuf>,
-    password_env: Option<&String>,
-) -> Result<Option<PixRecoveryStore>> {
-    match (db_path, password_env) {
-        (Some(path), Some(env)) => {
-            let password = std::env::var(env).map_err(|_| {
-                StrategyError::Other(anyhow::anyhow!(
-                    "environment variable {env} must be set when PIX recovery persistence is enabled"
-                ))
-            })?;
+/// A password held in [`PixStrategyConfig`]: deserialized from the plain string, never serialized,
+/// and shown redacted by `Debug` so a logged or dumped configuration does not leak it.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct PixRecoveryPassword(String);
+
+impl Debug for PixRecoveryPassword {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for PixRecoveryPassword {
+    fn from(password: String) -> Self {
+        Self(password)
+    }
+}
+
+impl PixStrategyConfig {
+    /// The password the PIX secrets on disk are sealed under: [`Self::pix_recovery_password`], or
+    /// failing that the environment variable [`Self::pix_recovery_password_env`] names. `purpose`
+    /// says which store asked, for the error when neither is set. An empty password is refused
+    /// wherever it came from: a key derived from it would seal nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hopr_strategy::pix::strategy::PixStrategyConfig;
+    ///
+    /// let cfg = PixStrategyConfig {
+    ///     pix_recovery_password: Some("correct horse battery staple".to_owned().into()),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(
+    ///     cfg.pix_recovery_password("the recovery store is sealed under it")
+    ///         .unwrap(),
+    ///     "correct horse battery staple"
+    /// );
+    ///
+    /// // Neither the password nor a variable to read it from: a configuration error naming both.
+    /// let error = PixStrategyConfig::default()
+    ///     .pix_recovery_password("the recovery store is sealed under it")
+    ///     .unwrap_err();
+    /// assert!(error.to_string().contains("pix_recovery_password_env"));
+    /// ```
+    pub fn pix_recovery_password(&self, purpose: &str) -> Result<String> {
+        self.pix_recovery_password_with(purpose, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::pix_recovery_password`] with the environment behind `lookup`, so it is testable
+    /// without mutating the process environment.
+    fn pix_recovery_password_with(&self, purpose: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
+        let (password, source) = match (&self.pix_recovery_password, &self.pix_recovery_password_env) {
+            (Some(PixRecoveryPassword(password)), _) => (password.clone(), "pix_recovery_password".to_owned()),
+            (None, Some(env)) => {
+                let password = lookup(env).ok_or_else(|| {
+                    StrategyError::InvalidConfiguration(format!("environment variable {env} must be set: {purpose}"))
+                })?;
+                (password, format!("environment variable {env}"))
+            }
+            (None, None) => {
+                return Err(StrategyError::InvalidConfiguration(format!(
+                    "pix_recovery_password or pix_recovery_password_env must be set: {purpose}"
+                )));
+            }
+        };
+        if password.is_empty() {
+            return Err(StrategyError::InvalidConfiguration(format!(
+                "{source} must not be empty: {purpose}"
+            )));
+        }
+        Ok(password)
+    }
+}
+
+fn open_recovery_store(cfg: &PixStrategyConfig) -> Result<Option<PixRecoveryStore>> {
+    match &cfg.pix_recovery_db_path {
+        Some(path) => {
+            let password = cfg.pix_recovery_password("PIX recovery persistence is enabled")?;
             PixRecoveryStore::open(path, &password)
                 .map(Some)
                 .map_err(StrategyError::other)
         }
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(StrategyError::Other(anyhow::anyhow!(
-            "pix_recovery_password_env must be set when pix_recovery_db_path is set"
-        ))),
-        (None, Some(_)) => Err(StrategyError::Other(anyhow::anyhow!(
-            "pix_recovery_db_path must be set when pix_recovery_password_env is set"
-        ))),
+        // A password alone is not a mistake: the Curvy pool's state file is sealed under it too.
+        None => Ok(None),
     }
 }
 
@@ -695,16 +780,131 @@ fn open_recovery_store(
 // ---------------------------------------------------------------------------
 
 /// One buffered deposit, which is exactly
-/// [`DepositPool::deposit_funds_to_multiple`]'s slice element.
+/// [`DepositPool::deposit_funds_to_multiple`]'s slice element plus the ledger entry that reserves
+/// its amount against the rolling spend window.
 ///
 /// Named so that the buffer and the batch argument cannot drift apart: a flush passes the buffer
 /// to the pool directly, with no projection in between for a field to go missing from.
+///
+/// The ledger entry is carried alongside so a provably fund-free failure can refund it.
 type BufferedDeposit<D, K> = (
     PixAddressId,
     <K as Keypair>::Public,
     HoprBalance,
     <D as DepositPool<K>>::PoolDepositData,
+    SpendEntry,
 );
+
+/// One reservation against [`PixStrategyConfig::max_spend_per_window`].
+///
+/// `at` is when it was committed (and expires), `amount` is what it reserved, and
+/// `seqs` is the inclusive range of reservations folded into this entry. A refund names a single
+/// `seq` and is applied only when some live entry's range contains it, so it can never touch
+/// another deposit's amount.
+#[derive(Clone, Copy, Debug)]
+struct SpendEntry {
+    at: std::time::Instant,
+    amount: HoprBalance,
+    /// Inclusive range of the reservations this entry accounts for; a single one until folded.
+    seqs: (u64, u64),
+}
+
+impl SpendEntry {
+    fn contains(&self, seq: u64) -> bool {
+        (self.seqs.0..=self.seqs.1).contains(&seq)
+    }
+}
+
+/// The rolling ledger behind [`PixStrategyConfig::max_spend_per_window`].
+///
+/// Oldest first; entries expire by age and coalesce once there are more than
+/// [`SPEND_LEDGER_CAPACITY`] of them.
+#[derive(Debug, Default)]
+struct SpendLedger {
+    entries: std::collections::VecDeque<SpendEntry>,
+    /// Source of [`SpendEntry::seq`]. Only ever incremented while creating entries.
+    seq: u64,
+    /// Reservations already refunded.
+    ///
+    /// A folded entry answers for several reservations, so a count on the entry cannot tell a
+    /// repeated refund of one from a refund of a different one. This set can, which keeps a
+    /// second release from subtracting the same amount twice. Pruned whenever entries expire.
+    refunded: std::collections::HashSet<u64>,
+}
+
+impl SpendLedger {
+    /// Drops entries that have aged out of `window` and returns what is still committed.
+    fn spent(&mut self, window: Duration, now: std::time::Instant) -> HoprBalance {
+        while let Some(entry) = self.entries.front() {
+            if now.duration_since(entry.at) < window {
+                break;
+            }
+            self.entries.pop_front();
+        }
+
+        // Entries are appended in `seq` order, so the live reservations are one contiguous range:
+        // anything below its start has expired. Pruning by that bound is linear; testing each
+        // refunded seq against every entry would be quadratic while holding the lock.
+        if !self.refunded.is_empty() {
+            match self.entries.front() {
+                Some(oldest) => self.refunded.retain(|seq| *seq >= oldest.seqs.0),
+                None => self.refunded.clear(),
+            }
+        }
+
+        self.entries
+            .iter()
+            .fold(HoprBalance::zero(), |total, entry| total + entry.amount)
+    }
+
+    /// Records `amount` against the window and returns the reservation.
+    ///
+    /// Committed before settlement, because a transfer reported as failed may still have landed;
+    /// a confirmed-only ledger could under-count real spend. The reservation is therefore
+    /// released only on a provably fund-free failure — see [`Self::release`].
+    fn commit(&mut self, amount: HoprBalance, now: std::time::Instant) -> SpendEntry {
+        let entry = SpendEntry {
+            at: now,
+            amount,
+            seqs: (self.seq, self.seq),
+        };
+        self.seq = self.seq.wrapping_add(1);
+        self.entries.push_back(entry);
+
+        // Fold the oldest entry into its successor. The merged amount then expires with the
+        // *newer* timestamp, so it is counted for longer than it strictly should be — the
+        // conservative direction for a cap.
+        //
+        // A folded entry's `seq` is absorbed by its successor, which then answers refunds for
+        // every reservation it covers. See [`Self::release`].
+        if self.entries.len() > SPEND_LEDGER_CAPACITY
+            && let Some(oldest) = self.entries.pop_front()
+            && let Some(next) = self.entries.front_mut()
+        {
+            next.amount += oldest.amount;
+            next.seqs = (oldest.seqs.0.min(next.seqs.0), oldest.seqs.1.max(next.seqs.1));
+        }
+        entry
+    }
+
+    /// Hands `entry`'s reserved amount back to the window.
+    ///
+    /// Only sound for a provably fund-free failure. Subtraction rather than zeroing: an entry may
+    /// hold older reservations folded into it, and zeroing would refund those too.
+    ///
+    /// The refund is applied only when a live entry's `seq` range contains this reservation. An
+    /// expired entry, or one whose range was folded away, is left alone — and crucially, an
+    /// expired reservation can no longer be matched to an unrelated live entry, so a slow deposit
+    /// failing after the window rolled does not refund someone else's spend.
+    fn release(&mut self, entry: SpendEntry) {
+        if !self.refunded.insert(entry.seqs.0) {
+            return; // already refunded once
+        }
+        if let Some(stored) = self.entries.iter_mut().find(|stored| stored.contains(entry.seqs.0)) {
+            stored.amount -= entry.amount;
+        }
+    }
+}
 
 /// The generic PIX strategy runner.
 struct PixStrategyInner<D, N, K>
@@ -734,8 +934,9 @@ where
     /// Debounced withdrawal buffer.
     withdrawal_buffer: Vec<(PixAddressId, PixDepositSecret)>,
     /// Rolling record of deposits committed within [`PixStrategyConfig::spend_window`], oldest
-    /// first. Entries are appended when a deposit is accepted into the buffer and expire by age.
-    spend_ledger: std::collections::VecDeque<(std::time::Instant, HoprBalance)>,
+    /// first. `Arc<Mutex<_>>` because a detached flush learns the outcome in a spawned task and
+    /// has to refund the same ledger the event loop reads.
+    spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
     /// Whether a zero buffer period flushes on a task instead of awaiting inline.
     ///
     /// Set by [`StrategyTrait::run`] and false otherwise, because it is a statement about who is
@@ -793,7 +994,7 @@ where
                 .build(),
             deposit_buffer: Vec::new(),
             withdrawal_buffer: Vec::new(),
-            spend_ledger: std::collections::VecDeque::new(),
+            spend_ledger: Arc::new(parking_lot::Mutex::new(SpendLedger::default())),
             detach_flushes: false,
             funding_gate: Arc::new(futures::lock::Mutex::new(())),
         }
@@ -820,43 +1021,16 @@ where
         + 'static,
     D::Error: Into<StrategyError>,
 {
-    /// Drops ledger entries that have aged out of the window and returns what is still committed.
-    ///
-    /// Called on every deposit event, so eviction keeps pace with arrivals without a timer.
+    /// What deposits committed in the current window add up to, refunds and expiries included.
     fn spent_in_window(&mut self) -> HoprBalance {
-        let (window, now) = (self.cfg.spend_window, std::time::Instant::now());
-
-        while let Some((at, _)) = self.spend_ledger.front() {
-            if now.duration_since(*at) < window {
-                break;
-            }
-            self.spend_ledger.pop_front();
-        }
-
         self.spend_ledger
-            .iter()
-            .fold(HoprBalance::zero(), |total, (_, amount)| total + *amount)
+            .lock()
+            .spent(self.cfg.spend_window, std::time::Instant::now())
     }
 
-    /// Records `amount` against the window.
-    ///
-    /// Committed at the moment a deposit is accepted into the buffer rather than after it
-    /// settles, and never refunded on failure: `deposit_funds_to` retries internally and
-    /// re-reads the destination balance precisely because a transfer reported as failed may
-    /// still have landed. A ledger that only counted confirmed spend could therefore under-count
-    /// real ones, which is the wrong direction for a safety limit to err in.
-    fn commit_spend(&mut self, amount: HoprBalance) {
-        self.spend_ledger.push_back((std::time::Instant::now(), amount));
-
-        // Fold the oldest entry into its successor. The merged amount then expires with the
-        // *newer* timestamp, so it is counted for longer than it strictly should be — the
-        // conservative direction for a cap.
-        if self.spend_ledger.len() > SPEND_LEDGER_CAPACITY
-            && let Some((_, oldest)) = self.spend_ledger.pop_front()
-            && let Some((_, next)) = self.spend_ledger.front_mut()
-        {
-            *next += oldest;
-        }
+    /// Records `amount` against the window and returns the reservation. See [`SpendLedger::commit`].
+    fn commit_spend(&mut self, amount: HoprBalance) -> SpendEntry {
+        self.spend_ledger.lock().commit(amount, std::time::Instant::now())
     }
 
     /// Validate and buffer a PIX event for batched execution.
@@ -962,9 +1136,9 @@ where
 
                 self.in_flight_destinations.insert(dest_addr.clone(), ());
 
-                self.commit_spend(target_deposit);
+                let spend = self.commit_spend(target_deposit);
                 self.deposit_buffer
-                    .push((new_deposit_address.id, dest_addr, target_deposit, deposit_data));
+                    .push((new_deposit_address.id, dest_addr, target_deposit, deposit_data, spend));
 
                 tracing::info!(%target_deposit, "deposit buffered, pending flush");
 
@@ -1180,6 +1354,7 @@ where
             self.pool.clone(),
             self.processed_deposits.clone(),
             self.in_flight_destinations.clone(),
+            Arc::clone(&self.spend_ledger),
             batch,
         )
         .await;
@@ -1205,6 +1380,7 @@ where
         let in_flight_destinations = self.in_flight_destinations.clone();
         let policy = self.cfg.funding.clone();
         let gate = Arc::clone(&self.funding_gate);
+        let spend_ledger = Arc::clone(&self.spend_ledger);
 
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
         // what it is funding for, and the loop must not wait on the funding any more than on them.
@@ -1212,7 +1388,7 @@ where
             if let Some(policy) = &policy {
                 apply_funding_policy::<D, K>(&pool, policy, &gate).await;
             }
-            flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, batch).await;
+            flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, spend_ledger, batch).await;
         });
     }
 
@@ -1310,6 +1486,7 @@ async fn flush_deposit_batch<D, K>(
     pool: D,
     processed_deposits: Cache<PixAddressId, ()>,
     in_flight_destinations: Cache<K::Public, ()>,
+    spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
     batch: Vec<BufferedDeposit<D, K>>,
 ) where
     // `Send + Sync + 'static` beyond what the work itself needs, so the future is spawnable. The
@@ -1333,7 +1510,7 @@ async fn flush_deposit_batch<D, K>(
     }
 
     if count == 1 {
-        let (id, dest_addr, amount, deposit_data) = batch.into_iter().next().unwrap();
+        let (id, dest_addr, amount, deposit_data, spend) = batch.into_iter().next().unwrap();
         let result = pool
             .deposit_funds_to(&id, &dest_addr, amount, deposit_data)
             .await
@@ -1349,15 +1526,26 @@ async fn flush_deposit_batch<D, K>(
             }
             Err(error) => {
                 in_flight_destinations.invalidate(&dest_addr);
+                // A failure the pool can prove moved no funds hands its budget back, so a streak
+                // of them cannot exhaust the window and lock the node out of PIX until it rolls.
+                if error.moved_no_funds() {
+                    refund(spend_ledger.as_ref(), spend, &id, amount);
+                }
                 tracing::error!(%error, ?id, "single deposit flush failed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 METRIC_PIX_DEPOSITS_FAILED.increment();
             }
         }
     } else {
-        // The buffer is already the argument: see `deposit_buffer`.
+        // The pool's slice element is the buffer's first four fields. The buffer is split rather
+        // than projected into a new `Vec`, so a batch flush does not clone every destination and
+        // payload; the ledger entries travel in their own parallel `Vec`.
+        let (deposits, spends): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .map(|(id, dest_addr, amount, deposit_data, spend)| ((id, dest_addr, amount, deposit_data), spend))
+            .unzip();
         let result = pool
-            .deposit_funds_to_multiple(&batch)
+            .deposit_funds_to_multiple(&deposits)
             .await
             .map_err(Into::<StrategyError>::into);
 
@@ -1367,20 +1555,50 @@ async fn flush_deposit_batch<D, K>(
                 // that actually settled are recorded as processed. `BatchOutcomes` carries the
                 // id in each outcome, so a partially failed batch no longer marks its failures
                 // done — the duplicate guard would otherwise drop the retry a peer resends.
-                for (_, dest_addr, ..) in &batch {
+                for (_, dest_addr, ..) in &deposits {
                     in_flight_destinations.invalidate(dest_addr);
                 }
 
-                let mut deposited = 0u64;
+                // `BatchOutcomes` identifies an item only on success — the `Err` arm carries no
+                // id — and the trait does not promise the outcomes keep the input order, so a
+                // failed item is never located by position. It is identified by elimination: a
+                // deposit with no success echo, once exactly one failure can be paired with it.
+                let outcomes_len = outcomes.len();
+                let batch_ids: std::collections::HashSet<PixAddressId> = deposits.iter().map(|(id, ..)| *id).collect();
+                let mut everything_failed_fund_free = true;
+                let mut failures = 0usize;
+                // Only ids that are in the batch and appear once: a repeated or foreign id would
+                // otherwise inflate the success count and let an unaccounted deposit pass below.
+                let mut settled: std::collections::HashSet<PixAddressId> = std::collections::HashSet::new();
                 for outcome in outcomes {
                     match outcome {
                         Ok((id, _receipt)) => {
                             processed_deposits.insert(id, ());
-                            deposited += 1;
+                            if batch_ids.contains(&id) {
+                                // A second echo of the same id fails to insert, so it is excluded.
+                                settled.insert(id);
+                            }
                         }
                         Err(error) => {
                             let error: StrategyError = error.into();
+                            failures += 1;
+                            everything_failed_fund_free &= error.moved_no_funds();
                             tracing::error!(%error, "deposit within the batch failed");
+                        }
+                    }
+                }
+                let deposited = settled.len() as u64;
+                let unaccounted = count - settled.len();
+
+                // Refund only when every failure is provably fund-free (one ambiguous failure
+                // means the window cannot tell which reservation moved money), every unaccounted
+                // deposit is paired with exactly one failure outcome, and every success is a
+                // distinct id from this batch — the last check rules out a repeated or foreign
+                // id, either of which would otherwise make an unaccounted deposit look failed.
+                if everything_failed_fund_free && outcomes_len == settled.len() + failures && failures == unaccounted {
+                    for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
+                        if !settled.contains(id) {
+                            refund(spend_ledger.as_ref(), *spend, id, *amount);
                         }
                     }
                 }
@@ -1395,8 +1613,15 @@ async fn flush_deposit_batch<D, K>(
             // The batch itself could not be attempted, as distinct from its items failing
             // individually above.
             Err(error) => {
-                for (_, dest_addr, ..) in &batch {
+                for (_, dest_addr, ..) in &deposits {
                     in_flight_destinations.invalidate(dest_addr);
+                }
+                // A pool-wide failure is one error for every item, so a fund-free class refunds
+                // them all. An ambiguous one refunds none, exactly as for the single path.
+                if error.moved_no_funds() {
+                    for ((id, _, amount, _), spend) in deposits.iter().zip(&spends) {
+                        refund(spend_ledger.as_ref(), *spend, id, *amount);
+                    }
                 }
                 tracing::error!(%error, count, "batch deposit flush failed");
                 #[cfg(all(feature = "telemetry", not(test)))]
@@ -1404,6 +1629,20 @@ async fn flush_deposit_batch<D, K>(
             }
         }
     }
+}
+
+/// Hands a failed deposit's spend reservation back to the window.
+///
+/// A free function so the flush paths can call it from inside a spawned task without borrowing
+/// the strategy. `id` and `amount` are only logged: the reservation is identified by
+/// [`SpendEntry::seq`], so a stale copy cannot refund an unrelated deposit.
+fn refund(ledger: &parking_lot::Mutex<SpendLedger>, spend: SpendEntry, id: &PixAddressId, amount: HoprBalance) {
+    ledger.lock().release(spend);
+    tracing::info!(
+        ?id,
+        %amount,
+        "deposit moved no funds; its spend reservation is released"
+    );
 }
 
 /// Sweep one drained buffer through the pool. The withdrawal counterpart of
@@ -1851,21 +2090,18 @@ mod tests {
     };
     use tokio::time::timeout;
 
-    use super::{PixStrategy, PixStrategyConfig, PixStrategyInner};
+    use super::{
+        PixStrategy, PixStrategyConfig, PixStrategyInner, SPEND_LEDGER_CAPACITY, SpendLedger, flush_deposit_batch,
+    };
     use crate::{
         errors::StrategyError,
         pix::{
             ByteDepositData,
-            pools::plain::{DEPOSIT_MARKER_PAYLOAD, NonAnonymousDepositPool},
+            pools::plain::{DEPOSIT_MARKER_PAYLOAD, EthDepositKey, NonAnonymousDepositPool},
             recovery_store::PixRecoveryStore,
         },
         testing::{BlokliTestClient, BlokliTestStateBuilder, FullStateEmulator, TestChainConnector},
     };
-
-    /// Owned exclusively by `test_build_with_recovery_path_opens_store`. Tests share one
-    /// process environment and run on several threads, so a name used by two tests can be
-    /// unset by one while the other still needs it.
-    const BUILD_PASSWORD_ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_BUILD";
 
     lazy_static::lazy_static! {
         static ref BOB_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
@@ -2853,6 +3089,638 @@ mod tests {
         Ok(())
     }
 
+    /// A deposit that fails for a reason that provably moved no funds hands its budget back, so a
+    /// streak of such failures cannot exhaust the window.
+    ///
+    /// This is the `max_spend_per_window` half of gnosis/gnosis_vpn#713: nine failed 0.66 wxHOPR
+    /// deposits drove `spent` to 5.94 of a 6 wxHOPR budget and the tenth was refused for the rest
+    /// of the 24 h window, even though the funds never left. The failing deposits here are refused
+    /// by `min_safe_hopr_reserve`, which `deposit_once` checks before it submits a transfer and
+    /// reports as `PlainDepositError::Unaffordable`; `moved_no_funds` treats that as fund-free.
+    #[test_log::test(tokio::test)]
+    async fn test_failed_deposits_release_their_spend_reservation() -> anyhow::Result<()> {
+        let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, _pool) = entry_side(&[first, second]).await?;
+
+        // A Safe that cannot cover even a 20 wxHOPR deposit plus its reserve, so every flush
+        // fails at the pool's pre-check without sending anything.
+        let pool_cfg = crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(1000),
+            max_deposit_retries: 0,
+            ..pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero())
+        };
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg,
+            Arc::clone(&cc).client(),
+        ));
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::new_base(50), StdDuration::from_secs(3600)),
+            *BOB,
+            None,
+        );
+
+        // Two failures of 30 each would be 60 against a 50 budget if neither reservation were
+        // released; the second is only accepted because the first refunded.
+        for address in [first, second] {
+            s.on_pix_event(new_deposit(address, 30)).await?;
+            assert!(
+                hopr_balance(&*cc, address).await?.is_zero(),
+                "the pool refuses every deposit, so nothing may have been funded"
+            );
+        }
+
+        assert_eq!(
+            s.spent_in_window(),
+            HoprBalance::zero(),
+            "both failed deposits must have released their reservations"
+        );
+        Ok(())
+    }
+
+    /// The reported symptom, end to end: a failure streak must not lock the node out of PIX.
+    ///
+    /// Nine refusals of 7 each would fill a 60 wxHOPR budget on their own; the deposit after them
+    /// is only accepted because each refusal released its reservation.
+    #[test_log::test(tokio::test)]
+    async fn test_a_failure_streak_does_not_exhaust_the_spend_budget() -> anyhow::Result<()> {
+        let addresses: Vec<Address> = (0..10u8).map(|i| [0x60 + i; 20].into()).collect();
+        let (cc, node, _pool) = entry_side(&addresses).await?;
+
+        let pool_cfg = crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(1000),
+            max_deposit_retries: 0,
+            ..pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero())
+        };
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg,
+            Arc::clone(&cc).client(),
+        ));
+        let mut s = PixStrategyInner::new(
+            pool,
+            node,
+            spend_cfg(HoprBalance::new_base(60), StdDuration::from_secs(24 * 3600)),
+            *BOB,
+            None,
+        );
+
+        // Nine failures of 7 = 63, past the budget if any were left counted.
+        for address in &addresses[..9] {
+            s.on_pix_event(new_deposit(*address, 7)).await?;
+        }
+        assert_eq!(s.spent_in_window(), HoprBalance::zero());
+
+        // The tenth is accepted: a refusal would have returned `Err` above.
+        s.on_pix_event(new_deposit(addresses[9], 7)).await?;
+        Ok(())
+    }
+
+    /// The same, for a batch flush: a pool-wide fund-free failure refunds every item in it.
+    #[test_log::test(tokio::test)]
+    async fn test_failed_batch_releases_every_spend_reservation() -> anyhow::Result<()> {
+        let (first, second): (Address, Address) = ([0x42u8; 20].into(), [0x43u8; 20].into());
+        let (cc, node, _pool) = entry_side(&[first, second]).await?;
+
+        let pool_cfg = crate::pix::pools::plain::NonAnonymousDepositPoolConfig {
+            min_safe_hopr_reserve: HoprBalance::new_base(1000),
+            max_deposit_retries: 0,
+            ..pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero())
+        };
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg,
+            Arc::clone(&cc).client(),
+        ));
+        // The budget covers both deposits, so neither is refused before a flush can fail.
+        let mut cfg = spend_cfg(HoprBalance::new_base(60), StdDuration::from_secs(3600));
+        // Buffered, so both events land in one flush and take the batch path.
+        cfg.deposit_buffer_period = StdDuration::from_secs(60);
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+
+        s.on_pix_event(new_deposit(first, 30)).await?;
+        s.on_pix_event(new_deposit(second, 30)).await?;
+        assert_eq!(s.deposit_buffer.len(), 2, "both events must wait for the same flush");
+        s.flush_deposits().await;
+
+        assert!(
+            hopr_balance(&*cc, first).await?.is_zero() && hopr_balance(&*cc, second).await?.is_zero(),
+            "the pool refuses every deposit, so nothing may have been funded"
+        );
+        assert_eq!(
+            s.spent_in_window(),
+            HoprBalance::zero(),
+            "a fund-free batch failure must release every reservation in it"
+        );
+        Ok(())
+    }
+
+    /// An ambiguous failure keeps its reservation: a transfer reported as failed may still have
+    /// landed, so the window stays counted. This is the case the conservative default exists for.
+    #[test_log::test(tokio::test)]
+    async fn test_ambiguous_failure_keeps_its_spend_reservation() -> anyhow::Result<()> {
+        // A pool whose error is opaque: a transfer reported as failed may still have landed.
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        let (id, address, amount, data) = buffered([0x42u8; 20].into(), HoprBalance::new_base(30));
+        let spend = ledger.lock().commit(amount, std::time::Instant::now());
+        batch.push((id, address, amount, data, spend));
+
+        // A one-item batch takes the single-deposit path, which follows `script`; `raw_outcomes`
+        // only drives `deposit_funds_to_multiple`, so an empty script here would just succeed.
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(vec![(false, true)]),
+            whole_batch_fails: false,
+            raw_outcomes: None,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            amount,
+            "an ambiguous failure must stay counted"
+        );
+        Ok(())
+    }
+
+    /// Only a refusal that provably precedes settlement is refundable.
+    ///
+    /// `CriteriaNotSatisfied` is ambiguous — the plain pool's gate is pre-transfer, but Curvy
+    /// could raise it after `allocate_all` submitted an earlier chunk — so it stays counted. Each
+    /// pool states its own fund-free failures through a typed error instead.
+    #[test]
+    fn test_only_provably_fund_free_errors_refund() {
+        use hopr_api::types::primitive::prelude::GeneralError;
+
+        assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds(), "ambiguous");
+
+        // `GeneralError` is fund-free only for `InvalidInput`; the other variants say nothing
+        // about funds.
+        assert!(StrategyError::GeneralError(GeneralError::InvalidInput).moved_no_funds());
+        assert!(!StrategyError::GeneralError(GeneralError::ParseError("x".into())).moved_no_funds());
+        assert!(!StrategyError::GeneralError(GeneralError::NonSpecificError("x".into())).moved_no_funds());
+
+        // An opaque failure may have moved funds.
+        assert!(!StrategyError::other(anyhow::anyhow!("lost confirmation")).moved_no_funds());
+
+        // A pool that classifies its own error is believed.
+        assert!(
+            StrategyError::other(crate::pix::pools::plain::PlainDepositError::Unaffordable { after_attempt: false })
+                .moved_no_funds()
+        );
+    }
+
+    /// The ledger's own contract: a release zeroes only the entry it names, and an expired entry
+    /// is dropped rather than refunded.
+    #[test]
+    fn test_spend_ledger_releases_only_the_named_entry() {
+        let window = StdDuration::from_secs(3600);
+        let now = std::time::Instant::now();
+        let mut ledger = SpendLedger::default();
+
+        let first = ledger.commit(HoprBalance::new_base(10), now);
+        ledger.commit(HoprBalance::new_base(20), now);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(30));
+
+        ledger.release(first);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(20));
+
+        // Releasing the same entry twice is harmless, and leaves the other one counted.
+        ledger.release(first);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(20));
+
+        // Once the window passes, an expired entry contributes nothing even unreleased.
+        let later = now + StdDuration::from_secs(3601);
+        assert_eq!(ledger.spent(window, later), HoprBalance::zero());
+    }
+
+    /// A release subtracts the reservation, so a folded successor keeps its other amounts.
+    #[test]
+    fn test_release_after_a_fold_keeps_the_other_reservations() {
+        let window = StdDuration::from_secs(3600);
+        let now = std::time::Instant::now();
+        let mut ledger = SpendLedger::default();
+
+        // Fill to capacity, then one more so the oldest folds into its successor.
+        let mut entries = Vec::new();
+        for _ in 0..=SPEND_LEDGER_CAPACITY {
+            entries.push(ledger.commit(HoprBalance::new_base(7), now));
+        }
+        let folded = entries[0];
+        let committed = 7 * (SPEND_LEDGER_CAPACITY as u64 + 1);
+        assert_eq!(
+            ledger.spent(window, now),
+            HoprBalance::new_base(committed),
+            "folding preserves the total"
+        );
+
+        // The folded entry's range was absorbed by its successor, so this subtracts its amount
+        // rather than zeroing the survivor — zeroing would refund the survivor's own 7 as well.
+        ledger.release(folded);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(committed - 7));
+        // And releasing it again must not subtract a second time.
+        ledger.release(folded);
+        assert_eq!(ledger.spent(window, now), HoprBalance::new_base(committed - 7));
+    }
+
+    /// Releasing an expired reservation must not touch a live one.
+    ///
+    /// A slow deposit that outlives the window and then fails fund-free must refund nothing: its
+    /// entry is gone, and a by-amount fallback would subtract from whatever live reservation
+    /// happened to be there.
+    #[test]
+    fn test_release_of_an_expired_reservation_leaves_live_ones_alone() {
+        let window = StdDuration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        let mut ledger = SpendLedger::default();
+        let slow = ledger.commit(HoprBalance::new_base(30), start);
+
+        // The slow deposit ages out, and a live one is committed afterwards.
+        let later = start + StdDuration::from_secs(50);
+        assert_eq!(ledger.spent(window, later), HoprBalance::zero());
+        let live = HoprBalance::new_base(10);
+        ledger.commit(live, later);
+
+        // Releasing the expired reservation must leave the live one counted.
+        ledger.release(slow);
+        assert_eq!(ledger.spent(window, later), live);
+    }
+
+    /// A retry that lands and is then refused by the gate must not refund: an earlier attempt
+    /// already moved funds.
+    ///
+    /// `backon` reports only the last attempt's error, so the pool records that it reached the
+    /// transfer (`after_attempt`) and the strategy treats a refusal carrying that as ambiguous.
+    #[test]
+    fn test_gate_refusal_after_an_attempt_is_not_fund_free() {
+        let before = crate::pix::pools::plain::PlainDepositError::Unaffordable { after_attempt: false };
+        let after = crate::pix::pools::plain::PlainDepositError::Unaffordable { after_attempt: true };
+        assert!(StrategyError::other(before).moved_no_funds());
+        assert!(
+            !StrategyError::other(after).moved_no_funds(),
+            "an earlier attempt may have landed"
+        );
+    }
+
+    /// A pool scripted per item, so each failure's class is attributed exactly.
+    ///
+    /// `whole_batch_fails` reproduces the Curvy contract: one allocation call for the chunk, so
+    /// every item gets the same error. Otherwise each item is independent, as for the plain pool's
+    /// default `join_all` fan-out.
+    struct ScriptedBatchPool {
+        /// Per item: `(fund_free, fails)`. A short vector returns fewer outcomes than deposits.
+        script: parking_lot::Mutex<Vec<(bool, bool)>>,
+        /// Return one error for the whole batch, shaped like the Curvy chunk failure.
+        whole_batch_fails: bool,
+        /// When set, return exactly this instead of running the script, so a test can shape
+        /// outcomes a well-behaved pool would not produce (a repeated id, say). Each entry is
+        /// either a success id or a failure class.
+        raw_outcomes: Option<Vec<RawOutcome>>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("scripted failure")]
+    struct ScriptedFailure;
+
+    /// One outcome a [`ScriptedBatchPool`] returns verbatim.
+    #[derive(Clone, Copy, Debug)]
+    enum RawOutcome {
+        Success(PixAddressId),
+        FundFreeFailure,
+    }
+
+    #[async_trait::async_trait]
+    impl hopr_api::chain::DepositPool<EthDepositKey> for ScriptedBatchPool {
+        type Error = StrategyError;
+        type PoolDepositData = ByteDepositData;
+        type Receipt = ();
+
+        async fn generate_deposit_data(
+            &self,
+            id: &PixAddressId,
+        ) -> std::result::Result<Self::PoolDepositData, StrategyError> {
+            Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
+        }
+
+        async fn deposit_funds_to(
+            &self,
+            _: &PixAddressId,
+            _: &Address,
+            _: HoprBalance,
+            _: Self::PoolDepositData,
+        ) -> std::result::Result<Self::Receipt, StrategyError> {
+            // Follow the script, so a single-item flush exercises a real failure rather than
+            // always succeeding.
+            let script = self.script.lock().first().copied().unwrap_or((true, false));
+            match script {
+                (_, false) => Ok(()),
+                (true, true) => Err(StrategyError::GeneralError(
+                    hopr_api::types::primitive::prelude::GeneralError::InvalidInput,
+                )),
+                (false, true) => Err(StrategyError::other(ScriptedFailure)),
+            }
+        }
+
+        async fn deposit_funds_to_multiple(
+            &self,
+            deposits: &[(PixAddressId, Address, HoprBalance, Self::PoolDepositData)],
+        ) -> Result<Vec<std::result::Result<(PixAddressId, Self::Receipt), Self::Error>>, Self::Error> {
+            if let Some(raw) = self.raw_outcomes.clone() {
+                return Ok(raw
+                    .into_iter()
+                    .map(|outcome| match outcome {
+                        RawOutcome::Success(id) => Ok((id, ())),
+                        RawOutcome::FundFreeFailure => Err(StrategyError::GeneralError(
+                            hopr_api::types::primitive::prelude::GeneralError::InvalidInput,
+                        )),
+                    })
+                    .collect());
+            }
+            let script = self.script.lock().clone();
+            if self.whole_batch_fails {
+                // The first item's class applies to all, as one chunk failure does.
+                let fund_free = script.first().map(|(fund_free, _)| *fund_free).unwrap_or(true);
+                return Ok(deposits
+                    .iter()
+                    .map(|(id, ..)| {
+                        Err(if fund_free {
+                            StrategyError::GeneralError(hopr_api::types::primitive::prelude::GeneralError::InvalidInput)
+                        } else {
+                            StrategyError::other(ScriptedFailure)
+                        })
+                        .map(|_: ()| (*id, ()))
+                    })
+                    .collect());
+            }
+            let mut outcomes = Vec::new();
+            for ((id, ..), (fund_free, fails)) in deposits.iter().zip(script) {
+                if fails {
+                    outcomes.push(if fund_free {
+                        Err(StrategyError::GeneralError(
+                            hopr_api::types::primitive::prelude::GeneralError::InvalidInput,
+                        ))
+                    } else {
+                        Err(StrategyError::other(ScriptedFailure))
+                    });
+                } else {
+                    outcomes.push(Ok((*id, ())));
+                }
+            }
+            Ok(outcomes)
+        }
+
+        fn notify_deposit(
+            &self,
+            _: PixAddressId,
+            _: Address,
+            _: HoprBalance,
+        ) -> std::result::Result<hopr_api::chain::DepositNotification<'static, Address, Self::Error>, Self::Error>
+        {
+            Err(StrategyError::CriteriaNotSatisfied)
+        }
+
+        async fn withdraw_deposit(
+            &self,
+            _: &PixAddressId,
+            _: &EthDepositKey,
+            _: Address,
+            _: Option<HoprBalance>,
+        ) -> std::result::Result<Self::Receipt, StrategyError> {
+            Ok(())
+        }
+
+        async fn pool_transfer(
+            &self,
+            _: hopr_api::chain::PoolTransferSource<'_, EthDepositKey>,
+            _: &PixAddressId,
+            _: Address,
+            _: Self::PoolDepositData,
+            _: Option<HoprBalance>,
+        ) -> std::result::Result<Self::Receipt, StrategyError> {
+            Ok(())
+        }
+
+        /// Not funded by this mock: the funding policy is never exercised against it.
+        async fn fund(&self, _amount: HoprBalance) -> std::result::Result<(), StrategyError> {
+            Err(StrategyError::CriteriaNotSatisfied)
+        }
+
+        /// Zero available: the funding policy is never exercised against this mock, and a
+        /// zero balance would refuse a top-up it cannot pay for.
+        async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
+            Ok(HoprBalance::zero())
+        }
+    }
+
+    /// Projects one event's flush input without a live pool.
+    fn buffered(address: Address, amount: HoprBalance) -> (PixAddressId, Address, HoprBalance, ByteDepositData) {
+        let id = pix_id(1);
+        (id, address, amount, ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD))
+    }
+
+    /// Batch refunds are attributed per item: a fund-free item among successful ones still
+    /// refunds, and one ambiguous failure stops every refund in the batch.
+    #[test_log::test(tokio::test)]
+    async fn test_batch_refunds_only_when_every_failure_is_fund_free() -> anyhow::Result<()> {
+        let first: Address = [0x42u8; 20].into();
+        let second: Address = [0x43u8; 20].into();
+
+        // Attempt 1: one settles, one fails fund-free. Only the failure's amount comes back.
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [first, second] {
+            let amount = HoprBalance::new_base(10);
+            let (id, address, amount, data) = buffered(address, amount);
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(vec![(true, false), (true, true)]),
+            whole_batch_fails: false,
+            raw_outcomes: None,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool.clone(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(10),
+            "the settled item stays counted and the fund-free failure is refunded"
+        );
+        Ok(())
+    }
+
+    /// The Curvy batch shape: one error for the whole chunk, fanned out to every item.
+    ///
+    /// A fund-free chunk failure refunds all items; an ambiguous one refunds none.
+    #[test_log::test(tokio::test)]
+    async fn test_a_whole_batch_failure_refunds_every_item_or_none() -> anyhow::Result<()> {
+        for (fund_free, expected_spent) in [(true, HoprBalance::zero()), (false, HoprBalance::new_base(20))] {
+            let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+            let mut batch = Vec::new();
+            for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+                let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+                let spend = ledger.lock().commit(amount, std::time::Instant::now());
+                batch.push((id, address, amount, data, spend));
+            }
+            let pool = Arc::new(ScriptedBatchPool {
+                script: parking_lot::Mutex::new(vec![(fund_free, true)]),
+                whole_batch_fails: true,
+                raw_outcomes: None,
+            });
+            flush_deposit_batch::<_, EthDepositKey>(
+                pool,
+                moka::sync::Cache::builder().max_capacity(1).build(),
+                moka::sync::Cache::builder().max_capacity(1).build(),
+                Arc::clone(&ledger),
+                batch,
+            )
+            .await;
+            assert_eq!(
+                ledger
+                    .lock()
+                    .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+                expected_spent,
+                "fund_free={fund_free}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A pool that repeats a success id must not have an unaccounted deposit refunded.
+    ///
+    /// The batch is `[A, B]` and the pool answers `[Ok(A), Ok(A), Err(fund-free)]`. Only A is
+    /// accounted for and B's fate is unknown, so B must stay counted — even though pairing one
+    /// failure with the one unaccounted deposit would otherwise look consistent.
+    #[test_log::test(tokio::test)]
+    async fn test_duplicate_success_ids_refund_nothing() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let ids: Vec<PixAddressId> = batch.iter().map(|(id, ..)| *id).collect();
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(Vec::new()),
+            whole_batch_fails: false,
+            raw_outcomes: Some(vec![
+                RawOutcome::Success(ids[0]),
+                RawOutcome::Success(ids[0]),
+                RawOutcome::FundFreeFailure,
+            ]),
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20),
+            "a repeated success id must not refund an unaccounted deposit"
+        );
+        Ok(())
+    }
+
+    /// A success id from outside the batch must not count as an accounted-for deposit.
+    ///
+    /// The batch is `[A, B]` and the pool answers `[Ok(X), Err(fund-free)]`. `X` settles nothing
+    /// in this batch, so neither A nor B has been accounted for and both must stay counted.
+    #[test_log::test(tokio::test)]
+    async fn test_foreign_success_id_refunds_nothing() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let foreign = pix_id(1);
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(Vec::new()),
+            whole_batch_fails: false,
+            raw_outcomes: Some(vec![RawOutcome::Success(foreign), RawOutcome::FundFreeFailure]),
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20),
+            "a foreign success id must not refund a batch item whose fate is unknown"
+        );
+        Ok(())
+    }
+
+    /// A short `BatchOutcomes` leaves items unaccounted for, so nothing is refunded.
+    #[test_log::test(tokio::test)]
+    async fn test_short_batch_outcomes_refund_nothing() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        // Two deposits, one outcome: the other item's fate is unknown.
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(vec![(true, true)]),
+            whole_batch_fails: false,
+            raw_outcomes: None,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool.clone(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20)
+        );
+        Ok(())
+    }
+
     /// A zero window would evict every entry the instant it was written, silently disabling a
     /// limit the operator believes is armed. The builder is where that is caught — and it did not
     /// validate its config at all before this.
@@ -2961,7 +3829,8 @@ mod tests {
     }
 
     /// The curvy pool validates its config before it looks for the operator key or opens the
-    /// state file, which is why this needs neither.
+    /// state file, which is why this needs neither. It does need the state password, which the
+    /// builder resolves before it constructs the pool.
     ///
     /// Validation happens inside `CurvyDepositPool::new` rather than in the builder — the
     /// environment overrides have to be applied first — so this also pins that the builder still
@@ -2973,7 +3842,11 @@ mod tests {
 
         let (_cc, node, _pool) = entry_side(&[]).await?;
 
-        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+        let result = PixStrategy::new(PixStrategyConfig {
+            pix_recovery_password: Some("test_password".to_owned().into()),
+            ..Default::default()
+        })
+        .build_curvy::<_, BjjPublicKey>(
             node,
             crate::pix::pools::curvy::PoolConfig {
                 max_deposit_tracking_time: StdDuration::ZERO,
@@ -2981,7 +3854,141 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("max_deposit_tracking_time"), "{message}")
+            }
+            other => panic!("expected a rejected pool config, got {:?}", other.err()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_pix_recovery_password_prefers_the_configured_value_over_the_environment() {
+        const ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_PRECEDENCE";
+        let environment = |value: &'static str| move |name: &str| (name == ENV).then(|| value.to_owned());
+        let empty_environment = |_: &str| None;
+
+        let neither = PixStrategyConfig::default();
+        match neither.pix_recovery_password_with("test", environment("from the environment")) {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password"), "{message}")
+            }
+            other => panic!("expected a missing password, got {:?}", other.err()),
+        }
+
+        let from_env = PixStrategyConfig {
+            pix_recovery_password_env: Some(ENV.to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_env
+                .pix_recovery_password_with("test", environment("from the environment"))
+                .unwrap(),
+            "from the environment"
+        );
+        match from_env.pix_recovery_password_with("test", empty_environment) {
+            Err(StrategyError::InvalidConfiguration(message)) => assert!(message.contains(ENV), "{message}"),
+            other => panic!("expected a missing variable, got {:?}", other.err()),
+        }
+
+        let configured = PixStrategyConfig {
+            pix_recovery_password: Some("from the configuration".to_owned().into()),
+            ..from_env
+        };
+        assert_eq!(
+            configured
+                .pix_recovery_password_with("test", environment("from the environment"))
+                .unwrap(),
+            "from the configuration"
+        );
+
+        // The configured password is neither printed nor written back out.
+        assert!(!format!("{configured:?}").contains("from the configuration"));
+        let dumped = serde_json::to_string(&configured).unwrap();
+        assert!(!dumped.contains("\"pix_recovery_password\""), "{dumped}");
+        assert!(dumped.contains("\"pix_recovery_password_env\""), "{dumped}");
+    }
+
+    /// A key derived from an empty password seals nothing, so it is refused from either source,
+    /// and the error says which one supplied it.
+    #[test]
+    fn test_pix_recovery_password_rejects_an_empty_password() {
+        const ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_EMPTY";
+        let empty_variable = |name: &str| (name == ENV).then(String::new);
+
+        let configured = PixStrategyConfig {
+            pix_recovery_password: Some(String::new().into()),
+            ..Default::default()
+        };
+        match configured.pix_recovery_password_with("test", empty_variable) {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password must not be empty"), "{message}")
+            }
+            other => panic!("expected an empty password, got {:?}", other.err()),
+        }
+
+        let from_env = PixStrategyConfig {
+            pix_recovery_password_env: Some(ENV.to_owned()),
+            ..Default::default()
+        };
+        match from_env.pix_recovery_password_with("test", empty_variable) {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains(&format!("{ENV} must not be empty")), "{message}")
+            }
+            other => panic!("expected an empty password, got {:?}", other.err()),
+        }
+    }
+
+    /// The Curvy state file is sealed under the PIX recovery password, so a build without one —
+    /// neither the field nor the environment variable it names — is refused at startup rather
+    /// than opening an unsealed state file.
+    #[cfg(feature = "strategy-pix-curvy")]
+    #[test_log::test(tokio::test)]
+    async fn test_build_curvy_requires_the_pix_recovery_password() -> anyhow::Result<()> {
+        use hopr_api::types::crypto::prelude::BjjPublicKey;
+
+        // Never set by anything, so the builder finds it missing; the process environment is
+        // only ever read here, never written.
+        const UNSET_PASSWORD_ENV: &str = "HOPRD_TEST_CURVY_STATE_PASSWORD_NEVER_SET";
+
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let state = tempfile::tempdir()?;
+        let cfg = || crate::pix::pools::curvy::PoolConfig {
+            relayer_url: Some("http://127.0.0.1:1/".parse().unwrap()),
+            state_path: Some(state.path().join("curvy.redb")),
+            ..Default::default()
+        };
+        let strategy_cfg = || PixStrategyConfig {
+            pix_recovery_password: Some("test_password".to_owned().into()),
+            ..Default::default()
+        };
+
+        // The state file is sealed under the PIX recovery password, so the field is required...
+        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+            Arc::clone(&node),
+            cfg(),
+        );
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password_env"), "{message}")
+            }
+            other => panic!("expected a missing recovery password, got {:?}", other.err()),
+        }
+        // ...and so is the variable it names.
+        let result = PixStrategy::new(PixStrategyConfig {
+            pix_recovery_password_env: Some(UNSET_PASSWORD_ENV.to_owned()),
+            ..Default::default()
+        })
+        .build_curvy::<_, BjjPublicKey>(Arc::clone(&node), cfg());
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains(UNSET_PASSWORD_ENV), "{message}")
+            }
+            other => panic!("expected a missing recovery password, got {:?}", other.err()),
+        }
+
+        PixStrategy::new(strategy_cfg()).build_curvy::<_, BjjPublicKey>(node, cfg())?;
         Ok(())
     }
 
@@ -3043,9 +4050,6 @@ mod tests {
     async fn test_build_with_recovery_path_opens_store() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("pix.redb");
-        // SAFETY: `BUILD_PASSWORD_ENV` is touched by this test alone, so no other test
-        // thread can observe or clobber it.
-        unsafe { std::env::set_var(BUILD_PASSWORD_ENV, "test_password") };
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],
@@ -3060,7 +4064,7 @@ mod tests {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
             pix_recovery_db_path: Some(db.clone()),
-            pix_recovery_password_env: Some(BUILD_PASSWORD_ENV.to_string()),
+            pix_recovery_password: Some("test_password".to_owned().into()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
             ..Default::default()
@@ -3071,8 +4075,6 @@ mod tests {
             Default::default(),
         )?;
         assert!(db.exists());
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(BUILD_PASSWORD_ENV) };
         Ok(())
     }
 
@@ -4024,9 +5026,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_build_fails_when_password_env_var_missing() -> anyhow::Result<()> {
+        // Never set by anything; the process environment is only ever read, never written.
         let ev = "HOPRD_TEST_ENV_THAT_DOES_NOT_EXIST_HOPEFULLY";
-        // SAFETY: single-threaded test, no concurrent access to this variable.
-        unsafe { std::env::remove_var(ev) };
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],

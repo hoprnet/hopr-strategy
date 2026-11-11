@@ -41,10 +41,11 @@ use hopr_api::{
 
 use super::{
     CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
-    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
-    OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
+    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
+    CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
+    state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
     token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
 };
@@ -273,6 +274,20 @@ fn detector_skips_notes_of_another_token() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn detector_ignores_zero_amount_notes() -> anyhow::Result<()> {
+    // Sealed correctly to the allocation, so everything but the amount would make it ours: the
+    // sweep refuses zero-amount inputs, and a recorded one would block the allocation's sweep.
+    let fixture = owned_candidate(1)?;
+    let (zero, _) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 0, 4, "5", 2)?;
+    let watched = [(fixture.id, fixture.address, fixture.scan_secret.clone())];
+
+    assert!(fixture.detector.detect_owned_note(&zero, &watched)?.is_none());
+    // The same allocation still finds its real note.
+    assert!(fixture.detector.detect_owned_note(&fixture.note, &watched)?.is_some());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -294,7 +309,7 @@ fn redb_state_recovers_complete_notes_for_withdrawal_after_restart() -> anyhow::
     let completion_cursor = CurvyEventCursor::from(&position(2));
 
     {
-        let state = RedbCurvyDepositState::open(&path)?;
+        let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         state.record_owned_candidate(&fixture.note_id, detected, &candidate_cursor)?;
         assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(candidate_cursor));
         assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
@@ -309,7 +324,7 @@ fn redb_state_recovers_complete_notes_for_withdrawal_after_restart() -> anyhow::
         assert_eq!(state.committed_amount(&id)?, amount);
     }
 
-    let reopened = RedbCurvyDepositState::open(&path)?;
+    let reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
     assert_eq!(reopened.cursor(CurvyEventKind::Committed)?, Some(completion_cursor));
     assert_eq!(reopened.committed_amount(&id)?, amount);
     let notes = reopened.committed_notes(&id)?;
@@ -319,10 +334,63 @@ fn redb_state_recovers_complete_notes_for_withdrawal_after_restart() -> anyhow::
     reopened.remove_spent_notes(&id, &[fixture.note_id])?;
     drop(reopened);
 
-    let spent_reopened = RedbCurvyDepositState::open(&path)?;
+    let spent_reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
     assert_eq!(spent_reopened.committed_amount(&id)?, HoprBalance::zero());
     assert!(spent_reopened.committed_notes(&id)?.is_empty());
     assert!(spent_reopened.owned_note_ids()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_pre_sealing_database_has_its_scan_secrets_sealed_on_open() -> anyhow::Result<()> {
+    use redb::{ReadableDatabase, TableHandle};
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("curvy-pix.redb");
+    let id = pix_id(1);
+    let secret = scan_secret("05", "06")?;
+    let clear = secret.to_bytes().as_ref().to_vec();
+    {
+        // What a node wrote before the state file was sealed: the secret in the clear.
+        let db = redb::Database::create(&path)?;
+        let write = db.begin_write()?;
+        write
+            .open_table(LEGACY_SCAN_SECRETS_TABLE)?
+            .insert(id_bytes(&id), clear.clone())?;
+        write.commit()?;
+    }
+
+    let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+    let stored = state.scan_secret(&id)?.expect("the secret survived sealing");
+    assert_eq!(stored.view().secret_be().as_ref(), secret.view().secret_be().as_ref());
+    {
+        let db = state.shared_database();
+        let read = db.begin_read()?;
+        assert!(
+            !read
+                .list_tables()?
+                .any(|table| table.name() == LEGACY_SCAN_SECRETS_TABLE.name()),
+            "the clear table is gone"
+        );
+        let sealed = read
+            .open_table(SCAN_SECRETS_TABLE)?
+            .get(id_bytes(&id))?
+            .expect("sealed row")
+            .value();
+        assert_ne!(sealed, clear);
+        assert!(
+            !sealed.windows(clear.len()).any(|window| window == clear.as_slice()),
+            "the clear secret is not in the sealed row"
+        );
+    }
+    drop(state);
+
+    assert!(matches!(
+        RedbCurvyDepositState::open(&path, "not the password"),
+        Err(CurvyStateError::WrongPassword)
+    ));
+    let reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+    assert!(reopened.scan_secret(&id)?.is_some());
     Ok(())
 }
 
@@ -334,12 +402,12 @@ fn scan_secrets_survive_a_restart_and_are_removed_on_request() -> anyhow::Result
     let secret = scan_secret("05", "06")?;
 
     {
-        let state = RedbCurvyDepositState::open(&path)?;
+        let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         assert!(state.scan_secret(&id)?.is_none());
         state.store_scan_secret(&id, &secret)?;
     }
 
-    let reopened = RedbCurvyDepositState::open(&path)?;
+    let reopened = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
     let stored = reopened.scan_secret(&id)?.expect("the secret was persisted");
     assert_eq!(stored.public(), secret.public());
     assert_eq!(stored.view().secret_be().as_ref(), secret.view().secret_be().as_ref());
@@ -351,7 +419,7 @@ fn scan_secrets_survive_a_restart_and_are_removed_on_request() -> anyhow::Result
 #[test]
 fn wiping_chain_state_leaves_an_empty_usable_store() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let fixture = owned_candidate(1)?;
     let detected = fixture
         .detector
@@ -381,7 +449,10 @@ fn wiping_chain_state_leaves_an_empty_usable_store() -> anyhow::Result<()> {
 #[test_log::test(tokio::test)]
 async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(2)?;
     let id = fixture.id;
     let address = fixture.address;
@@ -411,7 +482,10 @@ async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()>
 #[tokio::test]
 async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
@@ -423,7 +497,10 @@ async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Resu
 #[tokio::test]
 async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let mut fixture = owned_candidate(4)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
@@ -441,7 +518,10 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
 #[tokio::test]
 async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(2)?;
     let vault = ScriptedVault::registering(4);
     let tracker = CurvyLifecycleTracker::for_vault_token(VaultToken::from_table(vault.clone()), state.clone());
@@ -469,7 +549,10 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
 #[test]
 fn registering_an_address_requests_a_historical_lifecycle_pass() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
 
@@ -482,7 +565,10 @@ fn registering_an_address_requests_a_historical_lifecycle_pass() -> anyhow::Resu
 #[test]
 fn interrupted_historical_pass_remains_requested() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
 
@@ -503,7 +589,10 @@ fn interrupted_historical_pass_remains_requested() -> anyhow::Result<()> {
 #[test_log::test(tokio::test)]
 async fn late_registration_replays_pending_and_committed_history() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("curvy-pix.redb"),
+        TEST_PASSWORD,
+    )?);
     let fixture = owned_candidate(2)?;
     let id = fixture.id;
     let address = fixture.address;
@@ -785,8 +874,10 @@ impl CurvySdkAdapter for RecordingAdapter {
             .iter()
             .fold(HoprBalance::zero(), |total, note| total + note.deposit.amount);
         Ok(CurvyWithdrawalOutcome {
+            // Like the SDK adapter, zero-amount notes are left out of the withdrawal.
             spent_note_ids: notes
                 .iter()
+                .filter(|note| !note.deposit.amount.is_zero())
                 .map(|note| {
                     format!(
                         "0x{:064x}",
@@ -1000,7 +1091,7 @@ struct Harness {
 
 async fn harness(adapter: RecordingAdapter, tracking_time: Duration) -> anyhow::Result<Harness> {
     let dir = tempfile::tempdir()?;
-    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: tracking_time,
@@ -1120,6 +1211,58 @@ async fn sweeping_an_allocation_with_nothing_committed_keeps_the_key() -> anyhow
         .await;
     assert!(matches!(result, Err(StrategyError::CriteriaNotSatisfied)), "{result:?}");
     assert!(harness.adapter.withdrawals.lock().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sweep_removes_zero_amount_notes_from_the_store() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    let id = pix_id(1);
+    let owner = BjjKeypair::random();
+    let address = *owner.public();
+    let data = pool.generate_deposit_data(&id).await?;
+    let (pending, note_id) = pending_note_for(data.scan_key(), &address, 10, 4, "13", 5)?;
+    harness.index.pending.lock().push(pending);
+    let notification = pool.notify_deposit(id, address, ten())?;
+    harness.index.committed.lock().push(completion(&note_id, 6));
+    *harness.index.head.lock() = (8, 1);
+    notification.await?;
+
+    // A zero-amount note, as a store written before the scan skipped them holds.
+    let zero = KnownOwner::new(
+        bjj_point(&address).map_err(anyhow::Error::msg)?,
+        Bn254Fr::from_fr(curvy_core::Fr::from(9_u8)),
+    )
+    .note(
+        curvy_core::Fr::from(0_u8),
+        curvy_core::Fr::from(4_u8),
+        (curvy_core::Fr::from(1_u8), curvy_core::Fr::from(2_u8)),
+        curvy_core::Fr::from(3_u8),
+    );
+    let zero_id = format!(
+        "0x{:064x}",
+        U256::from_be_bytes(curvy_core::field::fr_to_be_32(&zero.id()))
+    );
+    pool.state().record_owned_candidate(
+        &zero_id,
+        DetectedCurvyNote {
+            deposit: OwnedCurvyDeposit {
+                id,
+                address,
+                amount: HoprBalance::zero(),
+            },
+            note: zero,
+        },
+        &CurvyEventCursor::from(&position(9)),
+    )?;
+    pool.state()
+        .record_completion(&zero_id, 8, &CurvyEventCursor::from(&position(10)))?;
+    assert_eq!(pool.state().committed_notes(&id)?.len(), 2);
+
+    pool.withdraw_deposit(&id, &owner, Address::from(SAFE), None).await?;
+    assert!(pool.state().committed_notes(&id)?.is_empty());
+    assert!(pool.state().owned_note_ids()?.is_empty());
     Ok(())
 }
 
@@ -1488,6 +1631,161 @@ async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The strategy refunds a failed deposit's spend budget only on a fund-free class, so this
+/// classifier has to be right in both directions.
+#[test]
+fn only_fund_free_failures_release_the_spend_budget() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    // Nothing was allocated: the input notes could not cover the request.
+    let no_funding = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
+    assert!(no_funding.moved_no_funds());
+
+    // A batch item rejected for naming another allocation never joined `allocate`.
+    let mismatched = super::CurvyDepositPoolError::MismatchedDepositData {
+        expected: pix_id(1),
+        actual: pix_id(2),
+    };
+    assert!(mismatched.moved_no_funds());
+
+    // The reported Curvy failure: local validation, refused before any proof was submitted.
+    let fee_owner = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+            "fee-collector identity does not own the aggregator's feeNotePublicKey; the resulting fee note would \
+             violate the circuit's owner constraint"
+        ))
+        .into(),
+    );
+    assert!(fee_owner.moved_no_funds());
+
+    // A submitted aggregation may still land, so its failure stays counted.
+    let ambiguous = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+    );
+    assert!(!ambiguous.moved_no_funds());
+
+    // The class survives the conversion into `StrategyError`, which is what the flush sees.
+    let error: StrategyError = no_funding.into();
+    assert!(error.moved_no_funds(), "{error}");
+    let error: StrategyError = super::CurvyDepositPoolError::WatcherStopped.into();
+    assert!(!error.moved_no_funds(), "{error}");
+
+    // The batch path fans one chunk error out to every item; it must reach each item with the
+    // class intact rather than collapsed to a variant that always reads fund-free.
+    let fan_out: StrategyError = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("submission rejected: nonce too low")).into(),
+    )
+    .into();
+    let per_item = super::clone_error(&fan_out);
+    assert!(
+        !per_item.moved_no_funds(),
+        "an ambiguous chunk stays ambiguous per item"
+    );
+
+    // The other direction is what catches a `curvy_clone` that stringifies: a fund-free chunk
+    // error must still be fund-free per item, or a batched drain never refunds.
+    for fund_free in [
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into()),
+        super::CurvyDepositPoolError::Adapter(
+            RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+                "fee-collector identity does not own the aggregator's feeNotePublicKey"
+            ))
+            .into(),
+        ),
+    ] {
+        let fan_out: StrategyError = fund_free.into();
+        assert!(
+            super::clone_error(&fan_out).moved_no_funds(),
+            "a fund-free chunk error must stay fund-free per item"
+        );
+    }
+
+    // `CriteriaNotSatisfied` is not fund-free for any pool: it is a generic refusal whose timing
+    // is up to the pool.
+    assert!(!StrategyError::CriteriaNotSatisfied.moved_no_funds());
+
+    // A failure raised after an earlier chunk was submitted is tagged, so it is never fund-free
+    // even when the underlying error is a pre-submission refusal.
+    let after_submission: StrategyError = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::AfterSubmission {
+            source: anyhow::anyhow!("the private pool has no committed note large enough to fund 10 wei"),
+            out_of_funding: true,
+        }
+        .into(),
+    )
+    .into();
+    assert!(
+        !after_submission.moved_no_funds(),
+        "an earlier chunk may have moved funds"
+    );
+
+    // The tag is applied only to errors that would otherwise look fund-free; an already
+    // ambiguous error keeps its own variant.
+    let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 1 });
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    // A rebuild inside the first chunk re-proves an aggregation that may already be POSTed, so
+    // its SDK-side refusal must be tagged too.
+    let rebuilt = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+        "fee-collector identity does not own the aggregator's feeNotePublicKey"
+    )));
+    assert!(matches!(rebuilt, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    assert!(!super::CurvyDepositPoolError::Adapter(rebuilt.into()).moved_no_funds());
+    let untouched = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::AmbiguousAllocation);
+    assert!(matches!(untouched, RsSdkCurvyAdapterError::AmbiguousAllocation));
+}
+
+/// A drain that follows an earlier chunk stays detectable as exhaustion, even though the tag
+/// makes it no longer refundable.
+#[test]
+fn a_tagged_drain_is_still_out_of_funding() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    let tagged = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::NoFunding { required: 10 });
+    assert!(matches!(tagged, RsSdkCurvyAdapterError::AfterSubmission { .. }));
+    let error: StrategyError = super::CurvyDepositPoolError::Adapter(tagged.into()).into();
+
+    assert!(
+        super::is_out_of_funding(&error),
+        "a later-chunk drain is still exhaustion"
+    );
+    assert!(!error.moved_no_funds(), "but an earlier chunk may have moved funds");
+
+    // The same tag on a fee-key refusal is not exhaustion.
+    let not_drained = super::sdk::tag_after_submission(RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+        "fee-collector identity does not own the aggregator's feeNotePublicKey"
+    )));
+    let error: StrategyError = super::CurvyDepositPoolError::Adapter(not_drained.into()).into();
+    assert!(!super::is_out_of_funding(&error));
+}
+
+/// Exhaustion is a narrower signal than "fund-free": a consumer must not read a fee-key
+/// misconfiguration as a drained pool.
+#[test]
+fn only_no_funding_is_reported_as_out_of_funding() {
+    use super::sdk::RsSdkCurvyAdapterError;
+
+    let drained = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
+    assert!(drained.is_out_of_funding());
+    assert!(super::is_out_of_funding(&StrategyError::other(
+        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into())
+    )));
+
+    // Fund-free, but not exhaustion.
+    let fee_key = super::CurvyDepositPoolError::Adapter(
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!(
+            "fee-collector identity does not own the aggregator's feeNotePublicKey"
+        ))
+        .into(),
+    );
+    assert!(fee_key.moved_no_funds());
+    assert!(!fee_key.is_out_of_funding());
+    assert!(!super::is_out_of_funding(&StrategyError::other(fee_key)));
+
+    let payload = StrategyError::GeneralError(hopr_api::types::primitive::prelude::GeneralError::InvalidInput);
+    assert!(payload.moved_no_funds());
+    assert!(!super::is_out_of_funding(&payload));
+}
+
 #[test]
 fn tree_lag_is_recognised_and_polled_at_a_tenth_of_the_budget() {
     use super::{relayer::RelayError, sdk::RsSdkCurvyAdapterError};
@@ -1695,7 +1993,7 @@ async fn replay_pool_watch_against_staging() -> anyhow::Result<()> {
     let owner = BjjPublicKey::try_from(owner_bytes.as_slice())?;
     let bytes: [u8; 10] = pseudonym.as_slice().try_into()?;
     let id = PixAddressId::new(&HoprPseudonym::from(bytes), NonZeroU32::new(index).expect("non-zero"));
-    let state = RedbCurvyDepositState::open(state_path)?;
+    let state = RedbCurvyDepositState::open(state_path, TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: Duration::from_secs(30),
@@ -1748,7 +2046,7 @@ async fn replay_detection_against_staging() -> anyhow::Result<()> {
     let owner = BjjPublicKey::try_from(owner_bytes.as_slice())?;
     let bytes: [u8; 10] = pseudonym.as_slice().try_into()?;
     let id = PixAddressId::new(&HoprPseudonym::from(bytes), NonZeroU32::new(index).expect("non-zero"));
-    let state = RedbCurvyDepositState::open(state_path)?;
+    let state = RedbCurvyDepositState::open(state_path, TEST_PASSWORD)?;
     println!(
         "state cursors: pending {:?} committed {:?}",
         state
@@ -1810,7 +2108,7 @@ async fn replay_detection_against_staging() -> anyhow::Result<()> {
 async fn staging_watcher_catches_up_on_gnosis() -> anyhow::Result<()> {
     use super::indexer::{CurvyIndexerClient, CurvyIndexerSource, HttpSyncApi};
     let dir = tempfile::tempdir()?;
-    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"))?;
+    let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: Duration::from_secs(20),
@@ -1965,7 +2263,10 @@ fn invalid_watch_owners_cannot_hide_valid_notes() -> anyhow::Result<()> {
     assert_eq!(detected.deposit.id, fixture.id);
 
     let dir = tempfile::tempdir()?;
-    let state = Arc::new(RedbCurvyDepositState::open(dir.path().join("state.redb"))?);
+    let state = Arc::new(RedbCurvyDepositState::open(
+        dir.path().join("state.redb"),
+        TEST_PASSWORD,
+    )?);
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
     assert!(tracker.watch(pix_id(3), invalid, fixture.scan_secret, ten()).is_err());
     assert!(tracker.watched_allocations().is_empty());

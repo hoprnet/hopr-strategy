@@ -55,8 +55,8 @@ use curvy_core::{
     stealth,
 };
 use curvy_sdk::{
-    Account, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route, ScanRecipient, TxLedger,
-    ViewerIdentity,
+    Account, CircuitFamily, CircuitRef, CurvyClient, Identity, OwnedNote, PreparedDeposit, PreparedDirectShield, Route,
+    ScanRecipient, TxLedger, ViewerIdentity,
 };
 use curvy_types::OnchainNote;
 use futures::future::BoxFuture;
@@ -76,9 +76,10 @@ use super::{
     detect::{bjj_point, scan_public_key_dec},
     indexer,
     relayer::{self, RelayClient},
-    state::{RedbCurvyDepositState, id_bytes},
+    state::{RedbCurvyDepositState, SPENDER_AAD, id_bytes},
     token::VaultToken,
 };
+use crate::pix::store::sealed::Sealer;
 
 const SDK_STATE_TABLE: TableDefinition<u8, Vec<u8>> = TableDefinition::new("curvy_pix_sdk_state");
 const SDK_STATE_KEY: u8 = 0;
@@ -86,8 +87,8 @@ const SDK_ALLOCATIONS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> 
     TableDefinition::new("curvy_pix_sdk_allocations");
 /// Verifier profile `(2, 9)`: nine regular outputs, one reserved for change.
 const MAX_ALLOCATIONS_PER_PROOF: usize = 7;
-/// The pending-commitment profile takes at most five note ids.
-const MAX_COMMITMENTS_PER_PROOF: usize = 5;
+/// The pending-commitment circuit's batch: the most note ids one commit proof takes.
+const MAX_COMMITMENTS_PER_PROOF: usize = curvy_sdk::MAX_COMMIT_NOTES;
 /// The PIX withdrawal profile takes at most ten notes.
 const MAX_WITHDRAWAL_INPUTS: usize = 10;
 /// An aggregation spends one or two committed input notes.
@@ -169,9 +170,9 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
     /// What one allocation can draw on from the pool's funding notes, as the pool's own ledger
     /// has them, net of allocations.
     ///
-    /// An allocation spends at most [`MAX_ALLOCATION_INPUTS`] notes, so this is the sum of the
-    /// largest ones, not of every note: funding left in many small notes cannot pay one deposit,
-    /// and reporting its total would stop a top-up that is needed.
+    /// An allocation spends at most two committed notes, so this is the sum of the largest ones,
+    /// not of every note: funding left in many small notes cannot pay one deposit, and reporting
+    /// its total would stop a top-up that is needed.
     ///
     /// A note counts from the moment its shield is journalled, before it is committed and
     /// spendable; under either submission mode the inputs of an aggregation still count until
@@ -313,8 +314,24 @@ pub enum RsSdkCurvyAdapterError {
     IncompleteRelayRecovery,
     #[error("invalid Curvy adapter value: {0}")]
     InvalidValue(String),
+    /// No committed note can fund the request.
+    ///
+    /// Raised before this item's aggregation is built, so it proves that item moved no funds.
+    /// When an earlier chunk of the same call already submitted one, [`Self::AfterSubmission`] is
+    /// used instead, because then the *call* moved funds even though this item did not.
     #[error("the private pool has no committed note large enough to fund {required} wei")]
     NoFunding { required: u128 },
+    /// A failure raised after an aggregation in the same call was submitted, so it does not prove
+    /// the call moved no funds.
+    ///
+    /// `out_of_funding` keeps the exhaustion meaning of a tagged [`Self::NoFunding`], so a pool
+    /// running dry is still recognisable by [`super::is_out_of_funding`] after an earlier chunk
+    /// submitted.
+    #[error("Curvy allocation failed after an earlier chunk was submitted: {source}")]
+    AfterSubmission {
+        source: anyhow::Error,
+        out_of_funding: bool,
+    },
     #[error("the requested withdrawal is {requested}, but only {available} is stored")]
     InsufficientNotes { requested: u128, available: u128 },
     #[error(
@@ -417,6 +434,8 @@ struct StoredRelayAggregation {
     aggregator: String,
     max_inputs: usize,
     proof: curvy_abi::curvy_types::Groth16Proof,
+    /// The calldata words the proof is bound to, sent as the relayer's `publicSignals`. The
+    /// relayer recomputes the proof's commitment from them, so it is not journalled.
     public_signals: Vec<String>,
     request_key: String,
     spend_key: String,
@@ -437,6 +456,10 @@ struct StoredRelayAggregation {
     last_status: Option<relayer::RelayStatus>,
     #[serde(default)]
     timeouts_without_progress: u8,
+    /// The circuit family version the proof was made for. Records written before circuit versions
+    /// load as `None`; the aggregator refuses their proofs.
+    #[serde(default)]
+    circuit: Option<CircuitRef>,
 }
 
 impl StoredRelayAggregation {
@@ -608,8 +631,14 @@ struct StoredSpender {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SdkState {
+    /// The spender identity, sealed under the PIX recovery password: hex of what
+    /// [`RedbCurvySdkStore::set_spender`] produced. Read through [`RedbCurvySdkStore::spender`].
     #[serde(default)]
-    spender: Option<StoredSpender>,
+    sealed_spender: Option<String>,
+    /// Read only for the atomic migration of databases written while the identity was stored in
+    /// the clear; [`RedbCurvySdkStore::load`] seals it and the clear copy is never written again.
+    #[serde(default, rename = "spender", skip_serializing)]
+    legacy_spender: Option<StoredSpender>,
     funding: Vec<StoredNote>,
     /// Emitted notes that must be committed before their change can fund another allocation.
     pending: Vec<StoredNote>,
@@ -652,6 +681,7 @@ struct SdkState {
 
 struct RedbCurvySdkStore {
     db: Arc<redb::Database>,
+    sealer: Sealer,
 }
 
 impl RedbCurvySdkStore {
@@ -661,7 +691,39 @@ impl RedbCurvySdkStore {
         write.open_table(SDK_STATE_TABLE).map_err(db_error)?;
         write.open_table(SDK_ALLOCATIONS_TABLE).map_err(db_error)?;
         write.commit().map_err(db_error)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            sealer: state.sealer(),
+        })
+    }
+
+    /// The spender identity `state` carries, opened; `None` until one was generated.
+    fn spender(&self, state: &SdkState) -> Result<Option<StoredSpender>, RsSdkCurvyAdapterError> {
+        state
+            .sealed_spender
+            .as_deref()
+            .map(|sealed| {
+                let sealed = const_hex::decode(sealed).map_err(|error| {
+                    RsSdkCurvyAdapterError::InvalidValue(format!("sealed spender identity: {error}"))
+                })?;
+                let opened = self.sealer.open(SPENDER_AAD, &sealed).map_err(|error| {
+                    RsSdkCurvyAdapterError::InvalidValue(format!("sealed spender identity: {error}"))
+                })?;
+                serde_json::from_slice(&opened)
+                    .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("sealed spender identity: {error}")))
+            })
+            .transpose()
+    }
+
+    /// Seals `spender` into `state`; durable once `state` is saved.
+    fn set_spender(&self, state: &mut SdkState, spender: &StoredSpender) -> Result<(), RsSdkCurvyAdapterError> {
+        let encoded = serde_json::to_vec(spender).map_err(anyhow::Error::new)?;
+        let sealed = self
+            .sealer
+            .seal(SPENDER_AAD, &encoded)
+            .map_err(|error| RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("sealing the spender identity: {error}")))?;
+        state.sealed_spender = Some(const_hex::encode(sealed));
+        Ok(())
     }
 
     fn load(&self) -> Result<SdkState, RsSdkCurvyAdapterError> {
@@ -676,9 +738,20 @@ impl RedbCurvySdkStore {
                 .unwrap_or_default()
         };
         let legacy = std::mem::take(&mut state.legacy_allocations);
-        if !legacy.is_empty() {
-            // The records and removal of the old JSON history become durable together.
+        let legacy_spender = std::mem::take(&mut state.legacy_spender);
+        if let Some(spender) = &legacy_spender
+            && state.sealed_spender.is_none()
+        {
+            self.set_spender(&mut state, spender)?;
+        }
+        if !legacy.is_empty() || legacy_spender.is_some() {
+            // The records, the sealed identity and the removal of the clear copies become
+            // durable together. "Removal" from the live state only: the pages the clear
+            // identity sat in are freed, not overwritten (see the `state` module docs).
             self.save_update(&state, &legacy, &[])?;
+            if legacy_spender.is_some() {
+                tracing::info!("sealed the Curvy spender identity of a pre-sealing state database");
+            }
         }
         Ok(state)
     }
@@ -768,6 +841,26 @@ fn stealth_identity(keys: &relayer::CurvyPublicKeys, who: &str) -> Result<Identi
         big_v: keys.view_public_key.clone(),
         bjj_pub: (coordinate(x, "x")?, coordinate(y, "y")?),
     })
+}
+
+/// Marks an otherwise fund-free-looking error as following a submission in the same call.
+///
+/// An error that is already unambiguously not fund-free is left alone, so its own variant still
+/// tells the caller what happened.
+pub(crate) fn tag_after_submission(error: RsSdkCurvyAdapterError) -> RsSdkCurvyAdapterError {
+    let (fund_free_looking, out_of_funding) = match &error {
+        RsSdkCurvyAdapterError::NoFunding { .. } => (true, true),
+        RsSdkCurvyAdapterError::Sdk(inner) => (super::is_pre_submission_refusal(&inner.to_string()), false),
+        _ => (false, false),
+    };
+    if fund_free_looking {
+        RsSdkCurvyAdapterError::AfterSubmission {
+            source: anyhow::anyhow!("{error}"),
+            out_of_funding,
+        }
+    } else {
+        error
+    }
 }
 
 fn relay_error(error: relayer::RelayError) -> RsSdkCurvyAdapterError {
@@ -953,14 +1046,14 @@ where
         config.validate_signer()?;
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
-        let spender = match &persisted.spender {
+        let spender = match store.spender(&persisted)? {
             Some(spender) => Account::from_meta_keys(&full_width_key(&spender.k), &full_width_key(&spender.v))?,
             None => {
                 let (k, v, ..) =
                     stealth::new_meta().map_err(|error| RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{error}")))?;
                 let (k, v) = (full_width_key(&k), full_width_key(&v));
                 let spender = Account::from_meta_keys(&k, &v)?;
-                persisted.spender = Some(StoredSpender { k, v });
+                store.set_spender(&mut persisted, &StoredSpender { k, v })?;
                 store.save(&persisted)?;
                 tracing::info!("generated this node's Curvy spender identity");
                 spender
@@ -1399,7 +1492,12 @@ where
             }
             if !ids.is_empty() {
                 let entries = client
-                    .commit(&ids, &self.config.operator_private_key, self.config.route)
+                    .commit(
+                        &ids,
+                        CircuitFamily::Pix,
+                        &self.config.operator_private_key,
+                        self.config.route,
+                    )
                     .await?;
                 for entry in &entries {
                     tracing::info!(tx = %entry.tx_hash, notes = ids.len(), "committed pending Curvy notes");
@@ -1525,6 +1623,7 @@ where
             rebuild: false,
             last_status: None,
             timeouts_without_progress: 0,
+            circuit: Some(request.circuit),
         });
         self.store.save_update(&next, allocations, &[])?;
         *current = next;
@@ -1746,6 +1845,13 @@ where
                 }
                 return self.finish_relay_aggregation(Some(winner));
             }
+            // A proof made before circuit versions is refused by the aggregator. One never posted is
+            // proved again rather than replayed; one already posted is left to the relayer's verdict,
+            // since it may have landed before the upgrade.
+            if pending.circuit.is_none() && !pending.attempted && !pending.rebuild {
+                pending.rebuild = true;
+                self.save_relay_attempt(attempts.len() - 1, pending.clone())?;
+            }
             if pending.rebuild {
                 if attempts.len() >= MAX_RELAY_AGGREGATION_ATTEMPTS {
                     return Err(RsSdkCurvyAdapterError::RelayAttemptLimit);
@@ -1790,6 +1896,13 @@ where
             let submission = if let Some(known) = known {
                 known
             } else {
+                // The relayer does not hold it, and a proof without a circuit version cannot be
+                // posted again: prove it again.
+                let Some(circuit) = pending.circuit else {
+                    pending.rebuild = true;
+                    self.save_relay_attempt(index, pending)?;
+                    continue;
+                };
                 let was_attempted = pending.attempted;
                 pending.attempted = true;
                 self.save_relay_attempt(index, pending.clone())?;
@@ -1798,6 +1911,7 @@ where
                         curvy_abi::RelayAction::Aggregation,
                         pending.chain_id,
                         pending.max_inputs,
+                        circuit,
                         &pending.proof,
                         &pending.public_signals,
                         &pending.request_key,
@@ -2129,6 +2243,7 @@ where
         chain_id: u64,
         action: curvy_abi::RelayAction,
         max_inputs: usize,
+        circuit: CircuitRef,
         proof: &curvy_abi::curvy_types::Groth16Proof,
         public_signals: &[String],
         request_key: &str,
@@ -2141,6 +2256,7 @@ where
                 action,
                 chain_id,
                 max_inputs,
+                circuit,
                 proof,
                 public_signals,
                 request_key,
@@ -2190,13 +2306,18 @@ where
     ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         let (client, endpoints) = self.client().await?;
-        self.reconcile_relay_aggregation().await?;
+        // Reconciliation resumes an aggregation an earlier run may have broadcast, and a rebuild
+        // re-proves one it may still land. Whatever the error, it is not a pre-submission
+        // refusal, so it is tagged as such rather than read as fund-free.
+        self.reconcile_relay_aggregation().await.map_err(tag_after_submission)?;
         let ambiguous = self.state.lock().ambiguous_allocation;
         if ambiguous && !self.reconcile_ambiguous_allocation().await? {
             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
         }
-        self.reconcile_operator_aggregation().await?;
-        let deposits = {
+        self.reconcile_operator_aggregation()
+            .await
+            .map_err(tag_after_submission)?;
+        let (deposits, completed_earlier) = {
             // Every journal has been reconciled above, so a prepared record none of them names
             // was never submitted: its preparation was interrupted before the attempt was
             // journalled. It is prepared again rather than blocking the allocation for good.
@@ -2217,13 +2338,17 @@ where
                     .collect::<std::collections::HashSet<_>>()
             };
             let mut pending = Vec::new();
+            let mut completed_earlier = false;
             for (id, address, scan_key, amount) in deposits {
                 if let Some(existing) = self.store.allocation(&id_bytes(id))? {
                     if !existing.matches(address, *scan_key, *amount) {
                         return Err(RsSdkCurvyAdapterError::ConflictingAllocation);
                     }
                     match existing.stage {
-                        StoredAllocationStage::Completed => continue,
+                        StoredAllocationStage::Completed => {
+                            completed_earlier = true;
+                            continue;
+                        }
                         StoredAllocationStage::Prepared if journalled.contains(&existing.id) => {
                             return Err(RsSdkCurvyAdapterError::AmbiguousAllocation);
                         }
@@ -2234,10 +2359,38 @@ where
                 }
                 pending.push((*id, *address, *scan_key, *amount));
             }
-            pending
+            (pending, completed_earlier)
         };
         let mut receipts = self.recover_pending().await?;
+        // Whether any aggregation has been submitted (or reconciled) ahead of the current chunk.
+        // Once true, no later error proves the call moved no funds: a chunk it follows may land.
+        //
+        // A deposit that is already `Completed` counts as well. `allocate` re-runs the whole batch
+        // after tree lag, so this can be the retry of a call whose first chunk landed; its
+        // deposits are skipped here, but the caller fans a failure out to every deposit it handed
+        // in, and would refund theirs.
+        let mut submitted = !receipts.is_empty() || completed_earlier;
         for chunk in deposits.chunks(MAX_ALLOCATIONS_PER_PROOF) {
+            let chunk_result = self.allocate_chunk(client, endpoints, chunk).await;
+            // A failure here may follow an aggregation a previous chunk (or this one, before the
+            // failure) already submitted, so it does not prove the call moved no funds.
+            let chunk_result =
+                chunk_result.map_err(|error| if submitted { tag_after_submission(error) } else { error });
+            submitted = true;
+            receipts.extend(chunk_result?);
+        }
+        Ok(receipts)
+    }
+
+    /// Allocates one chunk, the body of [`Self::allocate_all`]'s loop.
+    async fn allocate_chunk(
+        &self,
+        client: &CurvyClient,
+        endpoints: &CurvyChainEndpoints,
+        chunk: &[(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)],
+    ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        let mut receipts = Vec::new();
+        {
             // A relayed aggregation carries a gas-reimbursement note for the relayer's operator;
             // a self-submitted one pays its own gas and carries none.
             let relay_fee = match (self.config.submission, self.relay.as_ref()) {
@@ -2313,8 +2466,12 @@ where
                 .await?;
             if self.config.submission == CurvySubmission::Relayer {
                 self.prepare_relay_aggregation(&request, endpoints, &funding_notes, &allocation_records)?;
-                // Errors retain the exact request and its outputs.
-                self.reconcile_relay_aggregation().await?;
+                // Past this point the aggregation may have been POSTed: a rebuild inside the
+                // reconcile re-proves it and can refuse on a rotated fee key or a re-quoted fee,
+                // which looks fund-free but is not. Tagged here because the caller's per-chunk
+                // rule only applies from the *second* chunk on. Errors retain the request and
+                // its outputs.
+                self.reconcile_relay_aggregation().await.map_err(tag_after_submission)?;
             } else {
                 receipts.extend(
                     self.submit_operator_aggregation(client, endpoints, request, &funding_notes, &allocation_records)
@@ -2348,11 +2505,15 @@ where
     /// [`MAX_NOTE_SELECTION_STEPS`], because a deposit address holds a handful of notes and an
     /// unbounded subset-sum over a pathological one is not worth stalling a sweep for. When
     /// nothing exact is found, the greedy prefix is still what the error reports.
+    ///
+    /// Zero-amount notes are left out: the withdrawal refuses them as inputs, and the scan stores
+    /// none, but a store written before it may hold some.
     fn select_notes(
         notes: Vec<CommittedCurvyNote>,
         amount: Option<HoprBalance>,
     ) -> Result<Vec<OwnedNote>, RsSdkCurvyAdapterError> {
         let mut notes = notes.iter().map(Self::owned_note).collect::<Result<Vec<_>, _>>()?;
+        notes.retain(|note| note.amount != Fr::from(0u8));
         let Some(target) = amount else {
             return Ok(notes);
         };
@@ -2415,6 +2576,7 @@ where
                         endpoints.chain_id,
                         curvy_abi::RelayAction::Withdrawal,
                         request.max_inputs,
+                        request.circuit,
                         &request.proof,
                         &request.public_signals,
                         &request.request_key,
@@ -2572,7 +2734,7 @@ where
     fn reset_chain_state(&self) -> Result<(), Self::Error> {
         let mut state = self.state.lock();
         *state = SdkState {
-            spender: state.spender.clone(),
+            sealed_spender: state.sealed_spender.clone(),
             ..Default::default()
         };
         self.store.reset(&state)
@@ -2694,7 +2856,7 @@ mod tests {
         },
     };
 
-    use super::*;
+    use super::{super::state::TEST_PASSWORD, *};
     use crate::pix::pools::curvy::{
         OwnedCurvyDeposit,
         detect::{public_key_from_dec, spend_meta_key_dec, view_key_dec},
@@ -2761,11 +2923,14 @@ mod tests {
         // encodings that can omit leading zero bytes on a subsequent reload.
         let store = RedbCurvySdkStore::new(state)?;
         let mut persisted = store.load()?;
-        if persisted.spender.is_none() {
-            persisted.spender = Some(StoredSpender {
-                k: "01".repeat(32),
-                v: "02".repeat(32),
-            });
+        if store.spender(&persisted)?.is_none() {
+            store.set_spender(
+                &mut persisted,
+                &StoredSpender {
+                    k: "01".repeat(32),
+                    v: "02".repeat(32),
+                },
+            )?;
             store.save(&persisted)?;
         }
         let blokli = Arc::new(blokli_client::BlokliClient::new(url.clone(), Default::default()));
@@ -2981,7 +3146,7 @@ mod tests {
         let path = dir.path().join("state.redb");
         let mut expected = Vec::new();
         {
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let store = RedbCurvySdkStore::new(&state)?;
             let mut records = Vec::new();
             for (id, spend, view, amount) in [
@@ -3007,7 +3172,7 @@ mod tests {
             }
             store.save_update(&SdkState::default(), &records, &[])?;
         }
-        let state = RedbCurvyDepositState::open(&path)?;
+        let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         let store = RedbCurvySdkStore::new(&state)?;
         for (id, original, amount) in expected {
             let record = store.allocation(&id)?.unwrap();
@@ -3030,6 +3195,45 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_spender_identity_is_sealed_on_load_and_survives_reopening() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.redb");
+        let (k, v) = ("01".repeat(32), "02".repeat(32));
+        {
+            let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+            let store = RedbCurvySdkStore::new(&db)?;
+            // What a node wrote before the identity was sealed: the keys in the clear.
+            let mut legacy = serde_json::to_value(SdkState::default())?;
+            legacy["spender"] = serde_json::json!({ "k": k, "v": v });
+            let write = store.db.begin_write()?;
+            write
+                .open_table(SDK_STATE_TABLE)?
+                .insert(SDK_STATE_KEY, serde_json::to_vec(&legacy)?)?;
+            write.commit()?;
+
+            let loaded = store.load()?;
+            assert!(loaded.legacy_spender.is_none());
+            let spender = store.spender(&loaded)?.expect("the identity survived sealing");
+            assert_eq!((spender.k, spender.v), (k.clone(), v.clone()));
+            let read = store.db.begin_read()?;
+            let bytes = read.open_table(SDK_STATE_TABLE)?.get(SDK_STATE_KEY)?.unwrap().value();
+            let json = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+            assert!(json.get("spender").is_none(), "the clear copy is gone");
+            assert!(json.get("sealed_spender").is_some());
+            let text = String::from_utf8(bytes)?;
+            assert!(
+                !text.contains(&k) && !text.contains(&v),
+                "the keys are not on disk in the clear"
+            );
+        }
+        let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
+        let store = RedbCurvySdkStore::new(&db)?;
+        let spender = store.spender(&store.load()?)?.expect("sealed identity reopens");
+        assert_eq!((spender.k, spender.v), (k, v));
+        Ok(())
+    }
+
+    #[test]
     fn allocation_history_migrates_atomically_and_survives_reopening() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.redb");
@@ -3037,7 +3241,7 @@ mod tests {
         completed.stage = StoredAllocationStage::Completed;
         let prepared = stored_fixture(8)?;
         {
-            let db = RedbCurvyDepositState::open(&path)?;
+            let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let store = RedbCurvySdkStore::new(&db)?;
             let mut legacy = serde_json::to_value(SdkState::default())?;
             legacy["allocations"] = serde_json::json!([completed, prepared]);
@@ -3058,7 +3262,7 @@ mod tests {
                     .is_none()
             );
         }
-        let db = RedbCurvyDepositState::open(&path)?;
+        let db = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         let store = RedbCurvySdkStore::new(&db)?;
         store.load()?;
         assert_eq!(store.allocation(&completed.id)?, Some(completed));
@@ -3185,6 +3389,8 @@ mod tests {
         let request = curvy_sdk::PixAggregationRequest {
             proof: relayer::http_tests::proof(),
             public_signals: vec!["1".to_owned()],
+            commitment: "0".to_owned(),
+            circuit: relayer::http_tests::PIX_1,
             max_inputs: 2,
             allocations: vec![Adapter::owned_note(&fixture(7))?],
             change: Adapter::owned_note(&fixture(13))?,
@@ -3334,6 +3540,195 @@ mod tests {
         Ok(())
     }
 
+    /// The state `allocate` retries into after tree lag: an earlier attempt's first chunk landed,
+    /// so its deposits are `Completed`, and the rest of the batch then fails a fund-free check.
+    ///
+    /// The caller fans that one error out to every deposit it handed in, the landed ones
+    /// included, so it must not read as fund-free.
+    #[tokio::test]
+    async fn a_failure_after_a_landed_chunk_is_not_fund_free() -> anyhow::Result<()> {
+        // Prices an allocation at exactly its total, with no fees and no per-token gas, so an
+        // empty funding store fails with `NoFunding`.
+        let server = relayer::http_tests::Server::new(|path, body| {
+            if path != "/graphql" || !body["query"].as_str().unwrap_or_default().contains("curvyVaultFees") {
+                return Some((
+                    500,
+                    serde_json::json!({ "error": format!("unexpected request to {path}") }),
+                ));
+            }
+            Some((
+                200,
+                serde_json::json!({ "data": {
+                    "curvyVaultFees": { "__typename": "CurvyVaultFees", "depositFee": "0", "withdrawalFee": "0" },
+                    "curvyAggregatorFees": {
+                        "__typename": "CurvyAggregatorFees",
+                        "protocolFeePerThousand": "0",
+                        "commitmentFeeRoot": "0x01",
+                        "feeNotePublicKey": ["1", "2"],
+                    },
+                    "curvyVaultTokenCount": { "__typename": "CurvyVaultTokenCount", "count": "0" },
+                }}),
+            ))
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let key = scan_key("07", "0b")?;
+        let deposit = |note: &CommittedCurvyNote| (note.deposit.id, note.deposit.address, key, note.deposit.amount);
+        let (landed, rest) = (fixture(7), fixture(8));
+
+        // With nothing completed, the drain is a plain `NoFunding`, which is fund-free.
+        let error = adapter.allocate_all(&[deposit(&rest)]).await.unwrap_err();
+        assert!(matches!(error, RsSdkCurvyAdapterError::NoFunding { .. }), "{error}");
+
+        let mut record = StoredAllocation::new(landed.deposit.id, &landed.deposit.address, key, landed.deposit.amount)?;
+        record.stage = StoredAllocationStage::Completed;
+        adapter.store.save_update(&adapter.state.lock(), &[record], &[])?;
+
+        let error = adapter
+            .allocate_all(&[deposit(&landed), deposit(&rest)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RsSdkCurvyAdapterError::AfterSubmission {
+                    out_of_funding: true,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(!crate::pix::pools::curvy::CurvyDepositPoolError::Adapter(error.into()).moved_no_funds());
+        Ok(())
+    }
+
+    /// `is_pre_submission_refusal` recognises the SDK's validation failures by their text, so each
+    /// one is produced here from the SDK in use. A reworded message fails this test rather than
+    /// silently turning a fund-free failure into a counted one.
+    ///
+    /// Every case trips one local check in `build_pix_aggregation`, before it reads the tree; the
+    /// fee-key mismatch comes from `fee_note`, which `build_pix_aggregation` calls once proving.
+    #[tokio::test]
+    async fn the_sdk_pre_submission_refusals_are_still_recognised() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|path, _| {
+            Some((
+                500,
+                serde_json::json!({ "error": format!("validation reached {path}") }),
+            ))
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = operator_adapter(&state, server.url.clone())?;
+        let (client, _) = adapter.client().await?;
+        let spender = &adapter.spender;
+        let own = spender.identity();
+
+        // A valid input and allocation; each case below breaks exactly one thing.
+        let mut input = Adapter::owned_note(&fixture(100))?;
+        input.owner_pub = spender.bjj_pub;
+        input.token = Fr::from(4u64);
+        let mut recipient = StoredAllocation::recipient(&fixture(7).deposit.address, scan_key("07", "0b")?)?;
+        recipient.owner_pub = (Fr::from(5u64), Fr::from(6u64));
+        let allocation = (recipient.clone(), 7u128);
+
+        let zero_input = OwnedNote {
+            amount: Fr::from(0u64),
+            ..input.clone()
+        };
+        let other_token = OwnedNote {
+            token: Fr::from(9u64),
+            ..input.clone()
+        };
+        let foreign_input = OwnedNote {
+            owner_pub: (Fr::from(5u64), Fr::from(6u64)),
+            ..input.clone()
+        };
+        let to_self = (
+            curvy_sdk::account::ScanRecipient::new(recipient.viewer.clone(), spender.bjj_pub),
+            7u128,
+        );
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Vec<OwnedNote>, Vec<_>, Option<(&Identity, u128)>)> = vec![
+            (
+                "PIX aggregation requires one or two",
+                vec![],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX aggregation requires between one and",
+                vec![input.clone()],
+                vec![],
+                None,
+            ),
+            (
+                "PIX relayer note must carry a non-zero gas reimbursement",
+                vec![input.clone()],
+                vec![allocation.clone()],
+                Some((&own, 0)),
+            ),
+            (
+                "PIX aggregation inputs must have non-zero amounts",
+                vec![zero_input],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX aggregation inputs must use one token",
+                vec![input.clone(), other_token],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX aggregation input is not owned by the funding account",
+                vec![foreign_input],
+                vec![allocation.clone()],
+                None,
+            ),
+            (
+                "PIX allocation amounts must be non-zero",
+                vec![input.clone()],
+                vec![(recipient.clone(), 0)],
+                None,
+            ),
+            (
+                "PIX allocation owner must differ from the funding account",
+                vec![input.clone()],
+                vec![to_self],
+                None,
+            ),
+            (
+                "PIX relayer owner must differ from the funding account",
+                vec![input.clone()],
+                vec![allocation.clone()],
+                Some((&own, 1)),
+            ),
+        ];
+        for (expected, inputs, allocations, relayer) in cases {
+            let message = client
+                .build_pix_aggregation(spender, &inputs, &allocations, relayer, None)
+                .await
+                .expect_err(expected)
+                .to_string();
+            assert!(message.contains(expected), "expected {expected:?}, got {message:?}");
+            assert!(super::super::is_pre_submission_refusal(&message), "{message:?}");
+        }
+
+        let message = curvy_sdk::send::fee_note(
+            Some(&own),
+            (Fr::from(5u64), Fr::from(6u64)),
+            Fr::from(1u64),
+            input.token,
+            b"seed",
+        )
+        .expect_err("a fee note sealed to the wrong collector")
+        .to_string();
+        assert!(super::super::is_pre_submission_refusal(&message), "{message:?}");
+        Ok(())
+    }
+
     fn prepare_recovery_fixture(adapter: &Adapter) -> anyhow::Result<(StoredAllocation, StoredNote)> {
         let record = stored_fixture(7)?;
         let mut input = Adapter::owned_note(&fixture(100))?;
@@ -3345,6 +3740,8 @@ mod tests {
         let request = curvy_sdk::PixAggregationRequest {
             proof: relayer::http_tests::proof(),
             public_signals: vec!["1".to_owned()],
+            commitment: "0".to_owned(),
+            circuit: relayer::http_tests::PIX_1,
             max_inputs: 2,
             allocations: vec![allocated.clone()],
             change: change.clone(),
@@ -3414,6 +3811,8 @@ mod tests {
         let request = curvy_sdk::PixAggregationRequest {
             proof: relayer::http_tests::proof(),
             public_signals: vec![attempts.len().to_string()],
+            commitment: "0".to_owned(),
+            circuit: relayer::http_tests::PIX_1,
             max_inputs: previous.max_inputs,
             allocations: vec![emitted[0].clone()],
             change,
@@ -3542,6 +3941,66 @@ mod tests {
                 assert_eq!(completed.stage, StoredAllocationStage::Completed);
                 assert!(notes.lock().contains(&adapter.store.load()?.funding[0]));
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_proof_without_a_circuit_version_is_proved_again() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Never posted, and posted but unknown to the relayer: neither is posted again.
+        for attempted in [false, true] {
+            let state = RedbCurvyDepositState::in_memory()?;
+            let store = RedbCurvySdkStore::new(&state)?;
+            let notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let posts = Arc::new(AtomicUsize::new(0));
+            let server = relayer::http_tests::Server::new({
+                let notes = notes.clone();
+                let posts = posts.clone();
+                move |path, body| {
+                    if path == "/graphql" {
+                        return Some(recovery_chain_response(&body, &notes.lock(), true));
+                    }
+                    if path.starts_with("/relay/intent/") {
+                        assert!(attempted);
+                        return Some((404, serde_json::json!({"error":"not found"})));
+                    }
+                    assert_eq!(path, "/relay/submit");
+                    assert_eq!(posts.fetch_add(1, Ordering::SeqCst), 0);
+                    let attempts = store.load().unwrap().relay_aggregations;
+                    // Only the replacement is posted.
+                    assert_eq!(attempts.len(), 2);
+                    assert!(attempts[0].attempted == attempted && attempts[0].rebuild);
+                    assert_eq!(attempts[1].circuit, Some(relayer::http_tests::PIX_1));
+                    assert_eq!(body["requestKey"], attempts[1].request_key);
+                    assert_eq!(body["circuitFamily"], "pix");
+                    *notes.lock() = attempts[1].emitted.clone();
+                    Some((
+                        200,
+                        serde_json::json!({"requestId":"versioned", "status":"included", "transactionHash":"0xabc"}),
+                    ))
+                }
+            })
+            .await;
+            let adapter = test_adapter(&state, server.url.clone())?;
+            prepare_recovery_fixture(&adapter)?;
+            {
+                let mut current = adapter.state.lock();
+                current.relay_aggregations[0].circuit = None;
+                current.relay_aggregations[0].attempted = attempted;
+                adapter.store.save(&current)?;
+            }
+            let builds = AtomicUsize::new(0);
+            let outcome = adapter
+                .reconcile_relay_aggregation_with(|| async {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    prepare_replacement_fixture(&adapter)
+                })
+                .await?
+                .unwrap();
+            assert_eq!(builds.load(Ordering::SeqCst), 1);
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
+            assert_eq!(outcome.request_id.as_deref(), Some("versioned"));
         }
         Ok(())
     }
@@ -3683,13 +4142,15 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("state.redb");
-        let mut state = RedbCurvyDepositState::open(&path)?;
+        let mut state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
         let database = Arc::new(parking_lot::Mutex::new(Some(state.shared_database())));
+        let sealer = state.sealer();
         let progress = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
         let notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let server = relayer::http_tests::Server::new({
             let database = database.clone();
+            let sealer = sealer.clone();
             let progress = progress.clone();
             let posts = posts.clone();
             let notes = notes.clone();
@@ -3701,6 +4162,7 @@ mod tests {
                     posts.fetch_add(1, Ordering::SeqCst);
                     let store = RedbCurvySdkStore {
                         db: database.lock().as_ref().unwrap().clone(),
+                        sealer: sealer.clone(),
                     };
                     let attempts = store.load().unwrap().relay_aggregations;
                     assert_eq!(attempts.len(), 2);
@@ -3755,7 +4217,7 @@ mod tests {
             *database.lock() = None;
             drop(adapter);
             drop(state);
-            state = RedbCurvyDepositState::open(&path)?;
+            state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             *database.lock() = Some(state.shared_database());
             adapter = test_adapter(&state, server.url.clone())?;
             adapter.config.relay_timeout = std::time::Duration::ZERO;
@@ -3874,14 +4336,16 @@ mod tests {
         for (winner, lost_replacement_response) in [(0, false), (1, false), (0, true), (1, true)] {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("state.redb");
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let database = Arc::new(parking_lot::Mutex::new(Some(state.shared_database())));
+            let sealer = state.sealer();
             let chain_notes = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let finalized = Arc::new(AtomicBool::new(false));
             let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let builds = AtomicUsize::new(0);
             let server = relayer::http_tests::Server::new({
                 let database = database.clone();
+                let sealer = sealer.clone();
                 let chain_notes = chain_notes.clone();
                 let finalized = finalized.clone();
                 let sent = sent.clone();
@@ -3906,6 +4370,7 @@ mod tests {
                             // Every candidate's private outputs are durable before sending its proof.
                             let store = RedbCurvySdkStore {
                                 db: database.lock().as_ref().unwrap().clone(),
+                                sealer: sealer.clone(),
                             };
                             let durable = store.load().unwrap();
                             assert_eq!(durable.relay_aggregations.len(), 2);
@@ -3974,7 +4439,7 @@ mod tests {
             *database.lock() = None;
             drop(adapter);
             drop(state);
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             *database.lock() = Some(state.shared_database());
             let adapter = test_adapter(&state, server.url.clone())?;
             finalized.store(true, Ordering::SeqCst);
@@ -4197,6 +4662,7 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("transaction_hash");
         legacy.as_object_mut().unwrap().remove("last_status");
         legacy.as_object_mut().unwrap().remove("timeouts_without_progress");
+        legacy.as_object_mut().unwrap().remove("circuit");
         encoded["relay_aggregation"] = legacy;
         let write = adapter.store.db.begin_write()?;
         write
@@ -4210,6 +4676,7 @@ mod tests {
             adapter.state.lock().relay_aggregations[0].change
         );
         assert!(!recovered.relay_aggregations[0].rebuild);
+        assert!(recovered.relay_aggregations[0].circuit.is_none());
         assert_eq!(recovered.relay_aggregations[0].timeouts_without_progress, 0);
         assert!(recovered.relay_aggregations[0].last_status.is_none());
         adapter.store.save(&recovered)?;
@@ -4262,7 +4729,7 @@ mod tests {
             .await;
             let dir = tempfile::tempdir()?;
             let path = dir.path().join("state.redb");
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let mut adapter = test_adapter(&state, server.url.clone())?;
             if failure == "timeout" {
                 adapter.config.relay_timeout = std::time::Duration::ZERO;
@@ -4289,7 +4756,7 @@ mod tests {
 
             // The restarted process loads every output before checking status or retransmitting.
             recovering.store(true, Ordering::SeqCst);
-            let state = RedbCurvyDepositState::open(&path)?;
+            let state = RedbCurvyDepositState::open(&path, TEST_PASSWORD)?;
             let adapter = test_adapter(&state, server.url.clone())?;
             adapter.reconcile_relay_aggregation().await?;
             let recovered = adapter.store.load()?;
@@ -4319,12 +4786,16 @@ mod tests {
         let landed = Arc::new(AtomicBool::new(false));
         let server = relayer::http_tests::Server::new({
             let db = state.shared_database();
+            let sealer = state.sealer();
             let landed = landed.clone();
             move |path, _| {
                 if path == "/graphql" {
                     return Some(note_status_response(landed.load(Ordering::SeqCst)));
                 }
-                let store = RedbCurvySdkStore { db: db.clone() };
+                let store = RedbCurvySdkStore {
+                    db: db.clone(),
+                    sealer: sealer.clone(),
+                };
                 let pending = store.load().unwrap().relay_aggregations.into_iter().next().unwrap();
                 assert!(pending.attempted);
                 assert!(!pending.inputs.is_empty());
@@ -4869,16 +5340,42 @@ mod tests {
         let state = RedbCurvyDepositState::in_memory()?;
         let store = RedbCurvySdkStore::new(&state)?;
         let mut persisted = store.load()?;
-        persisted.spender = Some(StoredSpender {
-            k: "01".repeat(31),
-            v: "02".repeat(31),
-        });
+        store.set_spender(
+            &mut persisted,
+            &StoredSpender {
+                k: "01".repeat(31),
+                v: "02".repeat(31),
+            },
+        )?;
         store.save(&persisted)?;
 
         let adapter = test_adapter(&state, server.url.clone())?;
         let (big_k, big_v) = short_key_identity()?;
         assert_eq!(adapter.spender.big_k, big_k);
         assert_eq!(adapter.spender.big_v, big_v);
+        Ok(())
+    }
+
+    #[test]
+    fn withdrawals_leave_out_zero_amount_notes() -> anyhow::Result<()> {
+        let amounts = |selected: Vec<OwnedNote>| {
+            selected
+                .iter()
+                .map(|note| u128::try_from(fr_to_biguint(&note.amount)).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            amounts(Adapter::select_notes(vec![fixture(7), fixture(0)], None)?),
+            vec![7]
+        );
+        assert!(Adapter::select_notes(vec![fixture(0)], None)?.is_empty());
+        assert_eq!(
+            amounts(Adapter::select_notes(
+                vec![fixture(0), fixture(5), fixture(7)],
+                Some(HoprBalance::from(U256::from(5_u8)))
+            )?),
+            vec![5]
+        );
         Ok(())
     }
 

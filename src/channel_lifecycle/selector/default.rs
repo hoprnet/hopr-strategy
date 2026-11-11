@@ -1,8 +1,10 @@
 //! Default selector: the original `peer_score_for` / `should_close` scoring,
 //! plus the shared ticket-sink demotion (see
 //! [`partition_by_forwarding`](super::partition_by_forwarding)).  With
-//! `eligibility.demote_non_forwarding_peers` off it is byte-for-byte the
-//! pre-refactor pipeline.
+//! `eligibility.demote_non_forwarding_peers` off it reproduces the
+//! pre-refactor pipeline for candidates with ticket history; since
+//! hopr-strategy#84, a candidate with no ticket history scores on the edge
+//! signal alone rather than the pre-refactor pipeline's phantom-zero score.
 
 use std::time::Duration;
 
@@ -21,16 +23,20 @@ pub struct DefaultSelector;
 impl DefaultSelector {
     /// Composite quality score for a candidate peer.
     ///
-    /// Mirrors the original `ChannelLifecycleStrategyInner::peer_score_for`.
+    /// Mirrors the original `ChannelLifecycleStrategyInner::peer_score_for` for
+    /// candidates with ticket history; since hopr-strategy#84, a candidate with
+    /// no ticket history scores as the edge score alone.
     fn peer_score(candidate: &OpenCandidate, cfg: &super::super::ChannelLifecycleConfig) -> f64 {
         let edge_score = candidate.edge_info.quality_score();
-        cfg.eligibility.peer_quality_weight * edge_score
-            + cfg.eligibility.ticket_activity_weight * candidate.ticket_score
+        cfg.eligibility
+            .composite_quality_score(edge_score, candidate.ticket_score)
     }
 
     /// Returns `true` when the channel should be closed.
     ///
-    /// Mirrors the original `ChannelLifecycleStrategyInner::should_close`.
+    /// Mirrors the original `ChannelLifecycleStrategyInner::should_close` for
+    /// candidates with ticket history; since hopr-strategy#84, a candidate with
+    /// no ticket history scores as the edge score alone.
     /// `quality_threshold` overrides `cfg.closure.close_below_quality_score`; pass
     /// `None` to use the config value.  `MultiObjectiveSelector` passes an adjusted
     /// value to enforce the hysteresis gap.
@@ -66,8 +72,9 @@ impl DefaultSelector {
         }
 
         let edge_score = candidate.edge_info.quality_score();
-        let composite_score = cfg.eligibility.peer_quality_weight * edge_score
-            + cfg.eligibility.ticket_activity_weight * candidate.ticket_score;
+        let composite_score = cfg
+            .eligibility
+            .composite_quality_score(edge_score, candidate.ticket_score);
 
         let effective_threshold = quality_threshold.unwrap_or(cfg.closure.close_below_quality_score);
         if composite_score < effective_threshold {
@@ -165,8 +172,8 @@ mod tests {
 
     /// Builds an open-candidate with a given composite-score inputs and outgoing
     /// count; `subnet` is `Unknown` so the (multi-objective-only) anonymity logic
-    /// never applies here.
-    fn open_candidate(seed: u8, edge_score: f64, ticket_score: f64) -> OpenCandidate {
+    /// never applies here. `ticket_score: None` means no redemption observed.
+    fn open_candidate(seed: u8, edge_score: f64, ticket_score: Option<f64>) -> OpenCandidate {
         OpenCandidate {
             addr: addr(seed),
             offchain_key: offchain_key(seed),
@@ -203,8 +210,8 @@ mod tests {
     /// peer with a *worse* composite score still ranks above a higher-scored sink.
     #[tokio::test]
     async fn default_selector_demotes_sinks_to_last_resort() {
-        let capable = open_candidate(1, 0.1, 0.0); // poor score, but forwards
-        let sink = open_candidate(2, 1.0, 1.0); // great score, no outgoing channels
+        let capable = open_candidate(1, 0.1, Some(0.0)); // poor score, but forwards
+        let sink = open_candidate(2, 1.0, Some(1.0)); // great score, no outgoing channels
         let forwarding_view = ForwardingView::from_counts([(addr(1), 1u32)].into_iter().collect());
 
         let cfg = ChannelLifecycleConfig::default(); // demotion on by default
@@ -223,8 +230,8 @@ mod tests {
     /// score-only ranking: the higher-scored sink wins.
     #[tokio::test]
     async fn default_selector_disabled_demotion_is_score_only() {
-        let capable = open_candidate(1, 0.1, 0.0);
-        let sink = open_candidate(2, 1.0, 1.0);
+        let capable = open_candidate(1, 0.1, Some(0.0));
+        let sink = open_candidate(2, 1.0, Some(1.0));
         let forwarding_view = ForwardingView::from_counts([(addr(1), 1u32)].into_iter().collect());
 
         let mut cfg = ChannelLifecycleConfig::default();
@@ -243,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn default_selector_all_sinks_still_selected() {
         let cfg = ChannelLifecycleConfig::default();
-        let candidates = [open_candidate(1, 0.8, 0.5), open_candidate(2, 0.7, 0.5)];
+        let candidates = [open_candidate(1, 0.8, Some(0.5)), open_candidate(2, 0.7, Some(0.5))];
         let ctx = open_ctx(&cfg, &candidates, ForwardingView::empty());
 
         let opens = DefaultSelector.select_opens(&ctx).await;
@@ -285,7 +292,7 @@ mod tests {
                 probe_success_rate: Some(0.0),
                 ack_rate: Some(0.0),
             },
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
         let cfg = ChannelLifecycleConfig::default();
         assert!(
@@ -308,7 +315,7 @@ mod tests {
                 probe_success_rate: Some(0.0),
                 ack_rate: None,
             },
-            ticket_score: 0.0,
+            ticket_score: Some(0.0),
         };
         let mut cfg = ChannelLifecycleConfig::default();
         cfg.closure.close_below_quality_score = 1.0; // would close anything with data
@@ -339,12 +346,79 @@ mod tests {
                 probe_success_rate: Some(1.0),
                 ack_rate: Some(1.0),
             },
-            ticket_score: 1.0,
+            ticket_score: Some(1.0),
         };
         let cfg = ChannelLifecycleConfig::default();
         assert!(
             DefaultSelector::should_close(&candidate, &cfg, Duration::from_secs(600), None),
             "balance-drained channel must always be closed"
+        );
+    }
+
+    /// hopr-strategy#84: with no ticket-redemption history, the composite score is
+    /// the edge score alone, not `peer_quality_weight * edge_score`. An edge score
+    /// of 0.6 must rank as 0.6, not the pre-fix 0.36 (0.6 * 0.6).
+    #[test]
+    fn peer_score_with_no_ticket_data_is_edge_score_alone() {
+        let cfg = ChannelLifecycleConfig::default();
+        let candidate = open_candidate(1, 0.6, None);
+        assert_eq!(
+            DefaultSelector::peer_score(&candidate, &cfg),
+            0.6,
+            "no ticket history must score on the edge signal alone"
+        );
+    }
+
+    /// hopr-strategy#84: a peer with no ticket history and an edge score above the
+    /// close threshold must not be closed. Pre-fix, 0.6 * 0.4 = 0.24 fell below the
+    /// default 0.3 threshold and closed it.
+    #[test]
+    fn should_close_returns_false_for_no_ticket_data_above_edge_threshold() {
+        let ch = open_channel(addr(0), addr(4));
+        let candidate = CloseCandidate {
+            channel: ch,
+            offchain_key: Some(offchain_key(4)),
+            edge_info: PeerEdgeInfo {
+                edge_score: Some(0.4),
+                last_update: Duration::from_secs(10),
+                average_latency: Some(Duration::from_millis(100)),
+                probe_success_rate: Some(0.4),
+                ack_rate: Some(0.4),
+            },
+            ticket_score: None,
+        };
+        let cfg = ChannelLifecycleConfig::default(); // close_below_quality_score = 0.3
+        assert!(
+            !DefaultSelector::should_close(&candidate, &cfg, Duration::from_secs(600), None),
+            "a peer with no ticket history and edge score 0.4 must survive the default 0.3 close threshold"
+        );
+    }
+
+    /// hopr-strategy#84: with non-default weights, no-ticket-data scoring must
+    /// still reduce to the edge score alone — not a weight-dependent fraction of
+    /// it (the issue's own triage comment proposed a formula that failed this).
+    #[test]
+    fn composite_quality_score_with_no_ticket_data_ignores_weights() {
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.eligibility.peer_quality_weight = 0.5;
+        cfg.eligibility.ticket_activity_weight = 0.5;
+        assert_eq!(
+            cfg.eligibility.composite_quality_score(0.7, None),
+            0.7,
+            "absent ticket data must score as the edge score regardless of configured weights"
+        );
+    }
+
+    /// A peer with observed ticket history still gets the unchanged two-signal
+    /// composite — this fix must not touch scoring once data exists.
+    #[test]
+    fn peer_score_with_ticket_data_is_unchanged() {
+        let cfg = ChannelLifecycleConfig::default(); // 0.6 / 0.4
+        let candidate = open_candidate(1, 0.6, Some(0.5));
+        assert_eq!(
+            DefaultSelector::peer_score(&candidate, &cfg),
+            0.6 * 0.6 + 0.4 * 0.5,
+            "a peer with ticket history must keep the full two-signal composite"
         );
     }
 }

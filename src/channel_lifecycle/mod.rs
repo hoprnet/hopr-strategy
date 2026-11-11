@@ -49,7 +49,7 @@
 //!                                                (eligible to reopen)
 //! ```
 //!
-//! In-flight states are tracked off-chain as [`ActionLeases`], keyed by
+//! In-flight states are tracked off-chain as `ActionLeases`, keyed by
 //! `ChannelId` (fund / close / finalize) or peer `Address` (open).  The on-chain
 //! `ChannelStatus` plus those leases together drive transitions.
 //!
@@ -422,7 +422,7 @@ struct ChannelLifecycleStrategyInner<N> {
     /// issuing fresh chain RPC calls on every balance-decrease event.
     last_resolved_funding: Arc<Mutex<Option<ResolvedFunding>>>,
     /// This strategy's externally observable state, recomputed fresh every tick.
-    /// `AtomicStrategyState` (from `#[atomic_enum]`) is a lock-free wrapper — no mutex
+    /// `AtomicStrategyState` (the shared `hopr-api` atomic wrapper) is a lock-free wrapper — no mutex
     /// needed for a value with no invariant tying it to any other field.
     state: Arc<crate::strategy::AtomicStrategyState>,
     /// Monotonically increasing tick number, one per `run_pipeline` call. Carried as a
