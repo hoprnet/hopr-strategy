@@ -903,11 +903,11 @@ async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow
 #[test_log::test(tokio::test)]
 async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyhow::Result<()> {
     use futures::{FutureExt, future::BoxFuture};
-    use hopr_api::types::internal::prelude::Multiaddr;
     use hopr_api::{
         chain::{AnnouncementError, ChainReceipt, ChainWriteAccountOperations, SafeRegistrationError},
         types::{
             crypto::prelude::OffchainKeypair,
+            internal::prelude::Multiaddr,
             primitive::prelude::{Balance, Currency},
         },
     };
