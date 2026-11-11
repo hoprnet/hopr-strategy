@@ -36,7 +36,7 @@ pub(crate) fn open_private_database(path: impl AsRef<Path>) -> Result<redb::Data
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(redb::Database::builder().create_file(file)?)
+    Ok(redb::Database::builder().create_with_backend(redb::backends::FileBackend::new(file)?)?)
 }
 
 #[cfg(all(test, unix))]
