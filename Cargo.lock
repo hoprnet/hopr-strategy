@@ -2141,7 +2141,7 @@ dependencies = [
  "futures",
  "futures-time",
  "hex",
- "hopr-types",
+ "hopr-types 5.0.0",
  "http",
  "indexmap 2.14.2",
  "launchdarkly-sdk-transport",
@@ -4111,8 +4111,28 @@ dependencies = [
  "chrono",
  "futures",
  "futures-concurrency",
- "hopr-types",
- "libp2p-identity",
+ "hopr-types 5.0.0",
+ "libp2p-identity 0.2.14",
+ "serde",
+ "serde_bytes",
+ "strum",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "hopr-api"
+version = "7.0.0"
+source = "git+https://github.com/hoprnet/hopr-api?rev=1e2bc79351d28b53ee7138de8bbe7ae01785bff3#1e2bc79351d28b53ee7138de8bbe7ae01785bff3"
+dependencies = [
+ "async-trait",
+ "atomic_enum",
+ "auto_impl",
+ "chrono",
+ "futures",
+ "futures-concurrency",
+ "hopr-types 7.0.0",
+ "libp2p-identity 0.3.1",
  "num_enum",
  "serde",
  "serde_bytes",
@@ -4156,8 +4176,8 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "futures-time",
- "hopr-api",
- "hopr-utilities",
+ "hopr-api 5.1.0",
+ "hopr-utilities 0.19.0",
  "moka",
  "parking_lot 0.12.5",
  "petgraph",
@@ -4195,9 +4215,9 @@ dependencies = [
  "futures-concurrency",
  "futures-time",
  "hex-literal",
- "hopr-api",
+ "hopr-api 7.0.0",
  "hopr-chain-connector",
- "hopr-utilities",
+ "hopr-utilities 0.20.0",
  "humantime-serde",
  "insta",
  "lazy_static",
@@ -4230,7 +4250,7 @@ dependencies = [
  "anyhow",
  "bytesize",
  "futures",
- "hopr-api",
+ "hopr-api 7.0.0",
  "hopr-strategy",
  "rstest",
  "test-log",
@@ -4272,8 +4292,65 @@ dependencies = [
  "hybrid-array",
  "k256 0.14.0",
  "lazy_static",
- "libp2p-identity",
- "multiaddr",
+ "libp2p-identity 0.2.14",
+ "multiaddr 0.18.2",
+ "num_enum",
+ "poly1305",
+ "primitive-types 0.14.0",
+ "rand 0.10.3",
+ "rayon",
+ "regex",
+ "rlp 0.6.1",
+ "secp256k1 0.31.1",
+ "serde",
+ "serde_bytes",
+ "serde_with",
+ "sha2 0.11.1",
+ "sha3 0.12.0",
+ "smart-default",
+ "strum",
+ "subtle",
+ "thiserror 2.0.21",
+ "tracing",
+ "typenum",
+ "zeroize",
+]
+
+[[package]]
+name = "hopr-types"
+version = "7.0.0"
+source = "git+https://github.com/hoprnet/hopr-types?rev=fe23edc552c7362c41a08af7fad63b683b8b5cb9#fe23edc552c7362c41a08af7fad63b683b8b5cb9"
+dependencies = [
+ "aes",
+ "anyhow",
+ "aquamarine",
+ "ark-bn254 0.6.0",
+ "ark-ec 0.6.0",
+ "ark-ff 0.6.0",
+ "ark-serialize 0.6.0",
+ "arrayvec",
+ "async-trait",
+ "babyjubjub-ec",
+ "bigdecimal",
+ "blake3",
+ "chacha20",
+ "chrono",
+ "cipher",
+ "const-hex",
+ "ctr",
+ "curve25519-dalek 5.0.0",
+ "digest 0.11.3",
+ "ed25519-dalek 3.0.0",
+ "elliptic-curve 0.14.3",
+ "float-cmp",
+ "hash2curve",
+ "hex-literal",
+ "hopr-bindings",
+ "hybrid-array",
+ "k256 0.14.0",
+ "lazy_static",
+ "libp2p-identity 0.3.1",
+ "multiaddr 0.19.1",
  "num_enum",
  "opentelemetry",
  "opentelemetry-prometheus-text-exporter",
@@ -4305,6 +4382,20 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a47d87130566d650aea8a10c3614c3ea3ddde51fb23df9ef10792deaab38531a"
 dependencies = [
+ "auto_impl",
+ "const-hex",
+ "futures",
+ "indexmap 2.14.2",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hopr-utilities"
+version = "0.20.0"
+source = "git+https://github.com/hoprnet/hopr-utilities?rev=b92d6c7a7e3458d4b4856889fec14627232d0955#b92d6c7a7e3458d4b4856889fec14627232d0955"
+dependencies = [
  "anyhow",
  "async-broadcast",
  "async-trait",
@@ -4314,8 +4405,8 @@ dependencies = [
  "dashmap",
  "futures",
  "futures-time",
- "hopr-api",
- "hopr-types",
+ "hopr-api 7.0.0",
+ "hopr-types 7.0.0",
  "indexmap 2.14.2",
  "serde_json",
  "thiserror 2.0.21",
@@ -4995,6 +5086,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-identity"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4af6ad75465f6bf26a1001ddbf6f2b6b84a4673bf6de289f68cdbb1430098627"
+dependencies = [
+ "bs58",
+ "ed25519-dalek 3.0.0",
+ "hkdf 0.13.0",
+ "multihash",
+ "prost",
+ "rand 0.10.3",
+ "serde",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5228,7 +5338,26 @@ dependencies = [
  "arrayref",
  "byteorder",
  "data-encoding",
- "libp2p-identity",
+ "libp2p-identity 0.2.14",
+ "multibase",
+ "multihash",
+ "percent-encoding",
+ "serde",
+ "static_assertions",
+ "unsigned-varint",
+ "url",
+]
+
+[[package]]
+name = "multiaddr"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd707c05eadfb37577f01cbec206726feeecf0b9edea259aee6fc9bc541ee253"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "libp2p-identity 0.3.1",
  "multibase",
  "multihash",
  "percent-encoding",
