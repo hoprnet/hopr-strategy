@@ -4213,7 +4213,6 @@ dependencies = [
  "serde_with",
  "smart-default",
  "statrs",
- "strum",
  "subtle",
  "tempfile",
  "test-log",

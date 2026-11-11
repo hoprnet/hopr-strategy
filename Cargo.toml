@@ -84,7 +84,6 @@ serde               = { workspace = true, features = ["derive"] }
 serde_with          = { workspace = true }
 smart-default       = { workspace = true }
 statrs              = { workspace = true }
-strum               = { workspace = true, features = ["derive"] }
 thiserror           = { workspace = true }
 tracing             = { workspace = true }
 validator           = { workspace = true, features = ["derive"] }
@@ -210,7 +209,6 @@ serde_json           = "1.0.154"
 serde_with           = "3.24.0"
 smart-default        = "0.7.1"
 statrs               = "0.19.1"
-strum                = "0.28.0"
 subtle               = "2.6.1"
 tempfile             = "3.27.0"
 test-log             = "0.2.21"
