@@ -302,8 +302,10 @@ pub struct PixStrategyConfig {
 /// and, when that is below `min_available`, asks the pool to [`fund`](DepositPool::fund) `top_up`
 /// from the Safe. Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; one funding at a time, so that
-/// concurrent flushes cannot each top up. Without the policy, deposits fail with
-/// [`StrategyError::CriteriaNotSatisfied`] once the pool is empty until an operator funds it.
+/// concurrent flushes cannot each top up. Without the policy, deposits fail once the pool is
+/// empty until an operator funds it — with which error is the pool's own answer: the plain pool
+/// raises [`StrategyError::CriteriaNotSatisfied`], the Curvy pool a typed other-error that
+/// [`is_out_of_funding`](crate::pix::pools::curvy::is_out_of_funding) recognises as exhaustion.
 ///
 /// `min_available` should cover the deposits that can arrive while a funding lands, and a
 /// margin: [`available_balance`](DepositPool::available_balance) is the pool's own ledger, which
@@ -1329,15 +1331,20 @@ where
     /// every flush is: a funding can take a shield and a commitment round, and the event stream
     /// must be read meanwhile. The first flush's own application waits behind the gate and sees
     /// the funded balance, so the two do not fund twice.
-    fn detach_startup_funding(&self) {
-        let Some(policy) = self.cfg.funding.clone() else {
-            return;
-        };
+    ///
+    /// Returns the task's handle so `run` can abort it on the way out: the handle outlives the
+    /// borrow, and an event stream that closes at once would otherwise leave the task debiting
+    /// the Safe for a strategy that has already stopped. A funding already submitted is not lost
+    /// — the pool's own journal reconciles it on the next start — but nothing new is begun.
+    fn detach_startup_funding(&self) -> Option<hopr_utils::runtime::AbortHandle> {
+        let policy = self.cfg.funding.clone()?;
         let pool = self.pool.clone();
         let gate = Arc::clone(&self.funding_gate);
-        hopr_utils::runtime::prelude::spawn(async move {
+        let (task, handle) = hopr_utils::runtime::prelude::abortable(async move {
             apply_funding_policy::<D, K>(&pool, &policy, &gate).await;
         });
+        hopr_utils::runtime::prelude::spawn(task);
+        Some(handle)
     }
 
     /// Flush the buffered deposits, waiting for the pool to finish.
@@ -1953,7 +1960,7 @@ where
 
         // Only now that there is a strategy to fund for: a failed subscription returns above, and
         // a task spawned before it would still have debited the Safe.
-        self.detach_startup_funding();
+        let startup_funding = self.detach_startup_funding();
 
         let replay = self.recovery_store.clone().map(|store| {
             hopr_utils::runtime::prelude::spawn(replay_pending_recoveries(
@@ -2045,6 +2052,13 @@ where
 
         if let Some(replay) = replay {
             replay.abort();
+        }
+        // A funding still in flight when the stream closed must not debit the Safe after the
+        // strategy has stopped. Aborted rather than awaited: a shield takes a commitment round,
+        // and shutdown must not wait on the chain. What was already submitted is not lost — the
+        // pool's journal reconciles it on the next start.
+        if let Some(funding) = startup_funding {
+            funding.abort();
         }
 
         Ok(())
