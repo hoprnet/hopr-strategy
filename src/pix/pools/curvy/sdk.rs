@@ -168,6 +168,11 @@ fn spendable_total(largest_first: impl IntoIterator<Item = u128>) -> Result<u128
         })
 }
 
+/// A Unix time for a message, which may be unknown.
+fn unix_time(time: Option<u64>) -> String {
+    time.map_or_else(|| "an unknown time".to_owned(), |time| format!("{time} (Unix seconds)"))
+}
+
 /// Seconds since the Unix epoch, or `None` when the clock is not usable (set before the epoch).
 fn unix_now() -> Option<u64> {
     std::time::SystemTime::now()
@@ -196,27 +201,32 @@ fn journal_submission(
 async fn shield_journalled(
     state: &parking_lot::Mutex<SdkState>,
     store: &RedbCurvySdkStore,
-    since: Option<u64>,
     shield: BoxFuture<'static, Result<Confirmed, ShieldFailure>>,
-) -> Result<Result<Confirmed, ShieldFailure>, RsSdkCurvyAdapterError> {
-    journal_submission(state, store, ShieldSubmission::Unknown { since })?;
+) -> Result<(Result<Confirmed, ShieldFailure>, Option<u64>), RsSdkCurvyAdapterError> {
+    journal_submission(state, store, ShieldSubmission::Unknown { since: unix_now() })?;
     let outcome = shield.await;
+    // When the outcome arrived, not when the call began: the sequencer's queue and the connector's
+    // tracking window come before it, and a grace measured from the call would have spent them.
+    let at = unix_now();
     match &outcome {
         Ok(confirmed) => journal_submission(
             state,
             store,
             ShieldSubmission::Submitted {
                 tx: confirmed.tx.clone(),
+                at,
             },
         )?,
         // The float did not move: the next funding sends.
         Err(ShieldFailure::NotSubmitted(_) | ShieldFailure::Reverted { .. }) => {
             journal_submission(state, store, ShieldSubmission::NotSubmitted)?
         }
-        // Left as it is: it may have been broadcast.
-        Err(ShieldFailure::Unconfirmed(_)) => {}
+        // It may have been broadcast: unknown from now, which is what the grace runs from.
+        Err(ShieldFailure::Unconfirmed(_)) => {
+            journal_submission(state, store, ShieldSubmission::Unknown { since: at })?
+        }
     }
-    Ok(outcome)
+    Ok((outcome, at))
 }
 
 /// The shield router's ERC-777 payload for a direct shield: `abi.encode(aggregator, note)`, with
@@ -232,8 +242,8 @@ fn direct_shield_payload(aggregator: Address, note: &OnchainNote) -> Result<Erc7
             token: word("token", &note.token)?,
             amount: word("amount", &note.amount)?,
             ephemeral_key: [
-                word("ephemeral key", &note.ephemeral_key[0])?,
-                word("ephemeral key", &note.ephemeral_key[1])?,
+                word("ephemeral key[0]", &note.ephemeral_key[0])?,
+                word("ephemeral key[1]", &note.ephemeral_key[1])?,
             ],
             view_tag: u16::try_from(note.view_tag)
                 .map_err(|_| RsSdkCurvyAdapterError::InvalidValue(format!("note view tag: {}", note.view_tag)))?,
@@ -459,9 +469,11 @@ pub enum RsSdkCurvyAdapterError {
     #[error("cannot confirm Curvy aggregation finality: {0}; all attempts are retained")]
     RelayFinalityUnavailable(String),
     #[error(
-        "the direct shield of {gross} base units (note {note}) was handed to the chain at {since:?} (Unix seconds) \
-         and the Curvy aggregator does not know its note yet; it is looked for again on the next funding, and sent \
-         again if it has not shown by {resend_after:?} (Unix seconds)"
+        "the direct shield of {gross} base units (note {note}) was handed to the chain at {} and the Curvy \
+         aggregator does not know its note yet; it is looked for again on the next funding, and sent again if it \
+         has not shown by {}",
+        unix_time(*since),
+        unix_time(*resend_after)
     )]
     ShieldSettling {
         note: String,
@@ -665,9 +677,18 @@ enum ShieldSubmission {
     /// Refused before it was broadcast, or rejected by the chain: the float did not move, and
     /// sending is safe.
     NotSubmitted,
-    /// Confirmed on chain, which means the Safe's inner call succeeded: the shield took effect and
-    /// is never sent again, whether or not the aggregator has indexed its note yet. Never demoted.
-    Submitted { tx: String },
+    /// Confirmed on chain at `at` (Unix seconds), which means the Safe's inner call succeeded: the
+    /// shield took effect, and it is not sent again while the aggregator may still be indexing its
+    /// note — for `direct_shield_settle_grace` from `at`. That bound exists because the connector
+    /// reports a failed inner call only when Blokli fills in the Safe's execution result; without
+    /// it, a failed shield looks confirmed and its note never appears. Past the grace, or with no
+    /// `at` (a journal from before it was recorded), the shield is treated as a failed inner call
+    /// and sent again.
+    Submitted {
+        tx: String,
+        #[serde(default)]
+        at: Option<u64>,
+    },
 }
 
 impl Default for ShieldSubmission {
@@ -1366,12 +1387,24 @@ where
                 ShieldSubmission::NotSubmitted => {}
                 // Confirmed on chain, so the shield took effect and is never sent again; the
                 // aggregator indexes it when it does, and the next funding reads again.
-                ShieldSubmission::Submitted { tx } => {
-                    return Err(RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
-                        note: note_id(&prepared.note),
-                        gross,
-                        tx: tx.clone(),
-                    });
+                ShieldSubmission::Submitted { tx, at } => {
+                    let grace = self.config.direct_shield_settle_grace.as_secs();
+                    // A clock that cannot be read cannot say the grace is over.
+                    if at.is_some_and(|at| unix_now().is_none_or(|now| now < at.saturating_add(grace))) {
+                        return Err(RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+                            note: note_id(&prepared.note),
+                            gross,
+                            tx: tx.clone(),
+                        });
+                    }
+                    tracing::warn!(
+                        %tx,
+                        note = %note_id(&prepared.note),
+                        %gross,
+                        "a confirmed direct shield's note never appeared within the grace; treating it as a failed \
+                         inner call of the Safe, and sending it again"
+                    );
+                    journal_submission(&self.state, &self.store, ShieldSubmission::NotSubmitted)?;
                 }
                 // Handed to the chain with no outcome recorded. Within the grace it is only looked
                 // for, once per funding, which the read above was; the full observation is for
@@ -1424,11 +1457,10 @@ where
                 let payload = direct_shield_payload(aggregator, &prepared.onchain_note)?;
                 tracing::info!(%gross, %router, "shielding the Curvy funding note from the Safe through the shield router");
                 let shield = shielder(payload, router, gross);
-                let since = unix_now();
                 let (state, store) = (Arc::clone(&self.state), self.store.clone());
                 let guard = held.take().expect("held above");
                 let (outcome, guard) = tokio::spawn(async move {
-                    let outcome = shield_journalled(&state, &store, since, shield).await;
+                    let outcome = shield_journalled(&state, &store, shield).await;
                     (outcome, guard)
                 })
                 .await
@@ -1436,7 +1468,8 @@ where
                     RsSdkCurvyAdapterError::InvalidValue(format!("the direct shield submission: {error}"))
                 })?;
                 held = Some(guard);
-                match outcome? {
+                let (outcome, at) = outcome?;
+                match outcome {
                     Ok(confirmed) => {
                         tracing::info!(tx = %confirmed.tx, "the direct shield confirmed on chain");
                         match self.observe_direct_shield(client, &prepared.note, false).await? {
@@ -1452,10 +1485,7 @@ where
                             }
                         }
                     }
-                    Err(ShieldFailure::NotSubmitted(reason)) => {
-                        return Err(RsSdkCurvyAdapterError::Funding(reason));
-                    }
-                    Err(ShieldFailure::Reverted { reason }) => {
+                    Err(ShieldFailure::NotSubmitted(reason) | ShieldFailure::Reverted { reason }) => {
                         return Err(RsSdkCurvyAdapterError::Funding(reason));
                     }
                     Err(ShieldFailure::Unconfirmed(reason)) => {
@@ -1463,8 +1493,8 @@ where
                         return Err(RsSdkCurvyAdapterError::ShieldSettling {
                             note: note_id(&prepared.note),
                             gross,
-                            since,
-                            resend_after: since
+                            since: at,
+                            resend_after: at
                                 .map(|since| since.saturating_add(self.config.direct_shield_settle_grace.as_secs())),
                         });
                     }
@@ -5619,6 +5649,8 @@ mod tests {
         Revert,
         /// No answer: the note does not land, as far as anyone can tell.
         Unconfirmed,
+        /// No answer, after a wait of real time over a second: the call and the outcome differ.
+        SlowUnconfirmed,
         /// Confirmed, and the note lands.
         Confirm,
     }
@@ -5645,6 +5677,10 @@ mod tests {
                 Outcome::Unconfirmed => {
                     Box::pin(async { Err(ShieldFailure::Unconfirmed("tracking timed out".to_owned())) })
                 }
+                Outcome::SlowUnconfirmed => Box::pin(async {
+                    std::thread::sleep(std::time::Duration::from_millis(1100));
+                    Err(ShieldFailure::Unconfirmed("tracking timed out".to_owned()))
+                }),
                 Outcome::Confirm => {
                     landed.store(true, Ordering::SeqCst);
                     Box::pin(async { Ok(confirmed_shield()) })
@@ -5820,12 +5856,45 @@ mod tests {
         Ok(())
     }
 
-    /// A transaction confirmed on chain is never sent again, whatever the aggregator knows: its
-    /// note is read once per funding, and the shield settles when the aggregator catches up.
+    /// The grace runs from when the outcome arrived, not from when the call was made: the
+    /// sequencer's queue and the connector's tracking window come in between.
+    #[tokio::test]
+    async fn an_unconfirmed_direct_shield_is_dated_from_its_outcome() -> anyhow::Result<()> {
+        let rig = shield_rig(
+            "7",
+            Some(ShieldSubmission::NotSubmitted),
+            false,
+            vec![Outcome::SlowUnconfirmed],
+        )
+        .await?;
+        let before = unix_now().unwrap();
+
+        let error = rig.fund().await.unwrap_err();
+
+        let Some(ShieldSubmission::Unknown { since: Some(since) }) = rig.journal()? else {
+            panic!("journalled as unknown: {error}");
+        };
+        assert!(
+            since > before,
+            "dated from the outcome ({since}), not the call ({before})"
+        );
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::ShieldSettling { since: Some(reported), .. } if reported == since),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A transaction confirmed on chain is not sent again while the aggregator may be indexing its
+    /// note: it is read once per funding, and the shield settles when the aggregator catches up.
+    /// Past the grace the note's absence is taken for a failed inner call of the Safe, and it is
+    /// sent again.
     #[tokio::test(start_paused = true)]
-    async fn a_confirmed_direct_shield_with_no_note_is_never_resent() -> anyhow::Result<()> {
+    async fn a_confirmed_direct_shield_with_no_note_is_not_resent_within_its_grace() -> anyhow::Result<()> {
         let tx = confirmed_shield().tx;
-        let rig = shield_rig("7", Some(ShieldSubmission::Submitted { tx: tx.clone() }), false, vec![]).await?;
+        let at = Some(unix_now().unwrap());
+        let submitted = ShieldSubmission::Submitted { tx: tx.clone(), at };
+        let rig = shield_rig("7", Some(submitted.clone()), false, vec![]).await?;
 
         let error = rig.fund().await.unwrap_err();
 
@@ -5834,18 +5903,42 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains(&tx), "{error}");
-        assert_eq!(rig.sent(), 0, "nothing is sent");
+        assert_eq!(rig.sent(), 0, "nothing is sent within the grace");
         assert_eq!(
             rig.reads.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "one read per funding"
         );
-        assert_eq!(rig.journal()?, Some(ShieldSubmission::Submitted { tx }));
+        assert_eq!(rig.journal()?, Some(submitted));
 
         rig.landed.store(true, std::sync::atomic::Ordering::SeqCst);
         rig.fund().await?;
         assert_eq!(rig.sent(), 0);
         assert_eq!(rig.store.load()?.funding, vec![StoredNote::from(&rig.note)]);
+        Ok(())
+    }
+
+    /// Past the grace — or with no time recorded — a confirmed shield whose note never appeared is
+    /// treated as a failed inner call, and sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_direct_shield_with_no_note_is_resent_after_its_grace() -> anyhow::Result<()> {
+        for at in [Some(unix_now().unwrap() - 3600), None] {
+            let rig = shield_rig(
+                "7",
+                Some(ShieldSubmission::Submitted {
+                    tx: confirmed_shield().tx,
+                    at,
+                }),
+                false,
+                vec![],
+            )
+            .await?;
+
+            rig.fund().await?;
+
+            assert_eq!(rig.sent(), 1, "sent again, {at:?}");
+            assert_eq!(rig.store.load()?.funding, vec![StoredNote::from(&rig.note)]);
+        }
         Ok(())
     }
 
@@ -5856,6 +5949,7 @@ mod tests {
             "7",
             Some(ShieldSubmission::Submitted {
                 tx: confirmed_shield().tx,
+                at: None,
             }),
             true,
             vec![],

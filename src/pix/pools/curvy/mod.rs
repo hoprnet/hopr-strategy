@@ -677,8 +677,9 @@ impl CurvyDepositPoolError {
                 Some(sdk::RsSdkCurvyAdapterError::Sdk(error)) => is_pre_submission_refusal(&error.to_string()),
                 _ => false,
             },
-            // A batch item rejected for naming another allocation never joined `allocate`.
-            Self::MismatchedDepositData { .. } => true,
+            // A batch item rejected for naming another allocation never joined `allocate`, and a
+            // funding transfer with no amount is refused before the adapter is touched.
+            Self::MismatchedDepositData { .. } | Self::FundingTransferNeedsAmount => true,
             // Everything else is ambiguous: `Adapter` usually wraps a submitted aggregation whose
             // outcome was lost, and the rest leave the allocation in a state a later retry can
             // still spend.
@@ -690,8 +691,7 @@ impl CurvyDepositPoolError {
             | Self::Indexer(_)
             | Self::DepositTimeout
             | Self::ScanIdentity(_)
-            | Self::UnsupportedPoolTransfer
-            | Self::FundingTransferNeedsAmount => false,
+            | Self::UnsupportedPoolTransfer => false,
         }
     }
 
@@ -1425,7 +1425,10 @@ where
                     }
                     return Ok(value);
                 }
-                Err(error) if is_retryable_lag(&error.to_string()) && tokio::time::Instant::now() + poll < deadline => {
+                Err(error)
+                    if (is_retryable_lag(&error.to_string()) || is_shield_lag(&error))
+                        && tokio::time::Instant::now() + poll < deadline =>
+                {
                     waited += 1;
                     tracing::info!(
                         %error,
@@ -1475,6 +1478,15 @@ fn is_transient_chain_read(message: &str) -> bool {
 /// the chain read behind it failing transiently.
 fn is_retryable_lag(message: &str) -> bool {
     is_tree_lag(message) || is_transient_chain_read(message)
+}
+
+/// Whether a funding error is a direct shield settling, or confirmed and not yet indexed: the
+/// chain or the aggregator catching up, matched by type rather than text.
+fn is_shield_lag(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        error.downcast_ref::<RsSdkCurvyAdapterError>(),
+        Some(RsSdkCurvyAdapterError::ShieldSettling { .. } | RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { .. })
+    )
 }
 
 /// How often to re-try an allocation that is waiting for the committed tree: a tenth of the

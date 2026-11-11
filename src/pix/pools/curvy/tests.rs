@@ -1164,6 +1164,27 @@ fn a_failed_shield_transaction_is_classified_by_the_connectors_own_predicates() 
     ));
 }
 
+/// A direct shield that is settling, or confirmed and not yet indexed, is waited out by funding;
+/// any other failure of it is not.
+#[test]
+fn a_settling_direct_shield_is_lag() {
+    use super::sdk::RsSdkCurvyAdapterError as Error;
+    let settling = Error::ShieldSettling {
+        note: "0x01".into(),
+        gross: 7,
+        since: None,
+        resend_after: None,
+    };
+    let unindexed = Error::ShieldConfirmedUnindexed {
+        note: "0x01".into(),
+        gross: 7,
+        tx: "0x02".into(),
+    };
+    assert!(super::is_shield_lag(&settling), "{settling}");
+    assert!(super::is_shield_lag(&unindexed), "{unindexed}");
+    assert!(!super::is_shield_lag(&Error::Funding("refused".into())));
+}
+
 struct Harness {
     pool: CurvyDepositPool<ChainNodeOf, ScriptedIndex, RecordingAdapter, RedbCurvyDepositState>,
     index: Arc<ScriptedIndex>,
@@ -1729,6 +1750,9 @@ fn only_fund_free_failures_release_the_spend_budget() {
         actual: pix_id(2),
     };
     assert!(mismatched.moved_no_funds());
+
+    // A funding transfer with no amount is refused before the adapter is touched.
+    assert!(super::CurvyDepositPoolError::FundingTransferNeedsAmount.moved_no_funds());
 
     // The reported Curvy failure: local validation, refused before any proof was submitted.
     let fee_owner = super::CurvyDepositPoolError::Adapter(
