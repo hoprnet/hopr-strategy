@@ -10,14 +10,13 @@
 use std::fmt::{Debug, Display, Formatter};
 
 use futures::StreamExt as _;
-use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
-
-use crate::errors::Result;
-
 /// Shared component health types, retained under their strategy-specific names.
 ///
 /// States default to `Running` and are ordered by increasing severity.
 pub use hopr_api::{AtomicComponentState as AtomicStrategyState, ComponentState as StrategyState};
+use hopr_utils::runtime::prelude::{AbortHandle, abortable, spawn};
+
+use crate::errors::Result;
 
 /// A strategy that runs until cancelled or a fatal error occurs.
 ///

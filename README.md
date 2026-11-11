@@ -32,10 +32,10 @@ takes ownership of the children. Entries preserve construction order and duplica
 across strategies. Strategies without a health implementation report `Running`; channel lifecycle exposes live health transitions through
 its shared state handle.
 
-With the `serde` feature, the observer also implements `hopr_api::StateDump`. Import `hopr_api::StateDump` and call
-`observer.dump().await` to collect an owned Serde snapshot with the same `name` and `state` fields. Polling is non-consuming and does not
-change operational state; returned snapshots remain usable after the observer is dropped. `StrategyState` and `AtomicStrategyState`
-re-export the shared `hopr-api` component health types. Scheduling and logging remain the caller's responsibility.
+With the `serde` feature, the observer also implements `hopr_api::StateDump`. Import `hopr_api::StateDump` and call `observer.dump().await`
+to collect an owned Serde snapshot with the same `name` and `state` fields. Polling is non-consuming and does not change operational state;
+returned snapshots remain usable after the observer is dropped. `StrategyState` and `AtomicStrategyState` re-export the shared `hopr-api`
+component health types. Scheduling and logging remain the caller's responsibility.
 
 ### PIX deposit pools
 
