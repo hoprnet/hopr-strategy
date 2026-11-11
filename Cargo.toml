@@ -63,6 +63,7 @@ strategy-pix-curvy = [
   "dep:curvy-core",
   "dep:curvy-sdk",
   "dep:curvy-types",
+  "dep:hopr-chain-connector",
   "dep:reqwest",
   "dep:serde_json",
   "dep:zeroize",

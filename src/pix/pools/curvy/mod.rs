@@ -140,8 +140,8 @@ use hopr_api::{
 };
 pub use lifecycle::{BlokliIndex, CurvyIndexSource, PendingNotesPage};
 pub use sdk::{
-    CurvyChainEndpoints, CurvySdkAdapter, DirectShielder, PortalFunder, RsSdkCurvyAdapter, RsSdkCurvyAdapterConfig,
-    RsSdkCurvyAdapterError,
+    Confirmed, CurvyChainEndpoints, CurvySdkAdapter, DirectShielder, PortalFunder, RsSdkCurvyAdapter,
+    RsSdkCurvyAdapterConfig, RsSdkCurvyAdapterError, ShieldFailure,
 };
 use serde_with::{DisplayFromStr, serde_as};
 pub use state::{CurvyDepositState, CurvyEventKind, CurvyStateError, RedbCurvyDepositState};
@@ -196,6 +196,9 @@ impl crate::pix::DepositAddressOf<PoolKeypair> for DepositAddress {}
 /// Curvy-only YAML key is unreachable from there.
 pub const SHIELDING_ENV: &str = "HOPRD_CURVY_SHIELDING";
 /// Removed with the pool's implicit funding; still looked at so that a leftover value is reported.
+#[deprecated(
+    note = "the pool never funds itself; configure the strategy's `funding` policy or call `DepositPool::fund`"
+)]
 pub const INITIAL_FUNDING_ENV: &str = "HOPRD_CURVY_INITIAL_FUNDING";
 
 /// Environment variable that overrides [`CurvyDepositPoolConfig::submission`].
@@ -327,6 +330,10 @@ fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_direct_shield_settle_grace() -> Duration {
+    Duration::from_secs(600)
+}
+
 fn default_operator_key_env() -> String {
     "HOPRD_CURVY_OPERATOR_PRIVATE_KEY".to_owned()
 }
@@ -404,6 +411,22 @@ pub struct CurvyDepositPoolConfig {
     #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
     #[validate(custom(function = "validate_min_1sec"))]
     pub max_deposit_tracking_time: Duration,
+
+    /// How long a direct shield whose outcome is unknown — handed to the chain, then no answer, or
+    /// a crash in between — is waited for before the Safe sends it again. Within it, funding
+    /// reports that the shield is settling and looks for its note again on the next call; after it,
+    /// a note still missing is shielded again, which pays `top_up` a second time if the first
+    /// transaction lands after all. Default: 10 minutes.
+    ///
+    /// Sized to exceed the longest a transaction can be in flight and unanswered: the connector
+    /// gives a transaction its chain's finality times its block time times a multiplier of 2 to
+    /// confirm, and Blokli's own tracking timeout and the connector's nonce-gap tolerance are 5
+    /// minutes, after which a dropped transaction is given up on; the grace is twice that, which
+    /// leaves room for a slow block and for the aggregator to index the note.
+    #[default(default_direct_shield_settle_grace())]
+    #[serde(with = "humantime_serde", default = "default_direct_shield_settle_grace")]
+    #[validate(custom(function = "validate_min_1sec"))]
+    pub direct_shield_settle_grace: Duration,
 
     /// The Curvy vault token id of wxHOPR. Default: unset, and the pool resolves it through
     /// Blokli. Overridden by [`TOKEN_ENV`].
@@ -485,6 +508,9 @@ pub struct CurvyDepositPoolConfig {
     pub safe_multisend_address: Address,
     /// Removed: the pool never funds itself. Kept so that a leftover setting is reported rather
     /// than ignored; see [`CurvyDepositPool::new`].
+    #[deprecated(
+        note = "the pool never funds itself; configure the strategy's `funding` policy or call `DepositPool::fund`"
+    )]
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_funding: Option<HoprBalance>,
@@ -811,15 +837,57 @@ where
     Arc::new(move |payload: Erc777Payload, router: Address, gross: u128| {
         let api = api.clone();
         Box::pin(async move {
+            // Enqueueing only hands the transaction to the sequencer. Whether it is broadcast —
+            // every refusal by Blokli or the RPC node — comes with the confirmation, so the two
+            // are classified alike.
             let pending = api
                 .send_erc777(HoprBalance::from(U256::from(gross)), &router, &payload)
                 .await
-                .map_err(|error| error.to_string())?;
-            let tx = pending.await.map_err(|error| error.to_string())?;
-            tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
-            Ok(())
-        }) as BoxFuture<'static, Result<(), String>>
+                .map_err(|error| ShieldFailure::NotSubmitted(error.to_string()))?;
+            match pending.await {
+                Ok(tx) => {
+                    tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
+                    Ok(Confirmed { tx: tx.to_string() })
+                }
+                Err(error) => Err(classify_shield_error(&error)),
+            }
+        }) as BoxFuture<'static, Result<Confirmed, ShieldFailure>>
     })
+}
+
+/// What a failed direct-shield transaction leaves the float in, from the connector's own
+/// classification of its error, found by walking the error's sources in case the chain API wraps
+/// it. The same split as the connector's sequencer makes of whether a nonce was consumed:
+///
+/// | Connector error | Outcome |
+/// |---|---|
+/// | `is_refused_before_broadcast()`, or RPC `FEE_TOO_LOW` / `INSUFFICIENT_FUNDS` | [`ShieldFailure::NotSubmitted`] |
+/// | `as_transaction_rejection_error()`, or `InnerTxFailed` | [`ShieldFailure::Reverted`] |
+/// | any other RPC code (`NONCE_TOO_LOW`, `ALREADY_KNOWN`, …), a timeout, a transport failure, an error that is not the connector's | [`ShieldFailure::Unconfirmed`] |
+///
+/// The last row may have been broadcast — an earlier copy of the transaction can be in the mempool
+/// — so it is never treated as unsent.
+fn classify_shield_error(error: &(dyn std::error::Error + 'static)) -> ShieldFailure {
+    use hopr_chain_connector::errors::ConnectorError;
+    let reason = error.to_string();
+    let mut current = Some(error);
+    let connector = std::iter::from_fn(|| {
+        let this = current?;
+        current = this.source();
+        Some(this)
+    })
+    .find_map(|error| error.downcast_ref::<ConnectorError>());
+    match connector {
+        Some(error)
+            if error.is_refused_before_broadcast()
+                || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS")) =>
+        {
+            ShieldFailure::NotSubmitted(reason)
+        }
+        Some(error) if error.as_transaction_rejection_error().is_some() => ShieldFailure::Reverted { reason },
+        Some(ConnectorError::InnerTxFailed(_)) => ShieldFailure::Reverted { reason },
+        _ => ShieldFailure::Unconfirmed(reason),
+    }
 }
 
 /// How long a single relayer HTTP request may take.
@@ -949,16 +1017,20 @@ where
         // The pool never funds itself any more. Without `deny_unknown_fields` (see the config
         // docs) a leftover setting would be ignored without a word, and the first deposit would
         // fail for want of funding with nothing pointing at the setting.
-        if cfg.initial_funding.is_some() {
+        #[allow(deprecated)]
+        let leftover_initial_funding = cfg.initial_funding.is_some();
+        if leftover_initial_funding {
             tracing::warn!(
                 "`initial_funding` is no longer read: the pool never funds itself; configure the strategy's `funding` \
                  policy or fund the pool through the node API"
             );
         }
-        if std::env::var_os(INITIAL_FUNDING_ENV).is_some() {
+        #[allow(deprecated)]
+        let leftover_env = INITIAL_FUNDING_ENV;
+        if std::env::var_os(leftover_env).is_some() {
             tracing::warn!(
-                "{INITIAL_FUNDING_ENV} is no longer read: the pool never funds itself; configure the strategy's \
-                 `funding` policy or fund the pool through the node API"
+                "{leftover_env} is no longer read: the pool never funds itself; configure the strategy's `funding` \
+                 policy or fund the pool through the node API"
             );
         }
         // Environment overrides are applied before validation, so an override that contradicts
@@ -1021,7 +1093,8 @@ where
             cfg.blokli_url.to_string(),
             RsSdkCurvyAdapterConfig::new(operator_key, token.clone())
                 .with_modes(cfg.shielding, cfg.submission, cfg.relayer_url.clone())
-                .with_note_source(cfg.note_source, cfg.curvy_indexer_url.clone()),
+                .with_note_source(cfg.note_source, cfg.curvy_indexer_url.clone())
+                .with_direct_shield_settle_grace(cfg.direct_shield_settle_grace),
             safe_funder(node.chain_api().clone()),
             match cfg.shielding {
                 CurvyShielding::Direct => Some(safe_direct_shielder(node.chain_api().clone())),

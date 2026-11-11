@@ -132,6 +132,20 @@ fn validate_positive_balance(balance: &HoprBalance) -> std::result::Result<(), v
     Ok(())
 }
 
+fn validate_funding_policy(policy: &PixFundingPolicy) -> std::result::Result<(), validator::ValidationError> {
+    if policy.min_available >= policy.top_up {
+        return Err(
+            validator::ValidationError::new("min_available_not_below_top_up").with_message(
+                "`min_available` must be below `top_up`: a top-up nets `top_up` less the pool's fee, so a threshold \
+                 at or above `top_up` can never be cleared and every flush would shield again. Keep it at or below \
+                 half of `top_up` for one top-up to clear it"
+                    .into(),
+            ),
+        );
+    }
+    Ok(())
+}
+
 fn validate_min_1sec(duration: &Duration) -> std::result::Result<(), validator::ValidationError> {
     if duration.as_secs() < 1 {
         return Err(validator::ValidationError::new("must be at least 1 second"));
@@ -307,16 +321,25 @@ pub struct PixStrategyConfig {
 /// raises [`StrategyError::CriteriaNotSatisfied`], the Curvy pool a typed other-error that
 /// [`is_out_of_funding`](crate::pix::pools::curvy::is_out_of_funding) recognises as exhaustion.
 ///
-/// `min_available` should cover the deposits that can arrive while a funding lands, and a
-/// margin: [`available_balance`](DepositPool::available_balance) is the pool's own ledger, which
-/// for a privacy pool counts a funding note before it is spendable. It is also what one deposit
-/// can draw on, not everything the pool holds, so funding scattered over many small notes does
-/// not keep the top-up away.
+/// `min_available` must be below `top_up`, and is refused otherwise. A shield nets `top_up` less
+/// the pool's own fee, and [`available_balance`](DepositPool::available_balance) is what a single
+/// deposit can draw on, not everything the pool holds — for the Curvy pool, at most the two
+/// largest notes. After k top-ups from empty it is `min(k, 2) × (top_up − fee)`. A threshold at or
+/// above `top_up` can therefore never be cleared, and every flush and restart would shield another
+/// `top_up` without bound.
+///
+/// Below `top_up`, one top-up clears the threshold only when `min_available ≤ top_up − fee`;
+/// keeping `min_available` at or below half of `top_up` makes that hold for any fee under half of
+/// `top_up`. That is a recommendation, not a rule: above it a cycle can take a second top-up, and
+/// no more than two, for any fee under half of `top_up`. A privacy pool also counts a funding note
+/// before it is spendable.
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
+#[validate(schema(function = "validate_funding_policy"))]
 pub struct PixFundingPolicy {
-    /// Fund when the pool can pay less than this. Zero would never fund; leave the policy out instead.
+    /// Fund when the pool can pay less than this. Zero would never fund; leave the policy out
+    /// instead. Below `top_up`, so that the top-up can satisfy it.
     #[serde_as(as = "DisplayFromStr")]
     #[validate(custom(function = "validate_positive_balance"))]
     pub min_available: HoprBalance,
@@ -595,6 +618,14 @@ impl PixStrategy {
 
         // `Arc` for the same reason as in `build_non_anonymous`; the pool itself is deliberately
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
+        // Pairs with the leftover `initial_funding` warnings in `CurvyDepositPool::new`: a
+        // deployment that relied on the old default funds nothing now and fails every deposit.
+        if self.cfg.funding.is_none() {
+            tracing::warn!(
+                "the Curvy pool has no `funding` policy: the previous automatic initial funding no longer exists, and \
+                 deposits fail with `NoFunding` until the pool is funded through a `funding` policy or the node API"
+            );
+        }
         let state_password = self
             .cfg
             .pix_recovery_password("the Curvy pool's state file is sealed under it")?;
@@ -685,6 +716,7 @@ impl PixStrategy {
             spend_ledger: Arc::new(parking_lot::Mutex::new(SpendLedger::default())),
             detach_flushes: false,
             funding_gate: Arc::new(futures::lock::Mutex::new(())),
+            funding_stop: tokio::sync::watch::channel(false).0,
         }))
     }
 }
@@ -952,6 +984,13 @@ where
     /// Held across one application of the funding policy — the balance read and the funding it
     /// decides on — so that concurrent flush tasks fund once between them, not once each.
     funding_gate: Arc<futures::lock::Mutex<()>>,
+    /// Set to `true` when `run` is ending. It decides only whether a startup funding may *start*:
+    /// one that is still waiting for `funding_gate` then does not. A funding that holds the gate
+    /// always runs to the end and is journalled by the pool, whether or not `run` is still
+    /// running — a Safe transaction cannot be un-sent, and dropping its future would only lose the
+    /// record of it. The fundings of the flushes do not obey it: their batches depend on them.
+    /// Dropping the strategy reads as the same.
+    funding_stop: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(test)]
@@ -999,6 +1038,7 @@ where
             spend_ledger: Arc::new(parking_lot::Mutex::new(SpendLedger::default())),
             detach_flushes: false,
             funding_gate: Arc::new(futures::lock::Mutex::new(())),
+            funding_stop: tokio::sync::watch::channel(false).0,
         }
     }
 }
@@ -1313,17 +1353,6 @@ where
         Ok(())
     }
 
-    /// Applies the funding policy, if one is configured, waiting for it.
-    ///
-    /// Used where the loop is not running: at the end of `run`, ahead of the final flush. The
-    /// loop itself applies it inside [`Self::detach_flush_deposits`]'s task, and at startup in a
-    /// task of its own.
-    async fn apply_funding_policy(&self) {
-        if let Some(policy) = &self.cfg.funding {
-            apply_funding_policy::<D, K>(&self.pool, policy, &self.funding_gate).await;
-        }
-    }
-
     /// Hand the startup application of the funding policy to a task and return immediately.
     ///
     /// A pool that starts empty is funded before the first deposit arrives rather than at its
@@ -1332,19 +1361,40 @@ where
     /// must be read meanwhile. The first flush's own application waits behind the gate and sees
     /// the funded balance, so the two do not fund twice.
     ///
-    /// Returns the task's handle so `run` can abort it on the way out: the handle outlives the
-    /// borrow, and an event stream that closes at once would otherwise leave the task debiting
-    /// the Safe for a strategy that has already stopped. A funding already submitted is not lost
-    /// — the pool's own journal reconciles it on the next start — but nothing new is begun.
-    fn detach_startup_funding(&self) -> Option<hopr_utils::runtime::AbortHandle> {
-        let policy = self.cfg.funding.clone()?;
+    /// It obeys `funding_stop` (see [`Self::shut_down`]) while it waits for the gate: an event
+    /// stream that closes at once does not leave it to start a funding for a strategy that has
+    /// already stopped. Once it holds the gate it runs to its end and is journalled by the pool,
+    /// `run` having returned or not.
+    fn detach_startup_funding(&self) {
+        let policy = self.cfg.funding.clone();
         let pool = self.pool.clone();
         let gate = Arc::clone(&self.funding_gate);
-        let (task, handle) = hopr_utils::runtime::prelude::abortable(async move {
-            apply_funding_policy::<D, K>(&pool, &policy, &gate).await;
+        let stop = self.funding_stop.subscribe();
+        hopr_utils::runtime::prelude::spawn(async move {
+            apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, Some(stop)).await;
         });
-        hopr_utils::runtime::prelude::spawn(task);
-        Some(handle)
+    }
+
+    /// The end of `run`.
+    ///
+    /// A funding that has acquired the gate always runs to completion and is journalled, whether
+    /// or not `run` is still running; shutdown abandons only a startup top-up that has not started
+    /// (`funding_stop`). Each flush's own funding is left to finish too, since its batch depends on
+    /// it. With deposits still buffered, shutdown applies the policy once itself — which queues
+    /// behind whatever funding is on the gate, all of it work those deposits need — and then makes
+    /// the final flush, so that it waits for the fundings its deposits depend on plus at most one
+    /// of its own, then the flush. With none buffered it returns without waiting for any funding.
+    async fn shut_down(&mut self) {
+        self.funding_stop.send_replace(true);
+
+        if !self.deposit_buffer.is_empty() {
+            apply_funding_policy::<D, K>(&self.pool, self.cfg.funding.as_ref(), &self.funding_gate, None).await;
+        }
+
+        // Awaited, not detached: the loop is over, so there is nothing left to keep responsive,
+        // and a task spawned here would race `run` returning.
+        self.flush_deposits().await;
+        self.flush_withdrawals().await;
     }
 
     /// Flush the buffered deposits, waiting for the pool to finish.
@@ -1392,9 +1442,7 @@ where
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
         // what it is funding for, and the loop must not wait on the funding any more than on them.
         hopr_utils::runtime::prelude::spawn(async move {
-            if let Some(policy) = &policy {
-                apply_funding_policy::<D, K>(&pool, policy, &gate).await;
-            }
+            apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, None).await;
             flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, spend_ledger, batch).await;
         });
     }
@@ -1446,22 +1494,46 @@ where
     }
 }
 
-/// Applies a [`PixFundingPolicy`] once: reads the pool's available balance and funds `top_up` when
-/// it is below `min_available`.
+/// Applies the [`PixFundingPolicy`] once, if there is one: reads the pool's available balance and
+/// funds `top_up` when it is below `min_available`.
 ///
-/// A free function so that the startup task, the flush tasks and the final awaited flush share
-/// one body. `gate` is held for the whole of it, so that two tasks applying the policy at once
-/// read the balance one after the other and the second sees the first's funding; a `fund` that
-/// fails is logged and left to the next application, and the deposits it was for then fail on
-/// their own, through the pool, rather than here.
-async fn apply_funding_policy<D, K>(pool: &D, policy: &PixFundingPolicy, gate: &futures::lock::Mutex<()>)
-where
+/// A free function so that the startup task, the flush tasks and shutdown share one body. `gate`
+/// is held for the whole of it, so that two tasks applying the policy at once read the balance one
+/// after the other and the second sees the first's funding; a `fund` that fails is logged and left
+/// to the next application, and the deposits it was for then fail on their own, through the pool,
+/// rather than here.
+///
+/// `stop`, when given, ends it only while it is waiting for the gate: once the gate is held the
+/// funding runs to its end, never cancelled, because a Safe transaction cannot be un-sent and
+/// cancelling the wait would only lose the record of it. See `funding_stop` on [`PixStrategyInner`].
+async fn apply_funding_policy<D, K>(
+    pool: &D,
+    policy: Option<&PixFundingPolicy>,
+    gate: &futures::lock::Mutex<()>,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) where
     D: DepositPool<K> + Send + Sync,
     D::Error: Into<StrategyError>,
     K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress> + Send + Sync + 'static,
 {
-    let _one_at_a_time = gate.lock().await;
+    let Some(policy) = policy else {
+        return;
+    };
+    let _one_at_a_time = match stop {
+        Some(mut stop) => {
+            tokio::select! {
+                biased;
+                // An error is the strategy being dropped, which is stopping as well.
+                _ = stop.wait_for(|stopping| *stopping) => {
+                    tracing::debug!("not funding the deposit pool: the strategy is stopping");
+                    return;
+                }
+                guard = gate.lock() => guard,
+            }
+        }
+        None => gate.lock().await,
+    };
     let available = match pool.available_balance().await.map_err(Into::<StrategyError>::into) {
         Ok(available) => available,
         Err(error) => {
@@ -1946,11 +2018,17 @@ where
     /// retry budget per entry with no PIX events consumed. The task is aborted once the loop
     /// exits — an interrupted replay loses nothing, because an entry is removed from the store
     /// only after its funds have moved.
+    ///
+    /// Ends as [`Self::shut_down`] describes: a funding that has begun always finishes, and one
+    /// that has not begun when the stream closes is abandoned. May be called again on the same
+    /// strategy; the next run funds again.
     async fn run(&mut self) -> Result<()> {
         // From here on there is an event loop to keep responsive, so no flush may be awaited on
         // it — including the one a zero buffer period triggers from inside a handler. See
         // `detach_flushes`.
         self.detach_flushes = true;
+        // A strategy that ran before has set the stop signal; this run funds again.
+        self.funding_stop.send_replace(false);
 
         let mut event_stream = self
             .node
@@ -1960,7 +2038,7 @@ where
 
         // Only now that there is a strategy to fund for: a failed subscription returns above, and
         // a task spawned before it would still have debited the Safe.
-        let startup_funding = self.detach_startup_funding();
+        self.detach_startup_funding();
 
         let replay = self.recovery_store.clone().map(|store| {
             hopr_utils::runtime::prelude::spawn(replay_pending_recoveries(
@@ -2040,25 +2118,10 @@ where
             }
         }
 
-        // Flush any remaining buffered items. Awaited, not detached: the loop is over, so there is
-        // nothing left to keep responsive, and a task spawned here would race `run` returning.
-        // The policy only for deposits that are actually left: a pool drained by a run that is
-        // ending is not topped up on the way out.
-        if !self.deposit_buffer.is_empty() {
-            self.apply_funding_policy().await;
-        }
-        self.flush_deposits().await;
-        self.flush_withdrawals().await;
+        self.shut_down().await;
 
         if let Some(replay) = replay {
             replay.abort();
-        }
-        // A funding still in flight when the stream closed must not debit the Safe after the
-        // strategy has stopped. Aborted rather than awaited: a shield takes a commitment round,
-        // and shutdown must not wait on the chain. What was already submitted is not lost — the
-        // pool's journal reconciles it on the next start.
-        if let Some(funding) = startup_funding {
-            funding.abort();
         }
 
         Ok(())
@@ -3804,7 +3867,7 @@ mod tests {
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
-                top_up: HoprBalance::new_base(1),
+                top_up: HoprBalance::new_base(2),
             }),
             ..Default::default()
         };
@@ -5494,6 +5557,11 @@ mod tests {
     struct FundingProbePool {
         available: HoprBalance,
         funded: Arc<parking_lot::Mutex<Vec<HoprBalance>>>,
+        /// When set, `fund` waits on it before it records anything: a funding that is still on the
+        /// chain.
+        hold: Option<Arc<tokio::sync::Notify>>,
+        /// For each deposit, how many fundings had been recorded when it arrived.
+        deposits: Arc<parking_lot::Mutex<Vec<usize>>>,
     }
 
     #[async_trait::async_trait]
@@ -5510,6 +5578,9 @@ mod tests {
         }
 
         async fn fund(&self, amount: HoprBalance) -> std::result::Result<(), StrategyError> {
+            if let Some(hold) = &self.hold {
+                hold.notified().await;
+            }
             self.funded.lock().push(amount);
             Ok(())
         }
@@ -5525,7 +5596,8 @@ mod tests {
             _amount: HoprBalance,
             _additional_data: Self::PoolDepositData,
         ) -> std::result::Result<(), StrategyError> {
-            unreachable!("the funding policy deposits nothing")
+            self.deposits.lock().push(self.funded.lock().len());
+            Ok(())
         }
 
         fn notify_deposit(
@@ -5569,13 +5641,21 @@ mod tests {
         let pool = Arc::new(FundingProbePool {
             available,
             funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Default::default(),
         });
         let cfg = PixStrategyConfig {
             funding,
             ..Default::default()
         };
         let strategy = PixStrategyInner::new(pool, node, cfg, *BOB, None);
-        strategy.apply_funding_policy().await;
+        super::apply_funding_policy::<_, _>(
+            &strategy.pool,
+            strategy.cfg.funding.as_ref(),
+            &strategy.funding_gate,
+            None,
+        )
+        .await;
         let calls = funded.lock().clone();
         Ok(calls)
     }
@@ -5600,11 +5680,13 @@ mod tests {
         let pool = Arc::new(FundingProbePool {
             available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Default::default(),
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(50),
-                top_up: HoprBalance::new_base(10),
+                top_up: HoprBalance::new_base(200),
             }),
             ..Default::default()
         };
@@ -5620,6 +5702,219 @@ mod tests {
             funded.lock().is_empty(),
             "nothing was funded for a strategy that never ran"
         );
+        Ok(())
+    }
+
+    /// The threshold must be below one top-up, or every flush could shield again.
+    #[test]
+    fn a_funding_policy_with_a_floor_not_below_its_top_up_is_invalid() {
+        let policy = |min: u64, top: u64| crate::pix::strategy::PixFundingPolicy {
+            min_available: HoprBalance::new_base(min),
+            top_up: HoprBalance::new_base(top),
+        };
+        assert!(validator::Validate::validate(&policy(250, 100)).is_err());
+        assert!(validator::Validate::validate(&policy(101, 100)).is_err());
+        assert!(validator::Validate::validate(&policy(100, 100)).is_err());
+        assert!(validator::Validate::validate(&policy(99, 100)).is_ok());
+        assert!(validator::Validate::validate(&policy(50, 100)).is_ok());
+        // Reached through the strategy config's nested validation too.
+        let cfg = PixStrategyConfig {
+            funding: Some(policy(250, 100)),
+            ..Default::default()
+        };
+        assert!(validator::Validate::validate(&cfg).is_err());
+    }
+
+    /// With a deposit still buffered at shutdown the policy runs once, ahead of the final flush, so
+    /// that the deposit finds a funded pool; and the funding is not left to land afterwards.
+    #[test_log::test(tokio::test)]
+    async fn shutdown_funds_once_ahead_of_the_final_flush() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Arc::clone(&deposits),
+        });
+        let cfg = PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(1),
+                top_up: HoprBalance::new_base(2),
+            }),
+            ..Default::default()
+        };
+        let mut strategy = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+        let id = pix_id(1);
+        let amount = HoprBalance::new_base(1);
+        let spend = strategy.commit_spend(amount);
+        strategy
+            .deposit_buffer
+            .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+
+        strategy.shut_down().await;
+
+        assert_eq!(*funded.lock(), vec![HoprBalance::new_base(2)], "funded once");
+        assert_eq!(*deposits.lock(), vec![1], "the deposit came after the funding");
+        assert!(*strategy.funding_stop.borrow(), "and nothing funds after it");
+        Ok(())
+    }
+
+    /// A strategy that ran and stopped funds again when it runs again.
+    #[test_log::test(tokio::test)]
+    async fn a_second_run_funds_again() -> anyhow::Result<()> {
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Default::default(),
+        });
+        let cfg = PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(1),
+                top_up: HoprBalance::new_base(2),
+            }),
+            ..Default::default()
+        };
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), cfg, *BOB, None);
+
+        crate::strategy::Strategy::run(&mut strategy).await?;
+        funded.lock().clear();
+        crate::strategy::Strategy::run(&mut strategy).await?;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            funded.lock().len(),
+            1,
+            "the second run's startup funding was not stopped"
+        );
+        Ok(())
+    }
+
+    /// An event source whose stream gives the loop one turn, then closes.
+    struct ClosingEvents;
+
+    impl ActionableEventSource for ClosingEvents {
+        fn subscribe_to_actionable_events(
+            &self,
+            _: Option<&[ActionableEventDiscriminant]>,
+        ) -> std::result::Result<futures::stream::BoxStream<'static, ActionableEvent>, String> {
+            // One yield first, so that the startup funding gets to run as far as it can.
+            Ok(futures::stream::once(tokio::task::yield_now())
+                .filter_map(|()| futures::future::ready(None::<ActionableEvent>))
+                .boxed())
+        }
+    }
+
+    fn funding_cfg() -> PixStrategyConfig {
+        PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(1),
+                top_up: HoprBalance::new_base(2),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Lets spawned tasks run until `done` or a second has passed.
+    async fn settle(done: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    }
+
+    /// A startup funding still waiting for the gate when the stream closes never starts, and `run`
+    /// does not wait for it.
+    #[test_log::test(tokio::test)]
+    async fn a_startup_funding_queued_at_shutdown_never_starts() -> anyhow::Result<()> {
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Default::default(),
+        });
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
+        let gate = Arc::clone(&strategy.funding_gate);
+        let held = gate.lock().await;
+
+        tokio::time::timeout(StdDuration::from_secs(5), crate::strategy::Strategy::run(&mut strategy)).await??;
+        drop(held);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(funded.lock().is_empty(), "the queued funding never started");
+        Ok(())
+    }
+
+    /// A startup funding already inside `fund` when the stream closes is not cancelled: `run`
+    /// returns without waiting for it, and it completes in the background once released.
+    #[test_log::test(tokio::test)]
+    async fn a_startup_funding_in_flight_at_shutdown_finishes_in_the_background() -> anyhow::Result<()> {
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: Some(Arc::clone(&hold)),
+            deposits: Default::default(),
+        });
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
+
+        tokio::time::timeout(StdDuration::from_secs(5), crate::strategy::Strategy::run(&mut strategy)).await??;
+        assert!(funded.lock().is_empty(), "still on the chain when `run` returned");
+
+        for _ in 0..100 {
+            hold.notify_one();
+            if !funded.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert_eq!(*funded.lock(), vec![HoprBalance::new_base(2)], "it ran to its end");
+        Ok(())
+    }
+
+    /// A detached flush whose funding is still queued on the gate when the stream closes is funded
+    /// before its batch: the batch depends on it.
+    #[test_log::test(tokio::test)]
+    async fn a_queued_flush_funding_still_runs_before_its_batch() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Arc::clone(&deposits),
+        });
+        let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
+        let gate = Arc::clone(&strategy.funding_gate);
+        let held = gate.lock().await;
+        let id = pix_id(1);
+        let amount = HoprBalance::new_base(1);
+        let spend = strategy.commit_spend(amount);
+        strategy
+            .deposit_buffer
+            .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+        strategy.detach_flush_deposits();
+
+        // The buffer is the flush's now, so shutdown has nothing to wait for.
+        strategy.shut_down().await;
+        assert!(funded.lock().is_empty());
+        drop(held);
+        settle(|| !deposits.lock().is_empty()).await;
+
+        assert_eq!(*funded.lock(), vec![HoprBalance::new_base(2)], "funded once");
+        assert_eq!(*deposits.lock(), vec![1], "the batch came after its funding");
         Ok(())
     }
 

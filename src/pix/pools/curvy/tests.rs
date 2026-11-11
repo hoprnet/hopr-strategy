@@ -971,9 +971,7 @@ async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow
 
     let gross = 25_u128;
     let shielder = super::safe_direct_shielder(Arc::clone(&api));
-    shielder(direct_shield_payload(aggregator), router, gross)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    shielder(direct_shield_payload(aggregator), router, gross).await?;
 
     let hopr = |address: Address| {
         let api = Arc::clone(&api);
@@ -1065,9 +1063,7 @@ async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyh
     let gross = 25_u128;
 
     let shielder = super::safe_direct_shielder(api.clone());
-    shielder(direct_shield_payload(aggregator), router, gross)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    shielder(direct_shield_payload(aggregator), router, gross).await?;
 
     let sends = api.sends.lock().clone();
     assert_eq!(
@@ -1080,6 +1076,92 @@ async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyh
         "one send: the gross amount to the router, carrying the router's payload"
     );
     Ok(())
+}
+
+/// What the connector's own classification of a failed shield transaction leaves the float in: a
+/// refusal before broadcast is `NotSubmitted`, a rejection by the chain is `Reverted`, and
+/// anything else — a timeout, a transport failure, an error that is not the connector's — is
+/// `Unconfirmed`, because the transaction may have been broadcast.
+#[test]
+fn a_failed_shield_transaction_is_classified_by_the_connectors_own_predicates() {
+    use blokli_client::errors::{ErrorKind, TrackingErrorKind};
+    use hopr_chain_connector::errors::ConnectorError;
+
+    use super::ShieldFailure;
+
+    let client = |kind: ErrorKind| ConnectorError::ClientError(kind.into());
+    let classify = |error: ConnectorError| super::classify_shield_error(&error);
+
+    assert!(matches!(
+        classify(client(ErrorKind::BlokliError {
+            kind: "overloaded",
+            code: "OVERLOADED".into(),
+            message: "busy".into(),
+        })),
+        ShieldFailure::NotSubmitted(_)
+    ));
+    assert!(matches!(
+        classify(client(ErrorKind::BlokliError {
+            kind: "contract not allowed",
+            code: "X".into(),
+            message: "no".into(),
+        })),
+        ShieldFailure::NotSubmitted(_)
+    ));
+    let rpc = |code: &str| {
+        client(ErrorKind::BlokliError {
+            kind: "rpc error",
+            code: code.into(),
+            message: "refused".into(),
+        })
+    };
+    // The codes for which the connector's own sequencer knows no nonce was consumed.
+    for code in ["FEE_TOO_LOW", "INSUFFICIENT_FUNDS"] {
+        assert!(matches!(classify(rpc(code)), ShieldFailure::NotSubmitted(_)), "{code}");
+    }
+    // Every other code may have left an earlier copy in the mempool.
+    for code in [
+        "NONCE_TOO_LOW",
+        "NONCE_TOO_HIGH",
+        "ALREADY_KNOWN",
+        "REPLACEMENT_UNDERPRICED",
+        "SOMETHING_ELSE",
+    ] {
+        assert!(matches!(classify(rpc(code)), ShieldFailure::Unconfirmed(_)), "{code}");
+    }
+    assert!(matches!(
+        classify(client(ErrorKind::TrackingError(TrackingErrorKind::Reverted))),
+        ShieldFailure::Reverted { .. }
+    ));
+    assert!(matches!(
+        classify(ConnectorError::InnerTxFailed("n/a".into())),
+        ShieldFailure::Reverted { .. }
+    ));
+    assert!(matches!(
+        classify(client(ErrorKind::TrackingError(TrackingErrorKind::Timeout))),
+        ShieldFailure::Unconfirmed(_)
+    ));
+    assert!(matches!(
+        classify(ConnectorError::ConnectionTimeout),
+        ShieldFailure::Unconfirmed(_)
+    ));
+    assert!(matches!(
+        super::classify_shield_error(&std::io::Error::other("not the connector's")),
+        ShieldFailure::Unconfirmed(_)
+    ));
+
+    // A chain API that wraps the connector's error is still classified by it.
+    #[derive(Debug, thiserror::Error)]
+    #[error("the chain API failed")]
+    struct Wrapped(#[source] ConnectorError);
+    assert!(matches!(
+        super::classify_shield_error(&Wrapped(client(ErrorKind::BlokliError {
+            kind: "overloaded",
+            code: "OVERLOADED".into(),
+            message: "busy".into(),
+        }))),
+        ShieldFailure::NotSubmitted(_)
+    ));
 }
 
 struct Harness {
