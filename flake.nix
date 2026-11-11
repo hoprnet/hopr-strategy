@@ -23,19 +23,23 @@
   # - flake-root: Utilities for finding flake root directory
   #
   # Input optimization strategy:
-  # All inputs follow nixpkgs where possible to reduce closure size and improve caching.
+  # nixpkgs, nixpkgs-unstable, rust-overlay and crane follow nix-lib, so every hoprnet flake on
+  # the same nix-lib release shares one set of revisions; the other inputs follow nixpkgs.
   inputs = {
     # Core Nix ecosystem dependencies
     flake-parts.url = "github:hercules-ci/flake-parts";
-    nixpkgs.url = "github:NixOS/nixpkgs/release-26.05";
-    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # HOPR Nix Library (provides flake-utils and reusable build functions)
-    nix-lib.url = "github:hoprnet/nix-lib/v2.1.1";
+    nix-lib.url = "github:hoprnet/nix-lib/v2.1.7";
+    # nix-lib anchors the heavy pins (nixpkgs, nixpkgs-unstable, rust-overlay, crane) so every
+    # hoprnet flake on the same nix-lib release shares them. To bump them, point nix-lib.url at
+    # the new release tag, then run `nix flake update nix-lib`.
+    nixpkgs.follows = "nix-lib/nixpkgs";
+    nixpkgs-unstable.follows = "nix-lib/nixpkgs-unstable";
 
     # Rust build system
-    crane.url = "github:ipetkov/crane";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    crane.follows = "nix-lib/crane";
+    rust-overlay.follows = "nix-lib/rust-overlay";
 
     # Development tools and quality assurance
     pre-commit.url = "github:cachix/git-hooks.nix";
@@ -45,17 +49,8 @@
     # Input dependency optimization
     flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
     pre-commit.inputs.nixpkgs.follows = "nixpkgs";
-    nix-lib.inputs.nixpkgs.follows = "nixpkgs";
-    nix-lib.inputs.crane.follows = "crane";
-    nix-lib.inputs.rust-overlay.follows = "rust-overlay";
-    # One unstable/treefmt/flake-parts revision for the whole flake. Left
-    # unfollowed, `nix flake update nix-lib` moves nix-lib's private nixpkgs-unstable,
-    # which supplies cargo-llvm-cov to the dev shell, to a revision missing from the
-    # binary cache.
-    nix-lib.inputs.nixpkgs-unstable.follows = "nixpkgs-unstable";
     nix-lib.inputs.treefmt-nix.follows = "treefmt-nix";
     nix-lib.inputs.flake-parts.follows = "flake-parts";
-    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -101,6 +96,7 @@
           pkgs = import nixpkgs {
             inherit system overlays;
           };
+          pkgsUnstable = import nixpkgs-unstable { inherit system; };
 
           # Platform information
           buildPlatform = pkgs.stdenv.buildPlatform;
@@ -292,7 +288,8 @@
               gh
               cargo-insta
               cargo-machete
-              cargo-release
+              # From unstable: cargo-release 1.1.7 needs rustc 1.97, release-26.05 ships 1.95.
+              pkgsUnstable.cargo-release
               cargo-shear
               yq
             ];
@@ -321,7 +318,7 @@
               treefmtPrograms = pkgs.lib.attrValues config.treefmt.build.programs;
               extraPackages = with pkgs; [
                 cargo-machete
-                cargo-release
+                pkgsUnstable.cargo-release
                 cargo-shear
                 zizmor
               ];
