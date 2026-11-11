@@ -191,7 +191,7 @@ futures-concurrency  = "7.7.1"
 futures-time         = "3.1.0"
 hex-literal          = "1.1.0"
 hopr-api             = { git = "https://github.com/hoprnet/hopr-api", rev = "1e2bc79351d28b53ee7138de8bbe7ae01785bff3" }
-hopr-chain-connector = "0.31.0"
+hopr-chain-connector = { git = "https://github.com/hoprnet/hopr-impls", rev = "e371c44295e030575675d8e0834745862f031dd9" }
 hopr-strategy        = { path = "." }
 hopr-utils           = { package = "hopr-utilities", git = "https://github.com/hoprnet/hopr-utilities", rev = "b92d6c7a7e3458d4b4856889fec14627232d0955", default-features = false }
 humantime-serde      = "1.1.1"
