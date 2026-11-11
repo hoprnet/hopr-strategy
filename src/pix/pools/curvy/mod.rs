@@ -82,9 +82,9 @@
 //!   not configured".
 //! * A **Safe with wxHOPR** (Entry): [`DepositPool::fund`] shields from it through the node's own chain API, like the
 //!   plain pool's deposits. The pool never funds itself: a deposit is a [`DepositPool::pool_transfer`] from the
-//!   funding, and when the funding runs out the deposit fails with a typed error that
-//!   [`is_out_of_funding`] recognises until whoever decides to fund — the strategy's funding policy, or an
-//!   operator — calls `fund` again. [`DepositPool::available_balance`] is what is left to allocate.
+//!   funding, and when the funding runs out the deposit fails with a typed error that [`is_out_of_funding`] recognises
+//!   until whoever decides to fund — the strategy's funding policy, or an operator — calls `fund` again.
+//!   [`DepositPool::available_balance`] is what is left to allocate.
 //! * A **state file** ([`CurvyDepositPoolConfig::state_path`]) that survives restarts: it holds the node's Curvy
 //!   identity, the funding notes, every discovered note and the scan secrets. Losing it loses the ability to sweep what
 //!   has not been swept yet.
