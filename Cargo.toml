@@ -220,4 +220,3 @@ zeroize              = "1.9.1"
 
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde"]
-
