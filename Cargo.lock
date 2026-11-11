@@ -4101,9 +4101,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-api"
-version = "5.0.0"
+version = "5.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa64c5a401c0c7db4ad9a0688d11e59bc4566f92c0661e8ef97e4008816509ad"
+checksum = "e318135827d2b0838d5da8f53cf4cad7eb2117fcda288c154656cf9b5ec16d8b"
 dependencies = [
  "async-trait",
  "atomic_enum",
@@ -4113,6 +4113,7 @@ dependencies = [
  "futures-concurrency",
  "hopr-types",
  "libp2p-identity",
+ "num_enum",
  "serde",
  "serde_bytes",
  "strum",
@@ -4176,7 +4177,6 @@ version = "8.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "atomic_enum",
  "babyjubjub-ec",
  "backon",
  "blokli-client",
@@ -4203,7 +4203,6 @@ dependencies = [
  "lazy_static",
  "mockall",
  "moka",
- "num_enum",
  "parking_lot 0.13.0",
  "redb",
  "reqwest",
@@ -4214,7 +4213,6 @@ dependencies = [
  "serde_with",
  "smart-default",
  "statrs",
- "strum",
  "subtle",
  "tempfile",
  "test-log",
