@@ -20,7 +20,7 @@ permissions: {}
 jobs:
   build-library:
     name: Build Library
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@0b787ff18cd2f7840a9502be64987d451d8c00dd # feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@feat/fork-pr-ci-support
     permissions:
       contents: read
       id-token: write

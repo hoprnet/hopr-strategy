@@ -19,7 +19,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@0b787ff18cd2f7840a9502be64987d451d8c00dd # feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@feat/fork-pr-ci-support
     with:
       repo_sha: ${{ github.sha }}
       enable_unit_tests: false
