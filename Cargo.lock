@@ -2023,6 +2023,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bimap"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
+
+[[package]]
 name = "bitcoin-consensus-encoding"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4172,6 +4178,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hopr-network-graph"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053f0d252ace2004a36423758640118c9103fba9d55c1729b980370cf6f11087"
+dependencies = [
+ "anyhow",
+ "bimap",
+ "futures",
+ "hopr-api",
+ "hopr-utilities",
+ "indexmap 2.14.2",
+ "lazy_static",
+ "parking_lot 0.12.5",
+ "petgraph",
+ "rand 0.10.3",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "hopr-strategy"
 version = "8.0.0"
 dependencies = [
@@ -4231,6 +4258,7 @@ dependencies = [
  "bytesize",
  "futures",
  "hopr-api",
+ "hopr-network-graph",
  "hopr-strategy",
  "rstest",
  "test-log",
