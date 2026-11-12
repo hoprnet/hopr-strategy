@@ -261,7 +261,18 @@ pub struct PixStrategyConfig {
     /// the recovered key — the only means of moving those funds — is lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_db_path: Option<std::path::PathBuf>,
-    /// Environment variable for the recovery store encryption password.
+    /// The password the PIX secrets on disk are sealed under: the recovery store, and the Curvy
+    /// pool's state file (its spender identity and scan secrets). Required when
+    /// [`Self::pix_recovery_db_path`] is set, and always by the Curvy pool. The same password on
+    /// every start: both files refuse any other.
+    ///
+    /// Never serialized back out, and printed redacted, so the configuration can be dumped and
+    /// logged without exposing it. [`Self::pix_recovery_password_env`] is the alternative for a
+    /// deployment that would rather not write it into the configuration file.
+    #[serde(default, skip_serializing)]
+    pub pix_recovery_password: Option<PixRecoveryPassword>,
+    /// Name of an environment variable to read the password from when
+    /// [`Self::pix_recovery_password`] is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pix_recovery_password_env: Option<String>,
     /// How long to wait for additional deposit events before flushing the batch.
@@ -539,10 +550,14 @@ impl PixStrategy {
 
         // `Arc` for the same reason as in `build_non_anonymous`; the pool itself is deliberately
         // not `Clone`, since dropping a clone would abort the discovery task the other one uses.
+        let state_password = self
+            .cfg
+            .pix_recovery_password("the Curvy pool's state file is sealed under it")?;
         let pool = Arc::new(crate::pix::pools::curvy::CurvyDepositPool::new(
             Arc::clone(&node),
             node_key,
             pool_cfg,
+            &state_password,
         )?);
         let safe_address = node.identity().safe_address;
 
@@ -601,10 +616,7 @@ impl PixStrategy {
         // calling it, so `spend_window`'s constraint would have been decorative.
         StrategyError::validate_config(&self.cfg)?;
 
-        let recovery_store = open_recovery_store(
-            self.cfg.pix_recovery_db_path.as_ref(),
-            self.cfg.pix_recovery_password_env.as_ref(),
-        )?;
+        let recovery_store = open_recovery_store(&self.cfg)?;
 
         Ok(Box::new(PixStrategyInner {
             pool,
@@ -632,28 +644,91 @@ impl PixStrategy {
     }
 }
 
-fn open_recovery_store(
-    db_path: Option<&std::path::PathBuf>,
-    password_env: Option<&String>,
-) -> Result<Option<PixRecoveryStore>> {
-    match (db_path, password_env) {
-        (Some(path), Some(env)) => {
-            let password = std::env::var(env).map_err(|_| {
-                StrategyError::Other(anyhow::anyhow!(
-                    "environment variable {env} must be set when PIX recovery persistence is enabled"
-                ))
-            })?;
+/// A password held in [`PixStrategyConfig`]: deserialized from the plain string, never serialized,
+/// and shown redacted by `Debug` so a logged or dumped configuration does not leak it.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct PixRecoveryPassword(String);
+
+impl Debug for PixRecoveryPassword {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for PixRecoveryPassword {
+    fn from(password: String) -> Self {
+        Self(password)
+    }
+}
+
+impl PixStrategyConfig {
+    /// The password the PIX secrets on disk are sealed under: [`Self::pix_recovery_password`], or
+    /// failing that the environment variable [`Self::pix_recovery_password_env`] names. `purpose`
+    /// says which store asked, for the error when neither is set. An empty password is refused
+    /// wherever it came from: a key derived from it would seal nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hopr_strategy::pix::strategy::PixStrategyConfig;
+    ///
+    /// let cfg = PixStrategyConfig {
+    ///     pix_recovery_password: Some("correct horse battery staple".to_owned().into()),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(
+    ///     cfg.pix_recovery_password("the recovery store is sealed under it")
+    ///         .unwrap(),
+    ///     "correct horse battery staple"
+    /// );
+    ///
+    /// // Neither the password nor a variable to read it from: a configuration error naming both.
+    /// let error = PixStrategyConfig::default()
+    ///     .pix_recovery_password("the recovery store is sealed under it")
+    ///     .unwrap_err();
+    /// assert!(error.to_string().contains("pix_recovery_password_env"));
+    /// ```
+    pub fn pix_recovery_password(&self, purpose: &str) -> Result<String> {
+        self.pix_recovery_password_with(purpose, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::pix_recovery_password`] with the environment behind `lookup`, so it is testable
+    /// without mutating the process environment.
+    fn pix_recovery_password_with(&self, purpose: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
+        let (password, source) = match (&self.pix_recovery_password, &self.pix_recovery_password_env) {
+            (Some(PixRecoveryPassword(password)), _) => (password.clone(), "pix_recovery_password".to_owned()),
+            (None, Some(env)) => {
+                let password = lookup(env).ok_or_else(|| {
+                    StrategyError::InvalidConfiguration(format!("environment variable {env} must be set: {purpose}"))
+                })?;
+                (password, format!("environment variable {env}"))
+            }
+            (None, None) => {
+                return Err(StrategyError::InvalidConfiguration(format!(
+                    "pix_recovery_password or pix_recovery_password_env must be set: {purpose}"
+                )));
+            }
+        };
+        if password.is_empty() {
+            return Err(StrategyError::InvalidConfiguration(format!(
+                "{source} must not be empty: {purpose}"
+            )));
+        }
+        Ok(password)
+    }
+}
+
+fn open_recovery_store(cfg: &PixStrategyConfig) -> Result<Option<PixRecoveryStore>> {
+    match &cfg.pix_recovery_db_path {
+        Some(path) => {
+            let password = cfg.pix_recovery_password("PIX recovery persistence is enabled")?;
             PixRecoveryStore::open(path, &password)
                 .map(Some)
                 .map_err(StrategyError::other)
         }
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(StrategyError::Other(anyhow::anyhow!(
-            "pix_recovery_password_env must be set when pix_recovery_db_path is set"
-        ))),
-        (None, Some(_)) => Err(StrategyError::Other(anyhow::anyhow!(
-            "pix_recovery_db_path must be set when pix_recovery_password_env is set"
-        ))),
+        // A password alone is not a mistake: the Curvy pool's state file is sealed under it too.
+        None => Ok(None),
     }
 }
 
@@ -1924,11 +1999,6 @@ mod tests {
         },
         testing::{BlokliTestClient, BlokliTestStateBuilder, FullStateEmulator, TestChainConnector},
     };
-
-    /// Owned exclusively by `test_build_with_recovery_path_opens_store`. Tests share one
-    /// process environment and run on several threads, so a name used by two tests can be
-    /// unset by one while the other still needs it.
-    const BUILD_PASSWORD_ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_BUILD";
 
     lazy_static::lazy_static! {
         static ref BOB_KP: ChainKeypair = ChainKeypair::from_secret(&hex!(
@@ -3684,7 +3754,8 @@ mod tests {
     }
 
     /// The curvy pool validates its config before it looks for the operator key or opens the
-    /// state file, which is why this needs neither.
+    /// state file, which is why this needs neither. It does need the state password, which the
+    /// builder resolves before it constructs the pool.
     ///
     /// Validation happens inside `CurvyDepositPool::new` rather than in the builder — the
     /// environment overrides have to be applied first — so this also pins that the builder still
@@ -3696,7 +3767,11 @@ mod tests {
 
         let (_cc, node, _pool) = entry_side(&[]).await?;
 
-        let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+        let result = PixStrategy::new(PixStrategyConfig {
+            pix_recovery_password: Some("test_password".to_owned().into()),
+            ..Default::default()
+        })
+        .build_curvy::<_, BjjPublicKey>(
             node,
             hopr_api::ChainKeypair::random(),
             crate::pix::pools::curvy::PoolConfig {
@@ -3705,8 +3780,90 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(StrategyError::InvalidConfiguration(_))));
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("max_deposit_tracking_time"), "{message}")
+            }
+            other => panic!("expected a rejected pool config, got {:?}", other.err()),
+        }
         Ok(())
+    }
+
+    #[test]
+    fn test_pix_recovery_password_prefers_the_configured_value_over_the_environment() {
+        const ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_PRECEDENCE";
+        let environment = |value: &'static str| move |name: &str| (name == ENV).then(|| value.to_owned());
+        let empty_environment = |_: &str| None;
+
+        let neither = PixStrategyConfig::default();
+        match neither.pix_recovery_password_with("test", environment("from the environment")) {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password"), "{message}")
+            }
+            other => panic!("expected a missing password, got {:?}", other.err()),
+        }
+
+        let from_env = PixStrategyConfig {
+            pix_recovery_password_env: Some(ENV.to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            from_env
+                .pix_recovery_password_with("test", environment("from the environment"))
+                .unwrap(),
+            "from the environment"
+        );
+        match from_env.pix_recovery_password_with("test", empty_environment) {
+            Err(StrategyError::InvalidConfiguration(message)) => assert!(message.contains(ENV), "{message}"),
+            other => panic!("expected a missing variable, got {:?}", other.err()),
+        }
+
+        let configured = PixStrategyConfig {
+            pix_recovery_password: Some("from the configuration".to_owned().into()),
+            ..from_env
+        };
+        assert_eq!(
+            configured
+                .pix_recovery_password_with("test", environment("from the environment"))
+                .unwrap(),
+            "from the configuration"
+        );
+
+        // The configured password is neither printed nor written back out.
+        assert!(!format!("{configured:?}").contains("from the configuration"));
+        let dumped = serde_json::to_string(&configured).unwrap();
+        assert!(!dumped.contains("\"pix_recovery_password\""), "{dumped}");
+        assert!(dumped.contains("\"pix_recovery_password_env\""), "{dumped}");
+    }
+
+    /// A key derived from an empty password seals nothing, so it is refused from either source,
+    /// and the error says which one supplied it.
+    #[test]
+    fn test_pix_recovery_password_rejects_an_empty_password() {
+        const ENV: &str = "HOPRD_TEST_PIX_RECOVERY_PASSWORD_EMPTY";
+        let empty_variable = |name: &str| (name == ENV).then(String::new);
+
+        let configured = PixStrategyConfig {
+            pix_recovery_password: Some(String::new().into()),
+            ..Default::default()
+        };
+        match configured.pix_recovery_password_with("test", empty_variable) {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password must not be empty"), "{message}")
+            }
+            other => panic!("expected an empty password, got {:?}", other.err()),
+        }
+
+        let from_env = PixStrategyConfig {
+            pix_recovery_password_env: Some(ENV.to_owned()),
+            ..Default::default()
+        };
+        match from_env.pix_recovery_password_with("test", empty_variable) {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains(&format!("{ENV} must not be empty")), "{message}")
+            }
+            other => panic!("expected an empty password, got {:?}", other.err()),
+        }
     }
 
     /// Direct shielding signs `execTransactionFromModule` with the node key, which the module's
@@ -3717,6 +3874,10 @@ mod tests {
     async fn test_build_curvy_rejects_a_foreign_node_key_for_direct_shielding() -> anyhow::Result<()> {
         use hopr_api::types::crypto::prelude::BjjPublicKey;
 
+        // Never set by anything, so the builder finds it missing; the process environment is
+        // only ever read here, never written.
+        const UNSET_PASSWORD_ENV: &str = "HOPRD_TEST_CURVY_STATE_PASSWORD_NEVER_SET";
+
         let (_cc, node, _pool) = entry_side(&[]).await?;
         let state = tempfile::tempdir()?;
         let cfg = || crate::pix::pools::curvy::PoolConfig {
@@ -3724,8 +3885,37 @@ mod tests {
             state_path: Some(state.path().join("curvy.redb")),
             ..Default::default()
         };
+        let strategy_cfg = || PixStrategyConfig {
+            pix_recovery_password: Some("test_password".to_owned().into()),
+            ..Default::default()
+        };
 
+        // The state file is sealed under the PIX recovery password, so the field is required...
         let result = PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            cfg(),
+        );
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains("pix_recovery_password_env"), "{message}")
+            }
+            other => panic!("expected a missing recovery password, got {:?}", other.err()),
+        }
+        // ...and so is the variable it names.
+        let result = PixStrategy::new(PixStrategyConfig {
+            pix_recovery_password_env: Some(UNSET_PASSWORD_ENV.to_owned()),
+            ..Default::default()
+        })
+        .build_curvy::<_, BjjPublicKey>(Arc::clone(&node), BOB_KP.clone(), cfg());
+        match result {
+            Err(StrategyError::InvalidConfiguration(message)) => {
+                assert!(message.contains(UNSET_PASSWORD_ENV), "{message}")
+            }
+            other => panic!("expected a missing recovery password, got {:?}", other.err()),
+        }
+
+        let result = PixStrategy::new(strategy_cfg()).build_curvy::<_, BjjPublicKey>(
             Arc::clone(&node),
             hopr_api::ChainKeypair::random(),
             cfg(),
@@ -3734,8 +3924,7 @@ mod tests {
             Err(StrategyError::InvalidConfiguration(message)) => assert!(message.contains("node key"), "{message}"),
             other => panic!("expected a rejected node key, got {:?}", other.err()),
         }
-
-        PixStrategy::new(PixStrategyConfig::default()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg())?;
+        PixStrategy::new(strategy_cfg()).build_curvy::<_, BjjPublicKey>(node, BOB_KP.clone(), cfg())?;
         Ok(())
     }
 
@@ -3797,9 +3986,6 @@ mod tests {
     async fn test_build_with_recovery_path_opens_store() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("pix.redb");
-        // SAFETY: `BUILD_PASSWORD_ENV` is touched by this test alone, so no other test
-        // thread can observe or clobber it.
-        unsafe { std::env::set_var(BUILD_PASSWORD_ENV, "test_password") };
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],
@@ -3814,7 +4000,7 @@ mod tests {
             price_per_byte: HoprBalance::new_base(1),
             max_ssa_allocation: HoprBalance::new_base(100),
             pix_recovery_db_path: Some(db.clone()),
-            pix_recovery_password_env: Some(BUILD_PASSWORD_ENV.to_string()),
+            pix_recovery_password: Some("test_password".to_owned().into()),
             deposit_buffer_period: StdDuration::ZERO,
             withdrawal_buffer_period: StdDuration::ZERO,
             ..Default::default()
@@ -3825,8 +4011,6 @@ mod tests {
             Default::default(),
         )?;
         assert!(db.exists());
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(BUILD_PASSWORD_ENV) };
         Ok(())
     }
 
@@ -4768,9 +4952,8 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_build_fails_when_password_env_var_missing() -> anyhow::Result<()> {
+        // Never set by anything; the process environment is only ever read, never written.
         let ev = "HOPRD_TEST_ENV_THAT_DOES_NOT_EXIST_HOPEFULLY";
-        // SAFETY: single-threaded test, no concurrent access to this variable.
-        unsafe { std::env::remove_var(ev) };
         let sim = BlokliTestStateBuilder::default()
             .with_generated_accounts(
                 &[&*ALICE, &*BOB, &*CHRIS],

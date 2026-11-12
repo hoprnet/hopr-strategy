@@ -93,6 +93,7 @@
 
 pub mod pools;
 pub mod recovery_store;
+mod store;
 pub mod strategy;
 
 use hopr_api::node::{PixAddressId, PixDepositData};
