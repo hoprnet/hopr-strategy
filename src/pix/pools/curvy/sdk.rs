@@ -189,6 +189,32 @@ pub(super) fn unix_now() -> Option<u64> {
         .map(|elapsed| elapsed.as_secs())
 }
 
+/// The spends whose outcome is not settled yet — every relayed attempt, every operator attempt and
+/// the ambiguous allocation — as their inputs and the change they journal. Only a journal written
+/// by an earlier version can still carry an ambiguous set: nothing writes one now, and the
+/// reconciliation only clears it, but such a journal must still be read as it was meant. Their inputs stay in
+/// `funding` at full value until the outcome is observed.
+fn in_flight_spends(state: &SdkState) -> Vec<(&[StoredNote], &StoredNote)> {
+    state
+        .relay_aggregations
+        .iter()
+        .map(|attempt| (attempt.inputs.as_slice(), &attempt.change))
+        .chain(
+            state
+                .operator_aggregations
+                .iter()
+                .map(|attempt| (attempt.inputs.as_slice(), &attempt.change)),
+        )
+        .chain(
+            state
+                .ambiguous_change
+                .as_ref()
+                .filter(|_| state.ambiguous_allocation && !state.ambiguous_inputs.is_empty())
+                .map(|change| (state.ambiguous_inputs.as_slice(), change)),
+        )
+        .collect()
+}
+
 /// Which in-flight shield a journal write is for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShieldJournal {
@@ -325,9 +351,11 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
     /// its total would stop a top-up that is needed.
     ///
     /// A note counts from the moment its shield is journalled, before it is committed and
-    /// spendable; under either submission mode the inputs of an aggregation still count until
-    /// its outcome is observed. What is reported can therefore run ahead of what an allocation
-    /// can draw on right now.
+    /// spendable, so what is reported can run ahead of what an allocation can draw on right now.
+    /// A spend still in flight — an aggregation whose outcome is not observed yet, under either
+    /// submission mode — counts for what the next allocation will find once it settles: its inputs
+    /// are out and its journalled change is in. With several attempts at the same spend that is
+    /// the smallest change, which every one of them leaves at least.
     async fn available_balance(&self) -> Result<HoprBalance, Self::Error>;
 
     /// Allocates the given amounts to the given Baby JubJub owners, each discoverable by its scan
@@ -3125,23 +3153,44 @@ where
     }
 
     async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
-        // `state.funding` is kept net of allocations: a spent note is replaced by its change as
-        // soon as the spend is journalled. It is not filtered by note status — a note shielded a
-        // moment ago is listed before it is committed — which is what the trait documents.
-        let mut amounts = self
-            .state
-            .lock()
-            .funding
-            .iter()
+        // `state.funding` keeps the inputs of an aggregation at full value until its outcome
+        // settles, and only then swaps them for the change. What the next allocation will find is
+        // the funding without those inputs, and with the journalled change in their place. Not
+        // filtered by note status — a note shielded a moment ago is listed before it is committed
+        // — which is what the trait documents.
+        let mut amounts = {
+            let state = self.state.lock();
+            let spends = in_flight_spends(&state);
             // The amount alone, as the decimal it is stored in: rebuilding the whole note would
             // convert five field elements per note on every flush, and a note whose other fields
             // do not parse would fail a balance that only needs its amount.
-            .map(|stored| {
-                stored.amount.parse::<u128>().map_err(|error| {
+            let amount = |note: &StoredNote| {
+                note.amount.parse::<u128>().map_err(|error| {
                     RsSdkCurvyAdapterError::InvalidValue(format!("funding amount does not fit u128: {error}"))
                 })
-            })
-            .collect::<Result<Vec<u128>, _>>()?;
+            };
+            let mut amounts = state
+                .funding
+                .iter()
+                .filter(|note| !spends.iter().any(|(inputs, _)| inputs.contains(note)))
+                .map(amount)
+                .collect::<Result<Vec<u128>, _>>()?;
+            // Attempts that share their inputs are rivals for one spend: whichever wins leaves at
+            // least the smallest change. A change of zero is no note at all.
+            let mut changes: Vec<(&[StoredNote], u128)> = Vec::new();
+            for (inputs, change) in &spends {
+                let change = amount(change)?;
+                if change == 0 {
+                    continue;
+                }
+                match changes.iter_mut().find(|(rival, _)| rival == inputs) {
+                    Some((_, smallest)) => *smallest = (*smallest).min(change),
+                    None => changes.push((inputs, change)),
+                }
+            }
+            amounts.extend(changes.into_iter().map(|(_, change)| change));
+            amounts
+        };
         // The largest notes are what `allocate_all` picks when no single note suffices.
         amounts.sort_unstable_by_key(|amount| std::cmp::Reverse(*amount));
         Ok(HoprBalance::from(U256::from(spendable_total(amounts)?)))
@@ -3171,16 +3220,12 @@ where
         // outputs are known. Resolving which candidate won belongs to the funding path.
         let (funding, pending, attempts) = {
             let state = self.state.lock();
+            let spends = in_flight_spends(&state);
             (
                 state
                     .funding
                     .iter()
-                    .filter(|note| {
-                        !state
-                            .relay_aggregations
-                            .iter()
-                            .any(|attempt| attempt.inputs.contains(note))
-                    })
+                    .filter(|note| !spends.iter().any(|(inputs, _)| inputs.contains(note)))
                     .cloned()
                     .collect::<Vec<_>>(),
                 state.pending.clone(),
@@ -3826,6 +3871,144 @@ mod tests {
             emitted: emitted.iter().map(|amount| stored(*amount)).collect::<Result<_, _>>()?,
             allocation_ids,
         })
+    }
+
+    /// A relayed attempt journalled with the given inputs and change.
+    fn relay_attempt(inputs: &[u64], change: u64) -> anyhow::Result<StoredRelayAggregation> {
+        let stored = |amount: u64| -> anyhow::Result<StoredNote> {
+            Ok(StoredNote::from(&Adapter::owned_note(&fixture(amount))?))
+        };
+        Ok(StoredRelayAggregation {
+            intent: "intent".to_owned(),
+            chain_id: 100,
+            aggregator: format!("0x{}", "01".repeat(20)),
+            max_inputs: 2,
+            proof: relayer::http_tests::proof(),
+            public_signals: vec!["1".to_owned()],
+            request_key: "relay".to_owned(),
+            spend_key: "0x1".to_owned(),
+            inputs: inputs.iter().map(|amount| stored(*amount)).collect::<Result<_, _>>()?,
+            change: stored(change)?,
+            emitted: Vec::new(),
+            allocation_ids: Vec::new(),
+            attempted: true,
+            request_id: None,
+            transaction_hash: None,
+            rebuild: false,
+            last_status: None,
+            timeouts_without_progress: 0,
+            circuit: Some(relayer::http_tests::PIX_1),
+        })
+    }
+
+    /// An adapter whose funding is `amounts`, as notes that are in no way alike.
+    async fn adapter_funded_with(
+        state: &RedbCurvyDepositState,
+        amounts: &[u64],
+    ) -> anyhow::Result<(Adapter, relayer::http_tests::Server)> {
+        let server = relayer::http_tests::Server::new(|_, _| panic!("no chain access needed")).await;
+        let adapter = test_adapter(state, server.url.clone())?;
+        adapter.state.lock().funding = amounts
+            .iter()
+            .map(|amount| Ok(StoredNote::from(&Adapter::owned_note(&fixture(*amount))?)))
+            .collect::<anyhow::Result<_>>()?;
+        Ok((adapter, server))
+    }
+
+    fn base_units(amount: u128) -> HoprBalance {
+        HoprBalance::from(U256::from(amount))
+    }
+
+    /// The inputs of a relayed spend are still in the funding until it settles, but the next
+    /// allocation will not find them: it finds the change, which the policy must see or it skips
+    /// the top-up that allocation needs.
+    #[tokio::test]
+    async fn a_relayed_spend_in_flight_counts_for_its_change() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let (adapter, _server) = adapter_funded_with(&state, &[100]).await?;
+        assert_eq!(adapter.available_balance().await?, base_units(100));
+
+        adapter.state.lock().relay_aggregations = vec![relay_attempt(&[100], 10)?];
+        assert_eq!(adapter.available_balance().await?, base_units(10));
+
+        adapter.state.lock().relay_aggregations.clear();
+        assert_eq!(
+            adapter.available_balance().await?,
+            base_units(100),
+            "settled: the list again"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_operator_spend_in_flight_counts_for_its_change() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let (adapter, _server) = adapter_funded_with(&state, &[100]).await?;
+
+        adapter.state.lock().operator_aggregations = vec![operator_attempt(&[100], 10, &[], Vec::new())?];
+        assert_eq!(adapter.available_balance().await?, base_units(10));
+
+        adapter.state.lock().operator_aggregations.clear();
+        assert_eq!(
+            adapter.available_balance().await?,
+            base_units(100),
+            "settled: the list again"
+        );
+        Ok(())
+    }
+
+    /// Nothing writes an ambiguous set any more, so this is a journal from an earlier version.
+    #[tokio::test]
+    async fn an_ambiguous_set_from_an_earlier_version_counts_for_its_change() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let (adapter, _server) = adapter_funded_with(&state, &[100]).await?;
+        let attempt = operator_attempt(&[100], 10, &[], Vec::new())?;
+
+        {
+            let mut state = adapter.state.lock();
+            state.ambiguous_allocation = true;
+            state.ambiguous_inputs = attempt.inputs;
+            state.ambiguous_change = Some(attempt.change);
+        }
+        assert_eq!(adapter.available_balance().await?, base_units(10));
+
+        // A cleared flag with stale fields counts nothing: the inputs are at full value.
+        adapter.state.lock().ambiguous_allocation = false;
+        assert_eq!(
+            adapter.available_balance().await?,
+            base_units(100),
+            "flag clear: ignored"
+        );
+
+        {
+            let mut state = adapter.state.lock();
+            state.ambiguous_allocation = false;
+            state.ambiguous_inputs.clear();
+            state.ambiguous_change = None;
+        }
+        assert_eq!(
+            adapter.available_balance().await?,
+            base_units(100),
+            "settled: the list again"
+        );
+        Ok(())
+    }
+
+    /// Replacement attempts spend the same inputs, and whichever wins leaves at least the smallest
+    /// of their changes. Notes the spend does not touch are counted as they are.
+    #[tokio::test]
+    async fn rival_attempts_at_one_spend_count_for_the_smallest_change() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let (adapter, _server) = adapter_funded_with(&state, &[100, 50]).await?;
+
+        adapter.state.lock().relay_aggregations = vec![relay_attempt(&[100], 10)?, relay_attempt(&[100], 8)?];
+
+        assert_eq!(
+            adapter.available_balance().await?,
+            base_units(58),
+            "8 for the spend, 50 untouched"
+        );
+        Ok(())
     }
 
     fn prepared_record(
