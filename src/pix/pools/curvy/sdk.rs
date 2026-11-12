@@ -2395,8 +2395,13 @@ where
                     .checked_add(*amount)
                     .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("allocation total overflows u128".to_owned()))
             })?;
+            // The relayer's note is paid out of the same inputs as the allocations, so the funding
+            // has to cover it too. Leaving it out would pick a note that covers the allocations
+            // alone, and the build would then fail on it with an SDK error rather than
+            // `NoFunding` — so an exhausted pool would not be recognised as one.
+            let relayer_amount = relay_fee.as_ref().map_or(0, |(_, amount)| *amount);
             let minimum = client
-                .pix_minimum_input(&Fr::from(self.token().await?), total, 0)
+                .pix_minimum_input(&Fr::from(self.token().await?), total, relayer_amount)
                 .await?;
             let funding = {
                 let state = self.state.lock();
@@ -3000,9 +3005,88 @@ mod tests {
         };
         assert_eq!(amount, high.required_fee_in_token(&native, &token)?);
         assert!(amount > low.required_fee_in_token(&native, &token)?);
-        // And it clears the gate even if the gate then reads the chain's median tip.
-        assert!(amount >= high.gate_floor_in_token(118, &native, &token)?);
+        // And the headroom covers the miss on its own: had every draw come back low, the note
+        // would still clear a gate that reads the chain's median tip.
+        assert!(low.required_fee_in_token(&native, &token)? >= high.gate_floor_in_token(118, &native, &token)?);
         assert_eq!(draws.load(Ordering::SeqCst), relayer::FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// The relayer's fee note is paid out of the funding, so the funding is chosen against the
+    /// minimum *with* the note in it. A note that covers the allocation alone is not enough: the
+    /// build would refuse it with an SDK error, which does not read as an exhausted pool, so the
+    /// shortfall has to surface as `NoFunding` before anything is built.
+    #[tokio::test]
+    async fn funding_selection_counts_the_relayer_fee_note() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|path, body| {
+            Some(if path.starts_with("/relay/paymaster") {
+                (200, relayer::http_tests::paymaster_body("118"))
+            } else if path == "/networks" {
+                (
+                    200,
+                    serde_json::json!({"data":[{
+                        "slug":"gnosis","chainId":"100","currencies":[
+                            {"symbol":"XDAI","price":"1","decimals":18,"vaultTokenId":"1","nativeCurrency":true},
+                            {"symbol":"WXHOPR","price":"0.010698345713752304","decimals":18,
+                             "vaultTokenId":"4","nativeCurrency":false}
+                        ]}],"error":null}),
+                )
+            } else if path == "/protocol" {
+                (200, serde_json::json!({"data":{"feeCollector":null}}))
+            } else if path == "/graphql" && body["query"].as_str().unwrap_or_default().contains("curvyVaultFees") {
+                // No protocol or gas fee, so the minimum is the allocation plus the relayer's note.
+                (
+                    200,
+                    serde_json::json!({ "data": {
+                        "curvyVaultFees": { "__typename": "CurvyVaultFees", "depositFee": "0", "withdrawalFee": "0" },
+                        "curvyAggregatorFees": {
+                            "__typename": "CurvyAggregatorFees",
+                            "protocolFeePerThousand": "0",
+                            "commitmentFeeRoot": "0x01",
+                            "feeNotePublicKey": ["1", "2"],
+                        },
+                        "curvyVaultTokenCount": { "__typename": "CurvyVaultTokenCount", "count": "0" },
+                    }}),
+                )
+            } else {
+                (
+                    500,
+                    serde_json::json!({ "error": format!("unexpected request to {path}") }),
+                )
+            })
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        {
+            // Covers the 7-unit allocation many times over, and the relayer's note not at all.
+            let store = RedbCurvySdkStore::new(&state)?;
+            let mut persisted = store.load()?;
+            persisted.funding = vec![StoredNote::from(&Adapter::owned_note(&fixture(1_000))?)];
+            store.save(&persisted)?;
+        }
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let relay = adapter.relay.as_ref().expect("relayed submission");
+        let network = relayer::RelayClient::network(relay, 100)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let (native, token) = relayer::fee_note_valuations(&network, 4)?;
+        let relay_fee = serde_json::from_value::<relayer::PaymasterInfo>(relayer::http_tests::paymaster_body("118"))?
+            .required_fee_in_token(&native, &token)?;
+        assert!(relay_fee > 1_000, "the funding note cannot cover the relayer's note");
+
+        let note = fixture(7);
+        let deposits = [(
+            note.deposit.id,
+            note.deposit.address,
+            scan_key("07", "0b")?,
+            note.deposit.amount,
+        )];
+        let error = adapter.allocate_all(&deposits).await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::NoFunding { required } if required == 7 + relay_fee),
+            "{error}"
+        );
+        assert!(crate::pix::pools::curvy::CurvyDepositPoolError::Adapter(error.into()).moved_no_funds());
         Ok(())
     }
 

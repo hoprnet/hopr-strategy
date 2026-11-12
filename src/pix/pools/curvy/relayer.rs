@@ -26,7 +26,7 @@
 //! ### Fees
 //!
 //! An aggregation must carry an output note addressed to the relayer's operator, worth at least
-//! its live gas quote — [`RelayClient::paymaster`] is what prices it. A withdrawal carries none:
+//! its live gas quote — [`RelayClient::paymaster_quote`] is what prices it. A withdrawal carries none:
 //! the vault reimburses the submitter on chain, so the relayer does not gate withdrawals on a
 //! quote at all.
 
@@ -170,9 +170,10 @@ impl PaymasterInfo {
     /// flips between them on consecutive requests, so the gate draws its own value from the
     /// same distribution the quote came from. A note sized to the quote plus a few percent is
     /// therefore rejected whenever the client drew the low mode and the gate the high one, which
-    /// is about one first submission in four. The headroom covers the whole spread several
-    /// times over; the note is worth a fraction of a cent, and its excess is the operator's, so
-    /// erring far high is the cheap side of a re-proof.
+    /// is about one first submission in four. The headroom covers the widest spread measured
+    /// with a margin of about 1.3x — enough, but not several times over (see
+    /// [`FEE_NOTE_HEADROOM_BPS`]); the note is worth a fraction of a cent, and its excess is the
+    /// operator's, so erring far high is the cheap side of a re-proof.
     pub fn required_fee_in_token(
         &self,
         native: &TokenValuation,
@@ -275,21 +276,36 @@ impl NetworksEnvelope {
 /// The quote is drawn from the paymaster's gas-price view, which on Gnosis alternates between
 /// two modes about seven times apart on consecutive requests (see
 /// [`PaymasterInfo::required_fee_in_token`]); the gate then draws its own value from the same
-/// distribution. Covering that needs `1 + headroom` to exceed the mode ratio divided by the
-/// gate's downward tolerance: the widest spread measured, 7.7x live (125 against 15 wei), needs
-/// 8.2x, and the blocks of the four rejected submissions ranged 3.75x to 6.50x. Doubling covered
-/// only 2.42x, which is why roughly one first submission in four was refused. 800% over the
-/// client buffer is 10.35x the quoted gas cost (`1.15 × 9`), clearing 10.89x of drift after the
-/// gate's 5% allowance — a margin of about 1.3x over the worst case, not a generous one.
+/// distribution. The gate accepts a note down to `1 - tolerance` of its live gas cost, so a note
+/// worth `m` times the quoted gas cost covers a live price up to `m / (1 - tolerance)` times the
+/// quote. The widest spread measured is 8.33x (125 against 15 wei), which needs `m` of at least
+/// `8.33 × 0.95 = 7.92`; the blocks of the four rejected submissions ranged 3.75x to 6.50x.
+/// Doubling gave `m = 1.15 × 2 = 2.3` and covered only 2.42x, which is why roughly one first
+/// submission in four was refused. 800% over the client buffer gives `m = 1.15 × 9 = 10.35`,
+/// covering 10.89x after the gate's 5% allowance — a margin of about 1.3x over the worst case
+/// (`10.89 / 8.33`), not a generous one.
 pub const FEE_NOTE_HEADROOM_BPS: u64 = 80_000;
 
 /// How many paymaster quotes to draw, keeping the highest, when pricing a fee note.
 ///
 /// The quote is not a signed price, so the only defence against drawing the low gas-price mode
-/// is redundancy: the high mode comes up about half the time, so four draws miss it with
-/// probability `2^-4`. The draws run concurrently, so they cost one round trip rather than four,
-/// and the worst case is one request timeout rather than four.
+/// is redundancy: the high mode comes up about half the time, so four *independent* draws miss
+/// it with probability `2^-4`. Independence is not something the client controls — a gateway
+/// that answers identical requests from one cached or coalesced upstream read hands every draw
+/// the same mode — so the draws ask caches not to answer them and start
+/// [`FEE_QUOTE_DRAW_SPACING`] apart rather than at the same instant. They still overlap, so the
+/// call costs one round trip plus the spacing, and the worst case is one request timeout plus
+/// the spacing rather than one timeout per draw.
 pub const FEE_QUOTE_SAMPLES: usize = 4;
+
+/// How long after the previous paymaster draw the next one starts.
+///
+/// Identical requests sent at the same instant are the ones a gateway is most likely to merge
+/// into one upstream read, which would make the draws one sample repeated. Spaced out, each draw
+/// reaches the gateway on its own whenever the upstream read takes less than this, at a cost of
+/// `(FEE_QUOTE_SAMPLES - 1)` times this much added latency — under a second against a deposit
+/// budget of a minute.
+pub const FEE_QUOTE_DRAW_SPACING: Duration = Duration::from_millis(200);
 
 /// Decimal places the relayer scales USD prices to before integer arithmetic (`PRICE_DECIMALS`).
 pub const PRICE_DECIMALS: u32 = 8;
@@ -541,6 +557,10 @@ impl RelayClient {
     /// A `404` means the deployment runs no paymaster and accepts aggregations without a fee
     /// note; that is reported as `Ok(None)` rather than an error.
     ///
+    /// This is a single draw of a gas price that flips between two modes, so it is the wrong
+    /// thing to size a fee note from: use [`Self::paymaster_quote`] for that. The request asks
+    /// caches not to answer it, so repeated calls each reach the paymaster.
+    ///
     /// ```no_run
     /// # use std::time::Duration;
     /// # use hopr_strategy::pix::pools::curvy::relayer::RelayClient;
@@ -558,6 +578,8 @@ impl RelayClient {
         let response = self
             .http
             .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .header(reqwest::header::PRAGMA, "no-cache")
             .send()
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
@@ -568,20 +590,27 @@ impl RelayClient {
     }
 
     /// The paymaster terms to price a fee note from: [`Self::paymaster`], drawn
-    /// [`FEE_QUOTE_SAMPLES`] times, keeping the quote with the highest gas price.
+    /// [`FEE_QUOTE_SAMPLES`] times, keeping the quote with the highest required fee.
     ///
     /// The endpoint is not a signed quote — the gate re-prices when the proof arrives — and on
     /// Gnosis its gas price alternates between two modes about seven times apart on consecutive
     /// requests. One draw therefore lands low about half the time, and the note built from it is
     /// under the gate's floor whenever the gate then draws high: the first submission is refused
     /// with `operator note does not cover the gas cost`. Taking the highest of several draws
-    /// makes that a `2^-FEE_QUOTE_SAMPLES` event rather than a coin flip.
+    /// makes that a `2^-FEE_QUOTE_SAMPLES` event rather than a coin flip, as far as the draws are
+    /// independent (see [`FEE_QUOTE_SAMPLES`]).
     ///
-    /// A draw that fails does not fail the call: only if every draw fails is the error reported,
-    /// and a deployment without a paymaster (`404`) is reported as `Ok(None)` as soon as one draw
-    /// says so. The draws run concurrently, so the call costs one round trip however many are
-    /// taken — which matters because a hung gateway would otherwise burn the deposit's whole
-    /// tracking budget before the retry loop even saw an error.
+    /// A draw that fails does not fail the call: any draw that returns a quote prices the note,
+    /// and a warning names the draws that did not. A deployment without a paymaster (`404`) is
+    /// reported as `Ok(None)` only when *every* draw says so. A stray `404` from a gateway edge
+    /// next to a real quote is not taken as one: an aggregation built without the fee note is
+    /// refused by a paymaster deployment after it has been proven. When no draw returns a quote
+    /// and the others failed, the failure is reported instead, so the caller retries.
+    ///
+    /// The draws overlap, each starting [`FEE_QUOTE_DRAW_SPACING`] after the previous one, so the
+    /// call costs one round trip plus the spacing however many are taken — which matters because
+    /// a hung gateway would otherwise burn the deposit's whole tracking budget before the retry
+    /// loop even saw an error.
     ///
     /// ```no_run
     /// # use std::time::Duration;
@@ -596,14 +625,23 @@ impl RelayClient {
     /// # }
     /// ```
     pub async fn paymaster_quote(&self, chain_id: u64) -> Result<Option<PaymasterInfo>, RelayError> {
-        let draws = futures::future::join_all((0..FEE_QUOTE_SAMPLES).map(|_| self.paymaster(chain_id))).await;
+        let draws = futures::future::join_all((0..FEE_QUOTE_SAMPLES).map(|draw| async move {
+            // Staggered rather than simultaneous: identical requests sent at the same instant
+            // are the likeliest to be answered from one upstream read.
+            tokio::time::sleep(FEE_QUOTE_DRAW_SPACING * draw as u32).await;
+            self.paymaster(chain_id).await
+        }))
+        .await;
         let mut best: Option<PaymasterInfo> = None;
+        // Draws that answered `404`. Only a unanimous `404` means the deployment runs no
+        // paymaster.
+        let mut without_paymaster = 0_usize;
         // Every failed draw, kept so the reported error is the most informative one rather than
         // whichever happened to run last.
         let mut errors: Vec<RelayError> = Vec::new();
         for draw in draws {
             match draw {
-                Ok(None) => return Ok(None),
+                Ok(None) => without_paymaster += 1,
                 Ok(Some(info)) => {
                     let higher = match &best {
                         None => true,
@@ -623,19 +661,28 @@ impl RelayClient {
             }
         }
         if let Some(info) = best {
-            if !errors.is_empty() {
-                // Not a failure — the note is priced from a real quote — but the caller should
-                // be able to see that the gateway is degrading.
-                tracing::debug!(
+            if !errors.is_empty() || without_paymaster > 0 {
+                // Not a failure — the note is priced from a real quote — but it is priced from
+                // fewer draws than intended, so the chance that it missed the high gas-price mode
+                // is higher, and the gateway is degrading. Worth seeing in production.
+                tracing::warn!(
                     failed_draws = errors.len(),
+                    without_paymaster,
                     samples = FEE_QUOTE_SAMPLES,
                     gas_price_wei = %info.gas_price_wei,
-                    first_error = %errors[0],
-                    "some paymaster quote draws failed; priced from those that succeeded"
+                    first_error = %errors.first().map(ToString::to_string).unwrap_or_default(),
+                    "some paymaster quote draws failed; priced the fee note from those that succeeded"
                 );
             }
             return Ok(Some(info));
         }
+        if errors.is_empty() {
+            // Every draw answered `404`: the deployment runs no paymaster.
+            return Ok(None);
+        }
+        // Some draws may have said `404`, but the others failed rather than agreeing, so there
+        // is no telling a deployment without a paymaster from a gateway having a bad moment.
+        // Retrying is the safe side; building the aggregation without a fee note is not.
         let error = errors
             .into_iter()
             .min_by_key(RelayError::severity)
@@ -986,7 +1033,8 @@ mod tests {
     }
 
     /// The note covers the gas-price mode the quote missed, which is what the old doubling was
-    /// short of on Gnosis: 1.15 * 1 + headroom against a mode ratio of up to 7.4x.
+    /// short of on Gnosis: `1.15 × (1 + headroom)` against a mode ratio of up to 8.33x (125
+    /// against 15 wei).
     #[test]
     fn the_fee_note_covers_the_other_gas_price_mode() -> anyhow::Result<()> {
         let network = serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?.into_network(100)?;
@@ -1043,17 +1091,25 @@ mod tests {
     #[test]
     fn the_covered_ratio_is_above_the_measured_gas_price_spread() -> anyhow::Result<()> {
         // Measured on the prod paymaster 2026-11-12: modes at 15-26 and 113-125 wei, a ratio of
-        // 125/15 = 8.33. The gate tolerates 5% downward, so the note must be worth
-        // 8.33 / 0.95 = 8.77x the quote it was priced from.
+        // 125/15 = 8.33. The gate accepts a note down to 95% of its live cost, so a note priced
+        // at 15 wei must be worth at least 125 * 0.95 / 15 = 7.92x the quoted gas cost.
+        let (quoted_wei, live_wei, tolerance_bps) = (15_u128, 125_u128, 500_u128);
+        // In basis points of the quoted gas cost.
         let note_over_quote = |buffer_bps: u64, headroom_bps: u64| {
             (10_000 + buffer_bps) as u128 * (10_000 + headroom_bps) as u128 / 10_000
         };
-        // In basis points of the quoted gas cost.
-        let needed = 87_700_u128;
-        assert!(note_over_quote(1_500, FEE_NOTE_HEADROOM_BPS) >= needed);
-        // The doubling this replaced did not: 2.42 < 8.77, so it only covered the spread if the
-        // gate happened to draw a mode at most 2.42x the one that priced the note.
-        assert!(note_over_quote(1_500, 10_000) < needed);
+        // `note >= floor`, with both sides in basis points of one wei of gas and no division.
+        let clears = |note_bps: u128| note_bps * quoted_wei >= live_wei * (10_000 - tolerance_bps);
+        assert_eq!(note_over_quote(1_500, FEE_NOTE_HEADROOM_BPS), 103_500, "1.15 x 9");
+        assert!(clears(note_over_quote(1_500, FEE_NOTE_HEADROOM_BPS)));
+        // The margin is the covered ratio over the measured one: 10.35 / 0.95 = 10.89x against
+        // 8.33x, about 1.3x. Held in hundredths of the measured ratio.
+        let margin_hundredths =
+            note_over_quote(1_500, FEE_NOTE_HEADROOM_BPS) * quoted_wei * 100 / (live_wei * (10_000 - tolerance_bps));
+        assert_eq!(margin_hundredths, 130, "about 1.3x over the widest spread measured");
+        // The doubling this replaced did not: 2.3 / 0.95 = 2.42 < 8.33, so it only covered the
+        // spread if the gate happened to draw a mode at most 2.42x the one that priced the note.
+        assert!(!clears(note_over_quote(1_500, 10_000)));
         Ok(())
     }
 
@@ -1211,7 +1267,72 @@ pub(super) mod http_tests {
         }
     }
 
+    /// One request as the fixture read it.
+    pub struct Request {
+        pub path: String,
+        /// The request line and headers, as sent.
+        pub head: String,
+        pub body: serde_json::Value,
+    }
+
+    impl Request {
+        /// The value of header `name`, matched case-insensitively.
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.head.lines().skip(1).find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+            })
+        }
+    }
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Request {
+        let mut input = Vec::new();
+        let (head_end, length) = loop {
+            let mut buffer = [0; 4096];
+            let n = socket.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break (input.len(), 0);
+            }
+            input.extend_from_slice(&buffer[..n]);
+            if let Some(end) = input.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&input[..end]);
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                break (end + 4, length);
+            }
+        };
+        while input.len() < head_end + length {
+            let mut buffer = [0; 4096];
+            let n = socket.read(&mut buffer).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            input.extend_from_slice(&buffer[..n]);
+        }
+        let head = String::from_utf8_lossy(&input[..head_end]).into_owned();
+        let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+        let body = serde_json::from_slice(&input[head_end..]).unwrap_or(serde_json::Value::Null);
+        Request { path, head, body }
+    }
+
+    async fn respond(socket: &mut tokio::net::TcpStream, status: u16, response: serde_json::Value) {
+        let body = response.to_string();
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+             close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    }
+
     impl Server {
+        /// Answers one connection at a time, in the order they were accepted.
         pub async fn new(
             handler: impl Fn(&str, serde_json::Value) -> Option<(u16, serde_json::Value)> + Send + 'static,
         ) -> Self {
@@ -1220,47 +1341,38 @@ pub(super) mod http_tests {
             let task = tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut input = Vec::new();
-                    let (head_end, length) = loop {
-                        let mut buffer = [0; 4096];
-                        let n = socket.read(&mut buffer).await.unwrap();
-                        if n == 0 {
-                            break (input.len(), 0);
-                        }
-                        input.extend_from_slice(&buffer[..n]);
-                        if let Some(end) = input.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                            let head = String::from_utf8_lossy(&input[..end]);
-                            let length = head
-                                .lines()
-                                .find_map(|line| {
-                                    let (name, value) = line.split_once(':')?;
-                                    name.eq_ignore_ascii_case("content-length")
-                                        .then(|| value.trim().parse::<usize>().unwrap())
-                                })
-                                .unwrap_or(0);
-                            break (end + 4, length);
-                        }
-                    };
-                    while input.len() < head_end + length {
-                        let mut buffer = [0; 4096];
-                        let n = socket.read(&mut buffer).await.unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        input.extend_from_slice(&buffer[..n]);
+                    let request = read_request(&mut socket).await;
+                    if let Some((status, response)) = handler(&request.path, request.body) {
+                        respond(&mut socket, status, response).await;
                     }
-                    let head = String::from_utf8_lossy(&input[..head_end]);
-                    let path = head.split_whitespace().nth(1).unwrap_or("");
-                    let body = serde_json::from_slice(&input[head_end..]).unwrap_or(serde_json::Value::Null);
-                    if let Some((status, response)) = handler(path, body) {
-                        let body = response.to_string();
-                        let response = format!(
-                            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: \
-                             {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = socket.write_all(response.as_bytes()).await;
-                    }
+                }
+            });
+            Self { url, task }
+        }
+
+        /// Answers every connection on its own task, so `handler` can hold one response back
+        /// until other requests have arrived. Dropping the server cancels the requests still
+        /// being held.
+        pub async fn concurrent<F, Fut>(handler: F) -> Self
+        where
+            F: Fn(Request) -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = Option<(u16, serde_json::Value)>> + Send + 'static,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+            let handler = Arc::new(handler);
+            let task = tokio::spawn(async move {
+                // Owned by the accept loop, so aborting it on drop aborts every connection too.
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let handler = handler.clone();
+                    connections.spawn(async move {
+                        let request = read_request(&mut socket).await;
+                        if let Some((status, response)) = handler(request).await {
+                            respond(&mut socket, status, response).await;
+                        }
+                    });
                 }
             });
             Self { url, task }
@@ -1306,63 +1418,78 @@ pub(super) mod http_tests {
         Ok(())
     }
 
-    /// The draws are issued together, so a hung gateway costs one request timeout rather than
-    /// one per draw. Sequential draws would spend `FEE_QUOTE_SAMPLES` × 30 s of a 60 s deposit
-    /// budget before the retry loop saw any error at all.
+    /// The draws overlap, so a hung gateway costs one request timeout rather than one per draw.
+    /// Sequential draws would spend `FEE_QUOTE_SAMPLES` × 30 s of a 60 s deposit budget before
+    /// the retry loop saw any error at all.
+    ///
+    /// Checked without a clock: the server holds every answer until all `FEE_QUOTE_SAMPLES`
+    /// draws have arrived, and only the first draw to arrive is quoted high. Overlapping draws
+    /// are all answered, so the high quote wins. Draws one after another never get there: each
+    /// waits on an answer that only a later draw can release, so all but the last time out, and
+    /// the quote comes back low (or not at all). A slow runner can delay the answers but cannot
+    /// change which ones arrive.
     #[tokio::test]
     async fn the_fee_quote_draws_run_concurrently() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Answers every request after `delay`, accepting the connections in parallel so a
-        // sequential client really does wait four times as long.
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url: Url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
-        let server = tokio::spawn({
-            let in_flight = in_flight.clone();
-            let peak = peak.clone();
-            async move {
-                loop {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let in_flight = in_flight.clone();
-                    let peak = peak.clone();
-                    tokio::spawn(async move {
-                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(now, Ordering::SeqCst);
-                        let mut request = [0_u8; 2048];
-                        let _ = socket.read(&mut request).await;
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
-                        let body = paymaster_body("118").to_string();
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-                             Connection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = socket.write_all(response.as_bytes()).await;
-                    });
+        let all_arrived = Arc::new(tokio::sync::Barrier::new(FEE_QUOTE_SAMPLES));
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        let server = Server::concurrent({
+            let arrivals = arrivals.clone();
+            move |_| {
+                let all_arrived = all_arrived.clone();
+                let arrival = arrivals.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    all_arrived.wait().await;
+                    let price = if arrival == 0 { "118" } else { "16" };
+                    Some((200, paymaster_body(price)))
                 }
             }
-        });
-
-        let client = RelayClient::new(url, Duration::from_secs(5))?;
-        let started = std::time::Instant::now();
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(5))?;
         let info = client.paymaster_quote(100).await?.expect("a paymaster is served");
-        let elapsed = started.elapsed();
-        server.abort();
-
-        assert_eq!(info.gas_price_wei, "118");
         assert_eq!(
-            peak.load(Ordering::SeqCst),
-            FEE_QUOTE_SAMPLES,
-            "every draw was in flight at once"
+            info.gas_price_wei, "118",
+            "the first draw was answered, so every draw was in flight at once"
         );
+        assert_eq!(arrivals.load(Ordering::SeqCst), FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// The draws are spaced out rather than fired at the same instant, and each asks caches not
+    /// to answer it, so a gateway that merges or caches identical requests cannot hand every
+    /// draw one upstream read. The spacing is checked as a lower bound only — a sleep never ends
+    /// early, so no runner is too slow for it.
+    #[tokio::test]
+    async fn the_fee_quote_draws_are_spaced_out_and_bypass_caches() -> anyhow::Result<()> {
+        let headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = Server::concurrent({
+            let headers = headers.clone();
+            move |request: Request| {
+                headers.lock().unwrap().push((
+                    request.header("cache-control").map(str::to_owned),
+                    request.header("pragma").map(str::to_owned),
+                ));
+                async { Some((200, paymaster_body("118"))) }
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(5))?;
+        let started = std::time::Instant::now();
+        client.paymaster_quote(100).await?.expect("a paymaster is served");
+        let elapsed = started.elapsed();
+        let spread = FEE_QUOTE_DRAW_SPACING * (FEE_QUOTE_SAMPLES as u32 - 1);
         assert!(
-            elapsed < Duration::from_millis(4 * 150),
-            "took {elapsed:?}; sequential draws would take about {:?}",
-            Duration::from_millis(4 * 150)
+            elapsed >= spread,
+            "took {elapsed:?}; the last draw cannot start before {spread:?}"
         );
+        let headers = headers.lock().unwrap().clone();
+        assert_eq!(headers.len(), FEE_QUOTE_SAMPLES);
+        for (cache_control, pragma) in headers {
+            assert_eq!(cache_control.as_deref(), Some("no-cache"));
+            assert_eq!(pragma.as_deref(), Some("no-cache"));
+        }
         Ok(())
     }
 
@@ -1398,6 +1525,61 @@ pub(super) mod http_tests {
         let server = Server::new(|_, _| Some((404, serde_json::Value::Null))).await;
         let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
         assert!(client.paymaster_quote(100).await?.is_none());
+        Ok(())
+    }
+
+    /// One `404` among real quotes is a gateway edge misrouting a draw, not a deployment without
+    /// a paymaster. Taking it at its word would build the aggregation without a fee note, which
+    /// the paymaster's gate refuses only after the proof has been paid for.
+    #[tokio::test]
+    async fn a_stray_404_does_not_drop_the_fee_note() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = Server::new({
+            let draws = draws.clone();
+            move |_, _| {
+                let draw = draws.fetch_add(1, Ordering::SeqCst);
+                Some(match draw {
+                    0 => (404, serde_json::Value::Null),
+                    1 => (200, paymaster_body("118")),
+                    _ => (200, paymaster_body("16")),
+                })
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let info = client
+            .paymaster_quote(100)
+            .await?
+            .expect("the other draws quoted a paymaster");
+        assert_eq!(info.gas_price_wei, "118");
+        assert_eq!(draws.load(Ordering::SeqCst), FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// A `404` next to failed draws proves nothing either way, so the failure is reported and
+    /// retried rather than read as "no paymaster".
+    #[tokio::test]
+    async fn a_404_among_failed_draws_is_reported_as_the_failure() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = Server::new({
+            let draws = draws.clone();
+            move |_, _| {
+                let draw = draws.fetch_add(1, Ordering::SeqCst);
+                Some(match draw {
+                    0 => (404, serde_json::Value::Null),
+                    _ => (503, serde_json::json!({"error":"quote unavailable"})),
+                })
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let error = client
+            .paymaster_quote(100)
+            .await
+            .expect_err("a lone 404 is not a verdict");
+        assert!(matches!(error, RelayError::Transport(_)), "{error}");
         Ok(())
     }
 
