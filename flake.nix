@@ -2,7 +2,6 @@
 #
 # This is the main entry point for the Nix flake. It uses the HOPR nix-lib
 # for reusable Rust build functions and formatting configuration.
-#
 # Structure:
 # - nix/packages/: Package definitions (hopr-strategy)
 # - nix/checks.nix: CI/CD quality checks
