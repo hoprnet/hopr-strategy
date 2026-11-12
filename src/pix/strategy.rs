@@ -1967,7 +1967,7 @@ mod tests {
     use hopr_api::{
         chain::{
             AccountSelector, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations, ChainValues,
-            ChainWriteAccountOperations, HoprChainApi,
+            ChainWriteAccountOperations, DepositPool, HoprChainApi, PoolTransferSource,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2231,6 +2231,45 @@ mod tests {
             .await?
             .context("no notification")?;
         assert_eq!(n.1, target);
+        Ok(())
+    }
+
+    /// The Safe funds the plain pool, so it takes no top-up and reports the Safe's wxHOPR.
+    #[test_log::test(tokio::test)]
+    async fn test_plain_pool_funding_is_the_safe() -> anyhow::Result<()> {
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let client = connector.client();
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
+        );
+
+        assert!(
+            !pool.accepts_funding(),
+            "a pool whose funding is the Safe has nothing to move value into"
+        );
+        assert!(
+            pool.fund(HoprBalance::new_base(10)).await.is_err(),
+            "funding the plain pool must be refused rather than reported as done"
+        );
+        assert_eq!(
+            pool.available_balance().await?,
+            hopr_balance(&*cc, *BOB).await?,
+            "the funding this pool reports is the Safe's wxHOPR"
+        );
         Ok(())
     }
 
@@ -3317,6 +3356,15 @@ mod tests {
             Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
         }
 
+        /// Nothing to fund: the flush paths these tests drive pay through `deposit_funds_to`.
+        async fn fund(&self, _: HoprBalance) -> std::result::Result<(), StrategyError> {
+            Ok(())
+        }
+
+        async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
+            Ok(HoprBalance::zero())
+        }
+
         async fn deposit_funds_to(
             &self,
             _: &PixAddressId,
@@ -3409,8 +3457,7 @@ mod tests {
 
         async fn pool_transfer(
             &self,
-            _: &PixAddressId,
-            _: &EthDepositKey,
+            _: PoolTransferSource<'_, EthDepositKey>,
             _: &PixAddressId,
             _: Address,
             _: Self::PoolDepositData,
@@ -4229,8 +4276,10 @@ mod tests {
 
         let dst_id = pix_id(2);
         pool.pool_transfer(
-            &pix_id(1),
-            &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            PoolTransferSource::Deposit {
+                id: &pix_id(1),
+                key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            },
             &dst_id,
             *CHRIS,
             ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -4292,8 +4341,10 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                &pix_id(1),
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &pix_id(1),
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -4374,8 +4425,10 @@ mod tests {
         let dst_id = pix_id(2);
         let transferred = pool
             .pool_transfer(
-                &id,
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &id,
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, [0xde, 0xad, 0xbe, 0xef]),
@@ -4481,8 +4534,10 @@ mod tests {
         let dst_id = pix_id(3);
         let transferred = pool
             .pool_transfer(
-                &id,
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &id,
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 misfiled,
@@ -4552,8 +4607,10 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                &pix_id(1),
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &pix_id(1),
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
