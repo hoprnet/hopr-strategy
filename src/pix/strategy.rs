@@ -311,9 +311,10 @@ pub struct PixStrategyConfig {
 /// from the Safe. Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; one funding at a time, so that
 /// concurrent flushes cannot each top up. Without the policy, deposits fail once the pool is
-/// empty until an operator funds it — with which error is the pool's own answer: the plain pool
-/// raises [`StrategyError::CriteriaNotSatisfied`], the Curvy pool a typed other-error that
-/// [`is_out_of_funding`](crate::pix::pools::curvy::is_out_of_funding) recognises as exhaustion.
+/// empty until an operator funds it — with which error is the pool's own answer, wrapped in
+/// [`StrategyError::Other`]: the plain pool its affordability refusal, the Curvy pool a typed
+/// error that [`is_out_of_funding`](crate::pix::pools::curvy::is_out_of_funding) recognises as
+/// exhaustion.
 ///
 /// `min_available` must be below `top_up`, and is refused otherwise. A shield nets `top_up` less
 /// the pool's own fee, and [`available_balance`](DepositPool::available_balance) is what a single
