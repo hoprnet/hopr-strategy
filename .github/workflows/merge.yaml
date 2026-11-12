@@ -24,12 +24,12 @@ jobs:
             runner: depot-ubuntu-24.04-arm-4
           - architecture: aarch64-darwin
             runner: depot-macos-15
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@3d291616a704bea189af1f16cefc25e26d2857c0 # build-library-v3.2.0
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@feat/fork-pr-ci-support
     permissions:
       contents: read
       id-token: write
     with:
-      source_branch: ${{ github.event.pull_request.base.ref }}
+      repo_sha: ${{ github.event.pull_request.merge_commit_sha }}
       version_type: pr
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
