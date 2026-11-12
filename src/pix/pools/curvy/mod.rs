@@ -683,6 +683,30 @@ impl CurvyDepositPoolError {
         }
     }
 
+    /// Whether this error only means an earlier Curvy operation still has to be reconciled.
+    ///
+    /// Nothing about this deposit failed: the pool refuses to start another aggregation until the
+    /// previous one's outcome is known, and a later flush goes through once it is. A consumer
+    /// counting failed deposits must not count this one, and the spend reservation stays because
+    /// the earlier operation may still have moved funds.
+    pub(crate) fn is_reconciliation_pending(&self) -> bool {
+        match self {
+            // The recovery state is not confirmed by the endpoint yet.
+            Self::ReconciliationPending => true,
+            Self::Adapter(error) => matches!(
+                error.downcast_ref::<sdk::RsSdkCurvyAdapterError>(),
+                Some(
+                    sdk::RsSdkCurvyAdapterError::AmbiguousAllocation
+                        | sdk::RsSdkCurvyAdapterError::RelayAttemptLimit
+                        | sdk::RsSdkCurvyAdapterError::RelayFinalityPending
+                        | sdk::RsSdkCurvyAdapterError::RelayFinalityUnavailable(_)
+                        | sdk::RsSdkCurvyAdapterError::ShieldInProgress
+                )
+            ),
+            _ => false,
+        }
+    }
+
     /// Whether this error means the shielded pool has no funding left to allocate from.
     ///
     /// Distinct from [`Self::moved_no_funds`], which is also true for a malformed payload or a
@@ -761,8 +785,9 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
                 actual: *actual,
             }
         }
-        // Rebuilt from its own type, not its Display string: `moved_no_funds` downcasts, so a
-        // string would erase the classification and a fund-free batch would never refund.
+        // Rebuilt from its own type, not its Display string: `moved_no_funds` and
+        // `is_reconciliation_pending` downcast, so a string would erase the classification and a
+        // fund-free batch would never refund, nor a pending one be counted as pending.
         CurvyDepositPoolError::Adapter(error) => match error.downcast_ref::<sdk::RsSdkCurvyAdapterError>() {
             Some(sdk::RsSdkCurvyAdapterError::NoFunding { required }) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::NoFunding { required: *required }.into())
@@ -779,8 +804,26 @@ fn curvy_clone(error: &CurvyDepositPoolError) -> CurvyDepositPoolError {
             Some(sdk::RsSdkCurvyAdapterError::Sdk(inner)) => {
                 CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{inner}")).into())
             }
+            // The pending classes travel per item too, or a batched flush reports the wait as a
+            // failed deposit.
+            Some(sdk::RsSdkCurvyAdapterError::AmbiguousAllocation) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::AmbiguousAllocation.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::RelayAttemptLimit) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::RelayAttemptLimit.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::RelayFinalityPending) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::RelayFinalityPending.into())
+            }
+            Some(sdk::RsSdkCurvyAdapterError::RelayFinalityUnavailable(reason)) => CurvyDepositPoolError::Adapter(
+                sdk::RsSdkCurvyAdapterError::RelayFinalityUnavailable(reason.clone()).into(),
+            ),
+            Some(sdk::RsSdkCurvyAdapterError::ShieldInProgress) => {
+                CurvyDepositPoolError::Adapter(sdk::RsSdkCurvyAdapterError::ShieldInProgress.into())
+            }
             _ => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{error}")),
         },
+        CurvyDepositPoolError::ReconciliationPending => CurvyDepositPoolError::ReconciliationPending,
         other => CurvyDepositPoolError::Adapter(anyhow::anyhow!("{other}")),
     }
 }

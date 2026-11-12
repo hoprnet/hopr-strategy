@@ -259,4 +259,6 @@ jobs:
           # `build-library` are input-gated on `changes.outputs.rust`; when every
           # inner job of the reusable workflow skips, the caller job reports
           # skipped as well. Their skip is allowed only for a non-Rust change.
-          allowed-skips: ${{ format('validate-pr-title, label{0}{1}', (github.event_name != 'pull_request' || needs.changes.outputs.rust != 'true') && ', semver-checks' || '', needs.changes.outputs.rust != 'true' && ', tests, build-library' || '') }}
+          # `zizmor` is path-gated on `.github/**`, so its skip is allowed only
+          # when the workflow files did not change.
+          allowed-skips: ${{ format('validate-pr-title, label{0}{1}{2}', (github.event_name != 'pull_request' || needs.changes.outputs.rust != 'true') && ', semver-checks' || '', needs.changes.outputs.rust != 'true' && ', tests, build-library' || '', (github.event_name == 'pull_request' && needs.changes.outputs.zizmor != 'true') && ', zizmor' || '') }}
