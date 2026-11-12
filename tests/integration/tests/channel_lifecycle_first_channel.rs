@@ -1,4 +1,4 @@
-//! GNO-1314: failed loopbacks starve every relay, so a channel-less node never opens one.
+//! Failed loopbacks starve every relay, so a channel-less node never opens one.
 
 use std::{sync::Arc, time::Duration};
 
@@ -114,12 +114,12 @@ async fn opens_first_channel_to_unprobed_relays(fixture: IntegrationFixture) -> 
     Ok(())
 }
 
-/// GNO-1314: loopbacks that failed for lack of a channel must not block opening one.
+/// Loopbacks that failed for lack of a channel must not block opening one.
 #[rstest]
 #[test_log::test(tokio::test)]
 async fn opens_first_channel_although_every_loopback_failed(fixture: IntegrationFixture) -> Result<()> {
     first_channel_opens(&fixture, true)
         .await
-        .context("GNO-1314: failed loopbacks marked every relay starved")?;
+        .context("failed loopbacks marked every relay starved")?;
     Ok(())
 }

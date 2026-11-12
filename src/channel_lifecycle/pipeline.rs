@@ -123,7 +123,7 @@ enum LoopbackVerdict {
     /// The peer has a channel, so a loopback can route: a zeroed edge is measured-dead.
     Trusted,
     /// The peer has no channel, so every loopback fails for lack of one: a zeroed edge
-    /// falls back to the direct probe stream instead of reading as measured-dead (GNO-1314).
+    /// falls back to the direct probe stream instead of reading as measured-dead.
     Unroutable,
 }
 
@@ -280,7 +280,7 @@ where
     /// `verdict` says whether the graph's loopback-based starvation verdict is usable
     /// evidence for this peer. For an unroutable (channel-less) peer, a zeroed combined
     /// score falls back to the direct probe stream's own score instead of reading as
-    /// measured-dead (GNO-1314).
+    /// measured-dead.
     fn peer_edge_info(&self, peer_offchain: &OffchainPublicKey, verdict: LoopbackVerdict) -> PeerEdgeInfo {
         let my_key = self.node.graph().identity();
         match self.node.graph().edge(my_key, peer_offchain) {
@@ -1184,7 +1184,7 @@ where
                 // Every peer here has no `Open`/`PendingToClose` channel — `existing_dests`
                 // filtered those out above — so a loopback to it cannot route. Its starved
                 // loopback verdict is therefore an artifact of the missing channel, not
-                // evidence that the peer is measured-dead (GNO-1314).
+                // evidence that the peer is measured-dead.
                 let edge_info = self.peer_edge_info(&offchain_key, LoopbackVerdict::Unroutable);
                 let ticket_score = self
                     .peer_ticket_activity
@@ -3079,7 +3079,7 @@ mod tests {
         Ok(inner.state())
     }
 
-    /// GNO-1314: a starved loopback must not read as measured-dead when the peer
+    /// A starved loopback must not read as measured-dead when the peer
     /// has no channel for the loopback to route over. The direct probe stream is
     /// healthy, so the candidate clears the gate and the tick fails to afford it.
     #[tokio::test]

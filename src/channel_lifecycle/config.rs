@@ -69,7 +69,7 @@ pub struct EligibilityConfig {
     /// A peer this node has no `Open`/`PendingToClose` channel with is scored on its
     /// direct probe stream when the loopback verdict would otherwise zero it, so the
     /// default gate cannot deadlock a fresh node that has no channel to route a
-    /// loopback over (GNO-1314).
+    /// loopback over.
     #[default = 0.5]
     pub min_peer_quality_score: f64,
 
