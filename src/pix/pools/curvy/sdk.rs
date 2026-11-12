@@ -97,6 +97,9 @@ const MAX_ALLOCATION_INPUTS: usize = 2;
 const DIRECT_SHIELD_OBSERVATIONS: usize = 3;
 const DIRECT_SHIELD_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Search budget for an exact whole-note withdrawal; see `select_notes`.
+/// The default of `CurvyDepositPoolConfig::direct_shield_settle_grace`: three minutes, the
+/// operator's allowance for Gnosis finality; see there for the trade-off.
+pub(super) const DEFAULT_SHIELD_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
 const MAX_NOTE_SELECTION_STEPS: usize = 1 << 16;
 /// Never evict an uncertain proof to make room: its private outputs may still be needed.
 const MAX_RELAY_AGGREGATION_ATTEMPTS: usize = 8;
@@ -109,7 +112,12 @@ const RELAY_FINALITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Transfers `amount` of wxHOPR to a shield portal, resolving once the transfer is confirmed.
 ///
 /// Built by the pool over the node's chain API — see the module docs for why the Safe pays.
-pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+///
+/// Answers like a [`DirectShielder`], and for the same reason: whether the transfer was broadcast is
+/// known only when its confirmation arrives, and the journal needs to tell a refusal from a lost
+/// answer. A [`Confirmed`] is a transfer that took effect.
+pub type PortalFunder =
+    Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, Result<Confirmed, ShieldFailure>> + Send + Sync>;
 
 /// Performs a direct shield on behalf of the account that holds the float.
 ///
@@ -132,14 +140,14 @@ pub type PortalFunder = Arc<dyn Fn(Address, HoprBalance) -> BoxFuture<'static, R
 pub type DirectShielder =
     Arc<dyn Fn(Erc777Payload, Address, u128) -> BoxFuture<'static, Result<Confirmed, ShieldFailure>> + Send + Sync>;
 
-/// A direct shield's transaction, confirmed on chain.
+/// A shield's transaction — a direct shield, or the Safe's transfer to a portal — confirmed on chain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Confirmed {
     /// The transaction hash.
     pub tx: String,
 }
 
-/// How a direct shield's transaction failed, as far as the float is concerned.
+/// How a shield's transaction failed, as far as the float is concerned.
 #[derive(Debug, thiserror::Error)]
 pub enum ShieldFailure {
     /// Refused before anything was broadcast: nothing moved and no nonce was consumed.
@@ -174,22 +182,43 @@ fn unix_time(time: Option<u64>) -> String {
 }
 
 /// Seconds since the Unix epoch, or `None` when the clock is not usable (set before the epoch).
-fn unix_now() -> Option<u64> {
+pub(super) fn unix_now() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|elapsed| elapsed.as_secs())
 }
 
-/// Records how far the Safe's transaction for the in-flight direct shield got.
+/// Which in-flight shield a journal write is for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShieldJournal {
+    /// The direct shield, through the shield router.
+    Direct,
+    /// The portal shield, whose Safe transaction funds the portal.
+    Portal,
+}
+
+/// Records how far the Safe's transaction for the in-flight shield got. Never the stage: a
+/// confirmation can be of a transaction whose inner transfer failed, when Blokli omits the Safe's
+/// execution result, so only a balance read decides that a portal is funded.
 fn journal_submission(
     state: &parking_lot::Mutex<SdkState>,
     store: &RedbCurvySdkStore,
+    journal: ShieldJournal,
     submission: ShieldSubmission,
 ) -> Result<(), RsSdkCurvyAdapterError> {
     let mut state = state.lock();
-    if let Some(in_flight) = state.direct_shield_in_flight.as_mut() {
-        in_flight.submission = submission;
+    match journal {
+        ShieldJournal::Direct => {
+            if let Some(in_flight) = state.direct_shield_in_flight.as_mut() {
+                in_flight.submission = submission;
+            }
+        }
+        ShieldJournal::Portal => {
+            if let Some(in_flight) = state.shield_in_flight.as_mut() {
+                in_flight.submission = submission;
+            }
+        }
     }
     store.save(&state)
 }
@@ -201,9 +230,10 @@ fn journal_submission(
 async fn shield_journalled(
     state: &parking_lot::Mutex<SdkState>,
     store: &RedbCurvySdkStore,
+    journal: ShieldJournal,
     shield: BoxFuture<'static, Result<Confirmed, ShieldFailure>>,
 ) -> Result<(Result<Confirmed, ShieldFailure>, Option<u64>), RsSdkCurvyAdapterError> {
-    journal_submission(state, store, ShieldSubmission::Unknown { since: unix_now() })?;
+    journal_submission(state, store, journal, ShieldSubmission::Unknown { since: unix_now() })?;
     let outcome = shield.await;
     // When the outcome arrived, not when the call began: the sequencer's queue and the connector's
     // tracking window come before it, and a grace measured from the call would have spent them.
@@ -212,6 +242,7 @@ async fn shield_journalled(
         Ok(confirmed) => journal_submission(
             state,
             store,
+            journal,
             ShieldSubmission::Submitted {
                 tx: confirmed.tx.clone(),
                 at,
@@ -219,17 +250,18 @@ async fn shield_journalled(
         )?,
         // The float did not move: the next funding sends.
         Err(ShieldFailure::NotSubmitted(_) | ShieldFailure::Reverted { .. }) => {
-            journal_submission(state, store, ShieldSubmission::NotSubmitted)?
+            journal_submission(state, store, journal, ShieldSubmission::NotSubmitted)?
         }
         // It may have been broadcast: unknown from now, which is what the grace runs from.
         Err(ShieldFailure::Unconfirmed(_)) => {
-            journal_submission(state, store, ShieldSubmission::Unknown { since: at })?
+            journal_submission(state, store, journal, ShieldSubmission::Unknown { since: at })?
         }
     }
     Ok((outcome, at))
 }
 
-/// Records that the Safe's transfer to the in-flight shield's portal is done.
+/// The one stage transition of a portal shield: the portal is funded. Called only once a balance
+/// read has shown the portal holding the shield's amount.
 fn journal_portal_funded(
     state: &parking_lot::Mutex<SdkState>,
     store: &RedbCurvySdkStore,
@@ -377,7 +409,7 @@ impl RsSdkCurvyAdapterConfig {
             relay_timeout: std::time::Duration::from_secs(120),
             note_source: CurvyNoteSource::Blokli,
             curvy_indexer_url: None,
-            direct_shield_settle_grace: std::time::Duration::from_secs(180),
+            direct_shield_settle_grace: DEFAULT_SHIELD_SETTLE_GRACE,
         }
     }
 
@@ -481,9 +513,9 @@ pub enum RsSdkCurvyAdapterError {
     #[error("cannot confirm Curvy aggregation finality: {0}; all attempts are retained")]
     RelayFinalityUnavailable(String),
     #[error(
-        "the direct shield of {gross} base units (note {note}) was handed to the chain at {} and the Curvy \
-         aggregator does not know its note yet; it is looked for again on the next funding, and sent again if it \
-         has not shown by {}",
+        "the shield of {gross} base units (note {note}) was handed to the chain at {} and has not shown yet (the \
+         Curvy aggregator does not know its note, or the portal holds no funds); it is looked for again on the next \
+         funding, and sent again if it has not shown by {}",
         unix_time(*since),
         unix_time(*resend_after)
     )]
@@ -494,12 +526,41 @@ pub enum RsSdkCurvyAdapterError {
         resend_after: Option<u64>,
     },
     #[error(
-        "the direct shield of {gross} base units (note {note}) confirmed in transaction {tx}, but the Curvy \
-         aggregator has not indexed its note yet; it is never sent again, and looked for again on the next funding"
+        "the shield of {gross} base units (note {note}) confirmed in transaction {tx}, but it has not shown yet (the \
+         Curvy aggregator has not indexed its note, or the portal's balance is read from behind); it is not sent \
+         again within the grace, which ends at {}, and is looked for again on the next funding",
+        unix_time(*resend_after)
     )]
-    ShieldConfirmedUnindexed { note: String, gross: u128, tx: String },
-    #[error("the Curvy shield portal contains {actual} base units instead of the expected {required}")]
-    UnexpectedShieldFunding { actual: u128, required: u128 },
+    ShieldConfirmedUnindexed {
+        note: String,
+        gross: u128,
+        tx: String,
+        /// When the grace ends: what a caller that waits for the shield to show must not outlast.
+        resend_after: Option<u64>,
+    },
+    #[error(
+        "the Curvy shield portal {portal} contains {actual} base units instead of the expected {required}; check its \
+         balance and the transactions that funded it: the portal's recovery address can reclaim what it holds"
+    )]
+    UnexpectedShieldFunding {
+        portal: String,
+        actual: u128,
+        required: u128,
+    },
+    #[error(
+        "the Safe's transfer of {gross} base units to the Curvy shield portal {portal} has not shown within the \
+         grace (transaction {}, handed to the chain at {}), and is not sent again, since the first copy may still \
+         land and a portal holding twice the amount cannot be shielded: check the portal's balance and the \
+         transaction; the portal's recovery address can reclaim a portal's funds",
+        tx.as_deref().unwrap_or("unknown"),
+        unix_time(*since)
+    )]
+    PortalFundingUnresolved {
+        portal: String,
+        gross: u128,
+        tx: Option<String>,
+        since: Option<u64>,
+    },
     #[error("funding the Curvy shield portal from the Safe failed: {0}")]
     Funding(String),
     #[error("Blokli does not expose the Curvy deployment: {0}")]
@@ -716,6 +777,11 @@ struct StoredShield {
     recovery: String,
     portal_address: String,
     stage: StoredShieldStage,
+    /// How far the Safe's transfer to the portal got, which a pre-upgrade journal reads as
+    /// unknown; see [`ShieldSubmission`], whose rules apply with "the portal holds `gross`" in
+    /// place of "the aggregator knows the note".
+    #[serde(default)]
+    submission: ShieldSubmission,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1407,6 +1473,7 @@ where
                             note: note_id(&prepared.note),
                             gross,
                             tx: tx.clone(),
+                            resend_after: at.map(|at| at.saturating_add(grace)),
                         });
                     }
                     tracing::warn!(
@@ -1416,7 +1483,12 @@ where
                         "a confirmed direct shield's note never appeared within the grace; treating it as a failed \
                          inner call of the Safe, and sending it again"
                     );
-                    journal_submission(&self.state, &self.store, ShieldSubmission::NotSubmitted)?;
+                    journal_submission(
+                        &self.state,
+                        &self.store,
+                        ShieldJournal::Direct,
+                        ShieldSubmission::NotSubmitted,
+                    )?;
                 }
                 // Handed to the chain with no outcome recorded. Within the grace it is only looked
                 // for, once per funding, which the read above was; the full observation is for
@@ -1472,7 +1544,7 @@ where
                 let (state, store) = (Arc::clone(&self.state), self.store.clone());
                 let guard = held.take().expect("held above");
                 let (outcome, guard) = tokio::spawn(async move {
-                    let outcome = shield_journalled(&state, &store, shield).await;
+                    let outcome = shield_journalled(&state, &store, ShieldJournal::Direct, shield).await;
                     (outcome, guard)
                 })
                 .await
@@ -1493,6 +1565,8 @@ where
                                     note: note_id(&prepared.note),
                                     gross,
                                     tx: confirmed.tx,
+                                    resend_after: at
+                                        .map(|at| at.saturating_add(self.config.direct_shield_settle_grace.as_secs())),
                                 });
                             }
                         }
@@ -1620,7 +1694,7 @@ where
         let mut held = Some(chain);
         // As for a direct shield, the journalled amount and recovery address are authoritative for
         // a shield in flight; the caller's only size a new one.
-        let mut shield = if let Some(shield) = self.state.lock().shield_in_flight.clone() {
+        let shield = if let Some(shield) = self.state.lock().shield_in_flight.clone() {
             if shield.gross != gross.to_string() || shield.recovery != recovery_address {
                 tracing::warn!(
                     requested = %gross,
@@ -1640,6 +1714,7 @@ where
                 recovery: prepared.recovery,
                 portal_address: prepared.portal_address,
                 stage: StoredShieldStage::Prepared,
+                submission: ShieldSubmission::NotSubmitted,
             };
             let mut state = self.state.lock();
             state.shield_in_flight = Some(shield.clone());
@@ -1653,54 +1728,142 @@ where
         let mut ledger = Vec::new();
         if !matches!(observed_status, 1 | 2) {
             if shield.stage == StoredShieldStage::Prepared {
-                let mut portal_balance = client
+                let portal_balance = client
                     .erc20_balance(&endpoints.token_address, &prepared.portal_address)
                     .await?;
-                let mut funded_by_task = false;
-                if portal_balance == 0 {
-                    let portal = Address::from_str(&prepared.portal_address).map_err(|error| {
-                        RsSdkCurvyAdapterError::InvalidValue(format!("shield portal address: {error}"))
-                    })?;
+                let grace = self.config.direct_shield_settle_grace.as_secs();
+                let within = |since: u64| unix_now().is_none_or(|now| now < since.saturating_add(grace));
+                // As for a direct shield, with "the portal holds the funds" for "the aggregator
+                // knows the note": whether the Safe sends again follows from how far its last
+                // transfer got.
+                let portal = Address::from_str(&prepared.portal_address)
+                    .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("shield portal address: {error}")))?;
+                // Unlike a direct shield, a portal funding is never sent again on a guess: the
+                // first copy may land after the grace, and a portal holding twice `gross` can
+                // never be shielded, so past the grace the operator is asked instead.
+                let unresolved = |tx: Option<String>, since: Option<u64>| {
+                    tracing::warn!(
+                        note = %note_id(&prepared.note),
+                        %gross,
+                        ?tx,
+                        ?since,
+                        grace = ?self.config.direct_shield_settle_grace,
+                        "the portal funding has not shown within the grace; it is not sent again"
+                    );
+                    RsSdkCurvyAdapterError::PortalFundingUnresolved {
+                        portal: portal.to_string(),
+                        gross,
+                        tx,
+                        since,
+                    }
+                };
+                let send = match &shield.submission {
+                    ShieldSubmission::NotSubmitted => portal_balance == 0,
+                    // Confirmed, so it took effect; a portal that reads empty is the read being
+                    // behind, until the grace says it is not.
+                    ShieldSubmission::Submitted { tx, at } => {
+                        if portal_balance != 0 {
+                            false
+                        } else if at.is_some_and(within) {
+                            return Err(RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+                                note: note_id(&prepared.note),
+                                gross,
+                                tx: tx.clone(),
+                                resend_after: at.map(|at| at.saturating_add(grace)),
+                            });
+                        } else {
+                            return Err(unresolved(Some(tx.clone()), *at));
+                        }
+                    }
+                    // Handed to the chain with no outcome recorded: looked for once per funding,
+                    // which the read above was. A journal that never recorded when has nothing to
+                    // wait for, and nothing was ever sent that the balance does not show.
+                    ShieldSubmission::Unknown { since } => {
+                        if portal_balance != 0 {
+                            false
+                        } else if let Some(since) = *since {
+                            if within(since) {
+                                return Err(RsSdkCurvyAdapterError::ShieldSettling {
+                                    note: note_id(&prepared.note),
+                                    gross,
+                                    since: Some(since),
+                                    resend_after: Some(since.saturating_add(grace)),
+                                });
+                            }
+                            return Err(unresolved(None, Some(since)));
+                        } else {
+                            true
+                        }
+                    }
+                };
+                if send {
                     tracing::info!(%portal, gross, "funding the Curvy shield portal from the Safe");
                     // In a task of its own, holding the chain lock: a Safe transaction cannot be
                     // un-sent, and a caller that is dropped while it is in flight (an API request
                     // whose client went away) would otherwise lose it with the journal still at
                     // `Prepared`, and a retry would fund the portal a second time. The task runs it
-                    // to its end, and journals `Funded` before it returns: a balance read after it,
-                    // by a parent that may be gone by then, is no record of what the Safe sent.
+                    // to the end of its journalling — how far the transfer got — because a balance
+                    // read by a parent that may be gone by then is no record of what the Safe sent.
+                    // The stage is not part of it: only a balance read says the portal is funded.
                     let funding = (self.funder)(portal, HoprBalance::from(U256::from(gross)));
-                    let guard = held.take().expect("held above");
                     let (state, store) = (Arc::clone(&self.state), self.store.clone());
-                    let (funded, journalled, guard) = tokio::spawn(async move {
-                        let funded = funding.await;
-                        let journalled = if funded.is_ok() {
-                            journal_portal_funded(&state, &store)
-                        } else {
-                            Ok(())
-                        };
-                        (funded, journalled, guard)
+                    let guard = held.take().expect("held above");
+                    let (outcome, guard) = tokio::spawn(async move {
+                        let outcome = shield_journalled(&state, &store, ShieldJournal::Portal, funding).await;
+                        (outcome, guard)
                     })
                     .await
                     .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("the portal funding: {error}")))?;
                     held = Some(guard);
-                    funded.map_err(RsSdkCurvyAdapterError::Funding)?;
-                    journalled?;
-                    funded_by_task = true;
-                    // A sanity check only: the journal already says funded.
-                    portal_balance = client
-                        .erc20_balance(&endpoints.token_address, &prepared.portal_address)
-                        .await?;
+                    let (outcome, at) = outcome?;
+                    match outcome {
+                        Ok(confirmed) => {
+                            // A portal that reads empty is the read being behind, or a Safe call that
+                            // failed inside a confirmed transaction: the journal stays `Prepared`
+                            // with the confirmation, and the grace decides on a later call. One
+                            // holding anything but `gross` is not the shield this journal describes.
+                            let actual = client
+                                .erc20_balance(&endpoints.token_address, &prepared.portal_address)
+                                .await?;
+                            if actual == 0 {
+                                return Err(RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+                                    note: note_id(&prepared.note),
+                                    gross,
+                                    tx: confirmed.tx,
+                                    resend_after: at.map(|at| at.saturating_add(grace)),
+                                });
+                            }
+                            if actual != gross {
+                                return Err(RsSdkCurvyAdapterError::UnexpectedShieldFunding {
+                                    portal: portal.to_string(),
+                                    actual,
+                                    required: gross,
+                                });
+                            }
+                        }
+                        Err(ShieldFailure::NotSubmitted(reason) | ShieldFailure::Reverted { reason }) => {
+                            return Err(RsSdkCurvyAdapterError::Funding(reason));
+                        }
+                        Err(ShieldFailure::Unconfirmed(reason)) => {
+                            tracing::warn!(%reason, "the portal funding's outcome is unknown; not sent again until its grace is over");
+                            return Err(RsSdkCurvyAdapterError::ShieldSettling {
+                                note: note_id(&prepared.note),
+                                gross,
+                                since: at,
+                                resend_after: at.map(|since| since.saturating_add(grace)),
+                            });
+                        }
+                    }
+                } else {
+                    if portal_balance != gross {
+                        return Err(RsSdkCurvyAdapterError::UnexpectedShieldFunding {
+                            portal: portal.to_string(),
+                            actual: portal_balance,
+                            required: gross,
+                        });
+                    }
                 }
-                if portal_balance != gross {
-                    return Err(RsSdkCurvyAdapterError::UnexpectedShieldFunding {
-                        actual: portal_balance,
-                        required: gross,
-                    });
-                }
-                shield.stage = StoredShieldStage::Funded;
-                if !funded_by_task {
-                    journal_portal_funded(&self.state, &self.store)?;
-                }
+                journal_portal_funded(&self.state, &self.store)?;
             }
             let entry = client
                 .shield_prepared_deposit(&prepared, &self.config.operator_private_key, self.config.route)
@@ -5925,6 +6088,15 @@ mod tests {
             matches!(error, RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { gross: 7, .. }),
             "{error}"
         );
+        let grace = rig.adapter.config.direct_shield_settle_grace.as_secs();
+        assert!(
+            matches!(
+                error,
+                RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { resend_after, .. }
+                    if resend_after == at.map(|at| at + grace)
+            ),
+            "the error says when the grace ends: {error}"
+        );
         assert!(error.to_string().contains(&tx), "{error}");
         assert_eq!(rig.sent(), 0, "nothing is sent within the grace");
         assert_eq!(
@@ -6024,6 +6196,7 @@ mod tests {
             recovery: format!("0x{}", "aa".repeat(20)),
             portal_address: format!("0x{}", "bb".repeat(20)),
             stage: StoredShieldStage::Funded,
+            submission: ShieldSubmission::NotSubmitted,
         });
         store.save(&persisted)?;
         let server = relayer::http_tests::Server::new(|path, body| {
@@ -6059,7 +6232,11 @@ mod tests {
         _server: relayer::http_tests::Server,
     }
 
-    async fn portal_rig(stage: StoredShieldStage, funder: PortalFunder) -> anyhow::Result<PortalRig> {
+    async fn portal_rig(
+        stage: StoredShieldStage,
+        submission: ShieldSubmission,
+        funder: PortalFunder,
+    ) -> anyhow::Result<PortalRig> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let state = RedbCurvyDepositState::in_memory()?;
         let note = Adapter::owned_note(&fixture(7))?;
@@ -6071,6 +6248,7 @@ mod tests {
             recovery: format!("0x{}", "aa".repeat(20)),
             portal_address: format!("0x{}", "bb".repeat(20)),
             stage,
+            submission,
         });
         store.save(&persisted)?;
         let portal_balance = Arc::new(AtomicU64::new(0));
@@ -6124,7 +6302,8 @@ mod tests {
 
     /// The Safe's transfer to the portal is journalled by the task that makes it, not by the
     /// caller that awaits it: a caller dropped between the transfer and the write would otherwise
-    /// leave `Prepared`, and a retry that read a stale balance would fund the portal twice.
+    /// leave the journal not knowing it happened, and a retry would fund the portal twice. The
+    /// retry reads the portal, finds it funded, and moves on without the Safe.
     #[tokio::test]
     async fn a_portal_funding_is_journalled_even_if_the_caller_is_dropped() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6137,11 +6316,11 @@ mod tests {
                 let gate = gate.clone();
                 Box::pin(async move {
                     gate.notified().await;
-                    Ok(())
+                    Ok(confirmed_shield())
                 })
             })
         };
-        let rig = portal_rig(StoredShieldStage::Prepared, funder).await?;
+        let rig = portal_rig(StoredShieldStage::Prepared, ShieldSubmission::NotSubmitted, funder).await?;
 
         // The caller gives up while the transfer is in flight.
         assert!(
@@ -6153,16 +6332,248 @@ mod tests {
         rig.portal_balance.store(7, Ordering::SeqCst);
         gate.notify_one();
         for _ in 0..100 {
-            if rig.stage()? == Some(StoredShieldStage::Funded) {
+            if matches!(submission_of(&rig)?, Some(ShieldSubmission::Submitted { .. })) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(rig.stage()?, Some(StoredShieldStage::Funded), "the task journalled it");
+        assert!(
+            matches!(submission_of(&rig)?, Some(ShieldSubmission::Submitted { .. })),
+            "the task journalled the confirmation"
+        );
 
         // Whatever the retry goes on to do, it does not fund the portal again.
         let _ = rig.fund().await;
+        assert_eq!(
+            rig.stage()?,
+            Some(StoredShieldStage::Funded),
+            "the balance read says funded"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the portal is funded once");
+        Ok(())
+    }
+
+    /// A portal funder that counts its transfers and answers each from `script`, then confirms. A
+    /// confirmed transfer leaves `gross` in the portal when `lands` says so.
+    fn scripted_funder(
+        portal_balance: &Arc<std::sync::atomic::AtomicU64>,
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        lands: bool,
+        script: Vec<Outcome>,
+    ) -> PortalFunder {
+        use std::sync::atomic::Ordering;
+        let (balance, calls) = (portal_balance.clone(), calls.clone());
+        Arc::new(move |_, _| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            match script.get(attempt).copied().unwrap_or(Outcome::Confirm) {
+                Outcome::Refuse => {
+                    Box::pin(async { Err(ShieldFailure::NotSubmitted("the Safe holds too little".to_owned())) })
+                }
+                Outcome::Revert => Box::pin(async {
+                    Err(ShieldFailure::Reverted {
+                        reason: "reverted".to_owned(),
+                    })
+                }),
+                Outcome::Unconfirmed | Outcome::SlowUnconfirmed => {
+                    Box::pin(async { Err(ShieldFailure::Unconfirmed("tracking timed out".to_owned())) })
+                }
+                Outcome::Confirm => {
+                    if lands {
+                        balance.store(7, Ordering::SeqCst);
+                    }
+                    Box::pin(async { Ok(confirmed_shield()) })
+                }
+            }
+        })
+    }
+
+    /// A portal rig around a scripted funder; `lands` is whether its confirmed transfers show in
+    /// the portal's balance.
+    async fn scripted_portal_rig(
+        submission: ShieldSubmission,
+        lands: bool,
+        script: Vec<Outcome>,
+    ) -> anyhow::Result<(PortalRig, Arc<std::sync::atomic::AtomicUsize>)> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let placeholder: PortalFunder = Arc::new(|_, _| Box::pin(async { panic!("unexpected funding call") }));
+        let mut rig = portal_rig(StoredShieldStage::Prepared, submission, placeholder).await?;
+        // Built after the rig, for the balance its aggregator reports.
+        rig.adapter.funder = scripted_funder(&rig.portal_balance, &calls, lands, script);
+        Ok((rig, calls))
+    }
+
+    fn submission_of(rig: &PortalRig) -> anyhow::Result<Option<ShieldSubmission>> {
+        Ok(rig.store.load()?.shield_in_flight.map(|stored| stored.submission))
+    }
+
+    /// A refusal before anything was broadcast moves nothing and wedges nothing: the next funding
+    /// sends, as for a direct shield.
+    #[tokio::test]
+    async fn a_refused_portal_funding_is_sent_again() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (rig, calls) = scripted_portal_rig(ShieldSubmission::NotSubmitted, true, vec![Outcome::Refuse]).await?;
+
+        let error = rig.fund().await.unwrap_err();
+
+        assert!(matches!(error, RsSdkCurvyAdapterError::Funding(_)), "{error}");
+        assert_eq!(submission_of(&rig)?, Some(ShieldSubmission::NotSubmitted));
+        assert_eq!(rig.stage()?, Some(StoredShieldStage::Prepared));
+        let _ = rig.fund().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "sent again");
+        Ok(())
+    }
+
+    /// A transaction the chain rejected moved nothing either.
+    #[tokio::test]
+    async fn a_reverted_portal_funding_is_sent_again() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (rig, calls) = scripted_portal_rig(ShieldSubmission::NotSubmitted, true, vec![Outcome::Revert]).await?;
+
+        let error = rig.fund().await.unwrap_err();
+
+        assert!(matches!(error, RsSdkCurvyAdapterError::Funding(_)), "{error}");
+        assert_eq!(submission_of(&rig)?, Some(ShieldSubmission::NotSubmitted));
+        let _ = rig.fund().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "sent again");
+        Ok(())
+    }
+
+    /// A transfer with no answer may still land: it is waited for within the grace, and sent
+    /// again once the grace is over.
+    #[tokio::test]
+    async fn an_unconfirmed_portal_funding_settles_within_the_grace_and_is_reported_unresolved_after_it()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (rig, calls) =
+            scripted_portal_rig(ShieldSubmission::NotSubmitted, true, vec![Outcome::Unconfirmed]).await?;
+
+        let error = rig.fund().await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::ShieldSettling { .. }),
+            "{error}"
+        );
+        assert!(matches!(
+            submission_of(&rig)?,
+            Some(ShieldSubmission::Unknown { since: Some(_) })
+        ));
+
+        let error = rig.fund().await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::ShieldSettling { .. }),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not sent again within the grace");
+
+        // The grace is over.
+        journal_submission(
+            &rig.adapter.state,
+            &rig.store,
+            ShieldJournal::Portal,
+            ShieldSubmission::Unknown {
+                since: Some(unix_now().unwrap() - 3600),
+            },
+        )?;
+        let error = rig.fund().await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::PortalFundingUnresolved { tx: None, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "not sent again: the first copy may still land"
+        );
+        Ok(())
+    }
+
+    /// A pre-upgrade journal has no record of a submission: the portal is looked at before the
+    /// Safe sends, and not sent to when it already holds the funds.
+    #[tokio::test]
+    async fn a_legacy_portal_journal_is_looked_at_before_it_is_sent() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        for funded in [true, false] {
+            let (rig, calls) = scripted_portal_rig(ShieldSubmission::Unknown { since: None }, true, vec![]).await?;
+            rig.portal_balance.store(if funded { 7 } else { 0 }, Ordering::SeqCst);
+            let _ = rig.fund().await;
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!funded));
+            assert_eq!(rig.stage()?, Some(StoredShieldStage::Funded));
+        }
+        Ok(())
+    }
+
+    /// A confirmed transfer whose balance reads zero may be the read being behind: it is waited
+    /// for, never sent again within the grace, and funded once the read shows the balance. The
+    /// stage stays `Prepared` meanwhile, because only a balance read says the portal is funded.
+    #[tokio::test]
+    async fn a_confirmed_portal_funding_that_reads_empty_is_waited_for() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (rig, calls) = scripted_portal_rig(ShieldSubmission::NotSubmitted, false, vec![]).await?;
+        for _ in 0..2 {
+            let error = rig.fund().await.unwrap_err();
+            assert!(
+                matches!(error, RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { .. }),
+                "{error}"
+            );
+            assert_eq!(
+                rig.stage()?,
+                Some(StoredShieldStage::Prepared),
+                "not funded on a confirmation"
+            );
+            assert!(matches!(submission_of(&rig)?, Some(ShieldSubmission::Submitted { .. })));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not sent again within the grace");
+
+        rig.portal_balance.store(7, Ordering::SeqCst);
+        let _ = rig.fund().await;
+
+        assert_eq!(
+            rig.stage()?,
+            Some(StoredShieldStage::Funded),
+            "funded once the read shows it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "sent once, in all");
+        Ok(())
+    }
+
+    /// Confirmed, yet not showing within the grace, may be a failed inner call of the Safe or a
+    /// read that is still behind. The portal is not funded again either way: a first copy that
+    /// lands after all would leave twice `gross` in it, and nothing can shield that. The operator
+    /// is asked instead.
+    #[tokio::test]
+    async fn a_confirmed_portal_funding_that_never_shows_is_reported_unresolved_not_sent_again() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (rig, calls) = scripted_portal_rig(ShieldSubmission::NotSubmitted, false, vec![]).await?;
+        let error = rig.fund().await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { .. }),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The grace is over.
+        journal_submission(
+            &rig.adapter.state,
+            &rig.store,
+            ShieldJournal::Portal,
+            ShieldSubmission::Submitted {
+                tx: "0xabc".to_owned(),
+                at: Some(unix_now().unwrap() - 3600),
+            },
+        )?;
+        for _ in 0..2 {
+            let error = rig.fund().await.unwrap_err();
+            assert!(
+                matches!(&error, RsSdkCurvyAdapterError::PortalFundingUnresolved { tx: Some(tx), .. } if tx == "0xabc"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("recovery address"), "{error}");
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not sent again");
+        assert!(
+            matches!(submission_of(&rig)?, Some(ShieldSubmission::Submitted { .. })),
+            "the journal is kept as it was"
+        );
         Ok(())
     }
 

@@ -335,7 +335,7 @@ fn default_max_funding_time() -> Duration {
 }
 
 fn default_direct_shield_settle_grace() -> Duration {
-    Duration::from_secs(180)
+    sdk::DEFAULT_SHIELD_SETTLE_GRACE
 }
 
 fn default_operator_key_env() -> String {
@@ -429,21 +429,30 @@ pub struct CurvyDepositPoolConfig {
     #[validate(custom(function = "validate_min_1sec"))]
     pub max_funding_time: Duration,
 
-    /// How long a direct shield whose outcome is unknown — handed to the chain, then no answer, or
-    /// a crash in between — is waited for before the Safe sends it again. Within it, funding
-    /// reports that the shield is settling and looks for its note again on the next call; after it,
-    /// a note still missing is shielded again, which pays `top_up` a second time if the first
-    /// transaction lands after all. Default: 3 minutes.
+    /// How long a shield whose outcome is unknown, or whose confirmation has not shown, is waited
+    /// for before it is sent again. Default: three minutes (`DEFAULT_SHIELD_SETTLE_GRACE`).
     ///
-    /// A finality allowance chosen by the operator, not derived: three minutes covers Gnosis
-    /// finality plus a slow block and the aggregator indexing the note. The connector gives a
-    /// transaction its chain's finality times its block time times a multiplier of 2 to confirm,
-    /// and tracks it for 5 minutes (Blokli's tracking timeout and the connector's nonce-gap
-    /// tolerance) before giving up on a dropped one, so the grace is shorter than that window.
-    /// That is the trade-off: a crash mid-shield followed by a restart between 3 and 5 minutes
-    /// later sends the shield again while the mempool may still land the first copy, which pays
-    /// `top_up` twice. Raise it to close that gap at the cost of a longer wait before a lost
-    /// shield is replaced.
+    /// Governs both shield modes, and keeps its name for config compatibility. A direct shield
+    /// — handed to the chain, then no answer, or a crash in between — is reported as settling
+    /// within the grace, and after it a note still missing is shielded again, which pays `top_up`
+    /// a second time if the first transaction lands after all. A portal funding is not sent again
+    /// automatically past the grace: a first copy that lands after all would leave twice the
+    /// amount in the portal, which cannot be shielded, so funding reports it unresolved and the
+    /// operator checks the portal.
+    ///
+    /// The grace bounds in-call waiting too: funding waits out a shield that has not shown only
+    /// until the grace ends, whatever `max_funding_time` allows, so that sending it again is
+    /// only ever decided by a later call, never inside one funding's retry loop.
+    ///
+    /// A finality allowance chosen by the operator, not derived: it covers Gnosis finality plus a
+    /// slow block and the aggregator indexing the note. The connector gives a transaction its
+    /// chain's finality times its block time times a multiplier of 2 to confirm, and tracks it for
+    /// 5 minutes (Blokli's tracking timeout and the connector's nonce-gap tolerance) before giving
+    /// up on a dropped one, so the grace is shorter than that window. That is the trade-off: a
+    /// crash mid-shield followed by a restart between the grace and 5 minutes later sends the
+    /// direct shield again while the mempool may still land the first copy, which pays `top_up`
+    /// twice. Raise it to close that gap at the cost of a longer wait before a lost shield is
+    /// replaced.
     #[default(default_direct_shield_settle_grace())]
     #[serde(with = "humantime_serde", default = "default_direct_shield_settle_grace")]
     #[validate(custom(function = "validate_min_1sec"))]
@@ -876,7 +885,7 @@ where
     })
 }
 
-/// What a failed direct-shield transaction leaves the float in, from the connector's own
+/// What a failed shield transaction, direct or the portal's funding, leaves the float in, from the connector's own
 /// classification of its error, found by walking the error's sources in case the chain API wraps
 /// it. The same split as the connector's sequencer makes of whether a nonce was consumed:
 ///
@@ -927,12 +936,25 @@ where
     Api: ChainWriteAccountOperations + Clone + Send + Sync + 'static,
 {
     Arc::new(
-        move |portal: Address, amount: HoprBalance| -> BoxFuture<'static, Result<(), String>> {
+        move |portal: Address, amount: HoprBalance| -> BoxFuture<'static, Result<Confirmed, ShieldFailure>> {
             let api = api.clone();
             Box::pin(async move {
-                let pending = api.withdraw(amount, &portal).await.map_err(|error| error.to_string())?;
-                pending.await.map_err(|error| error.to_string())?;
-                Ok(())
+                // As for the direct shield: the call itself only hands the transaction to the
+                // sequencer, so an error from it is from before anything was handed over (the
+                // connector's `withdraw` and `send_erc777` share one `send_tx`). Whether it is
+                // broadcast — every refusal by Blokli or the RPC node — comes with the
+                // confirmation, which is classified like the direct shield's.
+                let pending = api
+                    .withdraw(amount, &portal)
+                    .await
+                    .map_err(|error| ShieldFailure::NotSubmitted(error.to_string()))?;
+                match pending.await {
+                    Ok(tx) => {
+                        tracing::info!(%tx, %portal, "the portal funding confirmed on chain");
+                        Ok(Confirmed { tx: tx.to_string() })
+                    }
+                    Err(error) => Err(classify_shield_error(&error)),
+                }
             })
         },
     )
@@ -1450,8 +1472,7 @@ where
                     return Ok(value);
                 }
                 Err(error)
-                    if (is_retryable_lag(&error.to_string()) || is_shield_lag(&error))
-                        && tokio::time::Instant::now() + poll < deadline =>
+                    if is_lag_worth_waiting_for(&error, poll) && tokio::time::Instant::now() + poll < deadline =>
                 {
                     waited += 1;
                     tracing::info!(
@@ -1504,13 +1525,29 @@ fn is_retryable_lag(message: &str) -> bool {
     is_tree_lag(message) || is_transient_chain_read(message)
 }
 
-/// Whether a funding error is a direct shield settling, or confirmed and not yet indexed: the
-/// chain or the aggregator catching up, matched by type rather than text.
-fn is_shield_lag(error: &(dyn std::error::Error + 'static)) -> bool {
-    matches!(
-        error.downcast_ref::<RsSdkCurvyAdapterError>(),
-        Some(RsSdkCurvyAdapterError::ShieldSettling { .. } | RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { .. })
-    )
+/// Whether a funding error is a shield settling, or confirmed and not yet indexed: the chain or
+/// the aggregator catching up, matched by type rather than text. Carries when the shield's grace
+/// ends, which is `None` for a clock that could not say.
+fn shield_lag(error: &(dyn std::error::Error + 'static)) -> Option<Option<u64>> {
+    match error.downcast_ref::<RsSdkCurvyAdapterError>() {
+        Some(
+            RsSdkCurvyAdapterError::ShieldSettling { resend_after, .. }
+            | RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { resend_after, .. },
+        ) => Some(*resend_after),
+        _ => None,
+    }
+}
+
+/// Whether waiting another `poll` for an error to clear is worth it. Shield lag is waited out
+/// only while the shield's grace has not ended: past it the next `fund` call may send the shield
+/// again, and that decision belongs to a later call, never to this one's retry loop, or a shield
+/// that is merely slow to index would be paid for twice inside one funding.
+fn is_lag_worth_waiting_for(error: &(dyn std::error::Error + 'static), poll: Duration) -> bool {
+    match shield_lag(error) {
+        Some(resend_after) => resend_after
+            .is_some_and(|after| sdk::unix_now().is_some_and(|now| (now as f64) + poll.as_secs_f64() < after as f64)),
+        None => is_retryable_lag(&error.to_string()),
+    }
 }
 
 /// How often to re-try an allocation that is waiting for the committed tree: a tenth of the

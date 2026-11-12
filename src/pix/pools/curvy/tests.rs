@@ -1191,10 +1191,11 @@ fn a_settling_direct_shield_is_lag() {
         note: "0x01".into(),
         gross: 7,
         tx: "0x02".into(),
+        resend_after: None,
     };
-    assert!(super::is_shield_lag(&settling), "{settling}");
-    assert!(super::is_shield_lag(&unindexed), "{unindexed}");
-    assert!(!super::is_shield_lag(&Error::Funding("refused".into())));
+    assert!(super::shield_lag(&settling).is_some(), "{settling}");
+    assert!(super::shield_lag(&unindexed).is_some(), "{unindexed}");
+    assert!(super::shield_lag(&Error::Funding("refused".into())).is_none());
 }
 
 struct Harness {
@@ -1645,8 +1646,13 @@ fn settling_shield() -> RsSdkCurvyAdapterError {
         note: "0x01".into(),
         gross: 10,
         since: Some(1_700_000_000),
-        resend_after: Some(1_700_000_600),
+        resend_after: Some(grace_ending_in(3600)),
     }
+}
+
+/// A grace that ends `seconds` from now.
+fn grace_ending_in(seconds: u64) -> u64 {
+    super::sdk::unix_now().expect("a clock") + seconds
 }
 
 fn unindexed_shield() -> RsSdkCurvyAdapterError {
@@ -1654,7 +1660,59 @@ fn unindexed_shield() -> RsSdkCurvyAdapterError {
         note: "0x01".into(),
         gross: 10,
         tx: "0x02".into(),
+        resend_after: Some(grace_ending_in(3600)),
     }
+}
+
+/// A shield whose grace ends inside one `fund` call is waited for only until the grace ends: past
+/// it the next call may send the shield again, which a retry loop inside this one must not do or
+/// a shield that is merely slow to index would be paid for twice in one funding.
+#[test_log::test(tokio::test)]
+async fn funding_stops_waiting_for_a_shield_when_its_grace_ends() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter.fund_failures.lock().extend(
+        std::iter::repeat_with(|| RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+            note: "0x01".into(),
+            gross: 10,
+            tx: "0x02".into(),
+            resend_after: Some(grace_ending_in(1)),
+        })
+        .take(100),
+    );
+    let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(5)).await?;
+
+    let started = tokio::time::Instant::now();
+    let error = harness
+        .pool
+        .fund(ten())
+        .await
+        .expect_err("the grace ends before the funding budget");
+
+    assert!(error.to_string().contains("has not shown yet"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "it did not wait out the budget"
+    );
+    assert!(
+        harness.adapter.funded.lock().len() <= 3,
+        "a few reads, not a retry every poll"
+    );
+
+    // Without a time for the grace to end, there is nothing to wait for.
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend([RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+            note: "0x01".into(),
+            gross: 10,
+            tx: "0x02".into(),
+            resend_after: None,
+        }]);
+    let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(5)).await?;
+    harness.pool.fund(ten()).await.expect_err("not retried");
+    assert_eq!(harness.adapter.funded.lock().len(), 1);
+    Ok(())
 }
 
 /// A direct shield that is settling, or confirmed but not yet indexed, is lag: `fund` keeps
@@ -1707,7 +1765,7 @@ async fn funding_waits_on_its_own_budget() -> anyhow::Result<()> {
         .await
         .expect_err("the funding budget runs out first");
     assert!(
-        error.to_string().contains("does not know its note yet"),
+        error.to_string().contains("has not shown yet"),
         "the last lag is what is reported: {error}"
     );
     let attempts = harness.adapter.funded.lock().len();
