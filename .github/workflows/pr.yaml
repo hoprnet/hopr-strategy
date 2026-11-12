@@ -97,6 +97,7 @@ jobs:
     outputs:
       rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
       lockfile: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lockfile == 'true' }}
+      zizmor: ${{ github.event_name != 'pull_request' || steps.filter.outputs.zizmor == 'true' }}
     steps:
       - name: Filter changed paths
         id: filter
@@ -123,6 +124,8 @@ jobs:
             lockfile:
               - "Cargo.toml"
               - "Cargo.lock"
+            zizmor:
+              - ".github/**"
   # ── Shared checks (lint, pre-commit, audit) ─────────────────────────────────
   checks:
     name: Check
@@ -138,6 +141,19 @@ jobs:
       audit: ${{ needs.changes.outputs.lockfile == 'true' }}
       runner_small: depot-ubuntu-24.04-2
       runner_large: depot-ubuntu-24.04-4
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  zizmor:
+    name: Zizmor
+    needs: changes
+    if: ${{ needs.changes.outputs.zizmor == 'true' }}
+    uses: hoprnet/hopr-workflows/.github/workflows/checks-zizmor.yaml@feat/fork-pr-ci-support
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      runner: depot-ubuntu-24.04-4
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   # ── Shared tests (unit) ─────────────────────────────────────────────────────
@@ -230,6 +246,7 @@ jobs:
       - semver-checks
       - tests
       - build-library
+      - zizmor
     runs-on: depot-ubuntu-24.04-2
     permissions: {}
     steps:
