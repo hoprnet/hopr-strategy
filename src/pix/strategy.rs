@@ -1967,7 +1967,7 @@ mod tests {
     use hopr_api::{
         chain::{
             AccountSelector, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations, ChainValues,
-            ChainWriteAccountOperations, HoprChainApi,
+            ChainWriteAccountOperations, HoprChainApi, PoolTransferSource,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -3317,6 +3317,15 @@ mod tests {
             Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
         }
 
+        /// Nothing to fund: the flush paths these tests drive pay through `deposit_funds_to`.
+        async fn fund(&self, _: HoprBalance) -> std::result::Result<(), StrategyError> {
+            Ok(())
+        }
+
+        async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
+            Ok(HoprBalance::zero())
+        }
+
         async fn deposit_funds_to(
             &self,
             _: &PixAddressId,
@@ -3409,8 +3418,7 @@ mod tests {
 
         async fn pool_transfer(
             &self,
-            _: &PixAddressId,
-            _: &EthDepositKey,
+            _: PoolTransferSource<'_, EthDepositKey>,
             _: &PixAddressId,
             _: Address,
             _: Self::PoolDepositData,
@@ -4229,8 +4237,10 @@ mod tests {
 
         let dst_id = pix_id(2);
         pool.pool_transfer(
-            &pix_id(1),
-            &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            PoolTransferSource::Deposit {
+                id: &pix_id(1),
+                key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            },
             &dst_id,
             *CHRIS,
             ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -4292,8 +4302,10 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                &pix_id(1),
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &pix_id(1),
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),
@@ -4374,8 +4386,10 @@ mod tests {
         let dst_id = pix_id(2);
         let transferred = pool
             .pool_transfer(
-                &id,
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &id,
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, [0xde, 0xad, 0xbe, 0xef]),
@@ -4481,8 +4495,10 @@ mod tests {
         let dst_id = pix_id(3);
         let transferred = pool
             .pool_transfer(
-                &id,
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &id,
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 misfiled,
@@ -4552,8 +4568,10 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                &pix_id(1),
-                &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                PoolTransferSource::Deposit {
+                    id: &pix_id(1),
+                    key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+                },
                 &dst_id,
                 *CHRIS,
                 ByteDepositData::new(dst_id, DEPOSIT_MARKER_PAYLOAD),

@@ -127,7 +127,7 @@ use curvy_core::{eddsa::ScalarSigningKey, field::fr_to_be_32, stealth, witness::
 pub use detect::RsCoreCurvyNoteDetector;
 use futures::future::BoxFuture;
 use hopr_api::{
-    chain::{BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool},
+    chain::{BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
         crypto::prelude::{
@@ -1553,6 +1553,30 @@ where
             .await
     }
 
+    /// Shields `amount` from the Safe into the pool's funding, on top of whatever it already holds.
+    ///
+    /// The funding is the shielded note an allocation draws from, so this is the only way value
+    /// enters the pool: an operator topping the pool up goes through here. The pool does not fund
+    /// itself, and `allocate` only shields the configured
+    /// [`initial_funding`](CurvyDepositPoolConfig::initial_funding) when nothing is funded yet.
+    async fn fund(&self, amount: HoprBalance) -> Result<(), Self::Error> {
+        self.ensure_reconciled().await?;
+        let safe_address = self.node.identity().safe_address;
+        self.adapter
+            .fund(amount, safe_address)
+            .await
+            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))
+    }
+
+    /// The funding notes as the adapter journals them, which counts a note from the moment its
+    /// shield is journalled: see [`CurvySdkAdapter::available_balance`].
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        self.adapter
+            .available_balance()
+            .await
+            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))
+    }
+
     /// One proof for the whole batch (up to the aggregator's output budget per proof).
     async fn deposit_funds_to_multiple(
         &self,
@@ -1739,10 +1763,16 @@ where
         Ok(outcomes)
     }
 
+    /// Refused for both sources.
+    ///
+    /// A deposit is paid by `allocate`, which is why this pool overrides
+    /// [`deposit_funds_to`](DepositPool::deposit_funds_to) rather than taking the trait default
+    /// that routes here with [`PoolTransferSource::Funding`]. Moving value between two deposit
+    /// addresses of a privacy pool is not the same operation as a withdrawal, so it stays
+    /// unsupported as before: a sweep leaves the pool through [`withdraw_deposit`](Self::withdraw_deposit).
     async fn pool_transfer(
         &self,
-        _src_id: &PixAddressId,
-        _key: &BjjKeypair,
+        _src: PoolTransferSource<'_, BjjKeypair>,
         _dst_id: &PixAddressId,
         _dst: BjjPublicKey,
         _additional_dst_data: Self::PoolDepositData,

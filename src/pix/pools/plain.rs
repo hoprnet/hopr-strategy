@@ -44,7 +44,7 @@ use backon::Retryable;
 use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool},
+    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
@@ -972,6 +972,31 @@ where
         Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
     }
 
+    /// The Safe is this pool's funding: there is nothing to move value into, so this is refused
+    /// rather than reported as done. Fund the Safe itself.
+    fn accepts_funding(&self) -> bool {
+        false
+    }
+
+    /// The Safe is this pool's funding: there is nothing to move it into, so this is refused
+    /// rather than reported as done. Fund the Safe itself.
+    async fn fund(&self, _amount: HoprBalance) -> Result<(), Self::Error> {
+        Err(StrategyError::other(anyhow::anyhow!(
+            "the plain pool does not take funding: its funding is the Safe, so fund the Safe instead"
+        )))
+    }
+
+    /// The Safe's wxHOPR, which is what every deposit here is paid from.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        let balance: HoprBalance = self
+            .node
+            .chain_api()
+            .balance(self.node.identity().safe_address)
+            .await
+            .map_err(StrategyError::other)?;
+        Ok(balance)
+    }
+
     /// Deposit funds from the node's own account to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
     ///
@@ -1149,16 +1174,27 @@ where
     /// that compares the ids on the wire form first.
     async fn pool_transfer(
         &self,
-        src_id: &PixAddressId,
-        key: &EthDepositKey,
+        src: PoolTransferSource<'_, EthDepositKey>,
         dst_id: &PixAddressId,
         dst: Address,
         additional_dst_data: Self::PoolDepositData,
         amount: Option<HoprBalance>,
     ) -> Result<Self::Receipt, Self::Error> {
-        check_deposit_payload(dst_id, &additional_dst_data)?;
-
-        self.withdraw_deposit(src_id, key, dst, amount).await
+        match src {
+            PoolTransferSource::Deposit { id, key } => {
+                check_deposit_payload(dst_id, &additional_dst_data)?;
+                self.withdraw_deposit(id, key, dst, amount).await
+            }
+            // The Safe is this pool's funding, so a transfer from it is an ordinary deposit.
+            PoolTransferSource::Funding => {
+                let amount = amount.ok_or_else(|| {
+                    StrategyError::other(anyhow::anyhow!(
+                        "a transfer from the Safe needs an amount; the Safe is not emptied into a deposit"
+                    ))
+                })?;
+                self.deposit_funds_to(dst_id, &dst, amount, additional_dst_data).await
+            }
+        }
     }
 }
 

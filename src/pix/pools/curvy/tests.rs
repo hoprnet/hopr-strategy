@@ -28,7 +28,7 @@ use curvy_core::{
 };
 use hopr_api::{
     ChainKeypair,
-    chain::DepositPool,
+    chain::{DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
         crypto::prelude::{BjjKeypair, BjjPublicKey, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
@@ -830,6 +830,20 @@ impl CurvySdkAdapter for RecordingAdapter {
         Ok(())
     }
 
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+        self.funded.lock().push((gross, recovery_address));
+        Ok(())
+    }
+
+    /// The test double keeps no note ledger, so it reports what it was asked to shield.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        Ok(self
+            .funded
+            .lock()
+            .iter()
+            .fold(HoprBalance::zero(), |total, (gross, _)| total + *gross))
+    }
+
     async fn allocate(
         &self,
         deposits: Vec<(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)>,
@@ -1267,8 +1281,10 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
     let result = harness
         .pool
         .pool_transfer(
-            &pix_id(1),
-            &BjjKeypair::random(),
+            PoolTransferSource::Deposit {
+                id: &pix_id(1),
+                key: &BjjKeypair::random(),
+            },
             &dst_id,
             *BjjKeypair::random().public(),
             data,
