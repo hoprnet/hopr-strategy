@@ -1160,18 +1160,25 @@ where
     /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
     /// anonymity set while a withdrawal leaves it.
     ///
-    /// `src_id` identifies the allocation whose key is being spent, which is what the underlying
-    /// sweep acts on. `dst_id` names an allocation on the receiving side, a notion this pool does
-    /// not have — the destination is just another Ethereum account, and nothing here is filed per
-    /// allocation — so it is used only to check `additional_dst_data` against, and to attribute it
-    /// when that check fails.
+    /// `src` picks what the value is taken from, and the two arms differ:
+    ///
+    /// - [`PoolTransferSource::Deposit`] spends the allocation named by `id`, which is what the underlying sweep acts
+    ///   on. That is the movement described above.
+    /// - [`PoolTransferSource::Funding`] is an ordinary deposit instead, because the Safe *is* this pool's funding:
+    ///   `amount` is moved from the Safe to `dst`. It is required here — this arm refuses `None` rather than emptying
+    ///   the Safe into one deposit address.
+    ///
+    /// `dst_id` names an allocation on the receiving side, a notion this pool does not have — the
+    /// destination is just another Ethereum account, and nothing here is filed per allocation — so
+    /// it is used only to check `additional_dst_data` against, and to attribute it when that check
+    /// fails.
     ///
     /// `additional_dst_data` is checked exactly as in
     /// [`deposit_funds_to`](Self::deposit_funds_to), and for the same reason: every payload this
     /// pool is handed is one it has to be able to accept, and a transfer that moves funds while
     /// dropping deposit data it disagreed with is the silent failure the check exists to prevent.
-    /// This is the only guard on `dst_id`: unlike a deposit, a transfer has no arm in the strategy
-    /// that compares the ids on the wire form first.
+    /// Both arms check it, and this is the only guard on `dst_id`: unlike a deposit, a transfer
+    /// has no arm in the strategy that compares the ids on the wire form first.
     async fn pool_transfer(
         &self,
         src: PoolTransferSource<'_, EthDepositKey>,
