@@ -1518,8 +1518,9 @@ where
     ) -> Result<Option<(Identity, u128)>, RsSdkCurvyAdapterError> {
         // Drawn several times and priced from the highest: the quote is one random draw from a
         // gas-price view that flips between two modes about seven times apart, so a single draw
-        // is the low one half the time and the note built from it is under the gate's floor
-        // whenever the gate then draws high. See [`RelayClient::paymaster_quote`].
+        // is the low one half the time. The headroom carries a low draw over the spread measured
+        // so far; the highest of several draws guards against a wider one. See
+        // [`RelayClient::paymaster_quote`].
         let Some(info) = relay.paymaster_quote(chain_id).await.map_err(relay_error)? else {
             return Ok(None);
         };
@@ -2987,7 +2988,8 @@ mod tests {
 
     /// The note the adapter bakes into an aggregation is priced from the highest paymaster draw,
     /// not from whichever one the first GET happened to return: the gate re-prices at submit time
-    /// from a two-mode gas view, so a note sized to a low draw is refused before it is queued.
+    /// from a two-mode gas view, so a note sized to a low draw has only the headroom's margin over
+    /// the high mode, and is refused before it is queued if the spread is ever wider than that.
     #[tokio::test]
     async fn the_relayer_fee_note_is_priced_from_the_highest_quote_draw() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};

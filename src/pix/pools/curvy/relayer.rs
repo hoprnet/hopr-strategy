@@ -202,6 +202,37 @@ impl PaymasterInfo {
     /// It is also what the note has to clear, not what sizes it: production prices the note from
     /// [`FEE_NOTE_HEADROOM_BPS`] alone and never compares the two, which is why the constant has
     /// to be justified against the measured spread rather than against this function.
+    ///
+    /// ```
+    /// # use hopr_strategy::pix::pools::curvy::relayer::{CurvyPublicKeys, PaymasterInfo, TokenValuation, parse_usd_price};
+    /// // A quote that drew the low gas-price mode on Gnosis.
+    /// let quote = PaymasterInfo {
+    ///     operator: CurvyPublicKeys {
+    ///         spend_public_key: "1.2".into(),
+    ///         view_public_key: "3.4".into(),
+    ///         bjj_public_key: "5.6".into(),
+    ///     },
+    ///     accepted_vault_token_ids: None,
+    ///     submit_aggregation_gas_units: "675000".into(),
+    ///     gas_price_wei: "15".into(),
+    ///     client_buffer_bps: 1_500,
+    ///     relayer_tolerance_bps: 500,
+    /// };
+    /// let xdai = TokenValuation {
+    ///     usd: parse_usd_price("1")?,
+    ///     decimals: 18,
+    /// };
+    /// let wxhopr = TokenValuation {
+    ///     usd: parse_usd_price("0.0107")?,
+    ///     decimals: 18,
+    /// };
+    /// let note = quote.required_fee_in_token(&xdai, &wxhopr)?;
+    /// // The note still clears a gate that reads the high mode when the proof arrives...
+    /// assert!(note >= quote.gate_floor_in_token(125, &xdai, &wxhopr)?);
+    /// // ...but its cover is finite: 1.15 × 9 / 0.95 is under eleven times the quote.
+    /// assert!(note < quote.gate_floor_in_token(11 * 15, &xdai, &wxhopr)?);
+    /// # Ok::<(), hopr_strategy::errors::StrategyError>(())
+    /// ```
     pub fn gate_floor_in_token(
         &self,
         live_gas_price_wei: u128,
@@ -288,14 +319,16 @@ pub const FEE_NOTE_HEADROOM_BPS: u64 = 80_000;
 
 /// How many paymaster quotes to draw, keeping the highest, when pricing a fee note.
 ///
-/// The quote is not a signed price, so the only defence against drawing the low gas-price mode
-/// is redundancy: the high mode comes up about half the time, so four *independent* draws miss
-/// it with probability `2^-4`. Independence is not something the client controls — a gateway
-/// that answers identical requests from one cached or coalesced upstream read hands every draw
-/// the same mode — so the draws ask caches not to answer them and start
-/// [`FEE_QUOTE_DRAW_SPACING`] apart rather than at the same instant. They still overlap, so the
-/// call costs one round trip plus the spacing, and the worst case is one request timeout plus
-/// the spacing rather than one timeout per draw.
+/// The quote is not a signed price, and [`FEE_NOTE_HEADROOM_BPS`] only covers the spread measured
+/// so far: a note priced from the low mode clears the high mode's floor with a margin of about
+/// 1.3x, and a wider spread would refuse it again. Keeping the highest of several draws makes
+/// pricing from the low mode unlikely in the first place: the high mode comes up about half the
+/// time, so four *independent* draws miss it with probability `2^-4`. Independence is not
+/// something the client controls — a gateway that answers identical requests from one cached or
+/// coalesced upstream read hands every draw the same mode — so the draws ask caches not to
+/// answer them and start [`FEE_QUOTE_DRAW_SPACING`] apart rather than at the same instant. They
+/// still overlap, so the call costs one round trip plus the spacing, and the worst case is one
+/// request timeout plus the spacing rather than one timeout per draw.
 pub const FEE_QUOTE_SAMPLES: usize = 4;
 
 /// How long after the previous paymaster draw the next one starts.
@@ -594,11 +627,13 @@ impl RelayClient {
     ///
     /// The endpoint is not a signed quote — the gate re-prices when the proof arrives — and on
     /// Gnosis its gas price alternates between two modes about seven times apart on consecutive
-    /// requests. One draw therefore lands low about half the time, and the note built from it is
-    /// under the gate's floor whenever the gate then draws high: the first submission is refused
-    /// with `operator note does not cover the gas cost`. Taking the highest of several draws
-    /// makes that a `2^-FEE_QUOTE_SAMPLES` event rather than a coin flip, as far as the draws are
-    /// independent (see [`FEE_QUOTE_SAMPLES`]).
+    /// requests. One draw therefore lands low about half the time. Under the old doubled
+    /// headroom, the note built from it was under the gate's floor whenever the gate then drew
+    /// high, and the first submission was refused with `operator note does not cover the gas
+    /// cost`. [`FEE_NOTE_HEADROOM_BPS`] now carries a low draw over the measured spread, with a
+    /// margin of about 1.3x; keeping the highest of several draws is what protects a spread
+    /// wider than that, by making a low-mode price a `2^-FEE_QUOTE_SAMPLES` event rather than a
+    /// coin flip, as far as the draws are independent (see [`FEE_QUOTE_SAMPLES`]).
     ///
     /// A draw that fails does not fail the call: any draw that returns a quote prices the note,
     /// and a warning names the draws that did not. A deployment without a paymaster (`404`) is
@@ -632,7 +667,8 @@ impl RelayClient {
             self.paymaster(chain_id).await
         }))
         .await;
-        let mut best: Option<PaymasterInfo> = None;
+        // The readable quote with the highest required fee, and that fee.
+        let mut best: Option<(u128, PaymasterInfo)> = None;
         // Draws that answered `404`. Only a unanimous `404` means the deployment runs no
         // paymaster.
         let mut without_paymaster = 0_usize;
@@ -642,25 +678,24 @@ impl RelayClient {
         for draw in draws {
             match draw {
                 Ok(None) => without_paymaster += 1,
-                Ok(Some(info)) => {
-                    let higher = match &best {
-                        None => true,
-                        // A quote we cannot parse must not win by default; `required_fee`
-                        // reports it, and a replacement quote may well be readable.
-                        Some(current) => match (info.required_fee(), current.required_fee()) {
-                            (Ok(candidate), Ok(incumbent)) => candidate > incumbent,
-                            (Ok(_), Err(_)) => true,
-                            (Err(_), _) => false,
-                        },
-                    };
-                    if higher {
-                        best = Some(info);
+                Ok(Some(info)) => match info.required_fee() {
+                    // A quote we cannot read is a failed draw, not a candidate: returned as the
+                    // best, it would only fail later, when the note is priced from it, and as an
+                    // error the caller does not retry. Counted as a transport fault, it lets a
+                    // readable draw win, or the call fail as retryable when none is readable.
+                    Err(error) => errors.push(RelayError::Transport(format!(
+                        "the paymaster served an unreadable quote: {error}"
+                    ))),
+                    Ok(fee) => {
+                        if best.as_ref().is_none_or(|(highest, _)| fee > *highest) {
+                            best = Some((fee, info));
+                        }
                     }
-                }
+                },
                 Err(error) => errors.push(error),
             }
         }
-        if let Some(info) = best {
+        if let Some((_, info)) = best {
             if !errors.is_empty() || without_paymaster > 0 {
                 // Not a failure — the note is priced from a real quote — but it is priced from
                 // fewer draws than intended, so the chance that it missed the high gas-price mode
@@ -1392,8 +1427,8 @@ pub(super) mod http_tests {
     }
 
     /// The quote comes from one random draw of the paymaster's two-mode gas price, so a single
-    /// draw is the low mode half the time and the note built from it falls under the gate's
-    /// floor. Sampling must keep the highest of the draws instead.
+    /// draw is the low mode half the time, and the note built from it is left with only the
+    /// headroom's margin over the high mode. Sampling must keep the highest of the draws instead.
     #[tokio::test]
     async fn the_fee_quote_keeps_the_highest_of_several_draws() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1515,6 +1550,34 @@ pub(super) mod http_tests {
         let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
         let info = client.paymaster_quote(100).await?.expect("a paymaster is served");
         assert_eq!(info.gas_price_wei, "19", "the highest readable draw wins");
+        Ok(())
+    }
+
+    /// A quote whose gas price cannot be read is a failed draw: a readable draw wins over it, and
+    /// with no readable draw at all the call fails as a retryable transport fault rather than
+    /// returning a quote the note cannot be priced from.
+    #[tokio::test]
+    async fn an_unreadable_quote_counts_as_a_failed_draw() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = Server::new({
+            let draws = draws.clone();
+            move |_, _| {
+                let draw = draws.fetch_add(1, Ordering::SeqCst);
+                let price = if draw == 1 { "16" } else { "not-a-number" };
+                Some((200, paymaster_body(price)))
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let info = client.paymaster_quote(100).await?.expect("one draw was readable");
+        assert_eq!(info.gas_price_wei, "16");
+
+        let server = Server::new(|_, _| Some((200, paymaster_body("not-a-number")))).await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let error = client.paymaster_quote(100).await.expect_err("no draw was readable");
+        assert!(matches!(error, RelayError::Transport(_)), "{error}");
+        assert!(error.to_string().contains("unreadable quote"), "{error}");
         Ok(())
     }
 
