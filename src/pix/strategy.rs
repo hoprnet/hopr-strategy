@@ -125,13 +125,6 @@ fn default_spend_window() -> Duration {
 
 // `Result` in this module is the crate alias, which fixes the error type.
 
-fn validate_positive_balance(balance: &HoprBalance) -> std::result::Result<(), validator::ValidationError> {
-    if balance.is_zero() {
-        return Err(validator::ValidationError::new("must be more than zero"));
-    }
-    Ok(())
-}
-
 fn validate_funding_policy(policy: &PixFundingPolicy) -> std::result::Result<(), validator::ValidationError> {
     if policy.min_available >= policy.top_up {
         return Err(
@@ -342,11 +335,11 @@ pub struct PixFundingPolicy {
     /// Fund when the pool can pay less than this. Zero would never fund; leave the policy out
     /// instead. Below `top_up`, so that the top-up can satisfy it.
     #[serde_as(as = "DisplayFromStr")]
-    #[validate(custom(function = "validate_positive_balance"))]
+    #[validate(custom(function = "crate::validation::validate_positive_balance"))]
     pub min_available: HoprBalance,
     /// How much to move from the Safe each time, gross of the pool's own fees.
     #[serde_as(as = "DisplayFromStr")]
-    #[validate(custom(function = "validate_positive_balance"))]
+    #[validate(custom(function = "crate::validation::validate_positive_balance"))]
     pub top_up: HoprBalance,
 }
 
