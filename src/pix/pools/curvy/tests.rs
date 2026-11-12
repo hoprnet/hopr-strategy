@@ -7,7 +7,7 @@
 //! shield, allocate and withdraw instead of proving and submitting it.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     num::NonZeroU32,
     sync::{
         Arc,
@@ -45,6 +45,7 @@ use super::{
     CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
+    sdk::RsSdkCurvyAdapterError,
     state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
     token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
@@ -776,10 +777,15 @@ impl CurvyIndexSource for ScriptedIndex {
 }
 
 /// Records what the pool asked of the SDK instead of proving and submitting it.
+///
+/// Fails with the SDK adapter's own error type, so that what the pool tells apart by type — a
+/// settling direct shield — can be scripted as well as what it tells apart by text.
 #[derive(Default)]
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
     funding_finality_failures: parking_lot::Mutex<usize>,
+    /// What the upcoming `fund` calls fail with, in order, before `fund` succeeds.
+    fund_failures: parking_lot::Mutex<VecDeque<RsSdkCurvyAdapterError>>,
     /// What `fund` has added, which is what `available_balance` reports.
     available: parking_lot::Mutex<HoprBalance>,
     /// How many upcoming `allocate` calls answer "not in the committed tree yet".
@@ -809,6 +815,11 @@ impl RecordingAdapter {
 #[error("{0}")]
 struct ScriptedFailure(String);
 
+/// An SDK failure that only carries text, as the SDK's own `anyhow` errors do.
+fn sdk_failure(message: &str) -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{message}"))
+}
+
 /// What the SDK reports while the funding note is committed on chain but not yet in the tree the
 /// SDK rebuilds from its (finalized) snapshot.
 const TREE_LAG: &str = "Curvy SDK operation failed: PIX aggregation input not found in committed tree";
@@ -819,16 +830,17 @@ const INDEX_LAG: &str = "Curvy SDK operation failed: sync: index did not reconci
 
 #[async_trait]
 impl CurvySdkAdapter for RecordingAdapter {
-    type Error = ScriptedFailure;
+    type Error = RsSdkCurvyAdapterError;
 
     async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
         self.funded.lock().push((gross, recovery_address));
+        if let Some(failure) = self.fund_failures.lock().pop_front() {
+            return Err(failure);
+        }
         let mut waiting = self.funding_finality_failures.lock();
         if *waiting > 0 {
             *waiting -= 1;
-            return Err(ScriptedFailure(
-                super::sdk::RsSdkCurvyAdapterError::RelayFinalityPending.to_string(),
-            ));
+            return Err(RsSdkCurvyAdapterError::RelayFinalityPending);
         }
         *self.available.lock() += gross;
         Ok(())
@@ -847,7 +859,7 @@ impl CurvySdkAdapter for RecordingAdapter {
             let mut lagging = self.tree_lag_failures.lock();
             if *lagging > 0 {
                 *lagging -= 1;
-                return Err(ScriptedFailure(TREE_LAG.to_owned()));
+                return Err(sdk_failure(TREE_LAG));
             }
         }
         self.allocations.lock().extend(deposits);
@@ -866,7 +878,7 @@ impl CurvySdkAdapter for RecordingAdapter {
             let mut lagging = self.sweep_lag_failures.lock();
             if *lagging > 0 {
                 *lagging -= 1;
-                return Err(ScriptedFailure(INDEX_LAG.to_owned()));
+                return Err(sdk_failure(INDEX_LAG));
             }
         }
         self.withdrawals.lock().push((dst, notes.len()));
@@ -1192,12 +1204,22 @@ struct Harness {
     _dir: tempfile::TempDir,
 }
 
+/// A pool whose deposit and funding budgets are both `tracking_time`.
 async fn harness(adapter: RecordingAdapter, tracking_time: Duration) -> anyhow::Result<Harness> {
+    harness_with_budgets(adapter, tracking_time, tracking_time).await
+}
+
+async fn harness_with_budgets(
+    adapter: RecordingAdapter,
+    tracking_time: Duration,
+    funding_time: Duration,
+) -> anyhow::Result<Harness> {
     let dir = tempfile::tempdir()?;
     let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: tracking_time,
+        max_funding_time: funding_time,
         token: Some(4),
         ..Default::default()
     };
@@ -1618,6 +1640,84 @@ async fn funding_waits_out_a_pending_finality() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn settling_shield() -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::ShieldSettling {
+        note: "0x01".into(),
+        gross: 10,
+        since: Some(1_700_000_000),
+        resend_after: Some(1_700_000_600),
+    }
+}
+
+fn unindexed_shield() -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+        note: "0x01".into(),
+        gross: 10,
+        tx: "0x02".into(),
+    }
+}
+
+/// A direct shield that is settling, or confirmed but not yet indexed, is lag: `fund` keeps
+/// asking within its own budget until the note is there, instead of failing the flush that asked
+/// for the funding.
+#[test_log::test(tokio::test)]
+async fn funding_waits_out_a_settling_direct_shield() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend([settling_shield(), unindexed_shield()]);
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+
+    harness.pool.fund(ten()).await?;
+    assert_eq!(
+        harness.adapter.funded.lock().len(),
+        3,
+        "settling, then unindexed, then funded"
+    );
+    assert_eq!(harness.pool.available_balance().await?, ten());
+    Ok(())
+}
+
+/// Funding's budget is [`CurvyDepositPoolConfig::max_funding_time`], not the deposit's: a
+/// deposit budget too short for one retry does not make funding give up, and a funding budget
+/// that runs out does.
+#[test_log::test(tokio::test)]
+async fn funding_waits_on_its_own_budget() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend([settling_shield(), settling_shield()]);
+    // Within the deposit budget there is no room for even one retry (the poll is a tenth of it);
+    // within the funding budget there is.
+    let harness = harness_with_budgets(adapter, Duration::from_secs(1), Duration::from_secs(2)).await?;
+    harness.pool.fund(ten()).await?;
+    assert_eq!(harness.adapter.funded.lock().len(), 3);
+
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend(std::iter::repeat_with(settling_shield).take(100));
+    let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(1)).await?;
+    let error = harness
+        .pool
+        .fund(ten())
+        .await
+        .expect_err("the funding budget runs out first");
+    assert!(
+        error.to_string().contains("does not know its note yet"),
+        "the last lag is what is reported: {error}"
+    );
+    let attempts = harness.adapter.funded.lock().len();
+    assert!(
+        (2..=11).contains(&attempts),
+        "a second's budget polled every tenth of it: {attempts} attempts"
+    );
+    Ok(())
+}
+
 #[test_log::test(tokio::test)]
 async fn a_deposit_waits_for_the_committed_tree_instead_of_failing() -> anyhow::Result<()> {
     // The funding note is on chain but the SDK's tree does not have it yet: two early attempts,
@@ -1738,8 +1838,6 @@ async fn a_relayer_gateway_error_is_waited_out() -> anyhow::Result<()> {
 /// classifier has to be right in both directions.
 #[test]
 fn only_fund_free_failures_release_the_spend_budget() {
-    use super::sdk::RsSdkCurvyAdapterError;
-
     // Nothing was allocated: the input notes could not cover the request.
     let no_funding = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
     assert!(no_funding.moved_no_funds());
@@ -2018,6 +2116,24 @@ fn a_config_without_the_mode_keys_still_parses() -> anyhow::Result<()> {
     )?;
     assert_eq!(cfg.shielding, CurvyShielding::Direct);
     assert_eq!(cfg.submission, CurvySubmission::Relayer);
+    assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(30));
+    assert_eq!(
+        cfg.max_funding_time,
+        Duration::from_secs(300),
+        "funding keeps its own budget when the file only sizes the deposit's"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_funding_budget_is_stated_apart_and_must_be_at_least_a_second() -> anyhow::Result<()> {
+    let cfg: CurvyDepositPoolConfig = serde_json::from_str(r#"{"max_funding_time":"2m"}"#)?;
+    assert_eq!(cfg.max_funding_time, Duration::from_secs(120));
+    StrategyError::validate_config(&cfg)?;
+
+    let zero: CurvyDepositPoolConfig = serde_json::from_str(r#"{"max_funding_time":"0s"}"#)?;
+    let error = StrategyError::validate_config(&zero).expect_err("a budget of nothing is refused");
+    assert!(error.to_string().contains("max_funding_time"), "{error}");
     Ok(())
 }
 

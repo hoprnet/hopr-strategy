@@ -330,6 +330,10 @@ fn default_max_deposit_tracking_time() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_max_funding_time() -> Duration {
+    Duration::from_secs(300)
+}
+
 fn default_direct_shield_settle_grace() -> Duration {
     Duration::from_secs(600)
 }
@@ -411,6 +415,19 @@ pub struct CurvyDepositPoolConfig {
     #[serde(with = "humantime_serde", default = "default_max_deposit_tracking_time")]
     #[validate(custom(function = "validate_min_1sec"))]
     pub max_deposit_tracking_time: Duration,
+
+    /// How long [`DepositPool::fund`] keeps waiting out lag — a relayed aggregation still settling
+    /// ahead of the shield, a chain read served from behind, a direct shield settling or confirmed
+    /// but not yet indexed — before it fails. Default: 5 minutes.
+    ///
+    /// A budget of its own, apart from `max_deposit_tracking_time`: that one is sized for how
+    /// soon a deposit should fail, this one for how long the Safe's funding is worth waiting for,
+    /// and tuning the first down must not make funding give up. A funding that fails here is
+    /// retried by the next flush, and the deposits it was for fail on their own.
+    #[default(default_max_funding_time())]
+    #[serde(with = "humantime_serde", default = "default_max_funding_time")]
+    #[validate(custom(function = "validate_min_1sec"))]
+    pub max_funding_time: Duration,
 
     /// How long a direct shield whose outcome is unknown — handed to the chain, then no answer, or
     /// a crash in between — is waited for before the Safe sends it again. Within it, funding
@@ -1385,37 +1402,40 @@ where
         // that arrives in that window is not a failure, it is early: wait for the tree, within
         // the same budget discovery gets, rather than fail the flush. Failing here would burn the
         // deposit's spend budget on a race.
-        self.wait_out_lag(move || self.adapter.allocate(deposits.clone()))
-            .await
-            .map_err(|error| {
-                let error = CurvyDepositPoolError::Adapter(error.into());
-                // Out of shielded funds is the expected end of a run, not a fault: the
-                // strategy's budget usually gets there first, and either way the kill switch
-                // ends the Session.
-                if error.is_out_of_funding() {
-                    tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
-                }
-                // Kept typed rather than collapsed to `CriteriaNotSatisfied`, so
-                // `is_out_of_funding` can tell exhaustion from any other fund-free failure
-                // and the strategy can refund it.
-                StrategyError::other(error)
-            })
+        self.wait_out_lag(self.cfg.max_deposit_tracking_time, move || {
+            self.adapter.allocate(deposits.clone())
+        })
+        .await
+        .map_err(|error| {
+            let error = CurvyDepositPoolError::Adapter(error.into());
+            // Out of shielded funds is the expected end of a run, not a fault: the
+            // strategy's budget usually gets there first, and either way the kill switch
+            // ends the Session.
+            if error.is_out_of_funding() {
+                tracing::warn!(%error, "the Curvy pool has no funding left for this deposit");
+            }
+            // Kept typed rather than collapsed to `CriteriaNotSatisfied`, so
+            // `is_out_of_funding` can tell exhaustion from any other fund-free failure
+            // and the strategy can refund it.
+            StrategyError::other(error)
+        })
     }
 
-    /// Runs `op` until it succeeds or fails with something other than lag, within
-    /// [`CurvyDepositPoolConfig::max_deposit_tracking_time`].
+    /// Runs `op` until it succeeds or fails with something other than lag, within `budget`.
     ///
     /// Lag — the committed tree not yet holding a note, a chain read served from behind, a
-    /// pending finality — is waited out rather than reported, because the next attempt sees a
-    /// different answer; see [`is_retryable_lag`]. Shared by allocating and funding, which meet
-    /// the same lag at the same places.
-    async fn wait_out_lag<T, F, Fut>(&self, mut op: F) -> Result<T, A::Error>
+    /// pending finality, a direct shield settling — is waited out rather than reported, because
+    /// the next attempt sees a different answer; see [`is_retryable_lag`] and [`is_shield_lag`].
+    /// Shared by allocating and funding, which meet the same lag at the same places but on
+    /// budgets of their own: [`CurvyDepositPoolConfig::max_deposit_tracking_time`] for a deposit,
+    /// [`CurvyDepositPoolConfig::max_funding_time`] for a funding.
+    async fn wait_out_lag<T, F, Fut>(&self, budget: Duration, mut op: F) -> Result<T, A::Error>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, A::Error>>,
     {
-        let deadline = tokio::time::Instant::now() + self.cfg.max_deposit_tracking_time;
-        let poll = tree_lag_poll_interval(self.cfg.max_deposit_tracking_time);
+        let deadline = tokio::time::Instant::now() + budget;
+        let poll = tree_lag_poll_interval(budget);
         let mut waited = 0u32;
         loop {
             match op().await {
@@ -1542,12 +1562,17 @@ where
     ///
     /// Gross of the deployment's shield fee: what becomes allocatable is `amount` less the vault's
     /// deposit fee.
+    ///
+    /// Lag on the way — a settling aggregation, a chain read from behind, the shield itself
+    /// settling — is waited out within [`CurvyDepositPoolConfig::max_funding_time`].
     async fn fund(&self, amount: HoprBalance) -> Result<(), Self::Error> {
         self.ensure_reconciled().await?;
         let safe_address = self.node.identity().safe_address;
-        self.wait_out_lag(move || self.adapter.fund(amount, safe_address))
-            .await
-            .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))
+        self.wait_out_lag(self.cfg.max_funding_time, move || {
+            self.adapter.fund(amount, safe_address)
+        })
+        .await
+        .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))
     }
 
     /// The funding notes as the adapter journals them, which counts a note from the moment its
