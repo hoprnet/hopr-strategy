@@ -130,7 +130,7 @@ jobs:
   checks:
     name: Check
     needs: changes
-    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # workflow-checks-v3.0.0
     with:
       repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       lint_command: "nix develop --command just quick"
@@ -147,7 +147,7 @@ jobs:
     name: Zizmor
     needs: changes
     if: ${{ needs.changes.outputs.zizmor == 'true' }}
-    uses: hoprnet/hopr-workflows/.github/workflows/checks-zizmor.yaml@feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/checks-zizmor.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # workflow-checks-zizmor-v2.0.0
     permissions:
       contents: read
       security-events: write
@@ -167,7 +167,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # Codecov OIDC upload in the coverage jobs
-    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # workflow-tests-v7.0.0
     with:
       repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       enable_unit_tests: false
@@ -199,7 +199,7 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # build-library-v4.0.0
     permissions:
       contents: read
       id-token: write
@@ -226,7 +226,7 @@ jobs:
       contents: read
     steps:
       - name: Check semver
-        uses: hoprnet/hopr-workflows/actions/nix-action@feat/fork-pr-ci-support
+        uses: hoprnet/hopr-workflows/actions/nix-action@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # nix-action-v2.0.0
         with:
           repo_sha: ${{ github.event.pull_request.head.sha }}
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}

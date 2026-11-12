@@ -24,7 +24,7 @@ jobs:
             runner: depot-ubuntu-24.04-arm-4
           - architecture: aarch64-darwin
             runner: depot-macos-15
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@feat/fork-pr-ci-support
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@43c833e72dffe4f2f3be60193733e5657f8aa0d7 # build-library-v4.0.0
     permissions:
       contents: read
       id-token: write
