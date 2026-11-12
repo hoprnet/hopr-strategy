@@ -335,7 +335,7 @@ fn default_max_funding_time() -> Duration {
 }
 
 fn default_direct_shield_settle_grace() -> Duration {
-    Duration::from_secs(600)
+    Duration::from_secs(180)
 }
 
 fn default_operator_key_env() -> String {
@@ -433,13 +433,17 @@ pub struct CurvyDepositPoolConfig {
     /// a crash in between — is waited for before the Safe sends it again. Within it, funding
     /// reports that the shield is settling and looks for its note again on the next call; after it,
     /// a note still missing is shielded again, which pays `top_up` a second time if the first
-    /// transaction lands after all. Default: 10 minutes.
+    /// transaction lands after all. Default: 3 minutes.
     ///
-    /// Sized to exceed the longest a transaction can be in flight and unanswered: the connector
-    /// gives a transaction its chain's finality times its block time times a multiplier of 2 to
-    /// confirm, and Blokli's own tracking timeout and the connector's nonce-gap tolerance are 5
-    /// minutes, after which a dropped transaction is given up on; the grace is twice that, which
-    /// leaves room for a slow block and for the aggregator to index the note.
+    /// A finality allowance chosen by the operator, not derived: three minutes covers Gnosis
+    /// finality plus a slow block and the aggregator indexing the note. The connector gives a
+    /// transaction its chain's finality times its block time times a multiplier of 2 to confirm,
+    /// and tracks it for 5 minutes (Blokli's tracking timeout and the connector's nonce-gap
+    /// tolerance) before giving up on a dropped one, so the grace is shorter than that window.
+    /// That is the trade-off: a crash mid-shield followed by a restart between 3 and 5 minutes
+    /// later sends the shield again while the mempool may still land the first copy, which pays
+    /// `top_up` twice. Raise it to close that gap at the cost of a longer wait before a lost
+    /// shield is replaced.
     #[default(default_direct_shield_settle_grace())]
     #[serde(with = "humantime_serde", default = "default_direct_shield_settle_grace")]
     #[validate(custom(function = "validate_min_1sec"))]

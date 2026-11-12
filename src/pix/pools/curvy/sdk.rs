@@ -365,7 +365,7 @@ impl RsSdkCurvyAdapterConfig {
             relay_timeout: std::time::Duration::from_secs(120),
             note_source: CurvyNoteSource::Blokli,
             curvy_indexer_url: None,
-            direct_shield_settle_grace: std::time::Duration::from_secs(600),
+            direct_shield_settle_grace: std::time::Duration::from_secs(180),
         }
     }
 
