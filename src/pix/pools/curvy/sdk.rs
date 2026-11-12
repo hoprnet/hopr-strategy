@@ -1494,7 +1494,11 @@ where
         chain_id: u64,
         token: u64,
     ) -> Result<Option<(Identity, u128)>, RsSdkCurvyAdapterError> {
-        let Some(info) = relay.paymaster(chain_id).await.map_err(relay_error)? else {
+        // Drawn several times and priced from the highest: the quote is one random draw from a
+        // gas-price view that flips between two modes about seven times apart, so a single draw
+        // is the low one half the time and the note built from it is under the gate's floor
+        // whenever the gate then draws high. See [`RelayClient::paymaster_quote`].
+        let Some(info) = relay.paymaster_quote(chain_id).await.map_err(relay_error)? else {
             return Ok(None);
         };
         // A fee note in a token the operator does not take is refused after we have paid to prove
@@ -2929,6 +2933,76 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// The note the adapter bakes into an aggregation is priced from the highest paymaster draw,
+    /// not from whichever one the first GET happened to return: the gate re-prices at submit time
+    /// from a two-mode gas view, so a note sized to a low draw is refused before it is queued.
+    #[tokio::test]
+    async fn the_relayer_fee_note_is_priced_from_the_highest_quote_draw() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = relayer::http_tests::Server::new({
+            let draws = draws.clone();
+            move |path, _| {
+                if path.starts_with("/relay/paymaster") {
+                    // Low for every draw but the last, as the prod gateway alternates.
+                    let draw = draws.fetch_add(1, Ordering::SeqCst);
+                    let price = if draw + 1 < relayer::FEE_QUOTE_SAMPLES {
+                        "16"
+                    } else {
+                        "118"
+                    };
+                    return Some((200, relayer::http_tests::paymaster_body(price)));
+                }
+                assert!(path.starts_with("/networks"), "{path}");
+                Some((
+                    200,
+                    serde_json::json!({"data":[{
+                        "slug":"gnosis","chainId":"100","currencies":[
+                            {"symbol":"XDAI","price":"1","decimals":18,"vaultTokenId":"1","nativeCurrency":true},
+                            {"symbol":"WXHOPR","price":"0.010698345713752304","decimals":18,
+                             "vaultTokenId":"2","nativeCurrency":false}
+                        ]}],"error":null}),
+                ))
+            }
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let relay = adapter.relay.as_ref().expect("relayed submission");
+        let (_, amount) = Adapter::relay_fee_recipient(relay, 100, 2)
+            .await?
+            .expect("the paymaster prices a note");
+
+        // The same arithmetic, on the quote the gate would read: 675 000 gas at 118 wei of a $1
+        // native, in a $0.01069834 wxHOPR, buffered and with the headroom on top.
+        let network = relayer::RelayClient::network(relay, 100)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let (native, token) = relayer::fee_note_valuations(&network, 2)?;
+        let high = relayer::PaymasterInfo {
+            operator: relayer::CurvyPublicKeys {
+                spend_public_key: "1.2".into(),
+                view_public_key: "3.4".into(),
+                bjj_public_key: "5.6".into(),
+            },
+            accepted_vault_token_ids: None,
+            submit_aggregation_gas_units: "675000".into(),
+            gas_price_wei: "118".into(),
+            client_buffer_bps: 1_500,
+            relayer_tolerance_bps: 500,
+        };
+        let low = relayer::PaymasterInfo {
+            gas_price_wei: "16".into(),
+            ..high.clone()
+        };
+        assert_eq!(amount, high.required_fee_in_token(&native, &token)?);
+        assert!(amount > low.required_fee_in_token(&native, &token)?);
+        // And it clears the gate even if the gate then reads the chain's median tip.
+        assert!(amount >= high.gate_floor_in_token(118, &native, &token)?);
+        assert_eq!(draws.load(Ordering::SeqCst), relayer::FEE_QUOTE_SAMPLES);
         Ok(())
     }
 

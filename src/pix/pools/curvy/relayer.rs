@@ -163,10 +163,16 @@ impl PaymasterInfo {
     /// so the note clears the gate's threshold by the client buffer rather than by luck.
     ///
     /// Carries [`FEE_NOTE_HEADROOM_BPS`] on top of the operator's own buffer. The gate re-reads
-    /// the gas price and the prices when the proof arrives, tolerating only 5% of drift, while
-    /// the quote is minutes old by then: on Gnosis the gas price is single-digit wei and moves by
-    /// tens of percent between the two. The note is worth a fraction of a cent, and its excess
-    /// is the operator's, so erring far high is the cheap side of a re-proof.
+    /// the gas price and the prices when the proof arrives, tolerating only 5% of drift. That
+    /// would be harmless if the quote were one number that drifted; on Gnosis it is not. The
+    /// paymaster's `gasPriceWei` alternates between two modes roughly seven times apart — base
+    /// fee alone (~15–25 wei) and base fee plus the chain's median tip (~113–125 wei) — and
+    /// flips between them on consecutive requests, so the gate draws its own value from the
+    /// same distribution the quote came from. A note sized to the quote plus a few percent is
+    /// therefore rejected whenever the client drew the low mode and the gate the high one, which
+    /// is about one first submission in four. The headroom covers the whole spread several
+    /// times over; the note is worth a fraction of a cent, and its excess is the operator's, so
+    /// erring far high is the cheap side of a re-proof.
     pub fn required_fee_in_token(
         &self,
         native: &TokenValuation,
@@ -178,6 +184,32 @@ impl PaymasterInfo {
             .checked_mul(10_000u128 + FEE_NOTE_HEADROOM_BPS as u128)
             .map(|scaled| scaled.div_ceil(10_000))
             .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the fee note headroom overflows")))
+    }
+
+    /// The lowest fee note the gate accepts if the proof arrives at `live_gas_price_wei`.
+    ///
+    /// The gate re-reads the gas price when the proof arrives and applies its own
+    /// `relayer_tolerance_bps` downward. A note below this floor is refused outright, so this is
+    /// what [`Self::required_fee_in_token`] has to clear — including the gas-price mode the
+    /// quote did not land on.
+    pub fn gate_floor_in_token(
+        &self,
+        live_gas_price_wei: u128,
+        native: &TokenValuation,
+        token: &TokenValuation,
+    ) -> Result<u128, StrategyError> {
+        let units: u128 = self.submit_aggregation_gas_units.parse().map_err(|error| {
+            StrategyError::other(anyhow::anyhow!("relayer quoted an unparseable gas unit count: {error}"))
+        })?;
+        let gas = units
+            .checked_mul(live_gas_price_wei)
+            .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the live gas cost overflows")))?;
+        let converted = convert_token_amount(gas, native, token)?;
+        let allowed = 10_000u128.saturating_sub(self.relayer_tolerance_bps.min(10_000) as u128);
+        converted
+            .checked_mul(allowed)
+            .map(|scaled| scaled / 10_000)
+            .ok_or_else(|| StrategyError::other(anyhow::anyhow!("the gate floor overflows")))
     }
 }
 
@@ -229,9 +261,24 @@ impl NetworksEnvelope {
     }
 }
 
-/// Headroom a relayer fee note carries over the converted quote, in basis points: doubled. See
-/// [`PaymasterInfo::required_fee_in_token`].
-pub const FEE_NOTE_HEADROOM_BPS: u64 = 10_000;
+/// Headroom a relayer fee note carries over the converted quote, in basis points.
+///
+/// The quote is drawn from the paymaster's gas-price view, which on Gnosis alternates between
+/// two modes about seven times apart on consecutive requests (see
+/// [`PaymasterInfo::required_fee_in_token`]); the gate then draws its own value from the same
+/// distribution. Covering that needs `1 + headroom` to exceed the mode ratio divided by the
+/// gate's downward tolerance, so doubling was short of the 3.75–7.4x ratios measured both live
+/// and in the blocks of the rejected submissions. 800% over the client buffer is 10.35x the
+/// quoted gas cost (`1.15 × 9`), which clears 10.89x of drift even after the gate's 5% allowance.
+pub const FEE_NOTE_HEADROOM_BPS: u64 = 80_000;
+
+/// How many paymaster quotes to draw, keeping the highest, when pricing a fee note.
+///
+/// The quote is not a signed price, so the only defence against drawing the low gas-price mode
+/// is redundancy: the high mode comes up about half the time, so four sequential draws miss it
+/// with probability `2^-4`. Each draw is a 650-byte GET, negligible next to the proof the note
+/// is baked into.
+pub const FEE_QUOTE_SAMPLES: usize = 4;
 
 /// Decimal places the relayer scales USD prices to before integer arithmetic (`PRICE_DECIMALS`).
 pub const PRICE_DECIMALS: u32 = 8;
@@ -488,6 +535,64 @@ impl RelayClient {
             return Ok(None);
         }
         Self::decode(response).await.map(Some)
+    }
+
+    /// The paymaster terms to price a fee note from: [`Self::paymaster`], drawn
+    /// [`FEE_QUOTE_SAMPLES`] times, keeping the quote with the highest gas price.
+    ///
+    /// The endpoint is not a signed quote — the gate re-prices when the proof arrives — and on
+    /// Gnosis its gas price alternates between two modes about seven times apart on consecutive
+    /// requests. One draw therefore lands low about half the time, and the note built from it is
+    /// under the gate's floor whenever the gate then draws high: the first submission is refused
+    /// with `operator note does not cover the gas cost`. Taking the highest of several draws
+    /// makes that a `2^-FEE_QUOTE_SAMPLES` event rather than a coin flip.
+    ///
+    /// A draw that fails does not fail the call: only if every draw fails is the error reported,
+    /// and a deployment without a paymaster (`404`) is reported as `Ok(None)` as soon as one draw
+    /// says so.
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use hopr_strategy::pix::pools::curvy::relayer::RelayClient;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let relay = RelayClient::new("https://api.curvy.box".parse()?, Duration::from_secs(10))?;
+    /// match relay.paymaster_quote(100).await? {
+    ///     Some(quote) => println!("fee note of {} wei", quote.required_fee()?),
+    ///     None => println!("this deployment takes aggregations without a fee note"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn paymaster_quote(&self, chain_id: u64) -> Result<Option<PaymasterInfo>, RelayError> {
+        let mut best: Option<PaymasterInfo> = None;
+        let mut last_error = None;
+        for _ in 0..FEE_QUOTE_SAMPLES {
+            match self.paymaster(chain_id).await {
+                Ok(None) => return Ok(None),
+                Ok(Some(info)) => {
+                    let higher = match &best {
+                        None => true,
+                        // A quote we cannot parse must not win by default; `required_fee`
+                        // reports it, and a replacement quote may well be readable.
+                        Some(current) => match (info.required_fee(), current.required_fee()) {
+                            (Ok(candidate), Ok(incumbent)) => candidate > incumbent,
+                            (Ok(_), Err(_)) => true,
+                            (Err(_), _) => false,
+                        },
+                    };
+                    if higher {
+                        best = Some(info);
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match best {
+            Some(info) => Ok(Some(info)),
+            None => {
+                Err(last_error.unwrap_or_else(|| RelayError::Transport("the paymaster quote was not drawn".to_owned())))
+            }
+        }
     }
 
     /// The protocol-global facts: the fee collector an aggregation's protocol fee note is sealed
@@ -809,24 +914,91 @@ mod tests {
             usd: parse_usd_price("0.5")?,
             decimals: 6,
         };
-        // ... and the note carries FEE_NOTE_HEADROOM_BPS on top: 2700.
+        // ... and the note carries FEE_NOTE_HEADROOM_BPS on top: 1350 * 9.
         assert_eq!(
             paymaster("675000", "1000000000", 0).required_fee_in_token(&native, &cheap)?,
-            2700
+            12_150
         );
         // Rounded up: one unit short would be refused by the gate.
         let odd = TokenValuation {
             usd: parse_usd_price("0.3")?,
             decimals: 6,
         };
-        assert_eq!(paymaster("1", "1", 0).required_fee_in_token(&native, &odd)?, 2);
-        // Staging's Gnosis numbers: the wxHOPR note is about 84x the native gas cost, doubled.
+        assert_eq!(paymaster("1", "1", 0).required_fee_in_token(&native, &odd)?, 9);
+        // Staging's Gnosis numbers: the wxHOPR note is about 84x the native gas cost, times the
+        // headroom.
         let network = serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?.into_network(100)?;
         let (native, wxhopr) = fee_note_valuations(&network, 2)?;
+        let staging_quote = 56637019634166807_u128;
         assert_eq!(
             paymaster("675000", "1000000000", 0).required_fee_in_token(&native, &wxhopr)?,
-            2 * 56637019634166807
+            9 * staging_quote
         );
+        Ok(())
+    }
+
+    /// The note covers the gas-price mode the quote missed, which is what the old doubling was
+    /// short of on Gnosis: 1.15 * 1 + headroom against a mode ratio of up to 7.4x.
+    #[test]
+    fn the_fee_note_covers_the_other_gas_price_mode() -> anyhow::Result<()> {
+        let network = serde_json::from_str::<NetworksEnvelope>(STAGING_NETWORKS)?.into_network(100)?;
+        let (native, wxhopr) = fee_note_valuations(&network, 2)?;
+        // The lowest quote the prod paymaster was observed to serve, and the highest the chain
+        // was paying at the same moment.
+        for (quote, live) in [(15_u128, 125_u128), (16, 118), (19, 114), (21, 120), (32, 131)] {
+            let info = paymaster("675000", &quote.to_string(), 1_500);
+            let note = info.required_fee_in_token(&native, &wxhopr)?;
+            let floor = info.gate_floor_in_token(live, &native, &wxhopr)?;
+            assert!(
+                note >= floor,
+                "a quote of {quote} wei cannot pay a gate that reads {live} wei: note {note} < floor {floor}"
+            );
+        }
+        // And the coverage is a property of the constants, not of the token: the note is
+        // 1.15 * (1 + headroom) the quoted gas cost.
+        let cover = 11_500_u128 * (10_000 + FEE_NOTE_HEADROOM_BPS as u128) / 10_000 / 10_000;
+        assert!(cover >= 9, "covers {cover}x the quoted gas cost");
+        Ok(())
+    }
+
+    /// The gate's own 5% allowance counts against us, so the covered ratio is the note over
+    /// `(1 - tolerance)`.
+    #[test]
+    fn the_gate_floor_applies_its_tolerance_downward() -> anyhow::Result<()> {
+        let native = TokenValuation {
+            usd: parse_usd_price("1")?,
+            decimals: 18,
+        };
+        let token = TokenValuation {
+            usd: parse_usd_price("1")?,
+            decimals: 18,
+        };
+        let info = paymaster("1000", "1", 0);
+        // 1000 gas at 1 wei, less the 500 bps the relayer tolerates: 950.
+        assert_eq!(info.gate_floor_in_token(1, &native, &token)?, 950);
+        assert_eq!(info.gate_floor_in_token(0, &native, &token)?, 0);
+        assert_eq!(
+            paymaster("1000", "1", 0).required_fee_in_token(&native, &token)?,
+            9_000,
+            "the note is the quote times the headroom, with no client buffer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_covered_ratio_is_above_the_measured_gas_price_spread() -> anyhow::Result<()> {
+        // Measured on the prod paymaster 2026-11-12: modes at 15-26 and 113-125 wei, a ratio of
+        // 125/15 = 8.33. The gate tolerates 5% downward, so the note must be worth
+        // 8.33 / 0.95 = 8.77x the quote it was priced from.
+        let note_over_quote = |buffer_bps: u64, headroom_bps: u64| {
+            (10_000 + buffer_bps) as u128 * (10_000 + headroom_bps) as u128 / 10_000
+        };
+        // In basis points of the quoted gas cost.
+        let needed = 87_700_u128;
+        assert!(note_over_quote(1_500, FEE_NOTE_HEADROOM_BPS) >= needed);
+        // The doubling this replaced did not: 2.42 < 8.77, so it only covered the spread if the
+        // gate happened to draw a mode at most 2.42x the one that priced the note.
+        assert!(note_over_quote(1_500, 10_000) < needed);
         Ok(())
     }
 
@@ -967,6 +1139,8 @@ mod tests {
 /// Local HTTP fixtures exercise the actual reqwest boundary without external services.
 #[cfg(test)]
 pub(super) mod http_tests {
+    use std::sync::Arc;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -1036,6 +1210,100 @@ pub(super) mod http_tests {
             });
             Self { url, task }
         }
+    }
+
+    /// The paymaster's body as the prod gateway serves it, parameterised by the gas price.
+    pub fn paymaster_body(gas_price_wei: &str) -> serde_json::Value {
+        serde_json::json!({
+            "operator":{"S":"1.2","V":"3.4","babyJubjubPublicKey":"5.6"},
+            "acceptedVaultTokenIds":null,
+            "submitAggregationGasUnits":"675000",
+            "gasPriceWei":gas_price_wei,
+            "clientBufferBps":1500,
+            "relayerToleranceBps":500,
+        })
+    }
+
+    /// The quote comes from one random draw of the paymaster's two-mode gas price, so a single
+    /// draw is the low mode half the time and the note built from it falls under the gate's
+    /// floor. Sampling must keep the highest of the draws instead.
+    #[tokio::test]
+    async fn the_fee_quote_keeps_the_highest_of_several_draws() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Low, low, high: a single draw would price the note at 16 wei two times in three.
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = Server::new({
+            let draws = draws.clone();
+            move |path, _| {
+                assert_eq!(path, "/relay/paymaster?chainId=100");
+                let draw = draws.fetch_add(1, Ordering::SeqCst);
+                let price = if draw < FEE_QUOTE_SAMPLES - 1 { "16" } else { "118" };
+                Some((200, paymaster_body(price)))
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let info = client.paymaster_quote(100).await?.expect("a paymaster is served");
+        assert_eq!(info.gas_price_wei, "118", "the highest draw prices the note");
+        assert_eq!(draws.load(Ordering::SeqCst), FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// A draw that fails does not lose the ones that succeeded: the quote is what the note is
+    /// built from, and a transport blip on one of four GETs is not a reason to re-prove.
+    #[tokio::test]
+    async fn a_failed_draw_does_not_discard_the_quote() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = Server::new({
+            let draws = draws.clone();
+            move |_, _| {
+                let draw = draws.fetch_add(1, Ordering::SeqCst);
+                Some(match draw {
+                    0 => (200, paymaster_body("17")),
+                    1 => (503, serde_json::json!({"error":"quote unavailable"})),
+                    2 => (200, paymaster_body("19")),
+                    _ => (200, paymaster_body("18")),
+                })
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let info = client.paymaster_quote(100).await?.expect("a paymaster is served");
+        assert_eq!(info.gas_price_wei, "19", "the highest readable draw wins");
+        Ok(())
+    }
+
+    /// With no paymaster (`404`) one answer is enough; a deployment without one is not retried
+    /// `FEE_QUOTE_SAMPLES` times.
+    #[tokio::test]
+    async fn a_deployment_without_a_paymaster_is_not_sampled() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = Server::new({
+            let draws = draws.clone();
+            move |_, _| {
+                draws.fetch_add(1, Ordering::SeqCst);
+                Some((404, serde_json::Value::Null))
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        assert!(client.paymaster_quote(100).await?.is_none());
+        assert_eq!(draws.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Every draw failing is still an error, reported as the last one: the caller retries it as
+    /// transient, exactly as it did a single failing `paymaster` call.
+    #[tokio::test]
+    async fn every_draw_failing_reports_the_relayer_error() -> anyhow::Result<()> {
+        let server = Server::new(|_, _| Some((503, serde_json::json!({"error":"quote unavailable"})))).await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(2))?;
+        let error = client.paymaster_quote(100).await.expect_err("no draw succeeded");
+        assert!(matches!(error, RelayError::Transport(_)), "{error}");
+        assert!(error.to_string().contains("503"), "{error}");
+        Ok(())
     }
 
     pub fn proof() -> curvy_abi::curvy_types::Groth16Proof {
