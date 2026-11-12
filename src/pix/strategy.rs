@@ -1967,7 +1967,7 @@ mod tests {
     use hopr_api::{
         chain::{
             AccountSelector, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations, ChainValues,
-            ChainWriteAccountOperations, HoprChainApi, PoolTransferSource,
+            ChainWriteAccountOperations, DepositPool, HoprChainApi, PoolTransferSource,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2231,6 +2231,45 @@ mod tests {
             .await?
             .context("no notification")?;
         assert_eq!(n.1, target);
+        Ok(())
+    }
+
+    /// The Safe funds the plain pool, so it takes no top-up and reports the Safe's wxHOPR.
+    #[test_log::test(tokio::test)]
+    async fn test_plain_pool_funding_is_the_safe() -> anyhow::Result<()> {
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let client = connector.client();
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
+        );
+
+        assert!(
+            !pool.accepts_funding(),
+            "a pool whose funding is the Safe has nothing to move value into"
+        );
+        assert!(
+            pool.fund(HoprBalance::new_base(10)).await.is_err(),
+            "funding the plain pool must be refused rather than reported as done"
+        );
+        assert_eq!(
+            pool.available_balance().await?,
+            hopr_balance(&*cc, *BOB).await?,
+            "the funding this pool reports is the Safe's wxHOPR"
+        );
         Ok(())
     }
 
