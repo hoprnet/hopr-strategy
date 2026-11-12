@@ -229,6 +229,18 @@ async fn shield_journalled(
     Ok((outcome, at))
 }
 
+/// Records that the Safe's transfer to the in-flight shield's portal is done.
+fn journal_portal_funded(
+    state: &parking_lot::Mutex<SdkState>,
+    store: &RedbCurvySdkStore,
+) -> Result<(), RsSdkCurvyAdapterError> {
+    let mut state = state.lock();
+    if let Some(in_flight) = state.shield_in_flight.as_mut() {
+        in_flight.stage = StoredShieldStage::Funded;
+    }
+    store.save(&state)
+}
+
 /// The shield router's ERC-777 payload for a direct shield: `abi.encode(aggregator, note)`, with
 /// the note as the aggregator's `directShield` takes it, carrying the gross amount.
 fn direct_shield_payload(aggregator: Address, note: &OnchainNote) -> Result<Erc777Payload, RsSdkCurvyAdapterError> {
@@ -1644,6 +1656,7 @@ where
                 let mut portal_balance = client
                     .erc20_balance(&endpoints.token_address, &prepared.portal_address)
                     .await?;
+                let mut funded_by_task = false;
                 if portal_balance == 0 {
                     let portal = Address::from_str(&prepared.portal_address).map_err(|error| {
                         RsSdkCurvyAdapterError::InvalidValue(format!("shield portal address: {error}"))
@@ -1653,17 +1666,27 @@ where
                     // un-sent, and a caller that is dropped while it is in flight (an API request
                     // whose client went away) would otherwise lose it with the journal still at
                     // `Prepared`, and a retry would fund the portal a second time. The task runs it
-                    // to its end; the portal's balance, read above, is what a retry then finds.
+                    // to its end, and journals `Funded` before it returns: a balance read after it,
+                    // by a parent that may be gone by then, is no record of what the Safe sent.
                     let funding = (self.funder)(portal, HoprBalance::from(U256::from(gross)));
                     let guard = held.take().expect("held above");
-                    let (funded, guard) =
-                        tokio::spawn(async move { (funding.await, guard) })
-                            .await
-                            .map_err(|error| {
-                                RsSdkCurvyAdapterError::InvalidValue(format!("the portal funding: {error}"))
-                            })?;
+                    let (state, store) = (Arc::clone(&self.state), self.store.clone());
+                    let (funded, journalled, guard) = tokio::spawn(async move {
+                        let funded = funding.await;
+                        let journalled = if funded.is_ok() {
+                            journal_portal_funded(&state, &store)
+                        } else {
+                            Ok(())
+                        };
+                        (funded, journalled, guard)
+                    })
+                    .await
+                    .map_err(|error| RsSdkCurvyAdapterError::InvalidValue(format!("the portal funding: {error}")))?;
                     held = Some(guard);
                     funded.map_err(RsSdkCurvyAdapterError::Funding)?;
+                    journalled?;
+                    funded_by_task = true;
+                    // A sanity check only: the journal already says funded.
                     portal_balance = client
                         .erc20_balance(&endpoints.token_address, &prepared.portal_address)
                         .await?;
@@ -1675,9 +1698,9 @@ where
                     });
                 }
                 shield.stage = StoredShieldStage::Funded;
-                let mut state = self.state.lock();
-                state.shield_in_flight = Some(shield.clone());
-                self.store.save(&state)?;
+                if !funded_by_task {
+                    journal_portal_funded(&self.state, &self.store)?;
+                }
             }
             let entry = client
                 .shield_prepared_deposit(&prepared, &self.config.operator_private_key, self.config.route)
@@ -6023,6 +6046,123 @@ mod tests {
             "the journalled shield landed"
         );
         assert!(stored.shield_in_flight.is_none(), "the journal is settled");
+        Ok(())
+    }
+
+    /// What the portal tests share: a journalled portal shield at `stage`, and an aggregator that
+    /// knows no note and reports `portal_balance` for the portal.
+    struct PortalRig {
+        _state: RedbCurvyDepositState,
+        store: RedbCurvySdkStore,
+        portal_balance: Arc<std::sync::atomic::AtomicU64>,
+        adapter: Adapter,
+        _server: relayer::http_tests::Server,
+    }
+
+    async fn portal_rig(stage: StoredShieldStage, funder: PortalFunder) -> anyhow::Result<PortalRig> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let state = RedbCurvyDepositState::in_memory()?;
+        let note = Adapter::owned_note(&fixture(7))?;
+        let store = RedbCurvySdkStore::new(&state)?;
+        let mut persisted = store.load()?;
+        persisted.shield_in_flight = Some(StoredShield {
+            note: StoredNote::from(&note),
+            gross: "7".to_owned(),
+            recovery: format!("0x{}", "aa".repeat(20)),
+            portal_address: format!("0x{}", "bb".repeat(20)),
+            stage,
+        });
+        store.save(&persisted)?;
+        let portal_balance = Arc::new(AtomicU64::new(0));
+        let balance = portal_balance.clone();
+        let server = relayer::http_tests::Server::new(move |path, body| {
+            assert_eq!(path, "/graphql");
+            let query = body["query"].as_str().unwrap();
+            if query.contains("hoprBalance") {
+                return Some((
+                    200,
+                    serde_json::json!({"data":{
+                        "hoprBalance":{
+                            "__typename":"HoprBalance",
+                            "address":format!("0x{}", "bb".repeat(20)),
+                            "balance":format!("0.{:018} wxHOPR", balance.load(Ordering::SeqCst)),
+                        },
+                        "chainInfo":{
+                            "__typename":"ChainInfo",
+                            "contractAddresses":serde_json::json!({"token": format!("0x{}", "03".repeat(20))}).to_string(),
+                        },
+                    }}),
+                ));
+            }
+            assert!(query.contains("curvyNoteStatus"), "{query}");
+            Some(note_status_response(false))
+        })
+        .await;
+        let mut adapter = test_adapter(&state, server.url.clone())?;
+        adapter.config.shielding = CurvyShielding::Portal;
+        adapter.funder = funder;
+        Ok(PortalRig {
+            _state: state,
+            store,
+            portal_balance,
+            adapter,
+            _server: server,
+        })
+    }
+
+    impl PortalRig {
+        async fn fund(&self) -> Result<(), RsSdkCurvyAdapterError> {
+            self.adapter
+                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+                .await
+        }
+
+        fn stage(&self) -> anyhow::Result<Option<StoredShieldStage>> {
+            Ok(self.store.load()?.shield_in_flight.map(|stored| stored.stage))
+        }
+    }
+
+    /// The Safe's transfer to the portal is journalled by the task that makes it, not by the
+    /// caller that awaits it: a caller dropped between the transfer and the write would otherwise
+    /// leave `Prepared`, and a retry that read a stale balance would fund the portal twice.
+    #[tokio::test]
+    async fn a_portal_funding_is_journalled_even_if_the_caller_is_dropped() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let funder: PortalFunder = {
+            let (calls, gate) = (calls.clone(), gate.clone());
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let gate = gate.clone();
+                Box::pin(async move {
+                    gate.notified().await;
+                    Ok(())
+                })
+            })
+        };
+        let rig = portal_rig(StoredShieldStage::Prepared, funder).await?;
+
+        // The caller gives up while the transfer is in flight.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rig.fund())
+                .await
+                .is_err()
+        );
+        assert_eq!(rig.stage()?, Some(StoredShieldStage::Prepared), "still in flight");
+        rig.portal_balance.store(7, Ordering::SeqCst);
+        gate.notify_one();
+        for _ in 0..100 {
+            if rig.stage()? == Some(StoredShieldStage::Funded) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(rig.stage()?, Some(StoredShieldStage::Funded), "the task journalled it");
+
+        // Whatever the retry goes on to do, it does not fund the portal again.
+        let _ = rig.fund().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the portal is funded once");
         Ok(())
     }
 
