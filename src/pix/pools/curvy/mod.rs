@@ -127,7 +127,10 @@ use curvy_core::{eddsa::ScalarSigningKey, field::fr_to_be_32, stealth, witness::
 pub use detect::RsCoreCurvyNoteDetector;
 use futures::future::BoxFuture;
 use hopr_api::{
-    chain::{BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
+    chain::{
+        BatchOutcomes, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource,
+        SubmissionFailure,
+    },
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
         chain::prelude::Erc777Payload,
@@ -860,6 +863,11 @@ impl From<CurvyDepositPoolError> for StrategyError {
 /// [`ChainWriteAccountOperations::send_erc777`] settles through the Safe module like
 /// [`withdraw`](ChainWriteAccountOperations::withdraw) does for [`safe_funder`], so the shield goes
 /// through the node's own transaction sequencer.
+///
+/// The chain API must implement [`ChainWriteAccountOperations::submission_failure`] (the connector
+/// does; a type that wraps it must forward it, as `&`, `Box` and `Arc` do through `auto_impl`): the
+/// trait's default classifies every failure as unknown, which would hold the float through the
+/// whole settle grace for a transaction that was never sent.
 fn safe_direct_shielder<Api>(api: Api) -> DirectShielder
 where
     Api: ChainWriteAccountOperations + Clone + Send + Sync + 'static,
@@ -879,44 +887,24 @@ where
                     tracing::info!(%tx, %router, gross, "the direct shield confirmed on chain");
                     Ok(Confirmed { tx: tx.to_string() })
                 }
-                Err(error) => Err(classify_shield_error(&error)),
+                Err(error) => Err(shield_failure(&api, &error)),
             }
         }) as BoxFuture<'static, Result<Confirmed, ShieldFailure>>
     })
 }
 
-/// What a failed shield transaction, direct or the portal's funding, leaves the float in, from the connector's own
-/// classification of its error, found by walking the error's sources in case the chain API wraps
-/// it. The same split as the connector's sequencer makes of whether a nonce was consumed:
-///
-/// | Connector error | Outcome |
-/// |---|---|
-/// | `is_refused_before_broadcast()`, or RPC `FEE_TOO_LOW` / `INSUFFICIENT_FUNDS` | [`ShieldFailure::NotSubmitted`] |
-/// | `as_transaction_rejection_error()`, or `InnerTxFailed` | [`ShieldFailure::Reverted`] |
-/// | any other RPC code (`NONCE_TOO_LOW`, `ALREADY_KNOWN`, …), a timeout, a transport failure, an error that is not the connector's | [`ShieldFailure::Unconfirmed`] |
-///
-/// The last row may have been broadcast — an earlier copy of the transaction can be in the mempool
-/// — so it is never treated as unsent.
-fn classify_shield_error(error: &(dyn std::error::Error + 'static)) -> ShieldFailure {
-    use hopr_chain_connector::errors::ConnectorError;
+/// What a failed shield transaction, direct or the portal's funding, leaves the float in: the chain
+/// API's own answer, [`ChainWriteAccountOperations::submission_failure`], where the table of what
+/// each error means now lives.
+fn shield_failure<Api>(api: &Api, error: &Api::Error) -> ShieldFailure
+where
+    Api: ChainWriteAccountOperations,
+{
     let reason = error.to_string();
-    let mut current = Some(error);
-    let connector = std::iter::from_fn(|| {
-        let this = current?;
-        current = this.source();
-        Some(this)
-    })
-    .find_map(|error| error.downcast_ref::<ConnectorError>());
-    match connector {
-        Some(error)
-            if error.is_refused_before_broadcast()
-                || matches!(error.rpc_rejection_code(), Some("FEE_TOO_LOW" | "INSUFFICIENT_FUNDS")) =>
-        {
-            ShieldFailure::NotSubmitted(reason)
-        }
-        Some(error) if error.as_transaction_rejection_error().is_some() => ShieldFailure::Reverted { reason },
-        Some(ConnectorError::InnerTxFailed(_)) => ShieldFailure::Reverted { reason },
-        _ => ShieldFailure::Unconfirmed(reason),
+    match api.submission_failure(error) {
+        SubmissionFailure::NotSubmitted => ShieldFailure::NotSubmitted(reason),
+        SubmissionFailure::Reverted => ShieldFailure::Reverted { reason },
+        SubmissionFailure::Unknown => ShieldFailure::Unconfirmed(reason),
     }
 }
 
@@ -953,7 +941,7 @@ where
                         tracing::info!(%tx, %portal, "the portal funding confirmed on chain");
                         Ok(Confirmed { tx: tx.to_string() })
                     }
-                    Err(error) => Err(classify_shield_error(&error)),
+                    Err(error) => Err(shield_failure(&api, &error)),
                 }
             })
         },

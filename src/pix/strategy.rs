@@ -521,14 +521,6 @@ impl PixStrategy {
     {
         StrategyError::validate_config(&pool_cfg)?;
 
-        // The plain pool pays deposits from the Safe, so there is nothing a funding policy could
-        // top up: it would read the Safe's balance and "fund" nothing on every flush.
-        if self.cfg.funding.is_some() {
-            return Err(StrategyError::InvalidConfiguration(
-                "the plain pool pays from the Safe and cannot be funded; drop the `funding` policy".to_owned(),
-            ));
-        }
-
         // The pool signs sweep-gas top-ups with `node_key` directly, and its reserve gate reads
         // that key's own balance. A key that is not the node's would therefore spend and gate an
         // account unrelated to the one `node.chain_api()` settles deposits from — a wiring mistake
@@ -567,6 +559,10 @@ impl PixStrategy {
     /// Unlike `build_non_anonymous`, no chain key is taken: under the default `shielding: direct`
     /// the pool spends the float by having the node's Safe ERC-777-`send` it to the Curvy shield
     /// router, and that transaction goes through the node's own chain API, which signs it.
+    /// That chain API must implement `ChainWriteAccountOperations::submission_failure` (the connector
+    /// does; a wrapper must forward it): the trait's default classifies every failure as unknown,
+    /// which would hold the float through the whole settle grace for a transaction that was never
+    /// sent.
     ///
     /// The pool needs one more thing the config cannot carry: a Blokli endpoint that exposes the
     /// Curvy deployment (`pool_cfg.blokli_url`). Under `submission: operator` it additionally
@@ -666,9 +662,9 @@ impl PixStrategy {
     /// Build with an arbitrary [`DepositPool`] implementation.
     ///
     /// A `funding` policy in the configuration is applied through the pool's
-    /// [`fund`](DepositPool::fund); a pool that cannot be funded would refuse it on every flush.
-    /// [`DepositPool`] has no way to ask, so only the plain pool's own builder refuses the policy
-    /// up front.
+    /// [`fund`](DepositPool::fund). A pool whose [`accepts_funding`](DepositPool::accepts_funding)
+    /// is `false` — one whose funding is the Safe itself, like the plain pool — would refuse it on
+    /// every flush, so it is refused here, up front, with [`StrategyError::InvalidConfiguration`].
     ///
     /// `D` must be [`Clone`] so the startup recovery replay can run in its own task. A pool
     /// that is not cloneable is used by wrapping it in an [`Arc`], which [`DepositPool`]
@@ -697,6 +693,14 @@ impl PixStrategy {
         // Every other strategy validates in its builder; this one derived `Validate` without ever
         // calling it, so `spend_window`'s constraint would have been decorative.
         StrategyError::validate_config(&self.cfg)?;
+
+        if self.cfg.funding.is_some() && !pool.accepts_funding() {
+            return Err(StrategyError::InvalidConfiguration(
+                "the deposit pool does not take funding (`accepts_funding` is false): drop the `funding` stanza, or \
+                 fund it another way (the plain pool's funding is the Safe itself)"
+                    .to_owned(),
+            ));
+        }
 
         let recovery_store = open_recovery_store(&self.cfg)?;
 
@@ -5598,6 +5602,8 @@ mod tests {
         deposits: Arc<parking_lot::Mutex<Vec<usize>>>,
         /// When set, every deposit fails with what it builds.
         deposit_failure: Option<fn() -> StrategyError>,
+        /// What the pool answers to `accepts_funding`.
+        accepts_funding: bool,
     }
 
     #[async_trait::async_trait]
@@ -5611,6 +5617,10 @@ mod tests {
             _id: &PixAddressId,
         ) -> std::result::Result<Self::PoolDepositData, StrategyError> {
             unreachable!("the funding policy generates nothing")
+        }
+
+        fn accepts_funding(&self) -> bool {
+            self.accepts_funding
         }
 
         async fn fund(&self, amount: HoprBalance) -> std::result::Result<(), StrategyError> {
@@ -5680,6 +5690,7 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
             funding,
@@ -5720,6 +5731,7 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
@@ -5776,6 +5788,7 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
@@ -5817,6 +5830,7 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: Some(|| StrategyError::CriteriaNotSatisfied),
+            accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let amount = HoprBalance::new_base(1);
@@ -5845,6 +5859,37 @@ mod tests {
         Ok(())
     }
 
+    /// A pool that says its funding is the Safe cannot take a funding policy: `build_with_pool`
+    /// refuses it up front, naming the stanza, and accepts the same policy for a pool that can.
+    #[test_log::test(tokio::test)]
+    async fn build_with_pool_refuses_a_funding_policy_only_for_a_pool_that_cannot_be_funded() -> anyhow::Result<()> {
+        for accepts_funding in [false, true] {
+            let (_cc, node, _pool) = entry_side(&[]).await?;
+            let pool = Arc::new(FundingProbePool {
+                available: HoprBalance::zero(),
+                funded: Default::default(),
+                hold: None,
+                deposits: Default::default(),
+                deposit_failure: None,
+                accepts_funding,
+            });
+
+            let result = PixStrategy::new(funding_cfg())
+                .build_with_pool::<_, _, crate::pix::pools::plain::PoolKeypair>(pool, node, *BOB)
+                .map(|_| ());
+
+            match (accepts_funding, result) {
+                (true, Ok(())) => {}
+                (false, Err(StrategyError::InvalidConfiguration(message))) => {
+                    assert!(message.contains("`funding`"), "{message}");
+                    assert!(message.contains("does not take funding"), "{message}");
+                }
+                (accepts, result) => panic!("accepts_funding {accepts} gave {result:?}"),
+            }
+        }
+        Ok(())
+    }
+
     /// A strategy that ran and stopped funds again when it runs again.
     #[test_log::test(tokio::test)]
     async fn a_second_run_funds_again() -> anyhow::Result<()> {
@@ -5855,6 +5900,7 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
@@ -5930,6 +5976,7 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let id = pix_id(1);
@@ -5962,6 +6009,7 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
         let gate = Arc::clone(&strategy.funding_gate);
@@ -5989,6 +6037,7 @@ mod tests {
             hold: Some(Arc::clone(&hold)),
             deposits: Default::default(),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
 
@@ -6019,6 +6068,7 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let gate = Arc::clone(&strategy.funding_gate);

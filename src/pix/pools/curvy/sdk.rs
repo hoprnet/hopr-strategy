@@ -134,6 +134,11 @@ pub type PortalFunder =
 /// is known only when the confirmation arrives. The outcome is therefore a [`ShieldFailure`], which
 /// says what the Safe's float is left in, or [`Confirmed`].
 ///
+/// The node's chain API must implement `ChainWriteAccountOperations::submission_failure` (the
+/// connector does; a type that wraps it must forward it, as `&`, `Box` and `Arc` do through
+/// `auto_impl`): the trait's default classifies every failure as unknown, which would hold the
+/// float through the whole settle grace for a transaction that was never sent.
+///
 /// A confirmation is a shield that took effect: the connector turns a failed inner call of the
 /// Safe into an error ([`ShieldFailure::Reverted`]), so a [`Confirmed`] whose note the aggregator
 /// does not know yet is the aggregator lagging, not a failed shield.
@@ -148,6 +153,8 @@ pub struct Confirmed {
 }
 
 /// How a shield's transaction failed, as far as the float is concerned.
+///
+/// The chain API classifies its own errors: see `ChainWriteAccountOperations::submission_failure`.
 #[derive(Debug, thiserror::Error)]
 pub enum ShieldFailure {
     /// Refused before anything was broadcast: nothing moved and no nonce was consumed.

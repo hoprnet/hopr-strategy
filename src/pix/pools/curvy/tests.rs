@@ -999,76 +999,102 @@ async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow
     Ok(())
 }
 
+/// One recorded `send_erc777`: the amount, the recipient and the payload.
+type RecordedSend = (HoprBalance, Address, Erc777Payload);
+
+/// The chain API the shield tests hand the pool: it records every `send`, its pending future
+/// ends as scripted (`None` is a confirmation), and its `submission_failure` answers as scripted,
+/// so that what the shielder and the funder make of each answer is the only thing under test:
+/// the classification itself belongs to the chain API.
+#[derive(Clone, Default)]
+struct RecordingChainApi {
+    sends: Arc<parking_lot::Mutex<Vec<RecordedSend>>>,
+    pending_fails: Option<hopr_api::chain::SubmissionFailure>,
+}
+
+impl RecordingChainApi {
+    fn pending(&self) -> futures::future::BoxFuture<'static, Result<hopr_api::chain::ChainReceipt, ScriptedFailure>> {
+        use futures::FutureExt;
+        let failed = self.pending_fails.is_some();
+        async move {
+            if failed {
+                Err(ScriptedFailure("the transaction failed".to_owned()))
+            } else {
+                Ok(hopr_api::chain::ChainReceipt::default())
+            }
+        }
+        .boxed()
+    }
+}
+
+#[async_trait]
+impl hopr_api::chain::ChainWriteAccountOperations for RecordingChainApi {
+    type Error = ScriptedFailure;
+
+    fn submission_failure(&self, error: &Self::Error) -> hopr_api::chain::SubmissionFailure {
+        assert_eq!(
+            error.0, "the transaction failed",
+            "classifies the pending future's error"
+        );
+        self.pending_fails.expect("only a failure is classified")
+    }
+
+    async fn announce(
+        &self,
+        _multiaddrs: &[hopr_api::types::internal::prelude::Multiaddr],
+        _key: &hopr_api::types::crypto::prelude::OffchainKeypair,
+    ) -> Result<
+        futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>,
+        hopr_api::chain::AnnouncementError<Self::Error>,
+    > {
+        unreachable!("a shield does not announce")
+    }
+
+    async fn withdraw<C: hopr_api::types::primitive::prelude::Currency + Send>(
+        &self,
+        _balance: hopr_api::types::primitive::prelude::Balance<C>,
+        _recipient: &Address,
+    ) -> Result<futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error>
+    {
+        Ok(self.pending())
+    }
+
+    async fn send_erc777(
+        &self,
+        balance: HoprBalance,
+        recipient: &Address,
+        payload: &Erc777Payload,
+    ) -> Result<futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error>
+    {
+        self.sends.lock().push((balance, *recipient, payload.clone()));
+        Ok(self.pending())
+    }
+
+    async fn withdraw_from_signer<C: hopr_api::types::primitive::prelude::Currency + Send>(
+        &self,
+        _signer: &ChainKeypair,
+        _balance: hopr_api::types::primitive::prelude::Balance<C>,
+        _recipient: &Address,
+    ) -> Result<futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error>
+    {
+        unreachable!("a shield does not withdraw from the node account")
+    }
+
+    async fn register_safe(
+        &self,
+        _safe_address: &Address,
+    ) -> Result<
+        futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>,
+        hopr_api::chain::SafeRegistrationError<Self::Error>,
+    > {
+        unreachable!("a shield does not register a Safe")
+    }
+}
+
 /// What the chain API is handed is exactly the ERC-777 `send` a direct shield is: the gross
 /// amount, the router as the recipient, and the router's payload — the aggregator and the note.
 #[test_log::test(tokio::test)]
 async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyhow::Result<()> {
-    use futures::{FutureExt, future::BoxFuture};
-    use hopr_api::{
-        chain::{AnnouncementError, ChainReceipt, ChainWriteAccountOperations, SafeRegistrationError},
-        types::{
-            crypto::prelude::OffchainKeypair,
-            internal::prelude::Multiaddr,
-            primitive::prelude::{Balance, Currency},
-        },
-    };
-
-    /// One recorded `send_erc777`: the amount, the recipient and the payload.
-    type RecordedSend = (HoprBalance, Address, Erc777Payload);
-
-    /// Records every `send`; nothing else is part of a direct shield.
-    #[derive(Clone, Default)]
-    struct RecordingChainApi {
-        sends: Arc<parking_lot::Mutex<Vec<RecordedSend>>>,
-    }
-
-    #[async_trait]
-    impl ChainWriteAccountOperations for RecordingChainApi {
-        type Error = ScriptedFailure;
-
-        async fn announce(
-            &self,
-            _multiaddrs: &[Multiaddr],
-            _key: &OffchainKeypair,
-        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, AnnouncementError<Self::Error>> {
-            unreachable!("a direct shield does not announce")
-        }
-
-        async fn withdraw<C: Currency + Send>(
-            &self,
-            _balance: Balance<C>,
-            _recipient: &Address,
-        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
-            unreachable!("a direct shield does not withdraw")
-        }
-
-        async fn send_erc777(
-            &self,
-            balance: HoprBalance,
-            recipient: &Address,
-            payload: &Erc777Payload,
-        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
-            self.sends.lock().push((balance, *recipient, payload.clone()));
-            Ok(futures::future::ready(Ok(ChainReceipt::default())).boxed())
-        }
-
-        async fn withdraw_from_signer<C: Currency + Send>(
-            &self,
-            _signer: &ChainKeypair,
-            _balance: Balance<C>,
-            _recipient: &Address,
-        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, Self::Error> {
-            unreachable!("a direct shield does not withdraw from the node account")
-        }
-
-        async fn register_safe(
-            &self,
-            _safe_address: &Address,
-        ) -> Result<BoxFuture<'life0, Result<ChainReceipt, Self::Error>>, SafeRegistrationError<Self::Error>> {
-            unreachable!("a direct shield does not register a Safe")
-        }
-    }
-
     let api = RecordingChainApi::default();
     let router: Address = [0xbb; 20].into();
     let aggregator: Address = [0xcc; 20].into();
@@ -1090,90 +1116,45 @@ async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyh
     Ok(())
 }
 
-/// What the connector's own classification of a failed shield transaction leaves the float in: a
-/// refusal before broadcast is `NotSubmitted`, a rejection by the chain is `Reverted`, and
-/// anything else — a timeout, a transport failure, an error that is not the connector's — is
-/// `Unconfirmed`, because the transaction may have been broadcast.
-#[test]
-fn a_failed_shield_transaction_is_classified_by_the_connectors_own_predicates() {
-    use blokli_client::errors::{ErrorKind, TrackingErrorKind};
-    use hopr_chain_connector::errors::ConnectorError;
+/// What the shielder and the funder make of the chain API's own classification of a failed
+/// transaction: each answer maps to the failure that says what the float is left in, with the
+/// error's text as its reason, and a confirmation carries the transaction hash.
+#[tokio::test]
+async fn a_failed_shield_transaction_is_classified_by_the_chain_api() {
+    use hopr_api::chain::SubmissionFailure;
 
-    use super::ShieldFailure;
+    use super::{Confirmed, ShieldFailure};
 
-    let client = |kind: ErrorKind| ConnectorError::ClientError(kind.into());
-    let classify = |error: ConnectorError| super::classify_shield_error(&error);
-
-    assert!(matches!(
-        classify(client(ErrorKind::BlokliError {
-            kind: "overloaded",
-            code: "OVERLOADED".into(),
-            message: "busy".into(),
-        })),
-        ShieldFailure::NotSubmitted(_)
-    ));
-    assert!(matches!(
-        classify(client(ErrorKind::BlokliError {
-            kind: "contract not allowed",
-            code: "X".into(),
-            message: "no".into(),
-        })),
-        ShieldFailure::NotSubmitted(_)
-    ));
-    let rpc = |code: &str| {
-        client(ErrorKind::BlokliError {
-            kind: "rpc error",
-            code: code.into(),
-            message: "refused".into(),
-        })
-    };
-    // The codes for which the connector's own sequencer knows no nonce was consumed.
-    for code in ["FEE_TOO_LOW", "INSUFFICIENT_FUNDS"] {
-        assert!(matches!(classify(rpc(code)), ShieldFailure::NotSubmitted(_)), "{code}");
-    }
-    // Every other code may have left an earlier copy in the mempool.
-    for code in [
-        "NONCE_TOO_LOW",
-        "NONCE_TOO_HIGH",
-        "ALREADY_KNOWN",
-        "REPLACEMENT_UNDERPRICED",
-        "SOMETHING_ELSE",
+    let router: Address = [0xbb; 20].into();
+    let hash = hopr_api::chain::ChainReceipt::default().to_string();
+    for pending_fails in [
+        None,
+        Some(SubmissionFailure::NotSubmitted),
+        Some(SubmissionFailure::Reverted),
+        Some(SubmissionFailure::Unknown),
     ] {
-        assert!(matches!(classify(rpc(code)), ShieldFailure::Unconfirmed(_)), "{code}");
+        let api = RecordingChainApi {
+            pending_fails,
+            ..Default::default()
+        };
+        let shielder = super::safe_direct_shielder(api.clone());
+        let funder = super::safe_funder(api);
+        let outcomes = [
+            shielder(direct_shield_payload([0xcc; 20].into()), router, 25).await,
+            funder(router, HoprBalance::from(U256::from(25_u8))).await,
+        ];
+        for outcome in outcomes {
+            match (pending_fails, outcome) {
+                (None, Ok(confirmed)) => assert_eq!(confirmed, Confirmed { tx: hash.clone() }),
+                (Some(SubmissionFailure::NotSubmitted), Err(ShieldFailure::NotSubmitted(reason)))
+                | (Some(SubmissionFailure::Reverted), Err(ShieldFailure::Reverted { reason }))
+                | (Some(SubmissionFailure::Unknown), Err(ShieldFailure::Unconfirmed(reason))) => {
+                    assert_eq!(reason, "the transaction failed")
+                }
+                (script, outcome) => panic!("{script:?} became {outcome:?}"),
+            }
+        }
     }
-    assert!(matches!(
-        classify(client(ErrorKind::TrackingError(TrackingErrorKind::Reverted))),
-        ShieldFailure::Reverted { .. }
-    ));
-    assert!(matches!(
-        classify(ConnectorError::InnerTxFailed("n/a".into())),
-        ShieldFailure::Reverted { .. }
-    ));
-    assert!(matches!(
-        classify(client(ErrorKind::TrackingError(TrackingErrorKind::Timeout))),
-        ShieldFailure::Unconfirmed(_)
-    ));
-    assert!(matches!(
-        classify(ConnectorError::ConnectionTimeout),
-        ShieldFailure::Unconfirmed(_)
-    ));
-    assert!(matches!(
-        super::classify_shield_error(&std::io::Error::other("not the connector's")),
-        ShieldFailure::Unconfirmed(_)
-    ));
-
-    // A chain API that wraps the connector's error is still classified by it.
-    #[derive(Debug, thiserror::Error)]
-    #[error("the chain API failed")]
-    struct Wrapped(#[source] ConnectorError);
-    assert!(matches!(
-        super::classify_shield_error(&Wrapped(client(ErrorKind::BlokliError {
-            kind: "overloaded",
-            code: "OVERLOADED".into(),
-            message: "busy".into(),
-        }))),
-        ShieldFailure::NotSubmitted(_)
-    ));
 }
 
 /// A direct shield that is settling, or confirmed and not yet indexed, is waited out by funding;

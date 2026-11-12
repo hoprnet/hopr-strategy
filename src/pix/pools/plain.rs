@@ -1125,11 +1125,18 @@ where
             .map(|_| ())
     }
 
+    /// Its funding is the Safe, so there is no pool to move value into: a builder refuses a
+    /// funding policy for it at build time, before the strategy runs.
+    fn accepts_funding(&self) -> bool {
+        false
+    }
+
     /// The Safe is this pool's funding: there is nothing to move it into, so this is refused
-    /// rather than reported as done. Fund the Safe itself.
+    /// rather than reported as done. Fund the Safe itself, and leave the `funding` stanza out.
     async fn fund(&self, _amount: HoprBalance) -> Result<(), Self::Error> {
         Err(StrategyError::other(anyhow::anyhow!(
-            "the plain pool pays from the Safe and cannot be funded; fund the Safe instead"
+            "the plain pool does not take funding: its funding is the Safe, so fund the Safe instead and leave the \
+             `funding` stanza out"
         )))
     }
 
