@@ -312,7 +312,8 @@ pub struct PixStrategyConfig {
 /// How the strategy keeps the deposit pool funded.
 ///
 /// A pool never funds itself. With this policy the strategy does, by configuration: once at
-/// startup and at the head of every deposit flush, it reads [`DepositPool::available_balance`]
+/// startup and at the head of every deposit flush except the final one at shutdown, which funds
+/// nothing, it reads [`DepositPool::available_balance`]
 /// and, when that is below `min_available`, asks the pool to [`fund`](DepositPool::fund) `top_up`
 /// from the Safe. Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; one funding at a time, so that
@@ -1001,7 +1002,8 @@ where
     /// one that is still waiting for `funding_gate` then does not. A funding that holds the gate
     /// always runs to the end and is journalled by the pool, whether or not `run` is still
     /// running — a Safe transaction cannot be un-sent, and dropping its future would only lose the
-    /// record of it. The fundings of the flushes do not obey it: their batches depend on them.
+    /// record of it. The fundings of the flushes do not obey it: their batches depend on them. The
+    /// final flush at shutdown funds nothing.
     /// Dropping the strategy reads as the same.
     funding_stop: tokio::sync::watch::Sender<bool>,
 }
@@ -1392,37 +1394,51 @@ where
     ///
     /// A funding that has acquired the gate always runs to completion and is journalled, whether
     /// or not `run` is still running; shutdown abandons only a startup top-up that has not started
-    /// (`funding_stop`). Each flush's own funding is left to finish too, since its batch depends on
-    /// it. Shutdown sets the stop and awaits [`Self::flush_deposits`], which, with deposits
-    /// buffered, applies the policy once ahead of its batch: that queues behind whatever funding
-    /// is on the gate, all of it work those deposits need, so it waits for the fundings its
-    /// deposits depend on plus at most one of its own, then the flush. With none buffered it
-    /// returns without waiting for any funding.
+    /// (`funding_stop`). Each detached flush's own funding is left to finish too, since its batch
+    /// depends on it.
+    ///
+    /// The final flush does not fund. Shutdown allocates what is already funded and never starts a
+    /// Safe shield: a shield takes a chain round, and a node that is stopping should not begin
+    /// one. A buffered deposit that cannot be made — an unfunded pool, or any other failure,
+    /// already logged for its own reason — is lost with the memory-only buffer, and shutdown says
+    /// how many.
     async fn shut_down(&mut self) {
         self.funding_stop.send_replace(true);
 
         // Awaited, not detached: the loop is over, so there is nothing left to keep responsive,
         // and a task spawned here would race `run` returning.
-        self.flush_deposits().await;
+        let failed = self.flush_buffered_deposits().await;
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                "{failed} buffered deposits were not made before shutdown; the buffer is not persisted"
+            );
+        }
         self.flush_withdrawals().await;
     }
 
-    /// Flush the buffered deposits, waiting for the pool to finish.
+    /// Flush the buffered deposits, waiting for the pool to finish, with the funding policy
+    /// applied ahead of the batch as in the detached flush: the deposits are what it funds for.
+    /// Returns how many deposits were not made.
     ///
     /// Retries are the pool's responsibility, so an error here means the pool already
     /// exhausted its own budget and the deposit is abandoned for this flush.
     ///
-    /// The funding policy is applied ahead of the batch, as in the detached flush.
-    ///
-    /// Used on the shutdown path, where there is no loop left to keep responsive and the work
-    /// must complete before `run` returns. Everywhere else the loop uses
+    /// What a caller gets when it drives the strategy without its loop, with detaching off. The
+    /// shutdown path uses [`Self::flush_buffered_deposits`], which funds nothing; everywhere else the loop uses
     /// [`Self::detach_flush_deposits`] — see there for why.
-    async fn flush_deposits(&mut self) {
+    async fn flush_deposits(&mut self) -> usize {
         if self.deposit_buffer.is_empty() {
-            return;
+            return 0;
         }
-        // Ahead of the batch, as in the detached flush: the deposits are what it funds for.
         apply_funding_policy::<D, K>(&self.pool, self.cfg.funding.as_ref(), &self.funding_gate, None).await;
+        self.flush_buffered_deposits().await
+    }
+
+    /// Drain the buffer through the pool against what it already holds, applying no funding
+    /// policy, and wait for it: the flush at shutdown, where starting a shield on the way out is
+    /// not something to do. Returns how many deposits were not made.
+    async fn flush_buffered_deposits(&mut self) -> usize {
         let batch = std::mem::take(&mut self.deposit_buffer);
         flush_deposit_batch::<D, K>(
             self.pool.clone(),
@@ -1431,7 +1447,7 @@ where
             Arc::clone(&self.spend_ledger),
             batch,
         )
-        .await;
+        .await
     }
 
     /// Hand the buffered deposits to a task and return immediately.
@@ -1572,7 +1588,7 @@ async fn apply_funding_policy<D, K>(
     }
 }
 
-/// Deposit one drained buffer through the pool.
+/// Deposit one drained buffer through the pool, returning how many of its deposits were not made.
 ///
 /// A free function so that both the awaiting and the detached caller share one body: the loop
 /// must not block on the pool (see [`PixStrategyInner::detach_flush_deposits`]), while shutdown
@@ -1584,7 +1600,8 @@ async fn flush_deposit_batch<D, K>(
     in_flight_destinations: Cache<K::Public, ()>,
     spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
     batch: Vec<BufferedDeposit<D, K>>,
-) where
+) -> usize
+where
     // `Send + Sync + 'static` beyond what the work itself needs, so the future is spawnable. The
     // `StrategyTrait` impl already requires exactly this of `D`, so no caller gains a bound.
     D: DepositPool<K> + Send + Sync + 'static,
@@ -1602,8 +1619,11 @@ async fn flush_deposit_batch<D, K>(
 {
     let count = batch.len();
     if count == 0 {
-        return;
+        return 0;
     }
+    // Deposits that did not go through, which the final flush at shutdown reports: the buffer
+    // they came from is not persisted.
+    let mut failed = 0usize;
 
     if count == 1 {
         let (id, dest_addr, amount, deposit_data, spend) = batch.into_iter().next().unwrap();
@@ -1627,6 +1647,7 @@ async fn flush_deposit_batch<D, K>(
                 if error.moved_no_funds() {
                     refund(spend_ledger.as_ref(), spend, &id, amount);
                 }
+                failed = 1;
                 tracing::error!(%error, ?id, "single deposit flush failed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 METRIC_PIX_DEPOSITS_FAILED.increment();
@@ -1685,6 +1706,7 @@ async fn flush_deposit_batch<D, K>(
                 }
                 let deposited = settled.len() as u64;
                 let unaccounted = count - settled.len();
+                failed = unaccounted;
 
                 // Refund only when every failure is provably fund-free (one ambiguous failure
                 // means the window cannot tell which reservation moved money), every unaccounted
@@ -1719,12 +1741,14 @@ async fn flush_deposit_batch<D, K>(
                         refund(spend_ledger.as_ref(), *spend, id, *amount);
                     }
                 }
+                failed = count;
                 tracing::error!(%error, count, "batch deposit flush failed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
             }
         }
     }
+    failed
 }
 
 /// Hands a failed deposit's spend reservation back to the window.
@@ -5579,6 +5603,8 @@ mod tests {
         hold: Option<Arc<tokio::sync::Notify>>,
         /// For each deposit, how many fundings had been recorded when it arrived.
         deposits: Arc<parking_lot::Mutex<Vec<usize>>>,
+        /// When set, every deposit fails with what it builds.
+        deposit_failure: Option<fn() -> StrategyError>,
     }
 
     #[async_trait::async_trait]
@@ -5614,7 +5640,7 @@ mod tests {
             _additional_data: Self::PoolDepositData,
         ) -> std::result::Result<(), StrategyError> {
             self.deposits.lock().push(self.funded.lock().len());
-            Ok(())
+            self.deposit_failure.map_or(Ok(()), |failure| Err(failure()))
         }
 
         fn notify_deposit(
@@ -5660,6 +5686,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
+            deposit_failure: None,
         });
         let cfg = PixStrategyConfig {
             funding,
@@ -5699,6 +5726,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
+            deposit_failure: None,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
@@ -5742,10 +5770,10 @@ mod tests {
         assert!(validator::Validate::validate(&cfg).is_err());
     }
 
-    /// With a deposit still buffered at shutdown the policy runs once, ahead of the final flush, so
-    /// that the deposit finds a funded pool; and the funding is not left to land afterwards.
+    /// Shutdown allocates what the pool already holds and starts no shield: the deposit is
+    /// flushed, the funding policy is not applied.
     #[test_log::test(tokio::test)]
-    async fn shutdown_funds_once_ahead_of_the_final_flush() -> anyhow::Result<()> {
+    async fn shutdown_flushes_without_funding() -> anyhow::Result<()> {
         let (_cc, node, _pool) = entry_side(&[]).await?;
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -5754,6 +5782,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
+            deposit_failure: None,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
@@ -5772,9 +5801,54 @@ mod tests {
 
         strategy.shut_down().await;
 
-        assert_eq!(*funded.lock(), vec![HoprBalance::new_base(2)], "funded once");
-        assert_eq!(*deposits.lock(), vec![1], "the deposit came after the funding");
+        assert!(funded.lock().is_empty(), "nothing is funded on the way out");
+        assert_eq!(
+            *deposits.lock(),
+            vec![0],
+            "the deposit was flushed against what was there"
+        );
         assert!(*strategy.funding_stop.borrow(), "and nothing funds after it");
+        Ok(())
+    }
+
+    /// A buffered deposit that cannot be made at shutdown is lost with the memory-only buffer,
+    /// whatever the reason, and counted; shutdown still completes.
+    #[test_log::test(tokio::test)]
+    async fn buffered_deposits_that_fail_at_shutdown_are_counted() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Arc::clone(&deposits),
+            deposit_failure: Some(|| StrategyError::CriteriaNotSatisfied),
+        });
+        let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
+        let amount = HoprBalance::new_base(1);
+        for n in [1, 2] {
+            let id = pix_id(n);
+            let spend = strategy.commit_spend(amount);
+            strategy
+                .deposit_buffer
+                .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+        }
+        assert_eq!(
+            strategy.flush_buffered_deposits().await,
+            2,
+            "both are counted as not made"
+        );
+
+        let id = pix_id(3);
+        let spend = strategy.commit_spend(amount);
+        strategy
+            .deposit_buffer
+            .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+        strategy.shut_down().await;
+
+        assert!(strategy.deposit_buffer.is_empty(), "shutdown flushed the buffer");
+        assert!(funded.lock().is_empty(), "and funded nothing");
         Ok(())
     }
 
@@ -5787,6 +5861,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
+            deposit_failure: None,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
@@ -5850,7 +5925,7 @@ mod tests {
     }
 
     /// The awaited flush — what a caller driving the strategy without its loop gets — funds ahead
-    /// of its batch too.
+    /// of its batch like a detached one. Only the flush at shutdown does not.
     #[test_log::test(tokio::test)]
     async fn an_awaited_flush_funds_ahead_of_its_batch() -> anyhow::Result<()> {
         let (_cc, node, _pool) = entry_side(&[]).await?;
@@ -5861,6 +5936,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
+            deposit_failure: None,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let id = pix_id(1);
@@ -5892,6 +5968,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
+            deposit_failure: None,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
         let gate = Arc::clone(&strategy.funding_gate);
@@ -5918,6 +5995,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: Some(Arc::clone(&hold)),
             deposits: Default::default(),
+            deposit_failure: None,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
 
@@ -5947,6 +6025,7 @@ mod tests {
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
+            deposit_failure: None,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let gate = Arc::clone(&strategy.funding_gate);
