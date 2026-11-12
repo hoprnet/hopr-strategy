@@ -97,6 +97,7 @@ jobs:
     outputs:
       rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
       lockfile: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lockfile == 'true' }}
+      zizmor: ${{ github.event_name != 'pull_request' || steps.filter.outputs.zizmor == 'true' }}
     steps:
       - name: Filter changed paths
         id: filter
@@ -123,13 +124,15 @@ jobs:
             lockfile:
               - "Cargo.toml"
               - "Cargo.lock"
+            zizmor:
+              - ".github/**"
   # ── Shared checks (lint, pre-commit, audit) ─────────────────────────────────
   checks:
     name: Check
     needs: changes
-    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
+    uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@feat/fork-pr-ci-support
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       lint_command: "nix develop --command just quick"
       audit_command: "nix run -L .#audit"
       deps: true
@@ -138,6 +141,19 @@ jobs:
       audit: ${{ needs.changes.outputs.lockfile == 'true' }}
       runner_small: depot-ubuntu-24.04-2
       runner_large: depot-ubuntu-24.04-4
+    secrets:
+      cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  zizmor:
+    name: Zizmor
+    needs: changes
+    if: ${{ needs.changes.outputs.zizmor == 'true' }}
+    uses: hoprnet/hopr-workflows/.github/workflows/checks-zizmor.yaml@feat/fork-pr-ci-support
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      runner: depot-ubuntu-24.04-4
     secrets:
       cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
   # ── Shared tests (unit) ─────────────────────────────────────────────────────
@@ -151,9 +167,9 @@ jobs:
     permissions:
       contents: read
       id-token: write # Codecov OIDC upload in the coverage jobs
-    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-tests-v6.1.1
+    uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@feat/fork-pr-ci-support
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       enable_unit_tests: false
       enable_unit_coverage: ${{ needs.changes.outputs.rust == 'true' }}
       unit_coverage_command: "nix build -L .#coverage -o coverage.lcov"
@@ -183,12 +199,12 @@ jobs:
           - architecture: aarch64-darwin
             runner: depot-macos-15
             required_label: "binary:aarch64-darwin"
-    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@3d291616a704bea189af1f16cefc25e26d2857c0 # build-library-v3.2.0
+    uses: hoprnet/hopr-workflows/.github/workflows/build-library.yaml@feat/fork-pr-ci-support
     permissions:
       contents: read
       id-token: write
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      repo_sha: ${{ github.event.pull_request.head.sha || github.sha }}
       version_type: commit
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
@@ -210,9 +226,9 @@ jobs:
       contents: read
     steps:
       - name: Check semver
-        uses: hoprnet/hopr-workflows/actions/nix-action@ff4c0b7afc400ee6cf217841dc576f8a1289bcc0 # nix-action-v1.2.1
+        uses: hoprnet/hopr-workflows/actions/nix-action@feat/fork-pr-ci-support
         with:
-          source_branch: ${{ github.event.pull_request.head.sha }}
+          repo_sha: ${{ github.event.pull_request.head.sha }}
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           command: "nix run -L .#semver-checks"
   # Single aggregate merge gate: green only if every other job in this run
@@ -230,6 +246,7 @@ jobs:
       - semver-checks
       - tests
       - build-library
+      - zizmor
     runs-on: depot-ubuntu-24.04-2
     permissions: {}
     steps:
