@@ -129,7 +129,7 @@ jobs:
     needs: changes
     uses: hoprnet/hopr-workflows/.github/workflows/checks.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-checks-v2.1.1
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      source_branch: ${{ github.event.pull_request.head.sha || github.sha }}
       lint_command: "nix develop --command just quick"
       audit_command: "nix run -L .#audit"
       deps: true
@@ -153,7 +153,7 @@ jobs:
       id-token: write # Codecov OIDC upload in the coverage jobs
     uses: hoprnet/hopr-workflows/.github/workflows/tests.yaml@3ee95c480962bb3c1fc0061887da9ba735f537c7 # workflow-tests-v6.1.1
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      source_branch: ${{ github.event.pull_request.head.sha || github.sha }}
       enable_unit_tests: false
       enable_unit_coverage: ${{ needs.changes.outputs.rust == 'true' }}
       unit_coverage_command: "nix build -L .#coverage -o coverage.lcov"
@@ -188,7 +188,7 @@ jobs:
       contents: read
       id-token: write
     with:
-      source_branch: ${{ github.event.pull_request.head.ref || github.ref }}
+      source_branch: ${{ github.event.pull_request.head.sha || github.sha }}
       version_type: commit
       architecture: ${{ matrix.architecture }}
       build_file: Cargo.toml
