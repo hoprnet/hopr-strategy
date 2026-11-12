@@ -117,6 +117,16 @@ impl<N> Drop for StatePublisher<'_, N> {
     }
 }
 
+/// Whether the graph's loopback-based starvation verdict is usable evidence for this peer.
+#[derive(Clone, Copy)]
+enum LoopbackVerdict {
+    /// The peer has a channel, so a loopback can route: a zeroed edge is measured-dead.
+    Trusted,
+    /// The peer has no channel, so every loopback fails for lack of one: a zeroed edge
+    /// falls back to the direct probe stream instead of reading as measured-dead.
+    Unroutable,
+}
+
 impl<N> ChannelLifecycleStrategyInner<N>
 where
     N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
@@ -266,7 +276,12 @@ where
 
     /// Fetches pre-computed graph edge information for `peer_offchain`.
     /// Returns default (zero) values when no edge record exists.
-    fn peer_edge_info(&self, peer_offchain: &OffchainPublicKey) -> PeerEdgeInfo {
+    ///
+    /// `verdict` says whether the graph's loopback-based starvation verdict is usable
+    /// evidence for this peer. For an unroutable (channel-less) peer, a zeroed combined
+    /// score falls back to the direct probe stream's own score instead of reading as
+    /// measured-dead.
+    fn peer_edge_info(&self, peer_offchain: &OffchainPublicKey, verdict: LoopbackVerdict) -> PeerEdgeInfo {
         let my_key = self.node.graph().identity();
         match self.node.graph().edge(my_key, peer_offchain) {
             Some(e) => {
@@ -277,8 +292,26 @@ where
                 } else {
                     (None, None, None)
                 };
+                let combined_score = e.score();
+                let edge_score = match (combined_score, verdict) {
+                    (Some(0.0), LoopbackVerdict::Unroutable) => {
+                        // A zero combined score with a non-zero direct score can only come
+                        // from the graph's starvation short-circuit: the normal
+                        // `(immediate + intermediate) / 2` combination would be > 0.
+                        let direct_score = e.immediate_qos().and_then(|qos| qos.score());
+                        debug!(
+                            peer = %peer_offchain,
+                            combined_score = ?combined_score,
+                            direct_score = ?direct_score,
+                            "channel-lifecycle: loopback starvation on a channel-less peer; \
+                             scoring on the direct probe stream"
+                        );
+                        direct_score
+                    }
+                    (score, _) => score,
+                };
                 PeerEdgeInfo {
-                    edge_score: e.score(),
+                    edge_score,
                     last_update: e.last_update(),
                     average_latency,
                     probe_success_rate,
@@ -1079,7 +1112,7 @@ where
                 let offchain_key = addr_to_key.get(&ch.destination).copied();
                 let edge_info = offchain_key
                     .as_ref()
-                    .map(|pk| self.peer_edge_info(pk))
+                    .map(|pk| self.peer_edge_info(pk, LoopbackVerdict::Trusted))
                     .unwrap_or_default();
                 let ticket_score = self
                     .peer_ticket_activity
@@ -1148,7 +1181,11 @@ where
                 // observable effect with the current iteration source — a follow-up can widen
                 // the source to `peer_addr_map` if that use-case is needed.
 
-                let edge_info = self.peer_edge_info(&offchain_key);
+                // Every peer here has no `Open`/`PendingToClose` channel — `existing_dests`
+                // filtered those out above — so a loopback to it cannot route. Its starved
+                // loopback verdict is therefore an artifact of the missing channel, not
+                // evidence that the peer is measured-dead.
+                let edge_info = self.peer_edge_info(&offchain_key, LoopbackVerdict::Unroutable);
                 let ticket_score = self
                     .peer_ticket_activity
                     .get(&chain_addr)
@@ -2137,6 +2174,7 @@ mod tests {
     struct StubEdge {
         last_update: Duration,
         score: f64,
+        immediate: Option<StubMeasurement>,
     }
 
     impl Default for StubEdge {
@@ -2144,6 +2182,7 @@ mod tests {
             Self {
                 last_update: Duration::ZERO,
                 score: 0.5,
+                immediate: None,
             }
         }
     }
@@ -2157,7 +2196,7 @@ mod tests {
         }
 
         fn immediate_qos(&self) -> Option<&Self::ImmediateMeasurement> {
-            None
+            self.immediate.as_ref()
         }
 
         fn intermediate_qos(&self) -> Option<&Self::IntermediateMeasurement> {
@@ -2173,7 +2212,10 @@ mod tests {
         fn record(&mut self, _measurement: hopr_api::graph::traits::EdgeWeightType) {}
     }
 
-    struct StubMeasurement;
+    #[derive(Clone)]
+    struct StubMeasurement {
+        score: Option<f64>,
+    }
 
     impl hopr_api::graph::EdgeLinkObservable for StubMeasurement {
         fn record(&mut self, _: hopr_api::graph::traits::EdgeTransportMeasurement) {}
@@ -2187,7 +2229,7 @@ mod tests {
         }
 
         fn score(&self) -> Option<f64> {
-            None
+            self.score
         }
     }
 
@@ -2870,6 +2912,7 @@ mod tests {
             StubEdge {
                 last_update: Duration::from_secs(1),
                 score: 1.0,
+                immediate: None,
             },
         );
 
@@ -2947,6 +2990,7 @@ mod tests {
             StubEdge {
                 last_update: Duration::from_secs(1),
                 score: 0.6,
+                immediate: None,
             },
         );
 
@@ -2968,6 +3012,95 @@ mod tests {
             "a peer with no ticket history and edge score 0.6 must clear the open-eligibility gate"
         );
 
+        Ok(())
+    }
+
+    /// Runs one open pass for a connected, channel-less peer whose combined edge
+    /// score is `0.0` (the graph's starved verdict) and whose direct probe stream
+    /// scores `direct_score`.
+    async fn run_open_pass_against_a_starved_edge(direct_score: f64) -> anyhow::Result<StrategyState> {
+        let module_address: Address = [1; Address::SIZE].into();
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB],
+                true,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1),
+            )
+            .build_dynamic_client(module_address)
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+
+        let connector = create_test_blokli_connector(&BOB_KP, blokli_sim, module_address).await?;
+        let connector = Arc::new(connector);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let alice_pk = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            let pseudo = hopr_api::types::crypto::types::Hash::create(&[(*ALICE).as_ref()]);
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(pseudo.as_ref())
+                .expect("alice offchain key")
+                .public()
+        };
+        let my_key = {
+            use hopr_api::types::crypto::keypairs::Keypair as _;
+            *hopr_api::types::crypto::prelude::OffchainKeypair::from_secret(&[1u8; 32])
+                .expect("my key")
+                .public()
+        };
+
+        let network = StubNetworkView::default();
+        network.connect(PeerId::from(&alice_pk));
+
+        let graph = Arc::new(StubGraph::default());
+        graph.insert_edge(
+            my_key,
+            alice_pk,
+            StubEdge {
+                last_update: Duration::from_secs(1),
+                score: 0.0,
+                immediate: Some(StubMeasurement {
+                    score: Some(direct_score),
+                }),
+            },
+        );
+
+        let cfg = ChannelLifecycleConfig {
+            population: PopulationConfig {
+                min_open_channels: 0,
+                target_open_channels: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let inner = fresh_inner_with_chain_graph_and_network(cfg, Arc::clone(&connector), graph, network);
+        inner.run_pipeline().await;
+        Ok(inner.state())
+    }
+
+    /// A starved loopback must not read as measured-dead when the peer
+    /// has no channel for the loopback to route over. The direct probe stream is
+    /// healthy, so the candidate clears the gate and the tick fails to afford it.
+    #[tokio::test]
+    async fn open_pass_ignores_loopback_starvation_without_a_channel() -> anyhow::Result<()> {
+        assert_eq!(
+            run_open_pass_against_a_starved_edge(1.0).await?,
+            StrategyState::Degraded,
+            "a channel-less peer whose direct probes are healthy must clear the open-eligibility gate"
+        );
+        Ok(())
+    }
+
+    /// The fallback is not a blanket pass: a channel-less peer whose direct probes
+    /// themselves measured it dead stays excluded.
+    #[tokio::test]
+    async fn open_pass_still_excludes_a_peer_whose_direct_probes_measured_it_dead() -> anyhow::Result<()> {
+        assert_eq!(
+            run_open_pass_against_a_starved_edge(0.0).await?,
+            StrategyState::Running,
+            "a channel-less peer whose direct probes measured it dead must stay filtered out"
+        );
         Ok(())
     }
 
@@ -4609,6 +4742,7 @@ mod tests {
             StubEdge {
                 last_update: Duration::from_secs(1),
                 score: 0.0, // forces low_quality_score close
+                immediate: None,
             },
         );
 
@@ -4812,6 +4946,7 @@ mod tests {
             StubEdge {
                 last_update: Duration::from_secs(1),
                 score: 0.0,
+                immediate: None,
             },
         );
 

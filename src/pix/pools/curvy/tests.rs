@@ -28,7 +28,7 @@ use curvy_core::{
 };
 use hopr_api::{
     ChainKeypair,
-    chain::DepositPool,
+    chain::{DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
         crypto::prelude::{BjjKeypair, BjjPublicKey, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
@@ -830,6 +830,20 @@ impl CurvySdkAdapter for RecordingAdapter {
         Ok(())
     }
 
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+        self.funded.lock().push((gross, recovery_address));
+        Ok(())
+    }
+
+    /// The test double keeps no note ledger, so it reports what it was asked to shield.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        Ok(self
+            .funded
+            .lock()
+            .iter()
+            .fold(HoprBalance::zero(), |total, (gross, _)| total + *gross))
+    }
+
     async fn allocate(
         &self,
         deposits: Vec<(PixAddressId, BjjPublicKey, CurvyScanPublicKey, HoprBalance)>,
@@ -1264,18 +1278,44 @@ async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let dst_id = pix_id(2);
     let data = harness.pool.generate_deposit_data(&dst_id).await?;
-    let result = harness
-        .pool
-        .pool_transfer(
-            &pix_id(1),
-            &BjjKeypair::random(),
-            &dst_id,
-            *BjjKeypair::random().public(),
-            data,
-            None,
-        )
-        .await;
-    assert!(result.is_err());
+    for src in [
+        PoolTransferSource::Deposit {
+            id: &pix_id(1),
+            key: &BjjKeypair::random(),
+        },
+        PoolTransferSource::Funding,
+    ] {
+        let result = harness
+            .pool
+            .pool_transfer(src, &dst_id, *BjjKeypair::random().public(), data.clone(), Some(ten()))
+            .await;
+        // The funding source is refused too: a deposit is paid by the allocation, not by a
+        // transfer, which is why this pool overrides `deposit_funds_to`.
+        assert!(result.is_err());
+    }
+    Ok(())
+}
+
+/// A top-up reaches the pool and is reported back: the funding the pool accounts for is the
+/// shielded notes, and a second shield adds to them rather than replacing them.
+#[test_log::test(tokio::test)]
+async fn funding_adds_up_and_is_reported_as_the_available_balance() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+
+    assert_eq!(pool.available_balance().await?, HoprBalance::zero());
+    assert!(pool.accepts_funding(), "the Curvy pool takes a top-up");
+
+    pool.fund(ten()).await?;
+    assert_eq!(pool.available_balance().await?, ten());
+
+    pool.fund(ten()).await?;
+    assert_eq!(
+        pool.available_balance().await?,
+        ten() + ten(),
+        "a second top-up must add to the funding, not replace it"
+    );
+    assert_eq!(harness.adapter.funded.lock().len(), 2, "each top-up shields once");
     Ok(())
 }
 

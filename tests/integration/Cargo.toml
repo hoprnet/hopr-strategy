@@ -32,5 +32,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 
-bytesize = { workspace = true }
-test-log = { workspace = true, features = ["trace"] }
+bytesize           = { workspace = true }
+hopr-network-graph = { workspace = true }
+test-log           = { workspace = true, features = ["trace"] }

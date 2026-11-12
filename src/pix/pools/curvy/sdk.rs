@@ -145,6 +145,18 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
     /// `recovery_address` as the portal's recovery address. Idempotent and crash-resumable.
     async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error>;
 
+    /// Shields `gross` into the private pool on top of whatever funding is already journalled,
+    /// with `recovery_address` as the portal's recovery address. Crash-resumable: an interrupted
+    /// shield is resumed with the amount it was journalled with, but once a shield has landed the
+    /// next call shields again.
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error>;
+
+    /// What the journalled funding notes hold in total, as the pool accounts for them.
+    ///
+    /// A note counts from the moment its shield is journalled, before it is committed and
+    /// spendable, so what is reported can run ahead of what an allocation can draw on right now.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error>;
+
     /// Allocates the given amounts to the given Baby JubJub owners, each discoverable by its scan
     /// identity. Succeeds or fails as a whole per proof.
     async fn allocate(
@@ -1281,6 +1293,16 @@ where
 
     /// Shields initial private-pool funding if no durable funding already exists.
     async fn shield(&self, gross: u128, recovery_address: &str) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+        self.shield_inner(gross, recovery_address, false).await
+    }
+
+    /// Shields `gross` even when the pool is already funded, which is what a top-up needs.
+    async fn shield_inner(
+        &self,
+        gross: u128,
+        recovery_address: &str,
+        top_up: bool,
+    ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let _chain = self.chain.lock().await;
         let (client, endpoints) = self.client().await?;
         self.reconcile_relay_aggregation().await?;
@@ -1289,7 +1311,7 @@ where
             let state = self.state.lock();
             !state.funding.is_empty() && state.shield_in_flight.is_none() && state.direct_shield_in_flight.is_none()
         };
-        if already_funded {
+        if already_funded && !top_up {
             return Ok(Vec::new());
         }
         if self.config.shielding == CurvyShielding::Direct {
@@ -2608,6 +2630,28 @@ where
         self.shield(balance_u128(gross)?, &recovery_address.to_string())
             .await
             .map(|_| ())
+    }
+
+    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+        self.shield_inner(balance_u128(gross)?, &recovery_address.to_string(), true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        let total = {
+            let state = self.state.lock();
+            state.funding.iter().try_fold(0_u128, |total, stored| {
+                let note = OwnedNote::try_from(stored)?;
+                let amount: u128 = fr_to_biguint(&note.amount)
+                    .try_into()
+                    .map_err(|_| RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned()))?;
+                total
+                    .checked_add(amount)
+                    .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("funding total overflows u128".to_owned()))
+            })?
+        };
+        Ok(HoprBalance::from(U256::from(total)))
     }
 
     async fn allocate(
