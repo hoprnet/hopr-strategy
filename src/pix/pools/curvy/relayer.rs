@@ -327,8 +327,10 @@ pub const FEE_NOTE_HEADROOM_BPS: u64 = 80_000;
 /// something the client controls — a gateway that answers identical requests from one cached or
 /// coalesced upstream read hands every draw the same mode — so the draws ask caches not to
 /// answer them and start [`FEE_QUOTE_DRAW_SPACING`] apart rather than at the same instant. They
-/// still overlap, so the call costs one round trip plus the spacing, and the worst case is one
-/// request timeout plus the spacing rather than one timeout per draw.
+/// still overlap, so the call costs one round trip plus the spacing. Once one has quoted, the
+/// rest are waited on for at most [`FEE_QUOTE_STRAGGLER_GRACE`], so a draw that hangs costs that
+/// grace rather than a request timeout; only a gateway that answers no draw at all costs a
+/// request timeout, and then one rather than one per draw.
 pub const FEE_QUOTE_SAMPLES: usize = 4;
 
 /// How long after the previous paymaster draw the next one starts.
@@ -339,6 +341,18 @@ pub const FEE_QUOTE_SAMPLES: usize = 4;
 /// `(FEE_QUOTE_SAMPLES - 1)` times this much added latency — under a second against a deposit
 /// budget of a minute.
 pub const FEE_QUOTE_DRAW_SPACING: Duration = Duration::from_millis(200);
+
+/// How much longer the paymaster draws still out are waited on once a readable quote is in hand,
+/// counted from when the last draw started or the first quote arrived, whichever is later.
+///
+/// Waiting for every draw would let one that hangs hold the fee note for the client's whole
+/// request timeout (30 s in the Curvy pool, against a default deposit budget of a minute) with
+/// good quotes already in hand. The draws still out at the cutoff are dropped, counted in the
+/// warning, and the note is priced from those that answered. That only raises the chance of
+/// missing the high gas-price mode, and [`FEE_NOTE_HEADROOM_BPS`] covers the measured spread even
+/// from a low draw. Every draw gets at least this long after it was sent, well over a healthy
+/// round trip.
+pub const FEE_QUOTE_STRAGGLER_GRACE: Duration = Duration::from_secs(2);
 
 /// Decimal places the relayer scales USD prices to before integer arithmetic (`PRICE_DECIMALS`).
 pub const PRICE_DECIMALS: u32 = 8;
@@ -636,16 +650,20 @@ impl RelayClient {
     /// coin flip, as far as the draws are independent (see [`FEE_QUOTE_SAMPLES`]).
     ///
     /// A draw that fails does not fail the call: any draw that returns a quote prices the note,
-    /// and a warning names the draws that did not. A deployment without a paymaster (`404`) is
-    /// reported as `Ok(None)` only when *every* draw says so. A stray `404` from a gateway edge
-    /// next to a real quote is not taken as one: an aggregation built without the fee note is
-    /// refused by a paymaster deployment after it has been proven. When no draw returns a quote
-    /// and the others failed, the failure is reported instead, so the caller retries.
+    /// and a warning counts the draws that did not, or were cut short. A deployment without a
+    /// paymaster (`404`) is reported as `Ok(None)` only when *every* draw says so. A stray `404`
+    /// from a gateway edge next to a real quote is not taken as one: an aggregation built without
+    /// the fee note is refused by a paymaster deployment after it has been proven. When no draw
+    /// returns a quote and the others failed, the failure is reported instead, so the caller
+    /// retries.
     ///
     /// The draws overlap, each starting [`FEE_QUOTE_DRAW_SPACING`] after the previous one, so the
-    /// call costs one round trip plus the spacing however many are taken — which matters because
-    /// a hung gateway would otherwise burn the deposit's whole tracking budget before the retry
-    /// loop even saw an error.
+    /// call costs one round trip plus the spacing however many are taken. Once a readable quote
+    /// is in hand, the draws still out get [`FEE_QUOTE_STRAGGLER_GRACE`] more and are then
+    /// dropped, so one draw that hangs costs that grace rather than the request timeout. A
+    /// gateway that answers no draw at all still costs one request timeout, not one per draw —
+    /// which matters because draws one after another would burn the deposit's whole tracking
+    /// budget before the retry loop even saw an error.
     ///
     /// ```no_run
     /// # use std::time::Duration;
@@ -660,13 +678,20 @@ impl RelayClient {
     /// # }
     /// ```
     pub async fn paymaster_quote(&self, chain_id: u64) -> Result<Option<PaymasterInfo>, RelayError> {
-        let draws = futures::future::join_all((0..FEE_QUOTE_SAMPLES).map(|draw| async move {
-            // Staggered rather than simultaneous: identical requests sent at the same instant
-            // are the likeliest to be answered from one upstream read.
-            tokio::time::sleep(FEE_QUOTE_DRAW_SPACING * draw as u32).await;
-            self.paymaster(chain_id).await
-        }))
-        .await;
+        use futures::StreamExt;
+
+        let started = tokio::time::Instant::now();
+        let mut draws: futures::stream::FuturesUnordered<_> = (0..FEE_QUOTE_SAMPLES)
+            .map(|draw| async move {
+                // Staggered rather than simultaneous: identical requests sent at the same instant
+                // are the likeliest to be answered from one upstream read.
+                tokio::time::sleep_until(started + FEE_QUOTE_DRAW_SPACING * draw as u32).await;
+                self.paymaster(chain_id).await
+            })
+            .collect();
+        let last_sent = started + FEE_QUOTE_DRAW_SPACING * (FEE_QUOTE_SAMPLES as u32 - 1);
+        // Set once a readable quote is in hand: the draws still out are not waited on past it.
+        let mut cutoff: Option<tokio::time::Instant> = None;
         // The readable quote with the highest required fee, and that fee.
         let mut best: Option<(u128, PaymasterInfo)> = None;
         // Draws that answered `404`. Only a unanimous `404` means the deployment runs no
@@ -675,7 +700,16 @@ impl RelayClient {
         // Every failed draw, kept so the reported error is the most informative one rather than
         // whichever happened to run last.
         let mut errors: Vec<RelayError> = Vec::new();
-        for draw in draws {
+        loop {
+            let next = match cutoff {
+                None => draws.next().await,
+                Some(cutoff) => match tokio::time::timeout_at(cutoff, draws.next()).await {
+                    Ok(next) => next,
+                    // The draws still out are dropped with `draws`, cancelling their requests.
+                    Err(_elapsed) => break,
+                },
+            };
+            let Some(draw) = next else { break };
             match draw {
                 Ok(None) => without_paymaster += 1,
                 Ok(Some(info)) => match info.required_fee() {
@@ -690,23 +724,30 @@ impl RelayClient {
                         if best.as_ref().is_none_or(|(highest, _)| fee > *highest) {
                             best = Some((fee, info));
                         }
+                        if cutoff.is_none() {
+                            cutoff = Some(last_sent.max(tokio::time::Instant::now()) + FEE_QUOTE_STRAGGLER_GRACE);
+                        }
                     }
                 },
                 Err(error) => errors.push(error),
             }
         }
+        // Only ever non-zero with a readable quote in hand: the cutoff is not set before one.
+        let cut_short = draws.len();
+        drop(draws);
         if let Some((_, info)) = best {
-            if !errors.is_empty() || without_paymaster > 0 {
+            if !errors.is_empty() || without_paymaster > 0 || cut_short > 0 {
                 // Not a failure — the note is priced from a real quote — but it is priced from
                 // fewer draws than intended, so the chance that it missed the high gas-price mode
                 // is higher, and the gateway is degrading. Worth seeing in production.
                 tracing::warn!(
                     failed_draws = errors.len(),
                     without_paymaster,
+                    cut_short,
                     samples = FEE_QUOTE_SAMPLES,
                     gas_price_wei = %info.gas_price_wei,
                     first_error = %errors.first().map(ToString::to_string).unwrap_or_default(),
-                    "some paymaster quote draws failed; priced the fee note from those that succeeded"
+                    "some paymaster quote draws failed or were cut short; priced the fee note from those that answered"
                 );
             }
             return Ok(Some(info));
@@ -1489,6 +1530,69 @@ pub(super) mod http_tests {
             "the first draw was answered, so every draw was in flight at once"
         );
         assert_eq!(arrivals.load(Ordering::SeqCst), FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// A draw that hangs is not waited on once the others have quoted: the note is priced from
+    /// the draws that answered, within [`FEE_QUOTE_STRAGGLER_GRACE`] of the last one being sent,
+    /// rather than after the client's request timeout. Waiting for every draw would hold the call
+    /// for the whole 30 s timeout here, twice the outer bound.
+    #[tokio::test]
+    async fn a_hung_draw_does_not_hold_the_quote() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        let server = Server::concurrent({
+            let arrivals = arrivals.clone();
+            move |_| {
+                let arrival = arrivals.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if arrival == 1 {
+                        // Never answers; the connection is cancelled with the server.
+                        std::future::pending::<()>().await;
+                    }
+                    let price = if arrival == 2 { "118" } else { "16" };
+                    Some((200, paymaster_body(price)))
+                }
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(30))?;
+        let info = tokio::time::timeout(Duration::from_secs(15), client.paymaster_quote(100))
+            .await
+            .map_err(|_| anyhow::anyhow!("the quote waited on the hung draw"))??
+            .expect("the other draws quoted a paymaster");
+        assert_eq!(info.gas_price_wei, "118", "the highest of the draws that answered");
+        assert_eq!(arrivals.load(Ordering::SeqCst), FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// The cutoff is a grace, not a race to the first answer: a draw that answers a little after
+    /// the others still counts, so a gateway that is merely slow prices the note from every draw.
+    #[tokio::test]
+    async fn a_slow_draw_within_the_grace_still_counts() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        let server = Server::concurrent({
+            let arrivals = arrivals.clone();
+            move |_| {
+                let arrival = arrivals.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let price = if arrival + 1 == FEE_QUOTE_SAMPLES {
+                        tokio::time::sleep(FEE_QUOTE_STRAGGLER_GRACE / 4).await;
+                        "118"
+                    } else {
+                        "16"
+                    };
+                    Some((200, paymaster_body(price)))
+                }
+            }
+        })
+        .await;
+        let client = RelayClient::new(server.url.clone(), Duration::from_secs(5))?;
+        let info = client.paymaster_quote(100).await?.expect("a paymaster is served");
+        assert_eq!(info.gas_price_wei, "118", "the slow draw answered within the grace");
         Ok(())
     }
 
