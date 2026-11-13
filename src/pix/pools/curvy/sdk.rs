@@ -1516,7 +1516,12 @@ where
         chain_id: u64,
         token: u64,
     ) -> Result<Option<(Identity, u128)>, RsSdkCurvyAdapterError> {
-        let Some(info) = relay.paymaster(chain_id).await.map_err(relay_error)? else {
+        // Drawn several times and priced from the highest: the quote is one random draw from a
+        // gas-price view that flips between two modes about seven times apart, so a single draw
+        // is the low one half the time. The headroom carries a low draw over the spread measured
+        // so far; the highest of several draws guards against a wider one. See
+        // [`RelayClient::paymaster_quote`].
+        let Some(info) = relay.paymaster_quote(chain_id).await.map_err(relay_error)? else {
             return Ok(None);
         };
         // A fee note in a token the operator does not take is refused after we have paid to prove
@@ -2413,8 +2418,13 @@ where
                     .checked_add(*amount)
                     .ok_or_else(|| RsSdkCurvyAdapterError::InvalidValue("allocation total overflows u128".to_owned()))
             })?;
+            // The relayer's note is paid out of the same inputs as the allocations, so the funding
+            // has to cover it too. Leaving it out would pick a note that covers the allocations
+            // alone, and the build would then fail on it with an SDK error rather than
+            // `NoFunding` — so an exhausted pool would not be recognised as one.
+            let relayer_amount = relay_fee.as_ref().map_or(0, |(_, amount)| *amount);
             let minimum = client
-                .pix_minimum_input(&Fr::from(self.token().await?), total, 0)
+                .pix_minimum_input(&Fr::from(self.token().await?), total, relayer_amount)
                 .await?;
             let funding = {
                 let state = self.state.lock();
@@ -2973,6 +2983,156 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// The note the adapter bakes into an aggregation is priced from the highest paymaster draw,
+    /// not from whichever one the first GET happened to return: the gate re-prices at submit time
+    /// from a two-mode gas view, so a note sized to a low draw has only the headroom's margin over
+    /// the high mode, and is refused before it is queued if the spread is ever wider than that.
+    #[tokio::test]
+    async fn the_relayer_fee_note_is_priced_from_the_highest_quote_draw() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let draws = Arc::new(AtomicUsize::new(0));
+        let server = relayer::http_tests::Server::new({
+            let draws = draws.clone();
+            move |path, _| {
+                if path.starts_with("/relay/paymaster") {
+                    // Low for every draw but the last, as the prod gateway alternates.
+                    let draw = draws.fetch_add(1, Ordering::SeqCst);
+                    let price = if draw + 1 < relayer::FEE_QUOTE_SAMPLES {
+                        "16"
+                    } else {
+                        "118"
+                    };
+                    return Some((200, relayer::http_tests::paymaster_body(price)));
+                }
+                assert!(path.starts_with("/networks"), "{path}");
+                Some((
+                    200,
+                    serde_json::json!({"data":[{
+                        "slug":"gnosis","chainId":"100","currencies":[
+                            {"symbol":"XDAI","price":"1","decimals":18,"vaultTokenId":"1","nativeCurrency":true},
+                            {"symbol":"WXHOPR","price":"0.010698345713752304","decimals":18,
+                             "vaultTokenId":"2","nativeCurrency":false}
+                        ]}],"error":null}),
+                ))
+            }
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let relay = adapter.relay.as_ref().expect("relayed submission");
+        let (_, amount) = Adapter::relay_fee_recipient(relay, 100, 2)
+            .await?
+            .expect("the paymaster prices a note");
+
+        // The same arithmetic, on the quote the gate would read: 675 000 gas at 118 wei of a $1
+        // native, in a $0.01069834 wxHOPR, buffered and with the headroom on top.
+        let network = relayer::RelayClient::network(relay, 100)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let (native, token) = relayer::fee_note_valuations(&network, 2)?;
+        let high = relayer::PaymasterInfo {
+            operator: relayer::CurvyPublicKeys {
+                spend_public_key: "1.2".into(),
+                view_public_key: "3.4".into(),
+                bjj_public_key: "5.6".into(),
+            },
+            accepted_vault_token_ids: None,
+            submit_aggregation_gas_units: "675000".into(),
+            gas_price_wei: "118".into(),
+            client_buffer_bps: 1_500,
+            relayer_tolerance_bps: 500,
+        };
+        let low = relayer::PaymasterInfo {
+            gas_price_wei: "16".into(),
+            ..high.clone()
+        };
+        assert_eq!(amount, high.required_fee_in_token(&native, &token)?);
+        assert!(amount > low.required_fee_in_token(&native, &token)?);
+        // And the headroom covers the miss on its own: had every draw come back low, the note
+        // would still clear a gate that reads the chain's median tip.
+        assert!(low.required_fee_in_token(&native, &token)? >= high.gate_floor_in_token(118, &native, &token)?);
+        assert_eq!(draws.load(Ordering::SeqCst), relayer::FEE_QUOTE_SAMPLES);
+        Ok(())
+    }
+
+    /// The relayer's fee note is paid out of the funding, so the funding is chosen against the
+    /// minimum *with* the note in it. A note that covers the allocation alone is not enough: the
+    /// build would refuse it with an SDK error, which does not read as an exhausted pool, so the
+    /// shortfall has to surface as `NoFunding` before anything is built.
+    #[tokio::test]
+    async fn funding_selection_counts_the_relayer_fee_note() -> anyhow::Result<()> {
+        let server = relayer::http_tests::Server::new(|path, body| {
+            Some(if path.starts_with("/relay/paymaster") {
+                (200, relayer::http_tests::paymaster_body("118"))
+            } else if path == "/networks" {
+                (
+                    200,
+                    serde_json::json!({"data":[{
+                        "slug":"gnosis","chainId":"100","currencies":[
+                            {"symbol":"XDAI","price":"1","decimals":18,"vaultTokenId":"1","nativeCurrency":true},
+                            {"symbol":"WXHOPR","price":"0.010698345713752304","decimals":18,
+                             "vaultTokenId":"4","nativeCurrency":false}
+                        ]}],"error":null}),
+                )
+            } else if path == "/protocol" {
+                (200, serde_json::json!({"data":{"feeCollector":null}}))
+            } else if path == "/graphql" && body["query"].as_str().unwrap_or_default().contains("curvyVaultFees") {
+                // No protocol or gas fee, so the minimum is the allocation plus the relayer's note.
+                (
+                    200,
+                    serde_json::json!({ "data": {
+                        "curvyVaultFees": { "__typename": "CurvyVaultFees", "depositFee": "0", "withdrawalFee": "0" },
+                        "curvyAggregatorFees": {
+                            "__typename": "CurvyAggregatorFees",
+                            "protocolFeePerThousand": "0",
+                            "commitmentFeeRoot": "0x01",
+                            "feeNotePublicKey": ["1", "2"],
+                        },
+                        "curvyVaultTokenCount": { "__typename": "CurvyVaultTokenCount", "count": "0" },
+                    }}),
+                )
+            } else {
+                (
+                    500,
+                    serde_json::json!({ "error": format!("unexpected request to {path}") }),
+                )
+            })
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        {
+            // Covers the 7-unit allocation many times over, and the relayer's note not at all.
+            let store = RedbCurvySdkStore::new(&state)?;
+            let mut persisted = store.load()?;
+            persisted.funding = vec![StoredNote::from(&Adapter::owned_note(&fixture(1_000))?)];
+            store.save(&persisted)?;
+        }
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let relay = adapter.relay.as_ref().expect("relayed submission");
+        let network = relayer::RelayClient::network(relay, 100)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let (native, token) = relayer::fee_note_valuations(&network, 4)?;
+        let relay_fee = serde_json::from_value::<relayer::PaymasterInfo>(relayer::http_tests::paymaster_body("118"))?
+            .required_fee_in_token(&native, &token)?;
+        assert!(relay_fee > 1_000, "the funding note cannot cover the relayer's note");
+
+        let note = fixture(7);
+        let deposits = [(
+            note.deposit.id,
+            note.deposit.address,
+            scan_key("07", "0b")?,
+            note.deposit.amount,
+        )];
+        let error = adapter.allocate_all(&deposits).await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::NoFunding { required } if required == 7 + relay_fee),
+            "{error}"
+        );
+        assert!(crate::pix::pools::curvy::CurvyDepositPoolError::Adapter(error.into()).moved_no_funds());
         Ok(())
     }
 
