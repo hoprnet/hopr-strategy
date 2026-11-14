@@ -65,8 +65,8 @@ It offers two independent choices, because the Curvy relayer never handles depos
 Both defaults describe a production deployment; a cluster without Curvy's off-chain services runs `submission: operator`. A **direct shield
 moves the float from the Safe straight into the vault**: through its permission module, the Safe ERC-777-`send`s it to Curvy's shield
 router, whose hook calls `directShield` in the same transaction, all or nothing. The Safe only ever calls wxHOPR, so this needs no change to
-the Safe or its module — just the node's own chain key to sign the module call, and a Blokli that publishes the router
-(`curvy_shield_router`).
+the Safe or its module. The `send` is submitted by the node's own chain API, like any other Safe transaction the node makes, so the strategy
+holds no chain key for it; it needs a Blokli that publishes the router (`curvy_shield_router`).
 
 At runtime it needs a Blokli endpoint that exposes the Curvy deployment, the Curvy Groth16 proving artifacts (`CURVY_ZK_KEYS_DIR`: the five
 zkeys and five witness graphs published with each [`rs-sdk` release](https://github.com/0xCurvy/rs-sdk/releases), digest-checked on load), a
@@ -77,6 +77,15 @@ shielded float, and without the password there is no way to spend it. A state fi
 the clear copies survive in its free pages and in every earlier backup, so treat those as exposed. Under `submission: relayer` it also needs
 a relayer URL, and **no EVM key of its own**; under `submission: operator` it needs the Curvy operator's key in the environment
 (`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by default). See the `pix::pools::curvy` module documentation.
+
+**A pool never funds itself.** The funding gets there through `DepositPool::fund`, called by the strategy when its stanza carries a
+`funding` policy (once at startup and before each deposit flush: `top_up` from the Safe when `available_balance` is below `min_available`;
+the final flush at shutdown does not fund, and a buffered deposit that finds the pool empty then is abandoned and logged) or by an operator
+through hoprd's API; without either, deposits fail once the pool is empty. The plain pool's funding is the Safe itself and refuses both.
+`min_available` must be below `top_up`: a top-up nets `top_up` less the pool's fee, and `available_balance` is what one deposit can draw on
+(the Curvy pool's two largest notes), so a threshold one top-up cannot clear would shield again on every flush. One top-up clears the
+threshold when `min_available ≤ top_up − fee`; keep it at or below half of `top_up` for that to hold for any fee under half of `top_up` (a
+recommendation — above it a cycle can take a second top-up, and no more than two).
 
 Enabling `strategy-pix` alone gives the engine without a pool, for a consumer supplying its own.
 

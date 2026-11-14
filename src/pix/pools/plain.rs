@@ -972,31 +972,6 @@ where
         Ok(ByteDepositData::new(*id, DEPOSIT_MARKER_PAYLOAD))
     }
 
-    /// The Safe is this pool's funding: there is nothing to move value into, so this is refused
-    /// rather than reported as done. Fund the Safe itself.
-    fn accepts_funding(&self) -> bool {
-        false
-    }
-
-    /// The Safe is this pool's funding: there is nothing to move it into, so this is refused
-    /// rather than reported as done. Fund the Safe itself.
-    async fn fund(&self, _amount: HoprBalance) -> Result<(), Self::Error> {
-        Err(StrategyError::other(anyhow::anyhow!(
-            "the plain pool does not take funding: its funding is the Safe, so fund the Safe instead"
-        )))
-    }
-
-    /// The Safe's wxHOPR, which is what every deposit here is paid from.
-    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
-        let balance: HoprBalance = self
-            .node
-            .chain_api()
-            .balance(self.node.identity().safe_address)
-            .await
-            .map_err(StrategyError::other)?;
-        Ok(balance)
-    }
-
     /// Deposit funds from the node's own account to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
     ///
@@ -1150,6 +1125,30 @@ where
             .map(|_| ())
     }
 
+    /// Its funding is the Safe, so there is no pool to move value into: a builder refuses a
+    /// funding policy for it at build time, before the strategy runs.
+    fn accepts_funding(&self) -> bool {
+        false
+    }
+
+    /// The Safe is this pool's funding: there is nothing to move it into, so this is refused
+    /// rather than reported as done. Fund the Safe itself, and leave the `funding` stanza out.
+    async fn fund(&self, _amount: HoprBalance) -> Result<(), Self::Error> {
+        Err(StrategyError::other(anyhow::anyhow!(
+            "the plain pool does not take funding: its funding is the Safe, so fund the Safe instead and leave the \
+             `funding` stanza out"
+        )))
+    }
+
+    /// The Safe's wxHOPR, which is what every deposit here is paid from.
+    async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
+        self.node
+            .chain_api()
+            .balance(self.node.identity().safe_address)
+            .await
+            .map_err(StrategyError::other)
+    }
+
     /// Move a deposit to another address inside the pool.
     ///
     /// For a non-anonymous pool "inside the pool" is not a meaningful distinction — every address
@@ -1160,18 +1159,14 @@ where
     /// An anonymous pool is where the two diverge: there a transfer can stay within the pool's
     /// anonymity set while a withdrawal leaves it.
     ///
-    /// `src` picks what the value is taken from, and the two arms differ:
+    /// From the funding: a plain Safe transfer, the same as [`deposit_funds_to`](Self::deposit_funds_to),
+    /// which needs an `amount`. From a deposit: a withdrawal to the destination address.
     ///
-    /// - [`PoolTransferSource::Deposit`] spends the allocation named by `id`, which is what the underlying sweep acts
-    ///   on. That is the movement described above.
-    /// - [`PoolTransferSource::Funding`] is an ordinary deposit instead, because the Safe *is* this pool's funding:
-    ///   `amount` is moved from the Safe to `dst`. It is required here — this arm refuses `None` rather than emptying
-    ///   the Safe into one deposit address.
-    ///
-    /// `dst_id` names an allocation on the receiving side, a notion this pool does not have — the
-    /// destination is just another Ethereum account, and nothing here is filed per allocation — so
-    /// it is used only to check `additional_dst_data` against, and to attribute it when that check
-    /// fails.
+    /// For a transfer from a deposit, `src_id` identifies the allocation whose key is being
+    /// spent, which is what the underlying sweep acts on. `dst_id` names an allocation on the
+    /// receiving side, a notion this pool does not have — the destination is just another
+    /// Ethereum account, and nothing here is filed per allocation — so it is used only to check
+    /// `additional_dst_data` against, and to attribute it when that check fails.
     ///
     /// `additional_dst_data` is checked exactly as in
     /// [`deposit_funds_to`](Self::deposit_funds_to), and for the same reason: every payload this
