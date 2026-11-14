@@ -987,6 +987,10 @@ struct SdkState {
 struct RedbCurvySdkStore {
     db: Arc<redb::Database>,
     sealer: Sealer,
+    /// How many of the next saves fail, as a full disk would: the only way a test reaches a
+    /// journal write that did not go through. Shared by the store's clones.
+    #[cfg(test)]
+    failing_saves: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RedbCurvySdkStore {
@@ -999,6 +1003,8 @@ impl RedbCurvySdkStore {
         Ok(Self {
             db,
             sealer: state.sealer(),
+            #[cfg(test)]
+            failing_saves: Default::default(),
         })
     }
 
@@ -1096,6 +1102,18 @@ impl RedbCurvySdkStore {
         allocations: &[StoredAllocation],
         remove: &[[u8; PixAddressId::SIZE]],
     ) -> Result<(), RsSdkCurvyAdapterError> {
+        #[cfg(test)]
+        if self
+            .failing_saves
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(db_error("the test failed this save"));
+        }
         let encoded = serde_json::to_vec(state).map_err(anyhow::Error::new)?;
         let write = self.db.begin_write().map_err(db_error)?;
         {
@@ -1660,26 +1678,7 @@ where
         };
 
         let _chain = held;
-        {
-            let mut state = self.state.lock();
-            let stored = StoredNote::from(&prepared.note);
-            let prepared_id = note_id(&prepared.note);
-            let already_funding = state
-                .funding
-                .iter()
-                .map(OwnedNote::try_from)
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|note| note_id(note) == prepared_id);
-            if !already_funding {
-                state.funding.push(stored.clone());
-            }
-            if observed != 2 && !state.pending.iter().any(|note| note == &stored) {
-                state.pending.push(stored);
-            }
-            state.direct_shield_in_flight = None;
-            self.store.save(&state)?;
-        }
+        self.book_shield(&prepared.note, observed, ShieldJournal::Direct)?;
         // As in `shield`: journalled is funded, and committing is retried by every reconciliation.
         match self.recover_pending().await {
             Ok(ledger) => Ok(ledger),
@@ -1688,6 +1687,40 @@ where
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Books a shield's note as funding, and as pending while it is not committed, and clears the
+    /// shield in flight, in one durable write.
+    ///
+    /// Built on a copy and made live only once that copy is saved. A save that fails leaves the
+    /// shield in flight, in memory as on disk, so that a retry resumes it, finds its note and books
+    /// it. Booked in memory first, the retry would find nothing in flight and, since `fund` adds
+    /// funding, shield a second time for the one failure.
+    fn book_shield(&self, note: &OwnedNote, status: u8, journal: ShieldJournal) -> Result<(), RsSdkCurvyAdapterError> {
+        let mut state = self.state.lock();
+        let mut booked = SdkState::clone(&state);
+        let stored = StoredNote::from(note);
+        let id = note_id(note);
+        let already_funding = booked
+            .funding
+            .iter()
+            .map(OwnedNote::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|funding| note_id(funding) == id);
+        if !already_funding {
+            booked.funding.push(stored.clone());
+        }
+        if status != 2 && !booked.pending.iter().any(|pending| pending == &stored) {
+            booked.pending.push(stored);
+        }
+        match journal {
+            ShieldJournal::Direct => booked.direct_shield_in_flight = None,
+            ShieldJournal::Portal => booked.shield_in_flight = None,
+        }
+        self.store.save(&booked)?;
+        *state = booked;
+        Ok(())
     }
 
     /// The router a direct shield sends through, once the deployment is known to have one and the
@@ -1957,26 +1990,7 @@ where
             ledger.push(entry);
         }
         let _chain = held;
-        {
-            let mut state = self.state.lock();
-            let stored = StoredNote::from(&prepared.note);
-            let prepared_id = note_id(&prepared.note);
-            let already_funding = state
-                .funding
-                .iter()
-                .map(OwnedNote::try_from)
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|note| note_id(note) == prepared_id);
-            if !already_funding {
-                state.funding.push(stored.clone());
-            }
-            if observed_status != 2 && !state.pending.iter().any(|note| note == &stored) {
-                state.pending.push(stored);
-            }
-            state.shield_in_flight = None;
-            self.store.save(&state)?;
-        }
+        self.book_shield(&prepared.note, observed_status, ShieldJournal::Portal)?;
         // The note is journalled: the shield is done whatever happens to committing it, and a
         // retry of `fund` on this error would shield a second time. Every reconciliation retries
         // the commitment instead.
@@ -5165,6 +5179,7 @@ mod tests {
                     let store = RedbCurvySdkStore {
                         db: database.lock().as_ref().unwrap().clone(),
                         sealer: sealer.clone(),
+                        failing_saves: Default::default(),
                     };
                     let attempts = store.load().unwrap().relay_aggregations;
                     assert_eq!(attempts.len(), 2);
@@ -5373,6 +5388,7 @@ mod tests {
                             let store = RedbCurvySdkStore {
                                 db: database.lock().as_ref().unwrap().clone(),
                                 sealer: sealer.clone(),
+                                failing_saves: Default::default(),
                             };
                             let durable = store.load().unwrap();
                             assert_eq!(durable.relay_aggregations.len(), 2);
@@ -5797,6 +5813,7 @@ mod tests {
                 let store = RedbCurvySdkStore {
                     db: db.clone(),
                     sealer: sealer.clone(),
+                    failing_saves: Default::default(),
                 };
                 let pending = store.load().unwrap().relay_aggregations.into_iter().next().unwrap();
                 assert!(pending.attempted);
@@ -6664,6 +6681,40 @@ mod tests {
 
         assert_eq!(rig.sent(), 0);
         assert_eq!(rig.store.load()?.funding, vec![StoredNote::from(&rig.note)]);
+        Ok(())
+    }
+
+    /// A shield whose booking does not reach the disk is still in flight, in memory as on disk: the
+    /// retry resumes it, finds its note and books it, rather than reading a journal with nothing in
+    /// flight and shielding a second time for the one failure.
+    #[tokio::test]
+    async fn a_shield_whose_booking_is_not_saved_stays_in_flight() -> anyhow::Result<()> {
+        let rig = shield_rig("7", Some(ShieldSubmission::NotSubmitted), true, vec![]).await?;
+        rig.adapter
+            .store
+            .failing_saves
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let error = rig.fund().await.unwrap_err();
+        assert!(error.to_string().contains("the test failed this save"), "{error}");
+        {
+            let live = rig.adapter.state.lock();
+            assert!(
+                live.direct_shield_in_flight.is_some(),
+                "still in flight in memory, not booked"
+            );
+            assert!(live.funding.is_empty(), "nothing booked in memory");
+        }
+        assert!(rig.journal()?.is_some(), "still in flight on disk");
+
+        rig.fund().await?;
+        assert_eq!(rig.sent(), 0, "the note was there: nothing was sent, either time");
+        assert_eq!(
+            rig.store.load()?.funding,
+            vec![StoredNote::from(&rig.note)],
+            "the one shield, booked once"
+        );
+        assert!(rig.journal()?.is_none(), "settled");
         Ok(())
     }
 
