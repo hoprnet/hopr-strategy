@@ -545,7 +545,8 @@ impl RsSdkCurvyAdapterConfig {
     /// use hopr_strategy::pix::pools::curvy::RsSdkCurvyAdapterConfig;
     ///
     /// let operator_key = String::new();
-    /// let config = RsSdkCurvyAdapterConfig::new(operator_key, 4).with_direct_shield_settle_grace(Duration::from_secs(300));
+    /// let config =
+    ///     RsSdkCurvyAdapterConfig::new(operator_key, 4).with_direct_shield_settle_grace(Duration::from_secs(300));
     /// assert_eq!(config.direct_shield_settle_grace, Duration::from_secs(300));
     /// ```
     pub fn with_direct_shield_settle_grace(mut self, grace: std::time::Duration) -> Self {
