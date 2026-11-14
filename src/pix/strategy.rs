@@ -72,6 +72,11 @@ lazy_static::lazy_static! {
             "hopr_strategy_pix_deposits_failed_total",
             "Count of SSA deposits that failed after exhausting retries",
         ).unwrap();
+    static ref METRIC_PIX_DEPOSITS_PENDING: hopr_api::types::telemetry::SimpleCounter =
+        hopr_api::types::telemetry::SimpleCounter::new(
+            "hopr_strategy_pix_deposits_pending_total",
+            "Count of SSA deposits deferred until an earlier Curvy operation is reconciled",
+        ).unwrap();
     static ref METRIC_PIX_DEPOSIT_DATA: hopr_api::types::telemetry::MultiCounter =
         hopr_api::types::telemetry::MultiCounter::new(
             "hopr_strategy_pix_deposit_data_total",
@@ -1586,6 +1591,27 @@ async fn apply_funding_policy<D, K>(
     }
 }
 
+/// Log a failed deposit flush and count it: a wait for reconciliation is pending, not failed.
+///
+/// The pool answers [`StrategyError::is_reconciliation_pending`] when it refused to start another
+/// aggregation until an earlier operation's outcome is known; nothing about this deposit failed.
+fn report_deposit_flush_failure(error: &StrategyError, id: Option<&PixAddressId>, count: u64) {
+    if error.is_reconciliation_pending() {
+        tracing::warn!(
+            %error,
+            ?id,
+            count,
+            "deposit flush deferred until an earlier Curvy operation is reconciled"
+        );
+        #[cfg(all(feature = "telemetry", not(test)))]
+        METRIC_PIX_DEPOSITS_PENDING.increment_by(count);
+    } else {
+        tracing::error!(%error, ?id, count, "deposit flush failed");
+        #[cfg(all(feature = "telemetry", not(test)))]
+        METRIC_PIX_DEPOSITS_FAILED.increment_by(count);
+    }
+}
+
 /// Deposit one drained buffer through the pool, returning how many of its deposits were not made.
 ///
 /// A free function so that both the awaiting and the detached caller share one body: the loop
@@ -1646,9 +1672,9 @@ where
                     refund(spend_ledger.as_ref(), spend, &id, amount);
                 }
                 failed = 1;
-                tracing::error!(%error, ?id, "single deposit flush failed");
-                #[cfg(all(feature = "telemetry", not(test)))]
-                METRIC_PIX_DEPOSITS_FAILED.increment();
+                // Nothing about a pending deposit failed: the pool waits for an earlier operation
+                // to reconcile, and the Exit re-requests the deposit data afterwards.
+                report_deposit_flush_failure(&error, Some(&id), 1);
             }
         }
     } else {
@@ -1682,6 +1708,7 @@ where
                 let batch_ids: std::collections::HashSet<PixAddressId> = deposits.iter().map(|(id, ..)| *id).collect();
                 let mut everything_failed_fund_free = true;
                 let mut failures = 0usize;
+                let mut pending = 0usize;
                 // Only ids that are in the batch and appear once: a repeated or foreign id would
                 // otherwise inflate the success count and let an unaccounted deposit pass below.
                 let mut settled: std::collections::HashSet<PixAddressId> = std::collections::HashSet::new();
@@ -1698,7 +1725,8 @@ where
                             let error: StrategyError = error.into();
                             failures += 1;
                             everything_failed_fund_free &= error.moved_no_funds();
-                            tracing::error!(%error, "deposit within the batch failed");
+                            pending += usize::from(error.is_reconciliation_pending());
+                            report_deposit_flush_failure(&error, None, 1);
                         }
                     }
                 }
@@ -1719,11 +1747,15 @@ where
                     }
                 }
 
-                tracing::info!(count, deposited, "batch deposit flushed");
+                tracing::info!(count, deposited, pending, "batch deposit flushed");
                 #[cfg(all(feature = "telemetry", not(test)))]
                 {
                     METRIC_PIX_DEPOSITS.increment_by(deposited);
-                    METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64 - deposited);
+                    // A deferred item did not fail; everything else that did not settle did.
+                    let deferred = pending as u64;
+                    METRIC_PIX_DEPOSITS_FAILED
+                        .increment_by((count as u64).saturating_sub(deposited).saturating_sub(deferred));
+                    METRIC_PIX_DEPOSITS_PENDING.increment_by(deferred);
                 }
             }
             // The batch itself could not be attempted, as distinct from its items failing
@@ -1740,9 +1772,7 @@ where
                     }
                 }
                 failed = count;
-                tracing::error!(%error, count, "batch deposit flush failed");
-                #[cfg(all(feature = "telemetry", not(test)))]
-                METRIC_PIX_DEPOSITS_FAILED.increment_by(count as u64);
+                report_deposit_flush_failure(&error, None, count as u64);
             }
         }
     }
@@ -2187,7 +2217,7 @@ mod tests {
     use hopr_api::{
         chain::{
             AccountSelector, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations, ChainValues,
-            ChainWriteAccountOperations, HoprChainApi,
+            ChainWriteAccountOperations, DepositPool, HoprChainApi, PoolTransferSource,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2208,6 +2238,7 @@ mod tests {
 
     use super::{
         PixStrategy, PixStrategyConfig, PixStrategyInner, SPEND_LEDGER_CAPACITY, SpendLedger, flush_deposit_batch,
+        report_deposit_flush_failure,
     };
     use crate::{
         errors::StrategyError,
@@ -2450,6 +2481,45 @@ mod tests {
             .await?
             .context("no notification")?;
         assert_eq!(n.1, target);
+        Ok(())
+    }
+
+    /// The Safe funds the plain pool, so it takes no top-up and reports the Safe's wxHOPR.
+    #[test_log::test(tokio::test)]
+    async fn test_plain_pool_funding_is_the_safe() -> anyhow::Result<()> {
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let client = connector.client();
+        let cc = Arc::new(connector);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = NonAnonymousDepositPool::with_client(
+            node,
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
+        );
+
+        assert!(
+            !pool.accepts_funding(),
+            "a pool whose funding is the Safe has nothing to move value into"
+        );
+        assert!(
+            pool.fund(HoprBalance::new_base(10)).await.is_err(),
+            "funding the plain pool must be refused rather than reported as done"
+        );
+        assert_eq!(
+            pool.available_balance().await?,
+            hopr_balance(&*cc, *BOB).await?,
+            "the funding this pool reports is the Safe's wxHOPR"
+        );
         Ok(())
     }
 
@@ -3351,6 +3421,7 @@ mod tests {
         // only drives `deposit_funds_to_multiple`, so an empty script here would just succeed.
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(false, true)]),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
         });
@@ -3503,6 +3574,8 @@ mod tests {
         script: parking_lot::Mutex<Vec<(bool, bool)>>,
         /// Return one error for the whole batch, shaped like the Curvy chunk failure.
         whole_batch_fails: bool,
+        /// Return a single `Err` for the whole call, so the pool-wide failure arm runs.
+        whole_call_fails: bool,
         /// When set, return exactly this instead of running the script, so a test can shape
         /// outcomes a well-behaved pool would not produce (a repeated id, say). Each entry is
         /// either a success id or a failure class.
@@ -3556,6 +3629,9 @@ mod tests {
             &self,
             deposits: &[(PixAddressId, Address, HoprBalance, Self::PoolDepositData)],
         ) -> Result<Vec<std::result::Result<(PixAddressId, Self::Receipt), Self::Error>>, Self::Error> {
+            if self.whole_call_fails {
+                return Err(StrategyError::other(ScriptedFailure));
+            }
             if let Some(raw) = self.raw_outcomes.clone() {
                 return Ok(raw
                     .into_iter()
@@ -3622,7 +3698,7 @@ mod tests {
 
         async fn pool_transfer(
             &self,
-            _: hopr_api::chain::PoolTransferSource<'_, EthDepositKey>,
+            _: PoolTransferSource<'_, EthDepositKey>,
             _: &PixAddressId,
             _: Address,
             _: Self::PoolDepositData,
@@ -3649,6 +3725,21 @@ mod tests {
         (id, address, amount, ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD))
     }
 
+    /// A flush blocked on an earlier operation is reported as pending, not as a failed deposit.
+    #[cfg(feature = "strategy-pix-curvy")]
+    #[test]
+    fn a_pending_flush_failure_is_reported_as_pending() {
+        use crate::pix::pools::curvy::CurvyDepositPoolError;
+
+        let pending: StrategyError = CurvyDepositPoolError::ReconciliationPending.into();
+        assert!(pending.is_reconciliation_pending());
+        report_deposit_flush_failure(&pending, Some(&pix_id(1)), 1);
+
+        let failed = StrategyError::other(ScriptedFailure);
+        assert!(!failed.is_reconciliation_pending());
+        report_deposit_flush_failure(&failed, None, 2);
+    }
+
     /// Batch refunds are attributed per item: a fund-free item among successful ones still
     /// refunds, and one ambiguous failure stops every refund in the batch.
     #[test_log::test(tokio::test)]
@@ -3667,6 +3758,7 @@ mod tests {
         }
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(true, false), (true, true)]),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
         });
@@ -3703,6 +3795,7 @@ mod tests {
             }
             let pool = Arc::new(ScriptedBatchPool {
                 script: parking_lot::Mutex::new(vec![(fund_free, true)]),
+                whole_call_fails: false,
                 whole_batch_fails: true,
                 raw_outcomes: None,
             });
@@ -3725,6 +3818,42 @@ mod tests {
         Ok(())
     }
 
+    /// A pool-wide failure is one error for the whole call, not one per item; an opaque one
+    /// refunds nothing.
+    #[test_log::test(tokio::test)]
+    async fn test_a_whole_call_failure_keeps_every_reservation() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let mut batch = Vec::new();
+        for address in [[0x42u8; 20].into(), [0x43u8; 20].into()] {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: true,
+            whole_batch_fails: false,
+            raw_outcomes: None,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            moka::sync::Cache::builder().max_capacity(1).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+
+        assert_eq!(
+            ledger
+                .lock()
+                .spent(StdDuration::from_secs(3600), std::time::Instant::now()),
+            HoprBalance::new_base(20),
+            "an opaque pool-wide failure refunds nothing"
+        );
+        Ok(())
+    }
+
     /// A pool that repeats a success id must not have an unaccounted deposit refunded.
     ///
     /// The batch is `[A, B]` and the pool answers `[Ok(A), Ok(A), Err(fund-free)]`. Only A is
@@ -3742,6 +3871,7 @@ mod tests {
         let ids: Vec<PixAddressId> = batch.iter().map(|(id, ..)| *id).collect();
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: Some(vec![
                 RawOutcome::Success(ids[0]),
@@ -3783,6 +3913,7 @@ mod tests {
         let foreign = pix_id(1);
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: Some(vec![RawOutcome::Success(foreign), RawOutcome::FundFreeFailure]),
         });
@@ -3817,6 +3948,7 @@ mod tests {
         // Two deposits, one outcome: the other item's fate is unknown.
         let pool = Arc::new(ScriptedBatchPool {
             script: parking_lot::Mutex::new(vec![(true, true)]),
+            whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
         });
@@ -4407,7 +4539,7 @@ mod tests {
 
         let dst_id = pix_id(2);
         pool.pool_transfer(
-            hopr_api::chain::PoolTransferSource::Deposit {
+            PoolTransferSource::Deposit {
                 id: &pix_id(1),
                 key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
             },
@@ -4472,7 +4604,7 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                hopr_api::chain::PoolTransferSource::Deposit {
+                PoolTransferSource::Deposit {
                     id: &pix_id(1),
                     key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 },
@@ -4556,7 +4688,7 @@ mod tests {
         let dst_id = pix_id(2);
         let transferred = pool
             .pool_transfer(
-                hopr_api::chain::PoolTransferSource::Deposit {
+                PoolTransferSource::Deposit {
                     id: &id,
                     key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 },
@@ -4665,7 +4797,7 @@ mod tests {
         let dst_id = pix_id(3);
         let transferred = pool
             .pool_transfer(
-                hopr_api::chain::PoolTransferSource::Deposit {
+                PoolTransferSource::Deposit {
                     id: &id,
                     key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 },
@@ -4738,7 +4870,7 @@ mod tests {
         let dst_id = pix_id(2);
         let result = pool
             .pool_transfer(
-                hopr_api::chain::PoolTransferSource::Deposit {
+                PoolTransferSource::Deposit {
                     id: &pix_id(1),
                     key: &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
                 },

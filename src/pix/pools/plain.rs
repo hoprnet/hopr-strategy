@@ -1172,8 +1172,8 @@ where
     /// [`deposit_funds_to`](Self::deposit_funds_to), and for the same reason: every payload this
     /// pool is handed is one it has to be able to accept, and a transfer that moves funds while
     /// dropping deposit data it disagreed with is the silent failure the check exists to prevent.
-    /// This is the only guard on `dst_id`: unlike a deposit, a transfer has no arm in the strategy
-    /// that compares the ids on the wire form first.
+    /// Both arms check it, and this is the only guard on `dst_id`: unlike a deposit, a transfer
+    /// has no arm in the strategy that compares the ids on the wire form first.
     async fn pool_transfer(
         &self,
         src: PoolTransferSource<'_, EthDepositKey>,
@@ -1187,6 +1187,7 @@ where
                 check_deposit_payload(dst_id, &additional_dst_data)?;
                 self.withdraw_deposit(id, key, dst, amount).await
             }
+            // The Safe is this pool's funding, so a transfer from it is an ordinary deposit.
             PoolTransferSource::Funding => {
                 let amount = amount.ok_or_else(|| {
                     StrategyError::other(anyhow::anyhow!(

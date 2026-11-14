@@ -65,6 +65,11 @@ pub struct EligibilityConfig {
 
     /// Peer quality score threshold `[0.0, 1.0]` for opening new channels.
     /// Default: 0.5.
+    ///
+    /// A peer this node has no `Open`/`PendingToClose` channel with is scored on its
+    /// direct probe stream when the loopback verdict would otherwise zero it, so the
+    /// default gate cannot deadlock a fresh node that has no channel to route a
+    /// loopback over.
     #[default = 0.5]
     pub min_peer_quality_score: f64,
 

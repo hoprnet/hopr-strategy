@@ -44,3 +44,18 @@ pub(crate) fn error_moved_no_funds(error: &anyhow::Error) -> bool {
     let _ = error;
     false
 }
+
+/// Asks a bundled pool whether a wrapped error only waits for an earlier Curvy operation to be
+/// reconciled, rather than saying this deposit failed.
+///
+/// Called from
+/// [`StrategyError::is_reconciliation_pending`](crate::errors::StrategyError::is_reconciliation_pending).
+/// The plain pool has no reconciliation step, so it never answers `true`.
+pub(crate) fn error_is_reconciliation_pending(error: &anyhow::Error) -> bool {
+    #[cfg(feature = "strategy-pix-curvy")]
+    if let Some(curvy) = error.downcast_ref::<curvy::CurvyDepositPoolError>() {
+        return curvy.is_reconciliation_pending();
+    }
+    let _ = error;
+    false
+}
