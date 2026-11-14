@@ -309,11 +309,12 @@ pub struct PixStrategyConfig {
 
 /// How the strategy keeps the deposit pool funded.
 ///
-/// A pool never funds itself. With this policy the strategy does, by configuration: once at
-/// startup and at the head of every deposit flush except the final one at shutdown, which funds
-/// nothing, it reads [`DepositPool::available_balance`]
+/// A pool never funds itself. With this policy the strategy does, by configuration: at the head of
+/// every deposit flush except the final one at shutdown, which funds nothing, it reads
+/// [`DepositPool::available_balance`]
 /// and, when that is below `min_available`, asks the pool to [`fund`](DepositPool::fund) `top_up`
-/// from the Safe. Both run off the event loop, in the task that flushes, so a funding that takes
+/// from the Safe — and, with [`PixFundingPolicy::fund_at_startup`], also once when `run` starts.
+/// Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; one funding at a time, so that
 /// concurrent flushes cannot each top up. Without the policy, deposits fail once the pool is
 /// empty until an operator funds it — with which error is the pool's own answer, wrapped in
@@ -347,6 +348,15 @@ pub struct PixFundingPolicy {
     #[serde_as(as = "DisplayFromStr")]
     #[validate(custom(function = "crate::validation::validate_positive_balance"))]
     pub top_up: HoprBalance,
+    /// Fund once when `run` starts, before the first deposit arrives, rather than only at the
+    /// head of a deposit flush. Default: `false`.
+    ///
+    /// Eager funding hides the shield and commitment round behind the startup of the node, so the
+    /// first deposit is not slowed by it; a node that never sees PIX still debits its Safe once per
+    /// start. Lazy funding — the default — leaves the pool untouched until a deposit needs it, and
+    /// then funds at that flush. Threshold and renewal behaviour are the same either way.
+    #[serde(default)]
+    pub fund_at_startup: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,7 +1385,8 @@ where
 
     /// Hand the startup application of the funding policy to a task and return immediately.
     ///
-    /// A pool that starts empty is funded before the first deposit arrives rather than at its
+    /// Only called for a policy with [`PixFundingPolicy::fund_at_startup`]: an eager pool that
+    /// starts empty is funded before the first deposit arrives rather than at its
     /// flush, which is the moment the deposit is already waiting. Detached for the same reason
     /// every flush is: a funding can take a shield and a commitment round, and the event stream
     /// must be read meanwhile. The first flush's own application waits behind the gate and sees
@@ -2124,8 +2135,11 @@ where
             .filter_map(|event| futures::future::ready(event.try_as_pix()));
 
         // Only now that there is a strategy to fund for: a failed subscription returns above, and
-        // a task spawned before it would still have debited the Safe.
-        self.detach_startup_funding();
+        // a task spawned before it would still have debited the Safe. A lazy policy — the default —
+        // funds at the first deposit's flush instead, so an idle node never touches the Safe.
+        if self.cfg.funding.as_ref().is_some_and(|policy| policy.fund_at_startup) {
+            self.detach_startup_funding();
+        }
 
         let replay = self.recovery_store.clone().map(|store| {
             hopr_utils::runtime::prelude::spawn(replay_pending_recoveries(
@@ -4057,6 +4071,7 @@ mod tests {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
+                fund_at_startup: false,
             }),
             ..Default::default()
         };
@@ -5888,6 +5903,7 @@ mod tests {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(50),
                 top_up: HoprBalance::new_base(200),
+                fund_at_startup: true,
             }),
             ..Default::default()
         };
@@ -5912,6 +5928,7 @@ mod tests {
         let policy = |min: u64, top: u64| crate::pix::strategy::PixFundingPolicy {
             min_available: HoprBalance::new_base(min),
             top_up: HoprBalance::new_base(top),
+            fund_at_startup: false,
         };
         assert!(validator::Validate::validate(&policy(250, 100)).is_err());
         assert!(validator::Validate::validate(&policy(101, 100)).is_err());
@@ -5945,6 +5962,7 @@ mod tests {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
+                fund_at_startup: true,
             }),
             ..Default::default()
         };
@@ -6057,6 +6075,7 @@ mod tests {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
+                fund_at_startup: true,
             }),
             ..Default::default()
         };
@@ -6094,11 +6113,26 @@ mod tests {
         }
     }
 
+    /// A policy that also funds at startup, so the tests that assert on the startup application
+    /// exercise it. [`lazy_funding_cfg`] is the default shape.
     fn funding_cfg() -> PixStrategyConfig {
         PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
+                fund_at_startup: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The default policy: funding only at the head of a deposit flush.
+    fn lazy_funding_cfg() -> PixStrategyConfig {
+        PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(1),
+                top_up: HoprBalance::new_base(2),
+                fund_at_startup: false,
             }),
             ..Default::default()
         }
@@ -6146,6 +6180,103 @@ mod tests {
             "funded once, for the one batch"
         );
         assert_eq!(*deposits.lock(), vec![1]);
+        Ok(())
+    }
+
+    /// The default policy is lazy: a strategy that starts and sees no deposit leaves the Safe
+    /// untouched, and the funding happens at the flush of the first deposit instead.
+    #[test_log::test(tokio::test)]
+    async fn a_lazy_policy_funds_nothing_at_startup_and_funds_at_the_first_flush() -> anyhow::Result<()> {
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Arc::clone(&deposits),
+            deposit_failure: None,
+            accepts_funding: true,
+        });
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), lazy_funding_cfg(), *BOB, None);
+
+        crate::strategy::Strategy::run(&mut strategy).await?;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            funded.lock().is_empty(),
+            "an idle node must not debit its Safe, whatever the funding policy"
+        );
+
+        let id = pix_id(1);
+        let amount = HoprBalance::new_base(1);
+        let spend = strategy.commit_spend(amount);
+        strategy
+            .deposit_buffer
+            .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+        strategy.flush_deposits().await;
+
+        assert_eq!(
+            *funded.lock(),
+            vec![HoprBalance::new_base(2)],
+            "the first deposit's flush funds the pool"
+        );
+        assert_eq!(
+            *deposits.lock(),
+            vec![1],
+            "the deposit was made from the funding the same flush put there"
+        );
+        Ok(())
+    }
+
+    /// The two modes differ only in *when* the policy is first applied: with `fund_at_startup` the
+    /// pool is funded by the time `run` returns, without it not until a deposit's flush.
+    #[test_log::test(tokio::test)]
+    async fn a_startup_funding_is_opt_in_and_the_default_policy_leaves_the_safe_alone() -> anyhow::Result<()> {
+        for fund_at_startup in [false, true] {
+            let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let pool = Arc::new(FundingProbePool {
+                available: HoprBalance::zero(),
+                funded: Arc::clone(&funded),
+                hold: None,
+                deposits: Default::default(),
+                deposit_failure: None,
+                accepts_funding: true,
+            });
+            let cfg = PixStrategyConfig {
+                funding: Some(crate::pix::strategy::PixFundingPolicy {
+                    min_available: HoprBalance::new_base(1),
+                    top_up: HoprBalance::new_base(2),
+                    fund_at_startup,
+                }),
+                ..Default::default()
+            };
+            let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), cfg, *BOB, None);
+
+            crate::strategy::Strategy::run(&mut strategy).await?;
+            // The eager grant is detached: let it finish before asserting.
+            settle(|| !funded.lock().is_empty()).await;
+
+            assert_eq!(
+                funded.lock().len(),
+                usize::from(fund_at_startup),
+                "fund_at_startup {fund_at_startup}: the startup application must follow the flag"
+            );
+        }
+        Ok(())
+    }
+
+    /// `fund_at_startup` is optional in the configuration and defaults to the lazy behaviour, so a
+    /// written policy funds at a flush unless it spells the flag out.
+    #[test]
+    fn a_funding_policy_defaults_to_lazy_and_can_ask_to_fund_at_startup() -> anyhow::Result<()> {
+        let lazy: crate::pix::strategy::PixFundingPolicy =
+            serde_json::from_str(r#"{"min_available":"50 wxHOPR","top_up":"100 wxHOPR"}"#)?;
+        assert!(!lazy.fund_at_startup, "the default is lazy");
+
+        let eager: crate::pix::strategy::PixFundingPolicy =
+            serde_json::from_str(r#"{"min_available":"50 wxHOPR","top_up":"100 wxHOPR","fund_at_startup":true}"#)?;
+        assert!(eager.fund_at_startup);
         Ok(())
     }
 
@@ -6356,6 +6487,7 @@ mod tests {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(50),
                 top_up: HoprBalance::new_base(100),
+                fund_at_startup: false,
             }),
             ..Default::default()
         };
@@ -6391,6 +6523,7 @@ mod tests {
         let policy = crate::pix::strategy::PixFundingPolicy {
             min_available: HoprBalance::new_base(50),
             top_up: HoprBalance::new_base(200),
+            fund_at_startup: false,
         };
 
         let low = funding_policy_run(HoprBalance::new_base(49), Some(policy.clone())).await?;

@@ -79,9 +79,11 @@ a relayer URL, and **no EVM key of its own**; under `submission: operator` it ne
 (`HOPRD_CURVY_OPERATOR_PRIVATE_KEY` by default). See the `pix::pools::curvy` module documentation.
 
 **A pool never funds itself.** The funding gets there through `DepositPool::fund`, called by the strategy when its stanza carries a
-`funding` policy (once at startup and before each deposit flush: `top_up` from the Safe when `available_balance` is below `min_available`;
-the final flush at shutdown does not fund, and a buffered deposit that finds the pool empty then is abandoned and logged) or by an operator
-through hoprd's API; without either, deposits fail once the pool is empty. The plain pool's funding is the Safe itself and refuses both.
+`funding` policy (before each deposit flush: `top_up` from the Safe when `available_balance` is below `min_available`; the final flush at
+shutdown does not fund, and a buffered deposit that finds the pool empty then is abandoned and logged) or by an operator through hoprd's
+API; without either, deposits fail once the pool is empty. The policy is **lazy by default**: a node that never sees PIX never debits its
+Safe, and the pool is funded at the flush of the first deposit. Set `fund_at_startup: true` to fund once when the strategy starts instead,
+so the first deposit does not wait for a shield and a commitment round. The plain pool's funding is the Safe itself and refuses both.
 `min_available` must be below `top_up`: a top-up nets `top_up` less the pool's fee, and `available_balance` is what one deposit can draw on
 (the Curvy pool's two largest notes), so a threshold one top-up cannot clear would shield again on every flush. One top-up clears the
 threshold when `min_available ≤ top_up − fee`; keep it at or below half of `top_up` for that to hold for any fee under half of `top_up` (a
