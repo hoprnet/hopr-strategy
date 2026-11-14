@@ -1758,9 +1758,9 @@ async fn a_funding_sends_a_shield_again_only_on_its_first_attempt() -> anyhow::R
     Ok(())
 }
 
-/// Funding's budget is [`CurvyDepositPoolConfig::max_funding_time`], not the deposit's: a
-/// deposit budget too short for one retry does not make funding give up, and a funding budget
-/// that runs out does.
+/// Funding's budget is [`CurvyDepositPoolConfig::max_funding_time`], not the deposit's, in both
+/// directions: a deposit budget too short for a single retry does not make funding give up, and
+/// a deposit budget long enough to wait out everything does not keep funding going past its own.
 #[test_log::test(tokio::test)]
 async fn funding_waits_on_its_own_budget() -> anyhow::Result<()> {
     let adapter = RecordingAdapter::consistent();
@@ -1768,11 +1768,11 @@ async fn funding_waits_on_its_own_budget() -> anyhow::Result<()> {
         .fund_failures
         .lock()
         .extend([settling_shield(), settling_shield()]);
-    // Within the deposit budget there is no room for even one retry (the poll is a tenth of it);
-    // within the funding budget there is.
-    let harness = harness_with_budgets(adapter, Duration::from_secs(1), Duration::from_secs(2)).await?;
+    // The poll is a tenth of the budget but at least 50ms, so a 50ms budget has no room for a
+    // retry: funding gets through only if it waits on its own two seconds.
+    let harness = harness_with_budgets(adapter, Duration::from_millis(50), Duration::from_secs(2)).await?;
     harness.pool.fund(ten()).await?;
-    assert_eq!(harness.adapter.funded.lock().len(), 3);
+    assert_eq!(harness.adapter.funded.lock().len(), 3, "retried twice, then funded");
 
     let adapter = RecordingAdapter::consistent();
     adapter
@@ -1780,11 +1780,19 @@ async fn funding_waits_on_its_own_budget() -> anyhow::Result<()> {
         .lock()
         .extend(std::iter::repeat_with(settling_shield).take(100));
     let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(1)).await?;
+    let started = std::time::Instant::now();
     let error = harness
         .pool
         .fund(ten())
         .await
         .expect_err("the funding budget runs out first");
+    // Funding on the deposit's thirty seconds would also give up, after about ten attempts: only
+    // the time it took tells the two budgets apart.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "gave up on its own second, not the deposit's thirty: {:?}",
+        started.elapsed()
+    );
     assert!(
         error.to_string().contains("has not shown yet"),
         "the last lag is what is reported: {error}"
