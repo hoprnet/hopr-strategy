@@ -144,7 +144,7 @@ use hopr_api::{
 pub use lifecycle::{BlokliIndex, CurvyIndexSource, PendingNotesPage};
 pub use sdk::{
     Confirmed, CurvyChainEndpoints, CurvySdkAdapter, DirectShielder, PortalFunder, RsSdkCurvyAdapter,
-    RsSdkCurvyAdapterConfig, RsSdkCurvyAdapterError, ShieldFailure,
+    RsSdkCurvyAdapterConfig, RsSdkCurvyAdapterError, ShieldFailure, ShieldResend,
 };
 use serde_with::{DisplayFromStr, serde_as};
 pub use state::{CurvyDepositState, CurvyEventKind, CurvyStateError, RedbCurvyDepositState};
@@ -1568,7 +1568,9 @@ fn shield_lag(error: &(dyn std::error::Error + 'static)) -> Option<Option<u64>> 
 /// Whether waiting another `poll` for an error to clear is worth it. Shield lag is waited out
 /// only while the shield's grace has not ended: past it the next `fund` call may send the shield
 /// again, and that decision belongs to a later call, never to this one's retry loop, or a shield
-/// that is merely slow to index would be paid for twice inside one funding.
+/// that is merely slow to index would be paid for twice inside one funding. What enforces that is
+/// [`ShieldResend::ObserveOnly`] on every retry; this only stops retrying once a retry could do no
+/// more than look.
 fn is_lag_worth_waiting_for(error: &(dyn std::error::Error + 'static), poll: Duration) -> bool {
     match shield_lag(error) {
         Some(resend_after) => resend_after
@@ -1636,8 +1638,14 @@ where
     async fn fund(&self, amount: HoprBalance) -> Result<(), Self::Error> {
         self.ensure_reconciled().await?;
         let safe_address = self.node.identity().safe_address;
+        // Only the first attempt may send a shield again whose grace is over. A retry comes after a
+        // sleep and the reads that precede the shield, and could cross the grace on the way: it
+        // only looks, so that one funding never pays twice for a shield whose first copy may
+        // still land. See `ShieldResend`.
+        let mut resend = ShieldResend::AfterGrace;
         self.wait_out_lag(self.cfg.max_funding_time, move || {
-            self.adapter.fund(amount, safe_address)
+            let this_attempt = std::mem::replace(&mut resend, ShieldResend::ObserveOnly);
+            self.adapter.fund(amount, safe_address, this_attempt)
         })
         .await
         .map_err(|error| StrategyError::other(CurvyDepositPoolError::Adapter(error.into())))

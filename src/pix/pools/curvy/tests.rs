@@ -45,7 +45,7 @@ use super::{
     CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
-    sdk::RsSdkCurvyAdapterError,
+    sdk::{RsSdkCurvyAdapterError, ShieldResend},
     state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
     token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
@@ -783,6 +783,8 @@ impl CurvyIndexSource for ScriptedIndex {
 #[derive(Default)]
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
+    /// What each `fund` call was allowed to do with a shield whose grace is over, in order.
+    resends: parking_lot::Mutex<Vec<ShieldResend>>,
     funding_finality_failures: parking_lot::Mutex<usize>,
     /// What the upcoming `fund` calls fail with, in order, before `fund` succeeds.
     fund_failures: parking_lot::Mutex<VecDeque<RsSdkCurvyAdapterError>>,
@@ -832,8 +834,14 @@ const INDEX_LAG: &str = "Curvy SDK operation failed: sync: index did not reconci
 impl CurvySdkAdapter for RecordingAdapter {
     type Error = RsSdkCurvyAdapterError;
 
-    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+    async fn fund(
+        &self,
+        gross: HoprBalance,
+        recovery_address: Address,
+        resend: ShieldResend,
+    ) -> Result<(), Self::Error> {
         self.funded.lock().push((gross, recovery_address));
+        self.resends.lock().push(resend);
         if let Some(failure) = self.fund_failures.lock().pop_front() {
             return Err(failure);
         }
@@ -1715,6 +1723,38 @@ async fn funding_waits_out_a_settling_direct_shield() -> anyhow::Result<()> {
         "settling, then unindexed, then funded"
     );
     assert_eq!(harness.pool.available_balance().await?, ten());
+    Ok(())
+}
+
+/// Only the first attempt of a funding may send a shield again whose grace is over; every retry
+/// only looks. The grace is checked before the sleep, and a retry's own reads can carry it past
+/// the grace, while lag that is not the shield's own — a transient chain read here — is retried
+/// whatever the grace: either way a retry that could resend would pay for the shield twice.
+#[test_log::test(tokio::test)]
+async fn a_funding_sends_a_shield_again_only_on_its_first_attempt() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter.fund_failures.lock().extend([
+        settling_shield(),
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("RPC_ERROR: upstream unavailable")),
+        unindexed_shield(),
+    ]);
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+
+    harness.pool.fund(ten()).await?;
+    assert_eq!(
+        harness.adapter.resends.lock().as_slice(),
+        &[
+            ShieldResend::AfterGrace,
+            ShieldResend::ObserveOnly,
+            ShieldResend::ObserveOnly,
+            ShieldResend::ObserveOnly,
+        ],
+        "only the first attempt may send again"
+    );
+
+    // The next funding is a first attempt again.
+    harness.pool.fund(ten()).await?;
+    assert_eq!(harness.adapter.resends.lock().last(), Some(&ShieldResend::AfterGrace));
     Ok(())
 }
 

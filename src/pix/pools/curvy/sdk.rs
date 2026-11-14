@@ -152,6 +152,22 @@ pub struct Confirmed {
     pub tx: String,
 }
 
+/// Whether a [`CurvySdkAdapter::fund`] call may send again a shield that was handed to the chain
+/// and has not shown.
+///
+/// A funding waits out lag by calling `fund` again within its budget, and those calls must never
+/// pay for one shield twice: the first copy may still land after its grace, and a second would
+/// debit the Safe again. So only the first call of a funding decides that a grace is over; a
+/// retry only looks, however long the sleep and the chain reads before it took, and leaves the
+/// decision to the next funding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShieldResend {
+    /// Send it again once its grace is over: the first call of a funding.
+    AfterGrace,
+    /// Only look for it, and fail as settling when it has not shown: a retry within a funding.
+    ObserveOnly,
+}
+
 /// How a shield's transaction failed, as far as the float is concerned.
 ///
 /// The chain API classifies its own errors: see `ChainWriteAccountOperations::submission_failure`.
@@ -345,10 +361,16 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
     /// size a new shield, so a changed amount cannot wedge funding — but once a shield has landed
     /// and been journalled, the next call shields again. A direct shield whose Safe
     /// transaction was handed to the chain without an answer is looked for on every call and sent
-    /// again only after a grace, failing as settling until then. An error after
+    /// again only after a grace, failing as settling until then, and only when `resend` is
+    /// [`ShieldResend::AfterGrace`]. An error after
     /// the note is journalled — committing it did not go through — is not one, so that a retry
     /// cannot shield twice for one failure.
-    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error>;
+    async fn fund(
+        &self,
+        gross: HoprBalance,
+        recovery_address: Address,
+        resend: ShieldResend,
+    ) -> Result<(), Self::Error>;
 
     /// What one allocation can draw on from the pool's funding notes, as the pool's own ledger
     /// has them, net of allocations.
@@ -1430,6 +1452,7 @@ where
         &self,
         requested: u128,
         chain: tokio::sync::OwnedMutexGuard<()>,
+        resend: ShieldResend,
     ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let Some(shielder) = self.shielder.clone() else {
             return Err(RsSdkCurvyAdapterError::InvalidValue(
@@ -1502,8 +1525,11 @@ where
                 // aggregator indexes it when it does, and the next funding reads again.
                 ShieldSubmission::Submitted { tx, at } => {
                     let grace = self.config.direct_shield_settle_grace.as_secs();
-                    // A clock that cannot be read cannot say the grace is over.
-                    if at.is_some_and(|at| unix_now().is_none_or(|now| now < at.saturating_add(grace))) {
+                    // A clock that cannot be read cannot say the grace is over, and a retry within
+                    // a funding never decides that it is.
+                    if resend == ShieldResend::ObserveOnly
+                        || at.is_some_and(|at| unix_now().is_none_or(|now| now < at.saturating_add(grace)))
+                    {
                         return Err(RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
                             note: note_id(&prepared.note),
                             gross,
@@ -1539,6 +1565,16 @@ where
                             gross,
                             since: Some(since),
                             resend_after: Some(since.saturating_add(grace)),
+                        });
+                    }
+                    // Past the grace, but a retry within a funding only looks: the read above was
+                    // its look, and the next funding observes in full and decides.
+                    if resend == ShieldResend::ObserveOnly {
+                        return Err(RsSdkCurvyAdapterError::ShieldSettling {
+                            note: note_id(&prepared.note),
+                            gross,
+                            since: *since,
+                            resend_after: since.map(|since| since.saturating_add(grace)),
                         });
                     }
                     observed = self.observe_direct_shield(client, &prepared.note, true).await?;
@@ -1716,14 +1752,20 @@ where
     }
 
     /// Shields `gross` into the pool as one more funding note. A journalled shield is resumed
-    /// first, with its own amount (and recovery address) rather than the requested ones.
-    async fn shield(&self, gross: u128, recovery_address: &str) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
+    /// first, with its own amount (and recovery address) rather than the requested ones, and is
+    /// sent again only as `resend` allows.
+    async fn shield(
+        &self,
+        gross: u128,
+        recovery_address: &str,
+        resend: ShieldResend,
+    ) -> Result<Vec<TxLedger>, RsSdkCurvyAdapterError> {
         let chain = Arc::clone(&self.chain).lock_owned().await;
         let (client, endpoints) = self.client().await?;
         self.reconcile_relay_aggregation().await?;
         self.recover_pending().await?;
         if self.config.shielding == CurvyShielding::Direct {
-            return self.direct_shield(gross, chain).await;
+            return self.direct_shield(gross, chain, resend).await;
         }
         // Held to the end, and handed to the task that funds the portal.
         let mut held = Some(chain);
@@ -1826,6 +1868,14 @@ where
                                 });
                             }
                             return Err(unresolved(None, Some(since)));
+                        } else if resend == ShieldResend::ObserveOnly {
+                            // Sent again on the next funding, never on a retry within this one.
+                            return Err(RsSdkCurvyAdapterError::ShieldSettling {
+                                note: note_id(&prepared.note),
+                                gross,
+                                since: None,
+                                resend_after: None,
+                            });
                         } else {
                             true
                         }
@@ -3163,8 +3213,13 @@ where
 {
     type Error = RsSdkCurvyAdapterError;
 
-    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
-        self.shield(balance_u128(gross)?, &recovery_address.to_string())
+    async fn fund(
+        &self,
+        gross: HoprBalance,
+        recovery_address: Address,
+        resend: ShieldResend,
+    ) -> Result<(), Self::Error> {
+        self.shield(balance_u128(gross)?, &recovery_address.to_string(), resend)
             .await
             .map(|_| ())
     }
@@ -3587,7 +3642,9 @@ mod tests {
             let safe = Address::from([9_u8; 20]);
 
             if inner_call_succeeds {
-                adapter.fund(HoprBalance::from(U256::from(7_u8)), safe).await?;
+                adapter
+                    .fund(HoprBalance::from(U256::from(7_u8)), safe, ShieldResend::AfterGrace)
+                    .await?;
                 let stored = store.load()?;
                 assert_eq!(stored.funding, vec![StoredNote::from(&note)]);
                 assert!(stored.direct_shield_in_flight.is_none(), "the journal is settled");
@@ -3607,7 +3664,9 @@ mod tests {
                 store.save(&persisted)?;
                 landed.store(false, Ordering::SeqCst);
                 let restarted = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
-                restarted.fund(HoprBalance::from(U256::from(8_u8)), safe).await?;
+                restarted
+                    .fund(HoprBalance::from(U256::from(8_u8)), safe, ShieldResend::AfterGrace)
+                    .await?;
                 assert_eq!(
                     last_gross.load(Ordering::SeqCst),
                     7,
@@ -3624,7 +3683,7 @@ mod tests {
                 // Confirmed, and the aggregator does not know the note: never sent again.
                 for _ in 0..2 {
                     let error = adapter
-                        .fund(HoprBalance::from(U256::from(7_u8)), safe)
+                        .fund(HoprBalance::from(U256::from(7_u8)), safe, ShieldResend::AfterGrace)
                         .await
                         .unwrap_err();
                     assert!(
@@ -3648,7 +3707,9 @@ mod tests {
                 );
                 // The aggregator catches up, and the shield settles without a second send.
                 landed.store(true, Ordering::SeqCst);
-                adapter.fund(HoprBalance::from(U256::from(7_u8)), safe).await?;
+                adapter
+                    .fund(HoprBalance::from(U256::from(7_u8)), safe, ShieldResend::AfterGrace)
+                    .await?;
                 assert_eq!(submissions.load(Ordering::SeqCst), 1);
                 assert_eq!(store.load()?.funding, vec![StoredNote::from(&note)]);
             }
@@ -5987,7 +6048,11 @@ mod tests {
                 .shield_router = router;
 
             let error = adapter
-                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+                .fund(
+                    HoprBalance::from(U256::from(7_u8)),
+                    Address::from([9_u8; 20]),
+                    ShieldResend::AfterGrace,
+                )
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
@@ -6086,7 +6151,11 @@ mod tests {
             .shield_router = None;
 
         adapter
-            .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+            .fund(
+                HoprBalance::from(U256::from(7_u8)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
             .await?;
         let stored = store.load()?;
         assert_eq!(
@@ -6146,7 +6215,11 @@ mod tests {
         let adapter = test_adapter_with_shielder(&state, server.url.clone(), Some(shielder))?;
 
         adapter
-            .fund(HoprBalance::from(U256::from(100_u8)), Address::from([9_u8; 20]))
+            .fund(
+                HoprBalance::from(U256::from(100_u8)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
             .await?;
 
         assert_eq!(sent_gross.load(Ordering::SeqCst), 100);
@@ -6286,8 +6359,12 @@ mod tests {
 
     impl ShieldRig {
         async fn fund(&self) -> Result<(), RsSdkCurvyAdapterError> {
+            self.fund_with(ShieldResend::AfterGrace).await
+        }
+
+        async fn fund_with(&self, resend: ShieldResend) -> Result<(), RsSdkCurvyAdapterError> {
             self.adapter
-                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]), resend)
                 .await
         }
 
@@ -6382,7 +6459,11 @@ mod tests {
         };
         restarted
             .0
-            .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+            .fund(
+                HoprBalance::from(U256::from(7_u8)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
             .await?;
         assert_eq!(rig.sent(), 2, "sent again once the grace was over");
         assert!(
@@ -6532,6 +6613,40 @@ mod tests {
         Ok(())
     }
 
+    /// A retry within one funding only looks for a direct shield, however far past its grace it
+    /// is: it never sends again, and leaves the journal as it was for the next funding, whose first
+    /// attempt decides.
+    #[tokio::test(start_paused = true)]
+    async fn an_observe_only_attempt_never_sends_a_direct_shield_again() -> anyhow::Result<()> {
+        let past = Some(unix_now().unwrap() - 3600);
+        for submission in [
+            ShieldSubmission::Unknown { since: past },
+            ShieldSubmission::Unknown { since: None },
+            ShieldSubmission::Submitted {
+                tx: confirmed_shield().tx,
+                at: past,
+            },
+        ] {
+            let rig = shield_rig("7", Some(submission.clone()), false, vec![Outcome::Confirm]).await?;
+
+            let error = rig.fund_with(ShieldResend::ObserveOnly).await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RsSdkCurvyAdapterError::ShieldSettling { gross: 7, .. }
+                        | RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { gross: 7, .. }
+                ),
+                "{submission:?}: {error}"
+            );
+            assert_eq!(rig.sent(), 0, "a retry does not send again: {submission:?}");
+            assert_eq!(rig.journal()?, Some(submission.clone()), "left for the next funding");
+
+            rig.fund().await?;
+            assert_eq!(rig.sent(), 1, "the next funding sends: {submission:?}");
+        }
+        Ok(())
+    }
+
     /// As for a direct shield, the portal shield's journal is authoritative: a different amount
     /// or recovery address resumes it rather than refusing it.
     #[tokio::test]
@@ -6559,7 +6674,11 @@ mod tests {
         adapter.config.shielding = CurvyShielding::Portal;
 
         adapter
-            .fund(HoprBalance::from(U256::from(8_u8)), Address::from([9_u8; 20]))
+            .fund(
+                HoprBalance::from(U256::from(8_u8)),
+                Address::from([9_u8; 20]),
+                ShieldResend::AfterGrace,
+            )
             .await?;
 
         let stored = store.load()?;
@@ -6640,8 +6759,12 @@ mod tests {
 
     impl PortalRig {
         async fn fund(&self) -> Result<(), RsSdkCurvyAdapterError> {
+            self.fund_with(ShieldResend::AfterGrace).await
+        }
+
+        async fn fund_with(&self, resend: ShieldResend) -> Result<(), RsSdkCurvyAdapterError> {
             self.adapter
-                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]))
+                .fund(HoprBalance::from(U256::from(7_u8)), Address::from([9_u8; 20]), resend)
                 .await
         }
 
@@ -6848,6 +6971,26 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), usize::from(!funded));
             assert_eq!(rig.stage()?, Some(StoredShieldStage::Funded));
         }
+        Ok(())
+    }
+
+    /// As for a direct shield, a retry within one funding never funds the portal again: a journal
+    /// with no time for its transfer is sent again by the next funding only.
+    #[tokio::test]
+    async fn an_observe_only_attempt_never_funds_the_portal_again() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (rig, calls) = scripted_portal_rig(ShieldSubmission::Unknown { since: None }, true, vec![]).await?;
+
+        let error = rig.fund_with(ShieldResend::ObserveOnly).await.unwrap_err();
+        assert!(
+            matches!(error, RsSdkCurvyAdapterError::ShieldSettling { gross: 7, .. }),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a retry does not send again");
+        assert_eq!(submission_of(&rig)?, Some(ShieldSubmission::Unknown { since: None }));
+
+        let _ = rig.fund().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the next funding sends");
         Ok(())
     }
 
