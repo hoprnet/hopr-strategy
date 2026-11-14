@@ -3248,19 +3248,23 @@ where
                 .map(amount)
                 .collect::<Result<Vec<u128>, _>>()?;
             // Attempts that share their inputs are rivals for one spend: whichever wins leaves at
-            // least the smallest change. A change of zero is no note at all.
+            // least the smallest change. A zero counts towards that smallest — a rival leaving
+            // nothing means the spend may leave nothing — and only then is dropped, since a change
+            // of zero is no note at all.
             let mut changes: Vec<(&[StoredNote], u128)> = Vec::new();
             for (inputs, change) in &spends {
                 let change = amount(change)?;
-                if change == 0 {
-                    continue;
-                }
                 match changes.iter_mut().find(|(rival, _)| rival == inputs) {
                     Some((_, smallest)) => *smallest = (*smallest).min(change),
                     None => changes.push((inputs, change)),
                 }
             }
-            amounts.extend(changes.into_iter().map(|(_, change)| change));
+            amounts.extend(
+                changes
+                    .into_iter()
+                    .map(|(_, change)| change)
+                    .filter(|change| *change != 0),
+            );
             amounts
         };
         // The largest notes are what `allocate_all` picks when no single note suffices.
@@ -4236,6 +4240,28 @@ mod tests {
             base_units(58),
             "8 for the spend, 50 untouched"
         );
+        Ok(())
+    }
+
+    /// A rival that leaves no change is the smallest change there is: the spend may leave nothing,
+    /// so it counts for nothing, in whichever order the attempts were journalled. Counting the
+    /// other rival's change instead would report funding a top-up is needed for.
+    #[tokio::test]
+    async fn a_rival_attempt_with_no_change_counts_for_nothing() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let (adapter, _server) = adapter_funded_with(&state, &[100, 50]).await?;
+
+        for rivals in [[10, 0], [0, 10]] {
+            adapter.state.lock().relay_aggregations = rivals
+                .iter()
+                .map(|change| relay_attempt(&[100], *change))
+                .collect::<anyhow::Result<_>>()?;
+            assert_eq!(
+                adapter.available_balance().await?,
+                base_units(50),
+                "nothing for the spend, 50 untouched: {rivals:?}"
+            );
+        }
         Ok(())
     }
 
