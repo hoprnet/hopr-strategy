@@ -142,10 +142,38 @@ pub type PortalFunder =
 /// A confirmation is a shield that took effect: the connector turns a failed inner call of the
 /// Safe into an error ([`ShieldFailure::Reverted`]), so a [`Confirmed`] whose note the aggregator
 /// does not know yet is the aggregator lagging, not a failed shield.
+///
+/// # Example
+///
+/// A shielder answers with the [`Confirmed`] transaction, or with the [`ShieldFailure`] that says
+/// what the float was left in, and the adapter's journal follows from that answer. This one is a
+/// test double, as the crate's own tests use: it refuses an empty shield before sending anything,
+/// which leaves the float where it was and lets the next funding send again, and confirms every
+/// other one. A real shielder hands the `send` to the Safe and maps the chain API's answer.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use futures::future::BoxFuture;
+/// use hopr_api::types::{chain::prelude::Erc777Payload, primitive::prelude::Address};
+/// use hopr_strategy::pix::pools::curvy::{Confirmed, DirectShielder, ShieldFailure};
+///
+/// let shielder: DirectShielder = Arc::new(|_payload: Erc777Payload, _router: Address, gross: u128| {
+///     Box::pin(async move {
+///         if gross == 0 {
+///             return Err(ShieldFailure::NotSubmitted("nothing to shield".into()));
+///         }
+///         Ok(Confirmed { tx: "0x01".into() })
+///     }) as BoxFuture<'static, Result<Confirmed, ShieldFailure>>
+/// });
+/// # drop(shielder);
+/// ```
 pub type DirectShielder =
     Arc<dyn Fn(Erc777Payload, Address, u128) -> BoxFuture<'static, Result<Confirmed, ShieldFailure>> + Send + Sync>;
 
 /// A shield's transaction — a direct shield, or the Safe's transfer to a portal — confirmed on chain.
+///
+/// See [`DirectShielder`] for a shielder that answers with one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Confirmed {
     /// The transaction hash.
@@ -159,7 +187,7 @@ pub struct Confirmed {
 /// pay for one shield twice: the first copy may still land after its grace, and a second would
 /// debit the Safe again. So only the first call of a funding decides that a grace is over; a
 /// retry only looks, however long the sleep and the chain reads before it took, and leaves the
-/// decision to the next funding.
+/// decision to the next funding. See [`CurvySdkAdapter::fund`] for a funding that uses both.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShieldResend {
     /// Send it again once its grace is over: the first call of a funding.
@@ -171,6 +199,7 @@ pub enum ShieldResend {
 /// How a shield's transaction failed, as far as the float is concerned.
 ///
 /// The chain API classifies its own errors: see `ChainWriteAccountOperations::submission_failure`.
+/// See [`DirectShielder`] for a shielder that answers with one.
 #[derive(Debug, thiserror::Error)]
 pub enum ShieldFailure {
     /// Refused before anything was broadcast: nothing moved and no nonce was consumed.
@@ -365,6 +394,40 @@ pub trait CurvySdkAdapter: Send + Sync + 'static {
     /// [`ShieldResend::AfterGrace`]. An error after
     /// the note is journalled — committing it did not go through — is not one, so that a retry
     /// cannot shield twice for one failure.
+    ///
+    /// # Example
+    ///
+    /// One funding, as the pool runs it: the first call may send again a shield whose grace is
+    /// over, and every retry while a shield settles only looks for it. Once this funding has
+    /// booked its note, the next one shields `gross` again and adds a second note; a shield that
+    /// was interrupted is resumed instead, with the amount and recovery address it was journalled
+    /// with, whatever the next call asks for.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use hopr_api::types::primitive::prelude::{Address, HoprBalance};
+    /// use hopr_strategy::pix::pools::curvy::{CurvySdkAdapter, RsSdkCurvyAdapterError, ShieldResend};
+    ///
+    /// async fn top_up<A>(adapter: &A, gross: HoprBalance, recovery: Address) -> Result<(), RsSdkCurvyAdapterError>
+    /// where
+    ///     A: CurvySdkAdapter<Error = RsSdkCurvyAdapterError>,
+    /// {
+    ///     let mut outcome = adapter.fund(gross, recovery, ShieldResend::AfterGrace).await;
+    ///     for _ in 0..10 {
+    ///         match outcome {
+    ///             Err(RsSdkCurvyAdapterError::ShieldSettling { .. })
+    ///             | Err(RsSdkCurvyAdapterError::ShieldConfirmedUnindexed { .. }) => {
+    ///                 tokio::time::sleep(Duration::from_secs(5)).await;
+    ///                 // However long that took, a retry never sends the shield again.
+    ///                 outcome = adapter.fund(gross, recovery, ShieldResend::ObserveOnly).await;
+    ///             }
+    ///             _ => break,
+    ///         }
+    ///     }
+    ///     outcome
+    /// }
+    /// ```
     async fn fund(
         &self,
         gross: HoprBalance,
@@ -471,12 +534,25 @@ impl RsSdkCurvyAdapterConfig {
     }
 
     /// Sets how long a direct shield of unknown outcome is waited for before it is sent again.
+    ///
+    /// Past the grace, the next funding sends the shield again; a retry within one funding never
+    /// does (see [`ShieldResend`]). A portal funding is never sent again, and is reported as
+    /// unresolved past the grace instead.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use hopr_strategy::pix::pools::curvy::RsSdkCurvyAdapterConfig;
+    ///
+    /// let operator_key = String::new();
+    /// let config = RsSdkCurvyAdapterConfig::new(operator_key, 4).with_direct_shield_settle_grace(Duration::from_secs(300));
+    /// assert_eq!(config.direct_shield_settle_grace, Duration::from_secs(300));
+    /// ```
     pub fn with_direct_shield_settle_grace(mut self, grace: std::time::Duration) -> Self {
         self.direct_shield_settle_grace = grace;
         self
     }
 
-    /// Applies the pool's configured modes.
     /// Selects where the SDK reads notes from; `curvy_indexer_url` is required for
     /// [`CurvyNoteSource::CurvyIndexer`] and validated by the pool before this is reached.
     pub fn with_note_source(mut self, note_source: CurvyNoteSource, curvy_indexer_url: Option<Url>) -> Self {
@@ -485,6 +561,7 @@ impl RsSdkCurvyAdapterConfig {
         self
     }
 
+    /// Applies the pool's configured modes.
     pub fn with_modes(
         mut self,
         shielding: CurvyShielding,

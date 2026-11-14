@@ -1083,6 +1083,40 @@ where
     /// No chain key is taken: a direct shield is submitted by the node's chain API, which signs
     /// with the node's own key, and the portal path signs with the operator key from the
     /// environment.
+    ///
+    /// # Migrating from 8.x
+    ///
+    /// 8.x took the node's chain key as the second argument, and shielded `initial_funding` on its
+    /// own when the first deposit found the pool empty. Neither is the case any more: nothing is
+    /// shielded until something calls [`DepositPool::fund`], whether the strategy's `funding`
+    /// policy ([`PixFundingPolicy`](crate::pix::strategy::PixFundingPolicy)) or the caller, and a
+    /// pool that is never funded fails every deposit for want of funding.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use hopr_api::{chain::DepositPool, node::HasChainApi, types::primitive::prelude::HoprBalance};
+    /// use hopr_strategy::{
+    ///     errors::StrategyError,
+    ///     pix::pools::curvy::{CurvyDepositPool, CurvyDepositPoolConfig},
+    /// };
+    ///
+    /// async fn open_funded<N>(
+    ///     node: Arc<N>,
+    ///     cfg: CurvyDepositPoolConfig,
+    ///     password: &str,
+    ///     top_up: HoprBalance,
+    /// ) -> Result<CurvyDepositPool<N>, StrategyError>
+    /// where
+    ///     N: HasChainApi + Send + Sync + 'static,
+    /// {
+    ///     // 8.x: `CurvyDepositPool::new(node, node_key, cfg, password)`.
+    ///     let pool = CurvyDepositPool::new(node, cfg, password)?;
+    ///     // Shields `top_up` from the Safe, gross of the shield fee.
+    ///     pool.fund(top_up).await?;
+    ///     Ok(pool)
+    /// }
+    /// ```
     pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig, state_password: &str) -> Result<Self, StrategyError> {
         // The pool never funds itself any more. Without `deny_unknown_fields` (see the config
         // docs) a leftover setting would be ignored without a word, and the first deposit would

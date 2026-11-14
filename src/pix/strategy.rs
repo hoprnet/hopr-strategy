@@ -315,8 +315,9 @@ pub struct PixStrategyConfig {
 /// and, when that is below `min_available`, asks the pool to [`fund`](DepositPool::fund) `top_up`
 /// from the Safe — and, with [`PixFundingPolicy::fund_at_startup`], also once when `run` starts.
 /// Both run off the event loop, in the task that flushes, so a funding that takes
-/// a shield and a commitment round never holds up PIX events; one funding at a time, so that
-/// concurrent flushes cannot each top up. Without the policy, deposits fail once the pool is
+/// a shield and a commitment round never holds up PIX events; and one flush at a time, from its
+/// funding decision to the end of its batch, so that concurrent flushes cannot each top up and
+/// each decides on the balance the one before it left. Without the policy, deposits fail once the pool is
 /// empty until an operator funds it — with which error is the pool's own answer, wrapped in
 /// [`StrategyError::Other`]: the plain pool its affordability refusal, the Curvy pool a typed
 /// error that [`is_out_of_funding`](crate::pix::pools::curvy::is_out_of_funding) recognises as
@@ -334,6 +335,38 @@ pub struct PixStrategyConfig {
 /// `top_up`. That is a recommendation, not a rule: above it a cycle can take a second top-up, and
 /// no more than two, for any fee under half of `top_up`. A privacy pool also counts a funding note
 /// before it is spendable.
+///
+/// # Example
+///
+/// A policy in the strategy's configuration, validated with it. Left out of the configuration,
+/// `fund_at_startup` is `false`: the policy is lazy, and a node that never sees a deposit never
+/// debits its Safe.
+///
+/// ```
+/// use hopr_api::types::primitive::prelude::HoprBalance;
+/// use hopr_strategy::pix::strategy::{PixFundingPolicy, PixStrategyConfig};
+/// use validator::Validate;
+///
+/// let policy: PixFundingPolicy = serde_json::from_str(r#"{"min_available":"50 wxHOPR","top_up":"100 wxHOPR"}"#)?;
+/// assert!(!policy.fund_at_startup, "lazy unless asked otherwise");
+///
+/// let cfg = PixStrategyConfig {
+///     funding: Some(policy.clone()),
+///     ..Default::default()
+/// };
+/// cfg.validate()?;
+///
+/// // A floor one top-up can never clear is refused, with the configuration that holds it.
+/// let unreachable = PixStrategyConfig {
+///     funding: Some(PixFundingPolicy {
+///         min_available: policy.top_up,
+///         ..policy
+///     }),
+///     ..Default::default()
+/// };
+/// assert!(unreachable.validate().is_err());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
