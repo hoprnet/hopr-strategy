@@ -14,7 +14,7 @@ pub(crate) fn validate_positive_balance(balance: &HoprBalance) -> Result<(), Val
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{HoprBalance, validate_positive_balance};
 
     #[test]
     fn a_zero_balance_is_refused_and_any_other_is_not() {
