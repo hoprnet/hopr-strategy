@@ -999,7 +999,9 @@ where
     /// [`Self::on_pix_event`] returns.
     detach_flushes: bool,
     /// Held across one application of the funding policy — the balance read and the funding it
-    /// decides on — so that concurrent flush tasks fund once between them, not once each.
+    /// decides on — so that concurrent flush tasks fund once between them, not once each; and by a
+    /// flush, on through the batch it funded for, so that the next flush's balance read already
+    /// sees this batch's spend and does not skip a top-up the next batch needs.
     funding_gate: Arc<futures::lock::Mutex<()>>,
     /// Set to `true` when `run` is ending. It decides only whether a startup funding may *start*:
     /// one that is still waiting for `funding_gate` then does not. A funding that holds the gate
@@ -1434,7 +1436,10 @@ where
         if self.deposit_buffer.is_empty() {
             return 0;
         }
-        apply_funding_policy::<D, K>(&self.pool, self.cfg.funding.as_ref(), &self.funding_gate, None).await;
+        // Held through the batch, as in the detached flush.
+        let gate = Arc::clone(&self.funding_gate);
+        let _funded_for_this_batch =
+            apply_funding_policy::<D, K>(&self.pool, self.cfg.funding.as_ref(), &gate, None).await;
         self.flush_buffered_deposits().await
     }
 
@@ -1461,7 +1466,10 @@ where
     /// Concurrent flushes are safe because the guards outlive them: `in_flight_destinations` is
     /// populated in [`Self::on_pix_event`] before an entry is ever buffered and released by the
     /// flush that owns it, and its [`Cache`] clones share state — so a second event for the same
-    /// destination is still refused while the first is in flight.
+    /// destination is still refused while the first is in flight. Under a funding policy they run
+    /// one after the other, each holding `funding_gate` from its funding decision to the end of
+    /// its batch, so that each decides on the balance the one before it left; the Curvy pool
+    /// makes one allocation at a time anyway, so this costs the batches nothing.
     fn detach_flush_deposits(&mut self) {
         if self.deposit_buffer.is_empty() {
             return;
@@ -1477,8 +1485,10 @@ where
 
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
         // what it is funding for, and the loop must not wait on the funding any more than on them.
+        // The gate stays held through the batch, so the next flush decides on the balance this
+        // batch leaves: see `apply_funding_policy`.
         hopr_utils::runtime::prelude::spawn(async move {
-            apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, None).await;
+            let _funded_for_this_batch = apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, None).await;
             flush_deposit_batch::<D, K>(pool, processed_deposits, in_flight_destinations, spend_ledger, batch).await;
         });
     }
@@ -1539,31 +1549,38 @@ where
 /// to the next application, and the deposits it was for then fail on their own, through the pool,
 /// rather than here.
 ///
+/// Returns the gate, still held, whenever there is a policy, funded or not: a flush keeps it
+/// through the batch it funded for, so that the next flush reads the balance only once this batch
+/// has spent from it. The pool counts a spend only once its attempt is journalled, after the
+/// proof, so a balance read while that proof is made still holds what the batch is about to spend:
+/// with 60 available, a floor of 50 and two flushes of 40, both would read 60, neither would fund,
+/// and the second would find 20. `None` when there is no policy, so a pool that is never funded
+/// does not serialize its flushes.
+///
 /// `stop`, when given, ends it only while it is waiting for the gate: once the gate is held the
 /// funding runs to its end, never cancelled, because a Safe transaction cannot be un-sent and
 /// cancelling the wait would only lose the record of it. See `funding_stop` on [`PixStrategyInner`].
-async fn apply_funding_policy<D, K>(
+async fn apply_funding_policy<'gate, D, K>(
     pool: &D,
     policy: Option<&PixFundingPolicy>,
-    gate: &futures::lock::Mutex<()>,
+    gate: &'gate futures::lock::Mutex<()>,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
-) where
+) -> Option<futures::lock::MutexGuard<'gate, ()>>
+where
     D: DepositPool<K> + Send + Sync,
     D::Error: Into<StrategyError>,
     K: Keypair<SecretLen = hopr_api::types::primitive::typenum::U32> + Send + Sync + 'static,
     K::Public: Into<PixDepositAddress> + Send + Sync + 'static,
 {
-    let Some(policy) = policy else {
-        return;
-    };
-    let _one_at_a_time = match stop {
+    let policy = policy?;
+    let one_at_a_time = match stop {
         Some(mut stop) => {
             tokio::select! {
                 biased;
                 // An error is the strategy being dropped, which is stopping as well.
                 _ = stop.wait_for(|stopping| *stopping) => {
                     tracing::debug!("not funding the deposit pool: the strategy is stopping");
-                    return;
+                    return None;
                 }
                 guard = gate.lock() => guard,
             }
@@ -1574,11 +1591,11 @@ async fn apply_funding_policy<D, K>(
         Ok(available) => available,
         Err(error) => {
             tracing::warn!(%error, "could not read the deposit pool's available balance");
-            return;
+            return Some(one_at_a_time);
         }
     };
     if available >= policy.min_available {
-        return;
+        return Some(one_at_a_time);
     }
     tracing::info!(
         %available,
@@ -1589,6 +1606,7 @@ async fn apply_funding_policy<D, K>(
     if let Err(error) = pool.fund(policy.top_up).await.map_err(Into::<StrategyError>::into) {
         tracing::error!(%error, "funding the deposit pool failed; the next flush retries");
     }
+    Some(one_at_a_time)
 }
 
 /// Log a failed deposit flush and count it: a wait for reconciliation is pending, not failed.
@@ -6222,6 +6240,147 @@ mod tests {
 
         assert_eq!(*funded.lock(), vec![HoprBalance::new_base(2)], "funded once");
         assert_eq!(*deposits.lock(), vec![1], "the batch came after its funding");
+        Ok(())
+    }
+
+    /// A pool whose balance falls only once a deposit is made, as the Curvy pool's does: a deposit
+    /// waits for a permit — its proof being made — with its funds still counted, and is refused
+    /// when the balance cannot pay for it by then.
+    struct ProvingPool {
+        balance: parking_lot::Mutex<HoprBalance>,
+        funded: parking_lot::Mutex<Vec<HoprBalance>>,
+        proving: tokio::sync::Semaphore,
+        /// Deposits that have started their proof.
+        started: std::sync::atomic::AtomicUsize,
+        /// Whether each deposit was made, in the order they finished.
+        made: parking_lot::Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl hopr_api::chain::DepositPool<crate::pix::pools::plain::EthDepositKey> for ProvingPool {
+        type Error = StrategyError;
+        type PoolDepositData = crate::pix::ByteDepositData;
+        type Receipt = ();
+
+        async fn generate_deposit_data(
+            &self,
+            _id: &PixAddressId,
+        ) -> std::result::Result<Self::PoolDepositData, StrategyError> {
+            unreachable!("the flush generates nothing")
+        }
+
+        async fn fund(&self, amount: HoprBalance) -> std::result::Result<(), StrategyError> {
+            self.funded.lock().push(amount);
+            *self.balance.lock() += amount;
+            Ok(())
+        }
+
+        async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
+            Ok(*self.balance.lock())
+        }
+
+        async fn deposit_funds_to(
+            &self,
+            _id: &PixAddressId,
+            _dst: &Address,
+            amount: HoprBalance,
+            _additional_data: Self::PoolDepositData,
+        ) -> std::result::Result<(), StrategyError> {
+            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.proving.acquire().await.expect("never closed").forget();
+            let made = {
+                let mut balance = self.balance.lock();
+                let made = *balance >= amount;
+                if made {
+                    *balance -= amount;
+                }
+                made
+            };
+            self.made.lock().push(made);
+            if made {
+                Ok(())
+            } else {
+                Err(StrategyError::other(anyhow::anyhow!(
+                    "the pool cannot pay for {amount}"
+                )))
+            }
+        }
+
+        fn notify_deposit(
+            &self,
+            _id: PixAddressId,
+            _dst: Address,
+            _min_amount: HoprBalance,
+        ) -> std::result::Result<hopr_api::chain::DepositNotification<'static, Address, Self::Error>, StrategyError>
+        {
+            unreachable!("the flush watches nothing")
+        }
+
+        async fn withdraw_deposit(
+            &self,
+            _id: &PixAddressId,
+            _key: &crate::pix::pools::plain::EthDepositKey,
+            _dst: Address,
+            _amount: Option<HoprBalance>,
+        ) -> std::result::Result<(), StrategyError> {
+            unreachable!("the flush withdraws nothing")
+        }
+
+        async fn pool_transfer(
+            &self,
+            _src: hopr_api::chain::PoolTransferSource<'_, crate::pix::pools::plain::EthDepositKey>,
+            _dst_id: &PixAddressId,
+            _dst: Address,
+            _additional_dst_data: Self::PoolDepositData,
+            _amount: Option<HoprBalance>,
+        ) -> std::result::Result<(), StrategyError> {
+            unreachable!("the flush transfers nothing")
+        }
+    }
+
+    /// Two flushes at once each decide on the balance the other leaves. With 60 available, a floor
+    /// of 50 and two deposits of 40, the first needs no top-up and the second does, since the first
+    /// leaves 20; a second flush reading the balance while the first is still proving would see 60
+    /// too, skip the top-up, and fail.
+    #[test_log::test(tokio::test)]
+    async fn concurrent_flushes_each_fund_for_what_the_one_before_left() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let pool = Arc::new(ProvingPool {
+            balance: parking_lot::Mutex::new(HoprBalance::new_base(60)),
+            funded: Default::default(),
+            proving: tokio::sync::Semaphore::new(0),
+            started: Default::default(),
+            made: Default::default(),
+        });
+        let cfg = PixStrategyConfig {
+            funding: Some(crate::pix::strategy::PixFundingPolicy {
+                min_available: HoprBalance::new_base(50),
+                top_up: HoprBalance::new_base(100),
+            }),
+            ..Default::default()
+        };
+        let mut strategy = PixStrategyInner::new(Arc::clone(&pool), node, cfg, *BOB, None);
+        let amount = HoprBalance::new_base(40);
+        for id in [pix_id(1), pix_id(2)] {
+            let spend = strategy.commit_spend(amount);
+            strategy
+                .deposit_buffer
+                .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+            strategy.detach_flush_deposits();
+        }
+
+        // The first is proving; the second has had every chance to read the balance meanwhile.
+        settle(|| pool.started.load(std::sync::atomic::Ordering::SeqCst) > 0).await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        pool.proving.add_permits(2);
+        settle(|| pool.made.lock().len() == 2).await;
+
+        assert_eq!(*pool.made.lock(), vec![true, true], "both deposits were made");
+        assert_eq!(
+            *pool.funded.lock(),
+            vec![HoprBalance::new_base(100)],
+            "topped up once, for the second, on the 20 the first left"
+        );
         Ok(())
     }
 
