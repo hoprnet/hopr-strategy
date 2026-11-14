@@ -3294,14 +3294,24 @@ where
         // Take one immutable snapshot without waiting behind proof generation/submission.
         // A pending spend is still from this deployment if its inputs or any candidate's
         // outputs are known. Resolving which candidate won belongs to the funding path.
+        //
+        // Only a relayed attempt's inputs are left out of the per-note check below, because only
+        // relayed attempts are checked on their own just after. An operator attempt's or an
+        // ambiguous allocation's inputs stay in, so they are still checked against this chain;
+        // `in_flight_spends` lists those too, and leaving them out here would let a journal whose
+        // funding is all in flight pass without a single read.
         let (funding, pending, attempts) = {
             let state = self.state.lock();
-            let spends = in_flight_spends(&state);
             (
                 state
                     .funding
                     .iter()
-                    .filter(|note| !spends.iter().any(|(inputs, _)| inputs.contains(note)))
+                    .filter(|note| {
+                        !state
+                            .relay_aggregations
+                            .iter()
+                            .any(|attempt| attempt.inputs.contains(note))
+                    })
                     .cloned()
                     .collect::<Vec<_>>(),
                 state.pending.clone(),
@@ -4260,6 +4270,48 @@ mod tests {
                 adapter.available_balance().await?,
                 base_units(50),
                 "nothing for the spend, 50 untouched: {rivals:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Only a relayed attempt is checked on its own, so an operator attempt's inputs, and an
+    /// ambiguous set's from an earlier version, are still checked note by note. Leaving them out
+    /// would let a journal whose funding is all in flight pass without a single read.
+    #[tokio::test]
+    async fn a_spend_in_flight_that_is_not_relayed_is_still_checked_against_the_chain() -> anyhow::Result<()> {
+        let known = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let server = relayer::http_tests::Server::new({
+            let known = known.clone();
+            move |_, body| Some(recovery_chain_response(&body, &known.lock(), false))
+        })
+        .await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        let attempt = operator_attempt(&[100], 10, &[], Vec::new())?;
+        adapter.state.lock().funding = attempt.inputs.clone();
+
+        for ambiguous in [false, true] {
+            {
+                let mut state = adapter.state.lock();
+                if ambiguous {
+                    state.operator_aggregations.clear();
+                    state.ambiguous_allocation = true;
+                    state.ambiguous_inputs = attempt.inputs.clone();
+                    state.ambiguous_change = Some(attempt.change.clone());
+                } else {
+                    state.operator_aggregations = vec![attempt.clone()];
+                }
+            }
+            *known.lock() = Vec::new();
+            assert!(
+                !adapter.chain_state_is_consistent().await?,
+                "inputs this chain does not know (ambiguous: {ambiguous})"
+            );
+            *known.lock() = attempt.inputs.clone();
+            assert!(
+                adapter.chain_state_is_consistent().await?,
+                "inputs this chain knows (ambiguous: {ambiguous})"
             );
         }
         Ok(())
