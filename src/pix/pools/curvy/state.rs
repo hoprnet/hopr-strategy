@@ -112,6 +112,13 @@ fn state_db_error(error: impl std::fmt::Display) -> CurvyStateError {
     CurvyStateError::Database(error.to_string())
 }
 
+/// A position a reorg margin before `cursor`, without a block anchor; `None` when the cursor is
+/// within the margin of genesis.
+pub(super) fn unanchored_before(cursor: &CurvyEventCursor) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+    let block = cursor_component(&cursor.block, "block")?;
+    Ok((block > REPLAY_FLOOR_REORG_MARGIN).then(|| CurvyEventCursor::new(block - REPLAY_FLOOR_REORG_MARGIN, 0, 0, 0)))
+}
+
 fn replay_floor_key(id: &PixAddressId, kind: CurvyEventKind) -> [u8; REPLAY_FLOOR_KEY_SIZE] {
     let mut key = [0_u8; REPLAY_FLOOR_KEY_SIZE];
     key[..PixAddressId::SIZE].copy_from_slice(&id_bytes(id));
@@ -382,10 +389,23 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// Forgets the scan secret for `id`, once nothing can arrive for it any more.
     fn remove_scan_secret(&self, id: &PixAddressId) -> Result<(), CurvyStateError>;
 
-    /// Where a historical replay for `id` has to start in the `kind` family: the position the
-    /// shared cursor had when the allocation's scan secret was first stored, since no note for it
-    /// can predate that. `None` means "replay from genesis", which is also what the default
-    /// answers (allocations stored before floors existed, and stores that do not keep them).
+    /// Where a historical replay for `id` has to start in the `kind` family: no later than the
+    /// position the shared cursor had when the allocation's scan secret was first stored, since
+    /// no note for it can predate that. `None` means "replay from genesis", which is also what
+    /// the default answers (allocations stored before floors existed, and stores that do not
+    /// keep them).
+    ///
+    /// ```
+    /// # use hopr_api::node::PixAddressId;
+    /// # use hopr_api::types::primitive::prelude::BytesRepresentable;
+    /// # use hopr_strategy::pix::pools::curvy::{CurvyDepositState, CurvyEventKind, RedbCurvyDepositState};
+    /// let dir = tempfile::tempdir()?;
+    /// let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), "correct horse battery")?;
+    /// // No scan secret was stored for this allocation: its replay starts at genesis.
+    /// let id = PixAddressId::try_from(&[7u8; PixAddressId::SIZE][..])?;
+    /// assert_eq!(state.replay_floor(&id, CurvyEventKind::Pending)?, None);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     fn replay_floor(
         &self,
         id: &PixAddressId,
@@ -703,11 +723,7 @@ impl CurvyDepositState for RedbCurvyDepositState {
                     };
                     let cursor = decode_cursor(&stored.value())?;
                     let floor = match kind {
-                        CurvyEventKind::Pending => {
-                            let block = cursor_component(&cursor.block, "block")?;
-                            (block > REPLAY_FLOOR_REORG_MARGIN)
-                                .then(|| CurvyEventCursor::new(block - REPLAY_FLOOR_REORG_MARGIN, 0, 0, 0))
-                        }
+                        CurvyEventKind::Pending => unanchored_before(&cursor)?,
                         CurvyEventKind::Committed => Some(cursor),
                     };
                     if let Some(floor) = floor {

@@ -44,7 +44,7 @@ use hopr_api::{
 
 use super::{
     detect::{CurvyDetectionError, RsCoreCurvyNoteDetector, bjj_point},
-    state::{CurvyDepositState, CurvyEventKind, CurvyStateError, cursor_component, note_id_key},
+    state::{CurvyDepositState, CurvyEventKind, CurvyStateError, cursor_component, note_id_key, unanchored_before},
     token::VaultToken,
 };
 
@@ -228,7 +228,7 @@ fn cursor_order(cursor: &CurvyEventCursor) -> Result<(u64, u64, u64, u64), Curvy
     ))
 }
 
-/// The earlier of two replay starts; genesis (`None`), or a start that cannot be ordered, wins.
+/// The earlier of two replay starts; a start that cannot be ordered counts as genesis (`None`).
 fn earlier(a: Option<CurvyEventCursor>, b: Option<CurvyEventCursor>) -> Option<CurvyEventCursor> {
     let (a, b) = (a?, b?);
     match (cursor_order(&a), cursor_order(&b)) {
@@ -532,35 +532,34 @@ where
         let page = client.pending_notes(after.clone(), QUERY_PAGE_SIZE).await?;
         let has_more = page.has_more;
         let mut last = None;
+        let mut stopped = false;
+        let mut watching = true;
         for note in page.notes {
             let position = CurvyEventCursor::from(&note.position);
             if replay && is_beyond(&position, window_end) {
-                return Ok(true);
+                stopped = true;
+                break;
             }
-            let watching = tracker
+            watching = tracker
                 .process_candidate(note, hold.as_ref())
                 .await
                 .map_err(|error| error.to_string())?;
             if !watching {
-                if let (false, Some(last)) = (replay, &last) {
-                    tracker
-                        .state
-                        .advance_cursor(CurvyEventKind::Pending, last)
-                        .map_err(|error| error.to_string())?;
-                }
-                return Ok(false);
+                stopped = true;
+                break;
             }
             after = Some(position.clone());
             last = Some(position);
         }
+        // Only what was actually processed is committed, also when the pass stops early.
         if let (false, Some(last)) = (replay, &last) {
             tracker
                 .state
                 .advance_cursor(CurvyEventKind::Pending, last)
                 .map_err(|error| error.to_string())?;
         }
-        if !has_more {
-            return Ok(true);
+        if stopped || !has_more {
+            return Ok(watching);
         }
     }
 }
@@ -674,7 +673,16 @@ where
         .state
         .cursor(CurvyEventKind::Pending)
         .map_err(|error| error.to_string())?;
-    if !pending_phase(client, tracker, p0.clone(), None, false).await? {
+    let mut forward = pending_phase(client, tracker, p0.clone(), None, false).await;
+    if let (Err(error), Some(anchored)) = (&forward, p0.as_ref().filter(|cursor| cursor.block_hash.is_some())) {
+        // The anchor may be a block that was reorganised away, which the index rejects. Start
+        // again once, unanchored and a margin earlier, so the cursor is refreshed with canonical
+        // positions and notes that landed in replacement blocks are seen.
+        tracing::warn!(%error, "Curvy pending cursor was rejected; rescanning from before it without its anchor");
+        let from = unanchored_before(anchored).unwrap_or(None);
+        forward = pending_phase(client, tracker, from, None, false).await;
+    }
+    if !forward? {
         return Ok(());
     }
     if let (Some(replay), Some(_)) = (replay, &p0)
@@ -689,7 +697,15 @@ where
         .state
         .cursor(CurvyEventKind::Committed)
         .map_err(|error| error.to_string())?;
-    if !committed_phase(client, tracker, c0.clone(), None, finalized_through, false).await? {
+    let mut forward = committed_phase(client, tracker, c0.clone(), None, finalized_through, false).await;
+    if let (Err(error), Some(anchored)) = (&forward, c0.as_ref().filter(|cursor| cursor.block_hash.is_some())) {
+        // As for the pending cursor, but the position stays: a leaf index must not be rewound.
+        tracing::warn!(%error, "Curvy committed cursor was rejected; retrying from the same position without its anchor");
+        let mut from = anchored.clone();
+        from.block_hash = None;
+        forward = committed_phase(client, tracker, Some(from), None, finalized_through, false).await;
+    }
+    if !forward? {
         return Ok(());
     }
     if let (Some(replay), Some(_)) = (replay, &c0) {
