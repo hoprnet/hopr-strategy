@@ -1643,6 +1643,9 @@ where
     /// public half. Idempotent: asking twice for one allocation returns the same identity.
     async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
         self.ensure_reconciled().await?;
+        // The fast path avoids minting a new identity on every idempotent call. The fallback is
+        // still atomic: two concurrent calls that both miss generate different candidates, and
+        // get-or-insert makes both return the secret whose public half is actually stored.
         let secret = match self
             .tracker
             .state
@@ -1651,12 +1654,11 @@ where
         {
             Some(existing) => existing,
             None => {
-                let secret = Self::generate_scan_secret()?;
+                let generated = Self::generate_scan_secret()?;
                 self.tracker
                     .state
-                    .store_scan_secret(id, &secret)
-                    .map_err(CurvyDepositPoolError::from)?;
-                secret
+                    .get_or_insert_scan_secret(id, &generated)
+                    .map_err(CurvyDepositPoolError::from)?
             }
         };
         Ok(CurvyDepositData::new(*id, secret.public()))

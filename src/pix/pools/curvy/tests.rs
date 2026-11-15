@@ -512,6 +512,123 @@ fn rewinding_a_cursor_drops_its_anchor_and_keeps_its_item_index() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn first_discovery_queues_a_committed_replay_after_a_head_jump() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+
+    // The secret's committed replay floor is block 1. A registration replay from it starts
+    // empty, so consume that first.
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+    let index = ScriptedIndex::default();
+    *index.head.lock() = (10, 1);
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+
+    // The old forward committed phase moved past the note's commit while it was unknown.
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(5)))?;
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+
+    // This pass discovers the note and queues a committed replay for the next pass.
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+    assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
+    let queued = tracker.take_committed_replay();
+    assert_eq!(queued.ids, [fixture.id].into_iter().collect());
+    tracker.restore_committed_replay(queued);
+
+    // The queued replay starts at the committed floor (1), not after the durable cursor (5).
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+    assert_eq!(receiver.await?, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_first_discovery_replay_is_requeued() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+    let index = ScriptedIndex::default();
+    *index.head.lock() = (10, 1);
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(5)))?;
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+
+    index.fail_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(run_pass(&index, &tracker).await.is_err());
+    let queued = tracker.take_committed_replay();
+    assert_eq!(queued.ids, [fixture.id].into_iter().collect());
+    tracker.restore_committed_replay(queued);
+
+    index.fail_committed.store(false, std::sync::atomic::Ordering::SeqCst);
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+    assert_eq!(receiver.await?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_candidate_reports_only_the_first_insert() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    let first = tracker.process_candidate(fixture.note.clone(), None).await?;
+    assert!(first.continue_processing);
+    assert_eq!(first.discovered, Some(fixture.id));
+    let second = tracker.process_candidate(fixture.note, None).await?;
+    assert!(second.continue_processing);
+    assert_eq!(second.discovered, None);
+    Ok(())
+}
+
+#[test]
+fn get_or_insert_scan_secret_is_atomic_and_keeps_floors() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let id = pix_id(1);
+    let first = scan_secret("01", "02")?;
+    let second = scan_secret("03", "04")?;
+    let s1 = state.clone();
+    let s2 = state.clone();
+    let a = first.clone();
+    let b = second.clone();
+    let one = std::thread::spawn(move || s1.get_or_insert_scan_secret(&id, &a));
+    let two = std::thread::spawn(move || s2.get_or_insert_scan_secret(&id, &b));
+    let one = one.join().expect("first thread")?;
+    let two = two.join().expect("second thread")?;
+    assert_eq!(one.public(), two.public());
+    assert_eq!(state.scan_secret(&id)?.expect("stored secret").public(), one.public());
+
+    let floored = pix_id(2);
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(100)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(7)))?;
+    let stored = state.get_or_insert_scan_secret(&floored, &first)?;
+    let before = (
+        state.replay_floor(&floored, CurvyEventKind::Pending)?,
+        state.replay_floor(&floored, CurvyEventKind::Committed)?,
+    );
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(500)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(400)))?;
+    let again = state.get_or_insert_scan_secret(&floored, &second)?;
+    assert_eq!(again.public(), stored.public());
+    assert_eq!(
+        (
+            state.replay_floor(&floored, CurvyEventKind::Pending)?,
+            state.replay_floor(&floored, CurvyEventKind::Committed)?,
+        ),
+        before
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
@@ -533,11 +650,11 @@ async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()>
     unrelated.note_id = Hex32(format!("0x{:064x}", 0));
     unrelated.position = position(1);
     // A foreign event writes no cursor of its own; the pass commits one per page.
-    assert!(tracker.process_candidate(unrelated, None).await?);
+    assert!(tracker.process_candidate(unrelated, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
 
     let candidate_cursor = CurvyEventCursor::from(&position(2));
-    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(candidate_cursor));
     assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
 
@@ -561,7 +678,7 @@ async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Resu
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
-    assert!(!tracker.process_candidate(fixture.note, None).await?);
+    assert!(!tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     Ok(())
 }
@@ -578,7 +695,7 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
     fixture.note.view_tag = 256;
 
-    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     assert!(state.owned_note_ids()?.is_empty());
     Ok(())
@@ -612,7 +729,7 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
     // Blokli is back: the same event is now recognised as the allocation it is.
     vault.reachable.store(true, Ordering::SeqCst);
     let cursor = CurvyEventCursor::from(&fixture.note.position);
-    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?.continue_processing);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
     assert_eq!(state.owned_note_ids()?.len(), 1);
     Ok(())
@@ -743,7 +860,7 @@ async fn late_registration_replays_pending_and_committed_history() -> anyhow::Re
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 3));
     *index.head.lock() = (10, 1);
-    super::lifecycle::catch_up(&index, &tracker, replay.as_ref())
+    super::lifecycle::catch_up(&index, &tracker, replay.as_ref(), None)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -819,7 +936,7 @@ async fn replay_is_bounded_by_the_floor_and_never_rewinds_the_cursors() -> anyho
         })
     );
 
-    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref())
+    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref(), None)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -845,7 +962,7 @@ async fn replay_scans_new_notes_before_history() -> anyhow::Result<()> {
         ten(),
     )?;
     let replay = test.tracker.take_replay();
-    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref())
+    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref(), None)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -877,7 +994,7 @@ async fn a_reorged_pending_anchor_is_rescanned_unanchored() -> anyhow::Result<()
     *index.head.lock() = (400, 1);
 
     for _ in 0..2 {
-        super::lifecycle::catch_up(&index, &tracker, None)
+        super::lifecycle::catch_up(&index, &tracker, None, None)
             .await
             .map_err(anyhow::Error::msg)?;
     }
@@ -913,7 +1030,7 @@ async fn a_reorged_committed_anchor_is_rescanned_from_before_it() -> anyhow::Res
     *index.head.lock() = (400, 1);
 
     for _ in 0..2 {
-        super::lifecycle::catch_up(&index, &tracker, None)
+        super::lifecycle::catch_up(&index, &tracker, None, None)
             .await
             .map_err(anyhow::Error::msg)?;
     }
@@ -952,7 +1069,7 @@ async fn a_reorged_committed_floor_is_replayed_from_before_it() -> anyhow::Resul
 
     // Every pass recovers, not only the first.
     for _ in 0..2 {
-        super::lifecycle::catch_up(&test.index, &test.tracker, Some(&replay))
+        super::lifecycle::catch_up(&test.index, &test.tracker, Some(&replay), None)
             .await
             .map_err(anyhow::Error::msg)?;
     }
@@ -982,7 +1099,7 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     let (state, tracker, fixture) = new_tracker()?;
     let index = ScriptedIndex::default();
     index.pending.lock().push(fixture.note.clone());
-    super::lifecycle::catch_up(&index, &tracker, None)
+    super::lifecycle::catch_up(&index, &tracker, None, None)
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
@@ -994,7 +1111,7 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     let index = ScriptedIndex::default();
     index.pending.lock().push(fixture.note.clone());
     let replay = ReplayFrom::default();
-    super::lifecycle::catch_up(&index, &tracker, Some(&replay))
+    super::lifecycle::catch_up(&index, &tracker, Some(&replay), None)
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(held));
@@ -1006,7 +1123,7 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     index.committed.lock().push(completion(&fixture.note_id, 3));
     index.committed_candidates.lock().push(fixture.note);
     *index.head.lock() = (10, 1);
-    super::lifecycle::catch_up(&index, &tracker, None)
+    super::lifecycle::catch_up(&index, &tracker, None, None)
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(state.cursor(CurvyEventKind::Committed)?, None);
@@ -1137,6 +1254,7 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 #[derive(Default)]
 struct ScriptedIndex {
     fail_pending: std::sync::atomic::AtomicBool,
+    fail_committed: std::sync::atomic::AtomicBool,
     pending_calls: std::sync::atomic::AtomicUsize,
     /// The `after` of every `pending_notes` call, in order.
     pending_afters: parking_lot::Mutex<Vec<Option<CurvyEventCursor>>>,
@@ -1220,6 +1338,9 @@ impl CurvyIndexSource for ScriptedIndex {
         first: u32,
     ) -> Result<Vec<CurvyCommittedNote>, String> {
         self.check_anchor(after.as_ref())?;
+        if self.fail_committed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("committed endpoint unavailable".to_owned());
+        }
         let after = after.as_ref().map(cursor_ordinal);
         Ok(self
             .committed
@@ -1262,6 +1383,23 @@ impl CurvyIndexSource for ScriptedIndex {
             .as_ref()
             .is_none_or(|known| known.contains(&note_id)))
     }
+}
+
+/// Drives one watcher pass exactly as `run_watcher` does: take both replay slots, pass them in,
+/// and restore both if the pass fails.
+async fn run_pass<I, S>(index: &I, tracker: &CurvyLifecycleTracker<S>) -> Result<(), String>
+where
+    I: CurvyIndexSource,
+    S: CurvyDepositState,
+{
+    let replay = tracker.take_replay();
+    let mut committed_replay = tracker.take_committed_replay();
+    let result = super::lifecycle::catch_up(index, tracker, replay.as_ref(), Some(&mut committed_replay)).await;
+    if result.is_err() {
+        tracker.restore_failed_replay(replay);
+        tracker.restore_committed_replay(committed_replay);
+    }
+    result
 }
 
 /// Records what the pool asked of the SDK instead of proving and submitting it.
@@ -3136,7 +3274,7 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         *index.head.lock() = (5, 1);
         tokio::time::timeout(
             Duration::from_secs(10),
-            super::lifecycle::catch_up(&index, &tracker, Some(&ReplayFrom::default())),
+            super::lifecycle::catch_up(&index, &tracker, Some(&ReplayFrom::default()), None),
         )
         .await?
         .map_err(anyhow::Error::msg)?;

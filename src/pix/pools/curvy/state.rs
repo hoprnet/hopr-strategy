@@ -365,6 +365,27 @@ pub trait CurvyDepositState: Send + Sync + 'static {
         cursor: &CurvyEventCursor,
     ) -> Result<(), CurvyStateError>;
 
+    /// Records an owned candidate, returning `true` only when it was not already present.
+    ///
+    /// The default is a check-then-record and is non-atomic; the Redb store overrides it and
+    /// returns the insert result from the same write transaction. The watcher is the only
+    /// inserter, so even the default is race-free inside the pool.
+    fn record_owned_candidate_if_new(
+        &self,
+        note_id: &str,
+        note: DetectedCurvyNote,
+        cursor: &CurvyEventCursor,
+    ) -> Result<bool, CurvyStateError> {
+        let key = note_id_key(note_id)?;
+        let existed = self
+            .owned_note_ids()?
+            .iter()
+            .filter_map(|id| note_id_key(id).ok())
+            .any(|existing| existing == key);
+        self.record_owned_candidate(note_id, note, cursor)?;
+        Ok(!existed)
+    }
+
     /// Marks a known note committed and advances the cursor atomically.
     fn record_completion(
         &self,
@@ -391,6 +412,25 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// Persists the Exit-side scan secret for `id`, generated with the deposit data for that
     /// allocation. Must be durable before the public half leaves the node.
     fn store_scan_secret(&self, id: &PixAddressId, secret: &CurvyScanSecret) -> Result<(), CurvyStateError>;
+
+    /// Returns the stored secret for `id`, inserting `generated` and recording its replay floors
+    /// when no secret exists yet.
+    ///
+    /// The default is a check-then-store and is non-atomic; the Redb store overrides it with one
+    /// write transaction. This is what makes two concurrent `generate_deposit_data` calls agree
+    /// on the secret whose public half is returned.
+    fn get_or_insert_scan_secret(
+        &self,
+        id: &PixAddressId,
+        generated: &CurvyScanSecret,
+    ) -> Result<CurvyScanSecret, CurvyStateError> {
+        if let Some(stored) = self.scan_secret(id)? {
+            return Ok(stored);
+        }
+        self.store_scan_secret(id, generated)?;
+        self.scan_secret(id)?
+            .ok_or_else(|| CurvyStateError::Corrupt("scan secret vanished during get-or-insert".to_owned()))
+    }
 
     /// The scan secret stored for `id`, if [`store_scan_secret`](Self::store_scan_secret) ran.
     fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError>;
@@ -549,6 +589,41 @@ impl RedbCurvyDepositState {
             .map_err(state_db_error)?;
         Ok(())
     }
+
+    fn record_owned_candidate_insert(
+        &self,
+        note_id: &str,
+        note: DetectedCurvyNote,
+        cursor: &CurvyEventCursor,
+    ) -> Result<bool, CurvyStateError> {
+        let id = note.deposit.id;
+        let note_id_key = note_id_key(note_id)?;
+        let owned_note_key = owned_note_key(&id, note_id)?;
+        let write = self.db.begin_write().map_err(state_db_error)?;
+        let inserted = {
+            let mut notes = write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
+            let inserted = notes.get(owned_note_key).map_err(state_db_error)?.is_none();
+            if inserted {
+                notes
+                    .insert(
+                        owned_note_key,
+                        encode_owned_note(&StoredOwnedNote {
+                            detected: note,
+                            committed: false,
+                            leaf_index: None,
+                        }),
+                    )
+                    .map_err(state_db_error)?;
+            }
+            let mut sessions = write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
+            sessions.insert(note_id_key, id_bytes(&id)).map_err(state_db_error)?;
+            let mut cursor_table = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
+            Self::put_cursor(&mut cursor_table, CurvyEventKind::Pending, cursor)?;
+            inserted
+        };
+        write.commit().map_err(state_db_error)?;
+        Ok(inserted)
+    }
 }
 
 impl CurvyDepositState for RedbCurvyDepositState {
@@ -568,30 +643,16 @@ impl CurvyDepositState for RedbCurvyDepositState {
         note: DetectedCurvyNote,
         cursor: &CurvyEventCursor,
     ) -> Result<(), CurvyStateError> {
-        let id = note.deposit.id;
-        let note_id_key = note_id_key(note_id)?;
-        let owned_note_key = owned_note_key(&id, note_id)?;
-        let write = self.db.begin_write().map_err(state_db_error)?;
-        {
-            let mut notes = write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
-            if notes.get(owned_note_key).map_err(state_db_error)?.is_none() {
-                notes
-                    .insert(
-                        owned_note_key,
-                        encode_owned_note(&StoredOwnedNote {
-                            detected: note,
-                            committed: false,
-                            leaf_index: None,
-                        }),
-                    )
-                    .map_err(state_db_error)?;
-            }
-            let mut sessions = write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
-            sessions.insert(note_id_key, id_bytes(&id)).map_err(state_db_error)?;
-            let mut cursor_table = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
-            Self::put_cursor(&mut cursor_table, CurvyEventKind::Pending, cursor)?;
-        }
-        write.commit().map_err(state_db_error)
+        self.record_owned_candidate_insert(note_id, note, cursor).map(|_| ())
+    }
+
+    fn record_owned_candidate_if_new(
+        &self,
+        note_id: &str,
+        note: DetectedCurvyNote,
+        cursor: &CurvyEventCursor,
+    ) -> Result<bool, CurvyStateError> {
+        self.record_owned_candidate_insert(note_id, note, cursor)
     }
 
     fn record_completion(
@@ -718,12 +779,13 @@ impl CurvyDepositState for RedbCurvyDepositState {
         let write = self.db.begin_write().map_err(state_db_error)?;
         {
             let mut table = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
-            let sealed = self
-                .sealer
-                .seal(&scan_secret_aad(id), secret.to_bytes().as_ref())
-                .map_err(state_db_error)?;
-            let existed = table.insert(id_bytes(id), sealed).map_err(state_db_error)?.is_some();
+            let existed = table.get(id_bytes(id)).map_err(state_db_error)?.is_some();
             if !existed {
+                let sealed = self
+                    .sealer
+                    .seal(&scan_secret_aad(id), secret.to_bytes().as_ref())
+                    .map_err(state_db_error)?;
+                table.insert(id_bytes(id), sealed).map_err(state_db_error)?;
                 let cursors = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
                 let mut floors = write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
                 for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
@@ -744,6 +806,51 @@ impl CurvyDepositState for RedbCurvyDepositState {
             }
         }
         write.commit().map_err(state_db_error)
+    }
+
+    fn get_or_insert_scan_secret(
+        &self,
+        id: &PixAddressId,
+        generated: &CurvyScanSecret,
+    ) -> Result<CurvyScanSecret, CurvyStateError> {
+        let write = self.db.begin_write().map_err(state_db_error)?;
+        let stored = {
+            let mut table = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+            if let Some(value) = table.get(id_bytes(id)).map_err(state_db_error)? {
+                let secret = self
+                    .sealer
+                    .open(&scan_secret_aad(id), &value.value())
+                    .map_err(|error| CurvyStateError::Corrupt(format!("sealed Curvy scan secret: {error}")))?;
+                CurvyScanSecret::try_from(secret.as_slice())
+                    .map_err(|error| CurvyStateError::Corrupt(format!("invalid stored Curvy scan secret: {error}")))?
+            } else {
+                let sealed = self
+                    .sealer
+                    .seal(&scan_secret_aad(id), generated.to_bytes().as_ref())
+                    .map_err(state_db_error)?;
+                table.insert(id_bytes(id), sealed).map_err(state_db_error)?;
+                let cursors = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
+                let mut floors = write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
+                for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+                    let Some(stored) = cursors.get(kind.cursor_key()).map_err(state_db_error)? else {
+                        continue;
+                    };
+                    let cursor = decode_cursor(&stored.value())?;
+                    let floor = match kind {
+                        CurvyEventKind::Pending => unanchored_before(&cursor)?,
+                        CurvyEventKind::Committed => Some(cursor),
+                    };
+                    if let Some(floor) = floor {
+                        floors
+                            .insert(replay_floor_key(id, kind), encode_cursor(&floor)?)
+                            .map_err(state_db_error)?;
+                    }
+                }
+                generated.clone()
+            }
+        };
+        write.commit().map_err(state_db_error)?;
+        Ok(stored)
     }
 
     fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError> {
