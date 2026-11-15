@@ -655,11 +655,40 @@ where
     }
 }
 
+/// Runs `phase` from `start`, and once more from [`unanchored_before`] `start` if it fails from
+/// an anchored start.
+///
+/// An anchored start (a durable cursor, or a committed replay floor) names a block, and the index
+/// refuses it once that block was reorganised away — on every pass, and again after a restart,
+/// since the start is persisted. The retry re-reads a margin of blocks before it without the
+/// anchor, so the events of replacement blocks are seen, the old position's included; a forward
+/// phase also replaces its durable cursor with canonical positions as it goes. The error cannot
+/// be told apart from an outage, so an outage costs one more query: a second failure is returned.
+async fn recovering_anchor<F, Fut>(
+    family: &'static str,
+    start: Option<CurvyEventCursor>,
+    mut phase: F,
+) -> Result<bool, String>
+where
+    F: FnMut(Option<CurvyEventCursor>) -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    let anchored = start.as_ref().filter(|cursor| cursor.block_hash.is_some()).cloned();
+    match (phase(start).await, anchored) {
+        (Err(error), Some(anchored)) => {
+            tracing::warn!(%error, family, "Curvy event start was rejected; rescanning from before it without its anchor");
+            phase(unanchored_before(&anchored).unwrap_or(None)).await
+        }
+        (result, _) => result,
+    }
+}
+
 /// One catch-up pass over both event families. See the module docs for the ordering.
 ///
 /// The forward phases consume what is new since the durable cursors; the replay phases, when
 /// `replay` is requested, then revisit the window `(replay start, durable cursor before this
 /// pass]` for the allocations registered since. All pending phases precede all committed ones.
+/// Every phase recovers from a start whose block was reorganised away: see [`recovering_anchor`].
 pub(super) async fn catch_up<I, S>(
     client: &I,
     tracker: &CurvyLifecycleTracker<S>,
@@ -673,20 +702,19 @@ where
         .state
         .cursor(CurvyEventKind::Pending)
         .map_err(|error| error.to_string())?;
-    let mut forward = pending_phase(client, tracker, p0.clone(), None, false).await;
-    if let (Err(error), Some(anchored)) = (&forward, p0.as_ref().filter(|cursor| cursor.block_hash.is_some())) {
-        // The anchor may be a block that was reorganised away, which the index rejects. Start
-        // again once, unanchored and a margin earlier, so the cursor is refreshed with canonical
-        // positions and notes that landed in replacement blocks are seen.
-        tracing::warn!(%error, "Curvy pending cursor was rejected; rescanning from before it without its anchor");
-        let from = unanchored_before(anchored).unwrap_or(None);
-        forward = pending_phase(client, tracker, from, None, false).await;
-    }
-    if !forward? {
+    let p0_end = p0.as_ref();
+    if !recovering_anchor("pending", p0.clone(), move |from| {
+        pending_phase(client, tracker, from, None, false)
+    })
+    .await?
+    {
         return Ok(());
     }
-    if let (Some(replay), Some(_)) = (replay, &p0)
-        && !pending_phase(client, tracker, replay.pending.clone(), p0.as_ref(), true).await?
+    if let (Some(replay), Some(_)) = (replay, p0_end)
+        && !recovering_anchor("pending", replay.pending.clone(), move |from| {
+            pending_phase(client, tracker, from, p0_end, true)
+        })
+        .await?
     {
         return Ok(());
     }
@@ -697,26 +725,18 @@ where
         .state
         .cursor(CurvyEventKind::Committed)
         .map_err(|error| error.to_string())?;
-    let mut forward = committed_phase(client, tracker, c0.clone(), None, finalized_through, false).await;
-    if let (Err(error), Some(anchored)) = (&forward, c0.as_ref().filter(|cursor| cursor.block_hash.is_some())) {
-        // As for the pending cursor, but the position stays: a leaf index must not be rewound.
-        tracing::warn!(%error, "Curvy committed cursor was rejected; retrying from the same position without its anchor");
-        let mut from = anchored.clone();
-        from.block_hash = None;
-        forward = committed_phase(client, tracker, Some(from), None, finalized_through, false).await;
-    }
-    if !forward? {
+    let c0_end = c0.as_ref();
+    if !recovering_anchor("committed", c0.clone(), move |from| {
+        committed_phase(client, tracker, from, None, finalized_through, false)
+    })
+    .await?
+    {
         return Ok(());
     }
-    if let (Some(replay), Some(_)) = (replay, &c0) {
-        committed_phase(
-            client,
-            tracker,
-            replay.committed.clone(),
-            c0.as_ref(),
-            finalized_through,
-            true,
-        )
+    if let (Some(replay), Some(_)) = (replay, c0_end) {
+        recovering_anchor("committed", replay.committed.clone(), move |from| {
+            committed_phase(client, tracker, from, c0_end, finalized_through, true)
+        })
         .await?;
     }
     Ok(())

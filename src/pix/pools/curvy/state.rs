@@ -73,8 +73,10 @@ pub(super) const LEGACY_SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::S
 const REPLAY_FLOOR_KEY_SIZE: usize = PixAddressId::SIZE + 1;
 const REPLAY_FLOORS_TABLE: TableDefinition<[u8; REPLAY_FLOOR_KEY_SIZE], Vec<u8>> =
     TableDefinition::new("curvy_pix_replay_floors");
-/// How many blocks before the pending cursor a new allocation's replay floor sits, so that a
-/// reorganisation cannot place the allocation's note just before the floor.
+/// How many blocks [`unanchored_before`] moves a position back: a new allocation's pending replay
+/// floor sits this far before the pending cursor, and a cursor whose block was reorganised away is
+/// rescanned from this far before it, so that a reorganisation cannot place an event just before
+/// either.
 const REPLAY_FLOOR_REORG_MARGIN: u64 = 64;
 const KDF_SALT_TABLE: TableDefinition<u8, [u8; 16]> = TableDefinition::new("curvy_pix_kdf_salt");
 const KDF_VERIFIER_TABLE: TableDefinition<u8, [u8; SEALED_32_SIZE]> = TableDefinition::new("curvy_pix_kdf_verifier");
@@ -112,11 +114,18 @@ fn state_db_error(error: impl std::fmt::Display) -> CurvyStateError {
     CurvyStateError::Database(error.to_string())
 }
 
-/// A position a reorg margin before `cursor`, without a block anchor; `None` when the cursor is
-/// within the margin of genesis.
+/// A position a reorg margin of blocks before `cursor`, without a block anchor; `None` (genesis)
+/// when the cursor is within the margin of genesis.
+///
+/// The event item index is kept. A chain-position source (Blokli) orders by block first, so it
+/// re-reads every event of the margin, the old position's replacements included. Curvy's indexer
+/// reads a committed cursor as that leaf index alone and serves finalized checkpoints only, so it
+/// resumes exactly where it was, rather than re-reading the tree or skipping its first leaf.
 pub(super) fn unanchored_before(cursor: &CurvyEventCursor) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
     let block = cursor_component(&cursor.block, "block")?;
-    Ok((block > REPLAY_FLOOR_REORG_MARGIN).then(|| CurvyEventCursor::new(block - REPLAY_FLOOR_REORG_MARGIN, 0, 0, 0)))
+    let item = cursor_component(&cursor.event_item_index, "event item index")?;
+    Ok((block > REPLAY_FLOOR_REORG_MARGIN)
+        .then(|| CurvyEventCursor::new(block - REPLAY_FLOOR_REORG_MARGIN, 0, 0, item)))
 }
 
 fn replay_floor_key(id: &PixAddressId, kind: CurvyEventKind) -> [u8; REPLAY_FLOOR_KEY_SIZE] {

@@ -46,7 +46,7 @@ use super::{
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker, ReplayFrom},
     sdk::{RsSdkCurvyAdapterError, ShieldResend},
-    state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
+    state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes, unanchored_before},
     token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
 };
@@ -498,6 +498,20 @@ fn replay_floors_are_recorded_once_and_cleared_with_the_secret() -> anyhow::Resu
     Ok(())
 }
 
+#[test]
+fn rewinding_a_cursor_drops_its_anchor_and_keeps_its_item_index() -> anyhow::Result<()> {
+    let mut anchored = CurvyEventCursor::new(1_000, 3, 2, 41);
+    anchored.block_hash = Some(Hex32(format!("0x{:064x}", 1_002)));
+    // A margin of blocks back, unanchored; the item index is what Curvy's indexer resumes from.
+    assert_eq!(
+        unanchored_before(&anchored)?,
+        Some(CurvyEventCursor::new(936, 0, 0, 41))
+    );
+    // Within the margin of genesis: from genesis.
+    assert_eq!(unanchored_before(&CurvyEventCursor::from(&position(64)))?, None);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
@@ -874,30 +888,81 @@ async fn a_reorged_pending_anchor_is_rescanned_unanchored() -> anyhow::Result<()
     Ok(())
 }
 
+/// A copy of `note` as a replacement block carries it after a reorganisation: same position, new
+/// block hash.
+fn in_replacement_block(mut note: CurvyCommittedNote) -> CurvyCommittedNote {
+    note.position.block_hash = Hex32(format!("0x{:064x}", 0xbeef_u64));
+    note
+}
+
 #[tokio::test]
-async fn a_reorged_committed_anchor_is_retried_at_the_same_position() -> anyhow::Result<()> {
+async fn a_reorged_committed_anchor_is_rescanned_from_before_it() -> anyhow::Result<()> {
     let state = Arc::new(RedbCurvyDepositState::in_memory()?);
-    let fixture = owned_candidate(4)?;
+    let fixture = owned_candidate(290)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
-    let stale = CurvyEventCursor::from(&position(5));
+    let stale = CurvyEventCursor::from(&position(300));
     state.advance_cursor(CurvyEventKind::Committed, &stale)?;
     let index = ScriptedIndex::default();
     *index.rejected_anchor.lock() = stale.block_hash.clone();
     index.pending.lock().push(fixture.note);
-    index.committed.lock().push(completion(&fixture.note_id, 6));
-    *index.head.lock() = (100, 1);
+    // The replacement block commits the note at the very position the stale cursor names, which
+    // resuming after that position would skip.
+    let replacement = in_replacement_block(completion(&fixture.note_id, 300));
+    index.committed.lock().push(replacement.clone());
+    *index.head.lock() = (400, 1);
 
-    super::lifecycle::catch_up(&index, &tracker, None)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    for _ in 0..2 {
+        super::lifecycle::catch_up(&index, &tracker, None)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
 
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
     assert_eq!(receiver.await?, ten());
-    // Retried after the same position (a leaf index is never rewound), not from genesis.
+    // Refreshed with the replacement's canonical position and anchor.
     assert_eq!(
         state.cursor(CurvyEventKind::Committed)?,
-        Some(CurvyEventCursor::from(&position(6)))
+        Some(CurvyEventCursor::from(&replacement.position))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reorged_committed_floor_is_replayed_from_before_it() -> anyhow::Result<()> {
+    let test = bounded_replay()?;
+    let receiver = test.tracker.watch(
+        test.fixture.id,
+        test.fixture.address,
+        test.fixture.scan_secret.clone(),
+        ten(),
+    )?;
+    // Read from the persisted floors, as after a restart: the committed one is anchored.
+    let replay = test.tracker.take_replay().expect("the registration requests a replay");
+    let floor = replay.committed.clone().expect("a committed floor");
+    assert!(floor.block_hash.is_some());
+    // The floor's block was reorganised away: the index refuses its anchor, and the replacement
+    // block commits the allocation's note at the very position the floor names.
+    *test.index.rejected_anchor.lock() = floor.block_hash.clone();
+    {
+        let mut committed = test.index.committed.lock();
+        committed.retain(|note| note.note_id.0 != test.window_note_id);
+        committed.insert(0, in_replacement_block(completion(&test.window_note_id, 200)));
+    }
+
+    // Every pass recovers, not only the first.
+    for _ in 0..2 {
+        super::lifecycle::catch_up(&test.index, &test.tracker, Some(&replay))
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    assert_eq!(test.state.committed_amount(&test.fixture.id)?, ten());
+    assert_eq!(receiver.await?, ten());
+    // The recovered replay held the durable cursors, as every replay does.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        assert_eq!(test.state.cursor(kind)?, Some(CurvyEventCursor::from(&position(350))));
+    }
     Ok(())
 }
 
