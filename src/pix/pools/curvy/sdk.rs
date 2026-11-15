@@ -108,6 +108,10 @@ const MAX_RELAY_TIMEOUTS_WITHOUT_PROGRESS: u8 = 3;
 /// A finality check runs once per call, with backoff between full snapshots.
 const RELAY_FINALITY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const RELAY_FINALITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long an allocation waits for the finalized notes tree it prefers committed funding from.
+/// The read only sharpens the choice of note, so a slow one is cut short and the choice is made
+/// without it.
+const FUNDING_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Transfers `amount` of wxHOPR to a shield portal, resolving once the transfer is confirmed.
 ///
@@ -3108,30 +3112,51 @@ where
             let minimum = client
                 .pix_minimum_input(&Fr::from(self.token().await?), total, relayer_amount)
                 .await?;
-            let funding = {
-                let state = self.state.lock();
-                let mut candidates = state
-                    .funding
+            let mut candidates = self
+                .state
+                .lock()
+                .funding
+                .iter()
+                .map(|stored| {
+                    let note = OwnedNote::try_from(stored)?;
+                    let amount = fr_to_biguint(&note.amount).try_into().map_err(|_| {
+                        RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned())
+                    })?;
+                    Ok((stored.clone(), note, amount))
+                })
+                .collect::<Result<Vec<(_, _, u128)>, RsSdkCurvyAdapterError>>()?;
+            candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.2));
+            // Only a choice between notes that each pay is worth the extra snapshot read.
+            let finalized = if candidates.iter().filter(|candidate| candidate.2 >= minimum).count() >= 2 {
+                Self::finalized_leaves(client).await
+            } else {
+                None
+            };
+            let largest = candidates.iter().find(|candidate| candidate.2 >= minimum);
+            // The build looks every input up in the finalized tree and refuses one it cannot find yet.
+            let committed = finalized.as_ref().and_then(|leaves| {
+                candidates
                     .iter()
-                    .map(|stored| {
-                        let note = OwnedNote::try_from(stored)?;
-                        let amount = fr_to_biguint(&note.amount).try_into().map_err(|_| {
-                            RsSdkCurvyAdapterError::InvalidValue("funding amount does not fit u128".to_owned())
-                        })?;
-                        Ok((stored.clone(), note, amount))
-                    })
-                    .collect::<Result<Vec<(_, _, u128)>, RsSdkCurvyAdapterError>>()?;
-                candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.2));
-                if let Some(single) = candidates.iter().find(|candidate| candidate.2 >= minimum) {
-                    vec![single.clone()]
-                } else {
-                    let selected = candidates.into_iter().take(MAX_ALLOCATION_INPUTS).collect::<Vec<_>>();
-                    let available = spendable_total(selected.iter().map(|candidate| candidate.2))?;
-                    if available < minimum {
-                        return Err(RsSdkCurvyAdapterError::NoFunding { required: minimum });
-                    }
-                    selected
+                    .find(|candidate| candidate.2 >= minimum && leaves.contains(&fr_to_dec(&candidate.1.note_id())))
+            });
+            if let (Some(committed), Some(largest)) = (committed, largest)
+                && committed.0 != largest.0
+            {
+                tracing::info!(
+                    spent = %HoprBalance::from(U256::from(committed.2)),
+                    largest = %HoprBalance::from(U256::from(largest.2)),
+                    "spending a funding note the finalized tree holds, not a larger one it does not hold yet"
+                );
+            }
+            let funding = if let Some(single) = committed.or(largest) {
+                vec![single.clone()]
+            } else {
+                let selected = candidates.into_iter().take(MAX_ALLOCATION_INPUTS).collect::<Vec<_>>();
+                let available = spendable_total(selected.iter().map(|candidate| candidate.2))?;
+                if available < minimum {
+                    return Err(RsSdkCurvyAdapterError::NoFunding { required: minimum });
                 }
+                selected
             };
             let allocation_records = chunk
                 .iter()
@@ -3164,6 +3189,24 @@ where
             receipts.extend(self.recover_pending().await?);
         }
         Ok(receipts)
+    }
+
+    /// The finalized tree's leaves, as the decimal note ids the SDK's build looks its inputs up by.
+    /// It is read only to choose between funding notes, so a failure is never an allocation
+    /// failure: the choice is then made as before and the build finds out for itself.
+    async fn finalized_leaves(client: &CurvyClient) -> Option<std::collections::HashSet<String>> {
+        match tokio::time::timeout(FUNDING_SNAPSHOT_TIMEOUT, client.notes.notes_tree_snapshot()).await {
+            Ok(Ok(Some(snapshot))) => Some(snapshot.leaves.into_iter().collect()),
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "could not read the finalized notes tree; choosing funding without it");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("timed out reading the finalized notes tree; choosing funding without it");
+                None
+            }
+        }
     }
 
     fn owned_note(note: &CommittedCurvyNote) -> Result<OwnedNote, RsSdkCurvyAdapterError> {
@@ -3970,6 +4013,169 @@ mod tests {
             "{error}"
         );
         assert!(crate::pix::pools::curvy::CurvyDepositPoolError::Adapter(error.into()).moved_no_funds());
+        Ok(())
+    }
+
+    /// A Blokli whose finalized tree holds exactly `leaves`, consistent with the aggregator's
+    /// state, with no fees, no paymaster and no fee collector: the minimum is the allocation
+    /// alone. The fee root is deliberately not the one the SDK rebuilds, so a build whose inputs
+    /// are all in the tree stops right after looking them up, before anything is proved. Also
+    /// returns how many `curvySyncCheckpoint` queries were made; the first `failing` of them
+    /// answer with an error instead of the checkpoint.
+    async fn finalized_tree_server(
+        leaves: Arc<parking_lot::Mutex<Vec<Fr>>>,
+        failing: usize,
+    ) -> (relayer::http_tests::Server, Arc<std::sync::atomic::AtomicUsize>) {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let hex = |value: &Fr| format!("0x{}", const_hex::encode(fr_to_be_32(value)));
+        let server = relayer::http_tests::Server::new(move |path, body| {
+            let query = body["query"].as_str().unwrap_or_default().to_owned();
+            let leaves = leaves.lock().clone();
+            let root = hex(&curvy_core::imt::Imt::from_leaves(30, &leaves).root());
+            Some(if path.starts_with("/relay/paymaster") {
+                (404, serde_json::Value::Null)
+            } else if path == "/protocol" {
+                (200, serde_json::json!({"data":{"feeCollector":null}}))
+            } else if query.contains("curvyVaultFees") {
+                (
+                    200,
+                    serde_json::json!({"data":{
+                        "curvyVaultFees":{"__typename":"CurvyVaultFees","depositFee":"0","withdrawalFee":"0"},
+                        "curvyAggregatorFees":{
+                            "__typename":"CurvyAggregatorFees","protocolFeePerThousand":"0",
+                            "commitmentFeeRoot":"0x01","feeNotePublicKey":["1","2"]
+                        },
+                        "curvyVaultTokenCount":{"__typename":"CurvyVaultTokenCount","count":"0"}
+                    }}),
+                )
+            } else if query.contains("curvySyncCheckpoint") {
+                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < failing {
+                    return Some((
+                        200,
+                        serde_json::json!({"data":{"curvySyncCheckpoint":{
+                            "__typename":"QueryFailedError","code":"INTERNAL","message":"the checkpoint is unavailable"
+                        }}}),
+                    ));
+                }
+                (
+                    200,
+                    serde_json::json!({"data":{"curvySyncCheckpoint":{
+                        "__typename":"CurvySyncCheckpoint","blockHash":"0x1234","blockNumber":"1",
+                        "noteCount":leaves.len(),"notesRoot":root,"treeDepth":30
+                    }}}),
+                )
+            } else if query.contains("curvySyncNotes") {
+                let notes = leaves
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| serde_json::json!({"leafIndex":index,"noteId":hex(id)}))
+                    .collect::<Vec<_>>();
+                (
+                    200,
+                    serde_json::json!({"data":{"curvySyncNotes":{
+                        "__typename":"CurvySyncNotePage","checkpoint":"0x1234",
+                        "total":notes.len(),"nextIndex":notes.len(),"notes":notes
+                    }}}),
+                )
+            } else if query.contains("curvyAggregatorState") {
+                (
+                    200,
+                    serde_json::json!({"data":{"curvyAggregatorState":{
+                        "__typename":"CurvyAggregatorState","notesTreeRoot":root,
+                        "noteIndex":leaves.len().to_string(),"notesBatchIndex":"0","nullifiersBatchIndex":"0"
+                    }}}),
+                )
+            } else {
+                (
+                    500,
+                    serde_json::json!({"error":format!("unexpected request to {path}: {query}")}),
+                )
+            })
+        })
+        .await;
+        (server, reads)
+    }
+
+    /// Funds a new adapter with a note of `committed` units that the finalized tree holds and a
+    /// fresh one of `fresh` units it does not hold yet, then allocates 7 units and returns the error the
+    /// build stops with and how many times the finalized tree's checkpoint was read by then. The
+    /// first `failing` reads fail.
+    async fn allocate_over_committed_and_fresh(
+        committed: u64,
+        fresh: u64,
+        failing: usize,
+    ) -> anyhow::Result<(String, usize)> {
+        let leaves = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (server, reads) = finalized_tree_server(leaves.clone(), failing).await;
+        let state = RedbCurvyDepositState::in_memory()?;
+        let adapter = test_adapter(&state, server.url.clone())?;
+        // Owned by the spender, so the SDK's ownership check passes and the build reaches the tree.
+        let note = |amount: u64| OwnedNote {
+            owner_pub: adapter.spender.bjj_pub,
+            shared_secret: Fr::from(amount),
+            ephemeral_key: (Fr::from(4u8), Fr::from(5u8)),
+            view_tag: 6,
+            amount: Fr::from(amount),
+            token: Fr::from(4u8),
+        };
+        let (committed, fresh) = (note(committed), note(fresh));
+        *leaves.lock() = vec![committed.note_id()];
+        {
+            let mut current = adapter.state.lock();
+            current.funding = vec![StoredNote::from(&committed), StoredNote::from(&fresh)];
+            adapter.store.save(&current)?;
+        }
+        let allocation = fixture(7);
+        let deposits = [(
+            allocation.deposit.id,
+            allocation.deposit.address,
+            scan_key("07", "0b")?,
+            allocation.deposit.amount,
+        )];
+        let error = adapter.allocate_all(&deposits).await.unwrap_err().to_string();
+        Ok((error, reads.load(std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    /// gnosis/gnosis_vpn#897: a top-up shielded a moment ago is the largest note, but not
+    /// spendable until the finalized tree holds it. An older note in that tree covers the
+    /// allocation, so the allocation must spend it rather than wait out the lag.
+    #[tokio::test]
+    async fn funding_selection_prefers_a_note_in_the_finalized_tree() -> anyhow::Result<()> {
+        let (error, reads) = allocate_over_committed_and_fresh(100, 1_000, 0).await?;
+        assert!(
+            !error.contains("not found in committed tree"),
+            "the note not yet in the tree was selected: {error}"
+        );
+        assert!(error.contains("rebuilt gas-fee root"), "{error}");
+        assert_eq!(reads, 2, "the selection's read and the build's own: {error}");
+        Ok(())
+    }
+
+    /// With no note in the finalized tree that covers the allocation on its own, the selection is
+    /// what it always was, and the caller waits out the tree lag on the fresh note. There is no
+    /// choice to make, so the tree is not read for one.
+    #[tokio::test]
+    async fn funding_selection_falls_back_without_a_committed_note_that_covers() -> anyhow::Result<()> {
+        let (error, reads) = allocate_over_committed_and_fresh(5, 1_000, 0).await?;
+        assert!(
+            error.contains("PIX aggregation input not found in committed tree"),
+            "{error}"
+        );
+        assert_eq!(reads, 1, "only the build reads the tree: {error}");
+        Ok(())
+    }
+
+    /// The read only sharpens the choice: when the finalized tree cannot be read, the selection
+    /// is what it always was rather than a failed allocation.
+    #[tokio::test]
+    async fn funding_selection_falls_back_when_the_finalized_tree_cannot_be_read() -> anyhow::Result<()> {
+        let (error, reads) = allocate_over_committed_and_fresh(100, 1_000, 1).await?;
+        assert!(
+            error.contains("PIX aggregation input not found in committed tree"),
+            "{error}"
+        );
+        assert_eq!(reads, 2, "the failed selection read and the build's own: {error}");
         Ok(())
     }
 
