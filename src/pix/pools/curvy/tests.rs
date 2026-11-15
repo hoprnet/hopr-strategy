@@ -44,7 +44,7 @@ use super::{
     CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
     CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
-    lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
+    lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker, ReplayFrom},
     sdk::{RsSdkCurvyAdapterError, ShieldResend},
     state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
     token::{VaultToken, VaultTokenTable},
@@ -443,6 +443,61 @@ fn wiping_chain_state_leaves_an_empty_usable_store() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn replay_floors_are_recorded_once_and_cleared_with_the_secret() -> anyhow::Result<()> {
+    let state = RedbCurvyDepositState::in_memory()?;
+    let id = pix_id(1);
+    let other = pix_id(2);
+    let secret = scan_secret("01", "02")?;
+    let floors = |id: &PixAddressId| -> Result<_, CurvyStateError> {
+        Ok((
+            state.replay_floor(id, CurvyEventKind::Pending)?,
+            state.replay_floor(id, CurvyEventKind::Committed)?,
+        ))
+    };
+
+    // No cursors yet: replay from genesis.
+    state.store_scan_secret(&id, &secret)?;
+    assert_eq!(floors(&id)?, (None, None));
+
+    // The pending floor is unanchored and a margin below; the committed one is verbatim.
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(100)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(7)))?;
+    state.store_scan_secret(&other, &secret)?;
+    let expected = (
+        Some(CurvyEventCursor::new(36, 0, 0, 0)),
+        Some(CurvyEventCursor::from(&position(7))),
+    );
+    assert_eq!(floors(&other)?, expected);
+    // An allocation stored before the cursors existed keeps its (absent) floors.
+    state.store_scan_secret(&id, &secret)?;
+    assert_eq!(floors(&id)?, (None, None));
+
+    // Storing the same secret again never overwrites the floors.
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(500)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(400)))?;
+    state.store_scan_secret(&other, &secret)?;
+    assert_eq!(floors(&other)?, expected);
+
+    // A cursor within the margin leaves no pending floor.
+    let near = pix_id(3);
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(64)))?;
+    state.store_scan_secret(&near, &secret)?;
+    assert_eq!(floors(&near)?.0, None);
+    assert!(floors(&near)?.1.is_some());
+
+    state.remove_scan_secret(&other)?;
+    assert_eq!(floors(&other)?, (None, None));
+
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(500)))?;
+    state.store_scan_secret(&other, &secret)?;
+    assert!(floors(&other)?.0.is_some());
+    state.wipe_chain_state()?;
+    assert_eq!(floors(&other)?, (None, None));
+    assert_eq!(floors(&near)?, (None, None));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
@@ -460,20 +515,22 @@ async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()>
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let receiver = tracker.watch(id, address, fixture.scan_secret.clone(), ten())?;
 
-    let unrelated_cursor = CurvyEventCursor::from(&position(1));
     let mut unrelated = fixture.note.clone();
     unrelated.note_id = Hex32(format!("0x{:064x}", 0));
     unrelated.position = position(1);
-    assert!(tracker.process_candidate(unrelated).await?);
-    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(unrelated_cursor));
+    // A foreign event writes no cursor of its own; the pass commits one per page.
+    assert!(tracker.process_candidate(unrelated, None).await?);
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
 
     let candidate_cursor = CurvyEventCursor::from(&position(2));
-    assert!(tracker.process_candidate(fixture.note).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(candidate_cursor));
     assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
 
     let completion_cursor = CurvyEventCursor::from(&position(3));
-    tracker.process_completion(completion(&fixture.note_id, 3)).await?;
+    tracker
+        .process_completion(completion(&fixture.note_id, 3), None)
+        .await?;
     assert_eq!(receiver.await?, ten());
     assert_eq!(state.cursor(CurvyEventKind::Committed)?, Some(completion_cursor));
     assert_eq!(state.committed_amount(&id)?, ten());
@@ -490,7 +547,7 @@ async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Resu
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
-    assert!(!tracker.process_candidate(fixture.note).await?);
+    assert!(!tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     Ok(())
 }
@@ -506,10 +563,10 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
     fixture.note.view_tag = 256;
-    let cursor = CurvyEventCursor::from(&fixture.note.position);
 
-    assert!(tracker.process_candidate(fixture.note).await?);
-    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
+    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+    assert!(state.owned_note_ids()?.is_empty());
     Ok(())
 }
 
@@ -531,7 +588,7 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
     // The lookup fails: the event is neither accepted nor skipped, so it is seen again.
     vault.reachable.store(false, Ordering::SeqCst);
     let error = tracker
-        .process_candidate(fixture.note.clone())
+        .process_candidate(fixture.note.clone(), None)
         .await
         .expect_err("the candidate cannot be judged without the token id");
     assert!(matches!(error, CurvyLifecycleError::VaultToken(_)), "{error}");
@@ -541,7 +598,7 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
     // Blokli is back: the same event is now recognised as the allocation it is.
     vault.reachable.store(true, Ordering::SeqCst);
     let cursor = CurvyEventCursor::from(&fixture.note.position);
-    assert!(tracker.process_candidate(fixture.note).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
     assert_eq!(state.owned_note_ids()?.len(), 1);
     Ok(())
@@ -559,7 +616,9 @@ fn registering_an_address_requests_a_historical_lifecycle_pass() -> anyhow::Resu
 
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
 
-    assert!(tracker.replay_history.load(Ordering::Acquire));
+    // No cursors yet, so no floors: the request is a replay from genesis.
+    assert_eq!(tracker.take_replay(), Some(ReplayFrom::default()));
+    assert_eq!(tracker.take_replay(), None);
     Ok(())
 }
 
@@ -574,16 +633,74 @@ fn interrupted_historical_pass_remains_requested() -> anyhow::Result<()> {
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
 
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
-    let replay_history = tracker.replay_history.swap(false, Ordering::AcqRel);
-    assert!(replay_history);
-    assert!(!tracker.replay_history.load(Ordering::Acquire));
+    let replay = tracker.take_replay();
+    assert!(replay.is_some());
+    assert_eq!(tracker.take_replay(), None);
 
-    tracker.restore_failed_replay(replay_history);
-    assert!(tracker.replay_history.load(Ordering::Acquire));
+    tracker.restore_failed_replay(replay);
+    assert!(tracker.replay.lock().is_some());
 
-    // A non-historical failure must not clear a newer registration's request.
-    tracker.restore_failed_replay(false);
-    assert!(tracker.replay_history.load(Ordering::Acquire));
+    // A failure of a pass that had no replay must not clear a newer registration's request.
+    tracker.restore_failed_replay(None);
+    assert!(tracker.replay.lock().is_some());
+    Ok(())
+}
+
+#[test]
+fn merged_replay_requests_keep_the_earlier_floor_and_genesis_wins() -> anyhow::Result<()> {
+    let at = |block: u64| Some(CurvyEventCursor::new(block, 0, 0, 0));
+    let fixture = owned_candidate(1)?;
+    let tracker = CurvyLifecycleTracker::new(
+        Arc::new(fixture.detector),
+        Arc::new(RedbCurvyDepositState::in_memory()?),
+    );
+    let merged = |first: ReplayFrom, second: ReplayFrom| {
+        tracker.restore_failed_replay(Some(first));
+        tracker.restore_failed_replay(Some(second));
+        tracker.take_replay().expect("a replay is requested")
+    };
+
+    let both = merged(
+        ReplayFrom {
+            pending: at(100),
+            committed: at(50),
+        },
+        ReplayFrom {
+            pending: at(80),
+            committed: at(60),
+        },
+    );
+    assert_eq!((both.pending, both.committed), (at(80), at(50)));
+
+    // Within a block, the later components order.
+    let tie = merged(
+        ReplayFrom {
+            pending: Some(CurvyEventCursor::new(5, 1, 0, 0)),
+            committed: None,
+        },
+        ReplayFrom {
+            pending: Some(CurvyEventCursor::new(5, 0, 9, 9)),
+            committed: at(1),
+        },
+    );
+    assert_eq!(tie.pending, Some(CurvyEventCursor::new(5, 0, 9, 9)));
+    // Genesis wins.
+    assert_eq!(tie.committed, None);
+
+    let mut garbled = CurvyEventCursor::new(1, 0, 0, 0);
+    garbled.block = Uint64("not a number".to_owned());
+    let unparsable = merged(
+        ReplayFrom {
+            pending: at(100),
+            committed: at(100),
+        },
+        ReplayFrom {
+            pending: Some(garbled),
+            committed: at(200),
+        },
+    );
+    assert_eq!(unparsable.pending, None);
+    assert_eq!(unparsable.committed, at(100));
     Ok(())
 }
 
@@ -599,30 +716,128 @@ async fn late_registration_replays_pending_and_committed_history() -> anyhow::Re
     let address = fixture.address;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
-    // A completion can be skipped while a different allocation is active,
-    // advancing the shared committed cursor before this allocation is known.
-    tracker.process_completion(completion(&fixture.note_id, 3)).await?;
-    assert_eq!(
-        state.cursor(CurvyEventKind::Committed)?,
-        Some(CurvyEventCursor::from(&position(3)))
-    );
-    assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
-
+    // Both shared cursors moved past this allocation's note while a different allocation was
+    // active, and the allocation has no replay floor: the replay starts at genesis.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(5)))?;
+    }
     let receiver = tracker.watch(id, address, fixture.scan_secret.clone(), ten())?;
-    let replay_history = tracker.replay_history.swap(false, Ordering::AcqRel);
-    assert!(replay_history);
-    assert_eq!(tracker.catch_up_cursor(CurvyEventKind::Pending, replay_history)?, None);
-    assert_eq!(
-        tracker.catch_up_cursor(CurvyEventKind::Committed, replay_history)?,
-        None
-    );
+    let replay = tracker.take_replay();
+    assert_eq!(replay, Some(ReplayFrom::default()));
 
-    // The worker performs these in this order during the historical pass.
-    assert!(tracker.process_candidate(fixture.note).await?);
-    tracker.process_completion(completion(&fixture.note_id, 3)).await?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    *index.head.lock() = (10, 1);
+    super::lifecycle::catch_up(&index, &tracker, replay.as_ref())
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(receiver.await?, ten());
     assert_eq!(state.committed_amount(&id)?, ten());
+    // The replay never rewound the durable cursors.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        assert_eq!(state.cursor(kind)?, Some(CurvyEventCursor::from(&position(5))));
+    }
+    Ok(())
+}
+
+/// An allocation registered after the shared cursors moved to block 300: its pending floor is
+/// block 136 (the margin below) and its committed floor the committed cursor at block 200.
+struct BoundedReplay {
+    state: Arc<RedbCurvyDepositState>,
+    tracker: CurvyLifecycleTracker<RedbCurvyDepositState>,
+    index: ScriptedIndex,
+    fixture: OwnedCandidateFixture,
+    /// Owned, but pending before the floor.
+    early_note_id: String,
+    /// Owned, pending inside `(floor, cursor]` and committed inside the committed window.
+    window_note_id: String,
+}
+
+fn bounded_replay() -> anyhow::Result<BoundedReplay> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(RsCoreCurvyNoteDetector::for_token(4)), state.clone());
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(200)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(200)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(300)))?;
+    }
+
+    let (early, early_note_id) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 10, 4, "5", 100)?;
+    let (window, window_note_id) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 10, 4, "6", 150)?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().extend([early, window]);
+    index.committed.lock().push(completion(&window_note_id, 250));
+    *index.head.lock() = (400, 1);
+    Ok(BoundedReplay {
+        state,
+        tracker,
+        index,
+        fixture,
+        early_note_id,
+        window_note_id,
+    })
+}
+
+#[tokio::test]
+async fn replay_is_bounded_by_the_floor_and_never_rewinds_the_cursors() -> anyhow::Result<()> {
+    let test = bounded_replay()?;
+    let receiver = test.tracker.watch(
+        test.fixture.id,
+        test.fixture.address,
+        test.fixture.scan_secret.clone(),
+        ten(),
+    )?;
+    let replay = test.tracker.take_replay();
+    assert_eq!(
+        replay,
+        Some(ReplayFrom {
+            pending: Some(CurvyEventCursor::new(136, 0, 0, 0)),
+            committed: Some(CurvyEventCursor::from(&position(200))),
+        })
+    );
+
+    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref())
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(receiver.await?, ten());
+    assert_eq!(test.state.committed_amount(&test.fixture.id)?, ten());
+    let owned = test.state.owned_note_ids()?;
+    assert_eq!(owned, vec![test.window_note_id.clone()]);
+    assert!(!owned.contains(&test.early_note_id));
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        assert_eq!(test.state.cursor(kind)?, Some(CurvyEventCursor::from(&position(300))));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_scans_new_notes_before_history() -> anyhow::Result<()> {
+    let test = bounded_replay()?;
+    let _receiver = test.tracker.watch(
+        test.fixture.id,
+        test.fixture.address,
+        test.fixture.scan_secret.clone(),
+        ten(),
+    )?;
+    let replay = test.tracker.take_replay();
+    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref())
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let asked: Vec<_> = test
+        .index
+        .pending_afters
+        .lock()
+        .iter()
+        .map(|after| after.as_ref().map(cursor_ordinal))
+        .collect();
+    // The durable cursor first (new notes), the floor second (history).
+    assert_eq!(asked, vec![Some((300, 0, 0, 0)), Some((136, 0, 0, 0))]);
     Ok(())
 }
 
@@ -667,6 +882,8 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 struct ScriptedIndex {
     fail_pending: std::sync::atomic::AtomicBool,
     pending_calls: std::sync::atomic::AtomicUsize,
+    /// The `after` of every `pending_notes` call, in order.
+    pending_afters: parking_lot::Mutex<Vec<Option<CurvyEventCursor>>>,
     snapshot_pending: bool,
     pending: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     /// Committed notes served as candidates, for a source whose pending view missed them.
@@ -705,6 +922,7 @@ impl CurvyIndexSource for ScriptedIndex {
         first: u32,
     ) -> Result<super::PendingNotesPage, String> {
         self.pending_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending_afters.lock().push(after.clone());
         if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("endpoint unavailable".to_owned());
         }
@@ -2648,7 +2866,7 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         *index.head.lock() = (5, 1);
         tokio::time::timeout(
             Duration::from_secs(10),
-            super::lifecycle::catch_up(&index, &tracker, true),
+            super::lifecycle::catch_up(&index, &tracker, Some(&ReplayFrom::default())),
         )
         .await?
         .map_err(anyhow::Error::msg)?;
@@ -2681,13 +2899,13 @@ async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Resul
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(index.pending_calls.load(Ordering::SeqCst), count);
-        assert!(tracker.replay_history.load(Ordering::SeqCst));
+        assert!(tracker.replay.lock().is_some());
     }
     index.fail_pending.store(false, Ordering::SeqCst);
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
     assert_eq!(index.pending_calls.load(Ordering::SeqCst), 6);
-    assert!(!tracker.replay_history.load(Ordering::SeqCst));
+    assert!(tracker.replay.lock().is_none());
     tokio::time::advance(Duration::from_millis(250)).await;
     tokio::task::yield_now().await;
     assert_eq!(index.pending_calls.load(Ordering::SeqCst), 7);
