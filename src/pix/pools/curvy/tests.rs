@@ -7,7 +7,7 @@
 //! shield, allocate and withdraw instead of proving and submitting it.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     num::NonZeroU32,
     sync::{
         Arc,
@@ -31,6 +31,7 @@ use hopr_api::{
     chain::{DepositPool, PoolTransferSource},
     node::{HasChainApi, PixAddressId, PixDepositData},
     types::{
+        chain::prelude::{CurvyErc777Payload, CurvyNote, Erc777Payload},
         crypto::prelude::{BjjKeypair, BjjPublicKey, Bn254Keypair, CurvyScanPublicKey, CurvyScanSecret, Keypair},
         crypto_random::Randomizable,
         internal::prelude::HoprPseudonym,
@@ -43,8 +44,9 @@ use super::{
     CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
     CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
-    lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker},
-    state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes},
+    lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker, ReplayFrom},
+    sdk::{RsSdkCurvyAdapterError, ShieldResend},
+    state::{LEGACY_SCAN_SECRETS_TABLE, SCAN_SECRETS_TABLE, TEST_PASSWORD, id_bytes, unanchored_before},
     token::{VaultToken, VaultTokenTable},
     validate_mode_requirements,
 };
@@ -441,6 +443,75 @@ fn wiping_chain_state_leaves_an_empty_usable_store() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn replay_floors_are_recorded_once_and_cleared_with_the_secret() -> anyhow::Result<()> {
+    let state = RedbCurvyDepositState::in_memory()?;
+    let id = pix_id(1);
+    let other = pix_id(2);
+    let secret = scan_secret("01", "02")?;
+    let floors = |id: &PixAddressId| -> Result<_, CurvyStateError> {
+        Ok((
+            state.replay_floor(id, CurvyEventKind::Pending)?,
+            state.replay_floor(id, CurvyEventKind::Committed)?,
+        ))
+    };
+
+    // No cursors yet: replay from genesis.
+    state.store_scan_secret(&id, &secret)?;
+    assert_eq!(floors(&id)?, (None, None));
+
+    // The pending floor is unanchored and a margin below; the committed one is verbatim.
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(100)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(7)))?;
+    state.store_scan_secret(&other, &secret)?;
+    let expected = (
+        Some(CurvyEventCursor::new(36, 0, 0, 0)),
+        Some(CurvyEventCursor::from(&position(7))),
+    );
+    assert_eq!(floors(&other)?, expected);
+    // An allocation stored before the cursors existed keeps its (absent) floors.
+    state.store_scan_secret(&id, &secret)?;
+    assert_eq!(floors(&id)?, (None, None));
+
+    // Storing the same secret again never overwrites the floors.
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(500)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(400)))?;
+    state.store_scan_secret(&other, &secret)?;
+    assert_eq!(floors(&other)?, expected);
+
+    // A cursor within the margin leaves no pending floor.
+    let near = pix_id(3);
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(64)))?;
+    state.store_scan_secret(&near, &secret)?;
+    assert_eq!(floors(&near)?.0, None);
+    assert!(floors(&near)?.1.is_some());
+
+    state.remove_scan_secret(&other)?;
+    assert_eq!(floors(&other)?, (None, None));
+
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(500)))?;
+    state.store_scan_secret(&other, &secret)?;
+    assert!(floors(&other)?.0.is_some());
+    state.wipe_chain_state()?;
+    assert_eq!(floors(&other)?, (None, None));
+    assert_eq!(floors(&near)?, (None, None));
+    Ok(())
+}
+
+#[test]
+fn rewinding_a_cursor_drops_its_anchor_and_keeps_its_item_index() -> anyhow::Result<()> {
+    let mut anchored = CurvyEventCursor::new(1_000, 3, 2, 41);
+    anchored.block_hash = Some(Hex32(format!("0x{:064x}", 1_002)));
+    // A margin of blocks back, unanchored; the item index is what Curvy's indexer resumes from.
+    assert_eq!(
+        unanchored_before(&anchored)?,
+        Some(CurvyEventCursor::new(936, 0, 0, 41))
+    );
+    // Within the margin of genesis: from genesis.
+    assert_eq!(unanchored_before(&CurvyEventCursor::from(&position(64)))?, None);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
@@ -458,20 +529,22 @@ async fn tracker_filters_correlates_and_notifies_locally() -> anyhow::Result<()>
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let receiver = tracker.watch(id, address, fixture.scan_secret.clone(), ten())?;
 
-    let unrelated_cursor = CurvyEventCursor::from(&position(1));
     let mut unrelated = fixture.note.clone();
     unrelated.note_id = Hex32(format!("0x{:064x}", 0));
     unrelated.position = position(1);
-    assert!(tracker.process_candidate(unrelated).await?);
-    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(unrelated_cursor));
+    // A foreign event writes no cursor of its own; the pass commits one per page.
+    assert!(tracker.process_candidate(unrelated, None).await?);
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
 
     let candidate_cursor = CurvyEventCursor::from(&position(2));
-    assert!(tracker.process_candidate(fixture.note).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(candidate_cursor));
     assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
 
     let completion_cursor = CurvyEventCursor::from(&position(3));
-    tracker.process_completion(completion(&fixture.note_id, 3)).await?;
+    tracker
+        .process_completion(completion(&fixture.note_id, 3), None)
+        .await?;
     assert_eq!(receiver.await?, ten());
     assert_eq!(state.cursor(CurvyEventKind::Committed)?, Some(completion_cursor));
     assert_eq!(state.committed_amount(&id)?, ten());
@@ -488,7 +561,7 @@ async fn tracker_does_not_advance_without_registered_addresses() -> anyhow::Resu
     let fixture = owned_candidate(1)?;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
-    assert!(!tracker.process_candidate(fixture.note).await?);
+    assert!(!tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
     Ok(())
 }
@@ -504,10 +577,10 @@ async fn tracker_quarantines_malformed_public_candidates() -> anyhow::Result<()>
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
     fixture.note.view_tag = 256;
-    let cursor = CurvyEventCursor::from(&fixture.note.position);
 
-    assert!(tracker.process_candidate(fixture.note).await?);
-    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
+    assert!(tracker.process_candidate(fixture.note, None).await?);
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+    assert!(state.owned_note_ids()?.is_empty());
     Ok(())
 }
 
@@ -529,7 +602,7 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
     // The lookup fails: the event is neither accepted nor skipped, so it is seen again.
     vault.reachable.store(false, Ordering::SeqCst);
     let error = tracker
-        .process_candidate(fixture.note.clone())
+        .process_candidate(fixture.note.clone(), None)
         .await
         .expect_err("the candidate cannot be judged without the token id");
     assert!(matches!(error, CurvyLifecycleError::VaultToken(_)), "{error}");
@@ -539,7 +612,7 @@ async fn tracker_resolves_the_vault_token_before_judging_a_candidate() -> anyhow
     // Blokli is back: the same event is now recognised as the allocation it is.
     vault.reachable.store(true, Ordering::SeqCst);
     let cursor = CurvyEventCursor::from(&fixture.note.position);
-    assert!(tracker.process_candidate(fixture.note).await?);
+    assert!(tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(cursor));
     assert_eq!(state.owned_note_ids()?.len(), 1);
     Ok(())
@@ -557,7 +630,9 @@ fn registering_an_address_requests_a_historical_lifecycle_pass() -> anyhow::Resu
 
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
 
-    assert!(tracker.replay_history.load(Ordering::Acquire));
+    // No cursors yet, so no floors: the request is a replay from genesis.
+    assert_eq!(tracker.take_replay(), Some(ReplayFrom::default()));
+    assert_eq!(tracker.take_replay(), None);
     Ok(())
 }
 
@@ -572,16 +647,74 @@ fn interrupted_historical_pass_remains_requested() -> anyhow::Result<()> {
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
 
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
-    let replay_history = tracker.replay_history.swap(false, Ordering::AcqRel);
-    assert!(replay_history);
-    assert!(!tracker.replay_history.load(Ordering::Acquire));
+    let replay = tracker.take_replay();
+    assert!(replay.is_some());
+    assert_eq!(tracker.take_replay(), None);
 
-    tracker.restore_failed_replay(replay_history);
-    assert!(tracker.replay_history.load(Ordering::Acquire));
+    tracker.restore_failed_replay(replay);
+    assert!(tracker.replay.lock().is_some());
 
-    // A non-historical failure must not clear a newer registration's request.
-    tracker.restore_failed_replay(false);
-    assert!(tracker.replay_history.load(Ordering::Acquire));
+    // A failure of a pass that had no replay must not clear a newer registration's request.
+    tracker.restore_failed_replay(None);
+    assert!(tracker.replay.lock().is_some());
+    Ok(())
+}
+
+#[test]
+fn merged_replay_requests_keep_the_earlier_floor_and_genesis_wins() -> anyhow::Result<()> {
+    let at = |block: u64| Some(CurvyEventCursor::new(block, 0, 0, 0));
+    let fixture = owned_candidate(1)?;
+    let tracker = CurvyLifecycleTracker::new(
+        Arc::new(fixture.detector),
+        Arc::new(RedbCurvyDepositState::in_memory()?),
+    );
+    let merged = |first: ReplayFrom, second: ReplayFrom| {
+        tracker.restore_failed_replay(Some(first));
+        tracker.restore_failed_replay(Some(second));
+        tracker.take_replay().expect("a replay is requested")
+    };
+
+    let both = merged(
+        ReplayFrom {
+            pending: at(100),
+            committed: at(50),
+        },
+        ReplayFrom {
+            pending: at(80),
+            committed: at(60),
+        },
+    );
+    assert_eq!((both.pending, both.committed), (at(80), at(50)));
+
+    // Within a block, the later components order.
+    let tie = merged(
+        ReplayFrom {
+            pending: Some(CurvyEventCursor::new(5, 1, 0, 0)),
+            committed: None,
+        },
+        ReplayFrom {
+            pending: Some(CurvyEventCursor::new(5, 0, 9, 9)),
+            committed: at(1),
+        },
+    );
+    assert_eq!(tie.pending, Some(CurvyEventCursor::new(5, 0, 9, 9)));
+    // Genesis wins.
+    assert_eq!(tie.committed, None);
+
+    let mut garbled = CurvyEventCursor::new(1, 0, 0, 0);
+    garbled.block = Uint64("not a number".to_owned());
+    let unparsable = merged(
+        ReplayFrom {
+            pending: at(100),
+            committed: at(100),
+        },
+        ReplayFrom {
+            pending: Some(garbled),
+            committed: at(200),
+        },
+    );
+    assert_eq!(unparsable.pending, None);
+    assert_eq!(unparsable.committed, at(100));
     Ok(())
 }
 
@@ -597,30 +730,370 @@ async fn late_registration_replays_pending_and_committed_history() -> anyhow::Re
     let address = fixture.address;
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
 
-    // A completion can be skipped while a different allocation is active,
-    // advancing the shared committed cursor before this allocation is known.
-    tracker.process_completion(completion(&fixture.note_id, 3)).await?;
-    assert_eq!(
-        state.cursor(CurvyEventKind::Committed)?,
-        Some(CurvyEventCursor::from(&position(3)))
-    );
-    assert_eq!(state.committed_amount(&id)?, HoprBalance::zero());
-
+    // Both shared cursors moved past this allocation's note while a different allocation was
+    // active, and the allocation has no replay floor: the replay starts at genesis.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(5)))?;
+    }
     let receiver = tracker.watch(id, address, fixture.scan_secret.clone(), ten())?;
-    let replay_history = tracker.replay_history.swap(false, Ordering::AcqRel);
-    assert!(replay_history);
-    assert_eq!(tracker.catch_up_cursor(CurvyEventKind::Pending, replay_history)?, None);
-    assert_eq!(
-        tracker.catch_up_cursor(CurvyEventKind::Committed, replay_history)?,
-        None
-    );
+    let replay = tracker.take_replay();
+    assert_eq!(replay, Some(ReplayFrom::default()));
 
-    // The worker performs these in this order during the historical pass.
-    assert!(tracker.process_candidate(fixture.note).await?);
-    tracker.process_completion(completion(&fixture.note_id, 3)).await?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    *index.head.lock() = (10, 1);
+    super::lifecycle::catch_up(&index, &tracker, replay.as_ref())
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     assert_eq!(receiver.await?, ten());
     assert_eq!(state.committed_amount(&id)?, ten());
+    // The replay never rewound the durable cursors.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        assert_eq!(state.cursor(kind)?, Some(CurvyEventCursor::from(&position(5))));
+    }
+    Ok(())
+}
+
+/// An allocation registered after the shared cursors moved to block 300: its pending floor is
+/// block 136 (the margin below) and its committed floor the committed cursor at block 200.
+struct BoundedReplay {
+    state: Arc<RedbCurvyDepositState>,
+    tracker: CurvyLifecycleTracker<RedbCurvyDepositState>,
+    index: ScriptedIndex,
+    fixture: OwnedCandidateFixture,
+    /// Owned, but pending before the floor.
+    early_note_id: String,
+    /// Owned, pending inside `(floor, cursor]` and committed inside the committed window.
+    window_note_id: String,
+}
+
+fn bounded_replay() -> anyhow::Result<BoundedReplay> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(RsCoreCurvyNoteDetector::for_token(4)), state.clone());
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(200)))?;
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(200)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(300)))?;
+    }
+
+    let (early, early_note_id) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 10, 4, "5", 100)?;
+    let (window, window_note_id) = pending_note_for(&fixture.scan_secret.public(), &fixture.address, 10, 4, "6", 150)?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().extend([early, window]);
+    // Foreign events after the cursors: new to the forward phases, beyond the replay windows.
+    let mut foreign = owned_candidate(350)?.note;
+    foreign.view_tag = -1;
+    index.pending.lock().push(foreign);
+    index.committed.lock().push(completion(&window_note_id, 250));
+    index.committed.lock().push(completion(&format!("0x{:064x}", 99), 350));
+    *index.head.lock() = (400, 1);
+    Ok(BoundedReplay {
+        state,
+        tracker,
+        index,
+        fixture,
+        early_note_id,
+        window_note_id,
+    })
+}
+
+#[tokio::test]
+async fn replay_is_bounded_by_the_floor_and_never_rewinds_the_cursors() -> anyhow::Result<()> {
+    let test = bounded_replay()?;
+    let receiver = test.tracker.watch(
+        test.fixture.id,
+        test.fixture.address,
+        test.fixture.scan_secret.clone(),
+        ten(),
+    )?;
+    let replay = test.tracker.take_replay();
+    assert_eq!(
+        replay,
+        Some(ReplayFrom {
+            pending: Some(CurvyEventCursor::new(136, 0, 0, 0)),
+            committed: Some(CurvyEventCursor::from(&position(200))),
+        })
+    );
+
+    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref())
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(receiver.await?, ten());
+    assert_eq!(test.state.committed_amount(&test.fixture.id)?, ten());
+    let owned = test.state.owned_note_ids()?;
+    assert_eq!(owned, vec![test.window_note_id.clone()]);
+    assert!(!owned.contains(&test.early_note_id));
+    // The forward phases moved on over the foreign events; the replays held that cursor.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        assert_eq!(test.state.cursor(kind)?, Some(CurvyEventCursor::from(&position(350))));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_scans_new_notes_before_history() -> anyhow::Result<()> {
+    let test = bounded_replay()?;
+    let _receiver = test.tracker.watch(
+        test.fixture.id,
+        test.fixture.address,
+        test.fixture.scan_secret.clone(),
+        ten(),
+    )?;
+    let replay = test.tracker.take_replay();
+    super::lifecycle::catch_up(&test.index, &test.tracker, replay.as_ref())
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let asked: Vec<_> = test
+        .index
+        .pending_afters
+        .lock()
+        .iter()
+        .map(|after| after.as_ref().map(cursor_ordinal))
+        .collect();
+    // The durable cursor first (new notes), the floor second (history).
+    assert_eq!(asked, vec![Some((300, 0, 0, 0)), Some((136, 0, 0, 0))]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reorged_pending_anchor_is_rescanned_unanchored() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(290)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+    let stale = CurvyEventCursor::from(&position(300));
+    state.advance_cursor(CurvyEventKind::Pending, &stale)?;
+    let index = ScriptedIndex::default();
+    *index.rejected_anchor.lock() = stale.block_hash.clone();
+    // Inside the margin before the stale cursor, so only the rewound rescan sees it.
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 295));
+    *index.head.lock() = (400, 1);
+
+    for _ in 0..2 {
+        super::lifecycle::catch_up(&index, &tracker, None)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    assert_eq!(receiver.await?, ten());
+    let cursor = state.cursor(CurvyEventKind::Pending)?.expect("a pending cursor");
+    assert_ne!(cursor.block_hash, stale.block_hash);
+    Ok(())
+}
+
+/// A copy of `note` as a replacement block carries it after a reorganisation: same position, new
+/// block hash.
+fn in_replacement_block(mut note: CurvyCommittedNote) -> CurvyCommittedNote {
+    note.position.block_hash = Hex32(format!("0x{:064x}", 0xbeef_u64));
+    note
+}
+
+#[tokio::test]
+async fn a_reorged_committed_anchor_is_rescanned_from_before_it() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(290)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+    let stale = CurvyEventCursor::from(&position(300));
+    state.advance_cursor(CurvyEventKind::Committed, &stale)?;
+    let index = ScriptedIndex::default();
+    *index.rejected_anchor.lock() = stale.block_hash.clone();
+    index.pending.lock().push(fixture.note);
+    // The replacement block commits the note at the very position the stale cursor names, which
+    // resuming after that position would skip.
+    let replacement = in_replacement_block(completion(&fixture.note_id, 300));
+    index.committed.lock().push(replacement.clone());
+    *index.head.lock() = (400, 1);
+
+    for _ in 0..2 {
+        super::lifecycle::catch_up(&index, &tracker, None)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    assert_eq!(receiver.await?, ten());
+    // Refreshed with the replacement's canonical position and anchor.
+    assert_eq!(
+        state.cursor(CurvyEventKind::Committed)?,
+        Some(CurvyEventCursor::from(&replacement.position))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reorged_committed_floor_is_replayed_from_before_it() -> anyhow::Result<()> {
+    let test = bounded_replay()?;
+    let receiver = test.tracker.watch(
+        test.fixture.id,
+        test.fixture.address,
+        test.fixture.scan_secret.clone(),
+        ten(),
+    )?;
+    // Read from the persisted floors, as after a restart: the committed one is anchored.
+    let replay = test.tracker.take_replay().expect("the registration requests a replay");
+    let floor = replay.committed.clone().expect("a committed floor");
+    assert!(floor.block_hash.is_some());
+    // The floor's block was reorganised away: the index refuses its anchor, and the replacement
+    // block commits the allocation's note at the very position the floor names.
+    *test.index.rejected_anchor.lock() = floor.block_hash.clone();
+    {
+        let mut committed = test.index.committed.lock();
+        committed.retain(|note| note.note_id.0 != test.window_note_id);
+        committed.insert(0, in_replacement_block(completion(&test.window_note_id, 200)));
+    }
+
+    // Every pass recovers, not only the first.
+    for _ in 0..2 {
+        super::lifecycle::catch_up(&test.index, &test.tracker, Some(&replay))
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    assert_eq!(test.state.committed_amount(&test.fixture.id)?, ten());
+    assert_eq!(receiver.await?, ten());
+    // The recovered replay held the durable cursors, as every replay does.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        assert_eq!(test.state.cursor(kind)?, Some(CurvyEventCursor::from(&position(350))));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow::Result<()> {
+    let new_tracker = || -> anyhow::Result<_> {
+        let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+        let fixture = owned_candidate(2)?;
+        let tracker = CurvyLifecycleTracker::new(Arc::new(RsCoreCurvyNoteDetector::for_token(4)), state.clone());
+        // Registered and then abandoned: nobody is waiting.
+        drop(tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?);
+        assert!(tracker.watched_allocations().is_empty());
+        Ok((state, tracker, fixture))
+    };
+
+    // Pending forward.
+    let (state, tracker, fixture) = new_tracker()?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note.clone());
+    super::lifecycle::catch_up(&index, &tracker, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, None);
+
+    // Pending replay: nothing new after the cursor, a note inside the replay window.
+    let (state, tracker, fixture) = new_tracker()?;
+    let held = CurvyEventCursor::from(&position(300));
+    state.advance_cursor(CurvyEventKind::Pending, &held)?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note.clone());
+    let replay = ReplayFrom::default();
+    super::lifecycle::catch_up(&index, &tracker, Some(&replay))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.cursor(CurvyEventKind::Pending)?, Some(held));
+    assert!(state.owned_note_ids()?.is_empty());
+
+    // Committed forward: a committed page whose candidates meet the empty watch set.
+    let (state, tracker, fixture) = new_tracker()?;
+    let index = ScriptedIndex::default();
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    index.committed_candidates.lock().push(fixture.note);
+    *index.head.lock() = (10, 1);
+    super::lifecycle::catch_up(&index, &tracker, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.cursor(CurvyEventKind::Committed)?, None);
+    assert!(state.owned_note_ids()?.is_empty());
+    Ok(())
+}
+
+/// A store that keeps no replay floors, like an external implementation written before they
+/// existed: it delegates everything and leaves `replay_floor` at its default.
+struct FloorlessState(RedbCurvyDepositState);
+
+impl CurvyDepositState for FloorlessState {
+    fn cursor(&self, kind: CurvyEventKind) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+        self.0.cursor(kind)
+    }
+
+    fn record_owned_candidate(
+        &self,
+        note_id: &str,
+        note: DetectedCurvyNote,
+        cursor: &CurvyEventCursor,
+    ) -> Result<(), CurvyStateError> {
+        self.0.record_owned_candidate(note_id, note, cursor)
+    }
+
+    fn record_completion(
+        &self,
+        note_id: &str,
+        leaf_index: u64,
+        cursor: &CurvyEventCursor,
+    ) -> Result<Option<CommittedCurvyNote>, CurvyStateError> {
+        self.0.record_completion(note_id, leaf_index, cursor)
+    }
+
+    fn advance_cursor(&self, kind: CurvyEventKind, cursor: &CurvyEventCursor) -> Result<(), CurvyStateError> {
+        self.0.advance_cursor(kind, cursor)
+    }
+
+    fn committed_amount(&self, id: &PixAddressId) -> Result<HoprBalance, CurvyStateError> {
+        self.0.committed_amount(id)
+    }
+
+    fn committed_notes(&self, id: &PixAddressId) -> Result<Vec<CommittedCurvyNote>, CurvyStateError> {
+        self.0.committed_notes(id)
+    }
+
+    fn remove_spent_notes(&self, id: &PixAddressId, note_ids: &[String]) -> Result<(), CurvyStateError> {
+        self.0.remove_spent_notes(id, note_ids)
+    }
+
+    fn owned_note_ids(&self) -> Result<Vec<String>, CurvyStateError> {
+        self.0.owned_note_ids()
+    }
+
+    fn store_scan_secret(&self, id: &PixAddressId, secret: &CurvyScanSecret) -> Result<(), CurvyStateError> {
+        self.0.store_scan_secret(id, secret)
+    }
+
+    fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError> {
+        self.0.scan_secret(id)
+    }
+
+    fn remove_scan_secret(&self, id: &PixAddressId) -> Result<(), CurvyStateError> {
+        self.0.remove_scan_secret(id)
+    }
+
+    fn wipe_chain_state(&self) -> Result<(), CurvyStateError> {
+        self.0.wipe_chain_state()
+    }
+}
+
+#[test]
+fn a_store_without_replay_floors_replays_from_genesis() -> anyhow::Result<()> {
+    let inner = RedbCurvyDepositState::in_memory()?;
+    let fixture = owned_candidate(1)?;
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        inner.advance_cursor(kind, &CurvyEventCursor::from(&position(300)))?;
+    }
+    inner.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    // The inner store does keep a floor; the wrapper does not expose it.
+    assert!(inner.replay_floor(&fixture.id, CurvyEventKind::Committed)?.is_some());
+    let state = Arc::new(FloorlessState(inner));
+    assert_eq!(state.replay_floor(&fixture.id, CurvyEventKind::Pending)?, None);
+
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    assert_eq!(tracker.take_replay(), Some(ReplayFrom::default()));
     Ok(())
 }
 
@@ -665,6 +1138,10 @@ fn deposit_data_round_trips_through_the_wire_form() -> anyhow::Result<()> {
 struct ScriptedIndex {
     fail_pending: std::sync::atomic::AtomicBool,
     pending_calls: std::sync::atomic::AtomicUsize,
+    /// The `after` of every `pending_notes` call, in order.
+    pending_afters: parking_lot::Mutex<Vec<Option<CurvyEventCursor>>>,
+    /// A block anchor the index refuses, as it would one whose block was reorganised away.
+    rejected_anchor: parking_lot::Mutex<Option<Hex32>>,
     snapshot_pending: bool,
     pending: parking_lot::Mutex<Vec<CurvyPendingNote>>,
     /// Committed notes served as candidates, for a source whose pending view missed them.
@@ -695,6 +1172,16 @@ fn cursor_ordinal(cursor: &CurvyEventCursor) -> (u64, u64, u64, u64) {
     )
 }
 
+impl ScriptedIndex {
+    fn check_anchor(&self, after: Option<&CurvyEventCursor>) -> Result<(), String> {
+        let rejected = self.rejected_anchor.lock();
+        match (after.and_then(|cursor| cursor.block_hash.as_ref()), rejected.as_ref()) {
+            (Some(anchor), Some(rejected)) if anchor == rejected => Err("unknown block hash".to_owned()),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[async_trait]
 impl CurvyIndexSource for ScriptedIndex {
     async fn pending_notes(
@@ -703,6 +1190,8 @@ impl CurvyIndexSource for ScriptedIndex {
         first: u32,
     ) -> Result<super::PendingNotesPage, String> {
         self.pending_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending_afters.lock().push(after.clone());
+        self.check_anchor(after.as_ref())?;
         if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("endpoint unavailable".to_owned());
         }
@@ -730,6 +1219,7 @@ impl CurvyIndexSource for ScriptedIndex {
         after: Option<CurvyEventCursor>,
         first: u32,
     ) -> Result<Vec<CurvyCommittedNote>, String> {
+        self.check_anchor(after.as_ref())?;
         let after = after.as_ref().map(cursor_ordinal);
         Ok(self
             .committed
@@ -775,10 +1265,19 @@ impl CurvyIndexSource for ScriptedIndex {
 }
 
 /// Records what the pool asked of the SDK instead of proving and submitting it.
+///
+/// Fails with the SDK adapter's own error type, so that what the pool tells apart by type — a
+/// settling direct shield — can be scripted as well as what it tells apart by text.
 #[derive(Default)]
 struct RecordingAdapter {
     funded: parking_lot::Mutex<Vec<(HoprBalance, Address)>>,
+    /// What each `fund` call was allowed to do with a shield whose grace is over, in order.
+    resends: parking_lot::Mutex<Vec<ShieldResend>>,
     funding_finality_failures: parking_lot::Mutex<usize>,
+    /// What the upcoming `fund` calls fail with, in order, before `fund` succeeds.
+    fund_failures: parking_lot::Mutex<VecDeque<RsSdkCurvyAdapterError>>,
+    /// What `fund` has added, which is what `available_balance` reports.
+    available: parking_lot::Mutex<HoprBalance>,
     /// How many upcoming `allocate` calls answer "not in the committed tree yet".
     tree_lag_failures: parking_lot::Mutex<usize>,
     /// Every `allocate` call, successful or not.
@@ -806,6 +1305,11 @@ impl RecordingAdapter {
 #[error("{0}")]
 struct ScriptedFailure(String);
 
+/// An SDK failure that only carries text, as the SDK's own `anyhow` errors do.
+fn sdk_failure(message: &str) -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("{message}"))
+}
+
 /// What the SDK reports while the funding note is committed on chain but not yet in the tree the
 /// SDK rebuilds from its (finalized) snapshot.
 const TREE_LAG: &str = "Curvy SDK operation failed: PIX aggregation input not found in committed tree";
@@ -816,32 +1320,30 @@ const INDEX_LAG: &str = "Curvy SDK operation failed: sync: index did not reconci
 
 #[async_trait]
 impl CurvySdkAdapter for RecordingAdapter {
-    type Error = ScriptedFailure;
+    type Error = RsSdkCurvyAdapterError;
 
-    async fn ensure_funded(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
+    async fn fund(
+        &self,
+        gross: HoprBalance,
+        recovery_address: Address,
+        resend: ShieldResend,
+    ) -> Result<(), Self::Error> {
         self.funded.lock().push((gross, recovery_address));
+        self.resends.lock().push(resend);
+        if let Some(failure) = self.fund_failures.lock().pop_front() {
+            return Err(failure);
+        }
         let mut waiting = self.funding_finality_failures.lock();
         if *waiting > 0 {
             *waiting -= 1;
-            return Err(ScriptedFailure(
-                super::sdk::RsSdkCurvyAdapterError::RelayFinalityPending.to_string(),
-            ));
+            return Err(RsSdkCurvyAdapterError::RelayFinalityPending);
         }
+        *self.available.lock() += gross;
         Ok(())
     }
 
-    async fn fund(&self, gross: HoprBalance, recovery_address: Address) -> Result<(), Self::Error> {
-        self.funded.lock().push((gross, recovery_address));
-        Ok(())
-    }
-
-    /// The test double keeps no note ledger, so it reports what it was asked to shield.
     async fn available_balance(&self) -> Result<HoprBalance, Self::Error> {
-        Ok(self
-            .funded
-            .lock()
-            .iter()
-            .fold(HoprBalance::zero(), |total, (gross, _)| total + *gross))
+        Ok(*self.available.lock())
     }
 
     async fn allocate(
@@ -853,7 +1355,7 @@ impl CurvySdkAdapter for RecordingAdapter {
             let mut lagging = self.tree_lag_failures.lock();
             if *lagging > 0 {
                 *lagging -= 1;
-                return Err(ScriptedFailure(TREE_LAG.to_owned()));
+                return Err(sdk_failure(TREE_LAG));
             }
         }
         self.allocations.lock().extend(deposits);
@@ -872,7 +1374,7 @@ impl CurvySdkAdapter for RecordingAdapter {
             let mut lagging = self.sweep_lag_failures.lock();
             if *lagging > 0 {
                 *lagging -= 1;
-                return Err(ScriptedFailure(INDEX_LAG.to_owned()));
+                return Err(sdk_failure(INDEX_LAG));
             }
         }
         self.withdrawals.lock().push((dst, notes.len()));
@@ -929,6 +1431,250 @@ async fn test_node() -> anyhow::Result<Arc<ChainNodeOf>> {
     Ok(Arc::new(ChainNode(Arc::new(connector))))
 }
 
+/// The direct shield of the note `(1, 2, 1000, [4, 5], 6)` through `aggregator`.
+fn direct_shield_payload(aggregator: Address) -> Erc777Payload {
+    Erc777Payload::Curvy(CurvyErc777Payload::DirectShield {
+        aggregator,
+        note: CurvyNote {
+            owner_hash: 1.into(),
+            token: 2.into(),
+            amount: 1000.into(),
+            ephemeral_key: [4.into(), 5.into()],
+            view_tag: 6,
+        },
+    })
+}
+
+/// A direct shield is one ERC-777 `send` from the node's Safe, made by the node's own chain API:
+/// the Safe pays the gross amount, the router is credited, and the node account, which only signs,
+/// is not drawn on.
+#[test_log::test(tokio::test)]
+async fn a_direct_shield_is_sent_from_the_safe_by_the_node_chain_api() -> anyhow::Result<()> {
+    use hopr_api::{
+        chain::ChainValues,
+        types::{
+            crypto::prelude::OffchainKeypair,
+            internal::prelude::{AccountEntry, AccountType},
+        },
+    };
+
+    let me = ChainKeypair::random();
+    let safe: Address = [0x5a; 20].into();
+    let router: Address = [0xbb; 20].into();
+    let aggregator: Address = [0xcc; 20].into();
+    let sim = BlokliTestStateBuilder::default()
+        .with_accounts([(
+            AccountEntry {
+                public_key: *OffchainKeypair::random().public(),
+                chain_addr: me.public().to_address(),
+                entry_type: AccountType::NotAnnounced,
+                safe_address: Some(safe),
+                key_id: 0u32.into(),
+            },
+            HoprBalance::new_base(1000),
+            XDaiBalance::new_base(10),
+        )])
+        .build_dynamic_client(Address::from(SAFE));
+    let api = Arc::new(create_test_blokli_connector(&me, sim, Address::from(SAFE)).await?);
+
+    let gross = 25_u128;
+    let shielder = super::safe_direct_shielder(Arc::clone(&api));
+    shielder(direct_shield_payload(aggregator), router, gross).await?;
+
+    let hopr = |address: Address| {
+        let api = Arc::clone(&api);
+        async move { ChainValues::balance::<_, Address>(&*api, address).await }
+    };
+    let moved = HoprBalance::from(U256::from(gross));
+    assert_eq!(hopr(safe).await?, HoprBalance::new_base(1000) - moved, "the Safe pays");
+    assert_eq!(hopr(router).await?, moved, "the router is credited");
+    assert!(
+        hopr(me.public().to_address()).await?.is_zero(),
+        "the node account signs the module call and pays nothing but gas"
+    );
+    Ok(())
+}
+
+/// One recorded `send_erc777`: the amount, the recipient and the payload.
+type RecordedSend = (HoprBalance, Address, Erc777Payload);
+
+/// The chain API the shield tests hand the pool: it records every `send`, its pending future
+/// ends as scripted (`None` is a confirmation), and its `submission_failure` answers as scripted,
+/// so that what the shielder and the funder make of each answer is the only thing under test:
+/// the classification itself belongs to the chain API.
+#[derive(Clone, Default)]
+struct RecordingChainApi {
+    sends: Arc<parking_lot::Mutex<Vec<RecordedSend>>>,
+    pending_fails: Option<hopr_api::chain::SubmissionFailure>,
+}
+
+impl RecordingChainApi {
+    fn pending(&self) -> futures::future::BoxFuture<'static, Result<hopr_api::chain::ChainReceipt, ScriptedFailure>> {
+        use futures::FutureExt;
+        let failed = self.pending_fails.is_some();
+        async move {
+            if failed {
+                Err(ScriptedFailure("the transaction failed".to_owned()))
+            } else {
+                Ok(hopr_api::chain::ChainReceipt::default())
+            }
+        }
+        .boxed()
+    }
+}
+
+#[async_trait]
+impl hopr_api::chain::ChainWriteAccountOperations for RecordingChainApi {
+    type Error = ScriptedFailure;
+
+    fn submission_failure(&self, error: &Self::Error) -> hopr_api::chain::SubmissionFailure {
+        assert_eq!(
+            error.0, "the transaction failed",
+            "classifies the pending future's error"
+        );
+        self.pending_fails.expect("only a failure is classified")
+    }
+
+    async fn announce(
+        &self,
+        _multiaddrs: &[hopr_api::types::internal::prelude::Multiaddr],
+        _key: &hopr_api::types::crypto::prelude::OffchainKeypair,
+    ) -> Result<
+        futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>,
+        hopr_api::chain::AnnouncementError<Self::Error>,
+    > {
+        unreachable!("a shield does not announce")
+    }
+
+    async fn withdraw<C: hopr_api::types::primitive::prelude::Currency + Send>(
+        &self,
+        _balance: hopr_api::types::primitive::prelude::Balance<C>,
+        _recipient: &Address,
+    ) -> Result<futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error>
+    {
+        Ok(self.pending())
+    }
+
+    async fn send_erc777(
+        &self,
+        balance: HoprBalance,
+        recipient: &Address,
+        payload: &Erc777Payload,
+    ) -> Result<futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error>
+    {
+        self.sends.lock().push((balance, *recipient, payload.clone()));
+        Ok(self.pending())
+    }
+
+    async fn withdraw_from_signer<C: hopr_api::types::primitive::prelude::Currency + Send>(
+        &self,
+        _signer: &ChainKeypair,
+        _balance: hopr_api::types::primitive::prelude::Balance<C>,
+        _recipient: &Address,
+    ) -> Result<futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>, Self::Error>
+    {
+        unreachable!("a shield does not withdraw from the node account")
+    }
+
+    async fn register_safe(
+        &self,
+        _safe_address: &Address,
+    ) -> Result<
+        futures::future::BoxFuture<'life0, Result<hopr_api::chain::ChainReceipt, Self::Error>>,
+        hopr_api::chain::SafeRegistrationError<Self::Error>,
+    > {
+        unreachable!("a shield does not register a Safe")
+    }
+}
+
+/// What the chain API is handed is exactly the ERC-777 `send` a direct shield is: the gross
+/// amount, the router as the recipient, and the router's payload — the aggregator and the note.
+#[test_log::test(tokio::test)]
+async fn the_direct_shielder_hands_the_router_payload_to_the_chain_api() -> anyhow::Result<()> {
+    let api = RecordingChainApi::default();
+    let router: Address = [0xbb; 20].into();
+    let aggregator: Address = [0xcc; 20].into();
+    let gross = 25_u128;
+
+    let shielder = super::safe_direct_shielder(api.clone());
+    shielder(direct_shield_payload(aggregator), router, gross).await?;
+
+    let sends = api.sends.lock().clone();
+    assert_eq!(
+        sends,
+        vec![(
+            HoprBalance::from(U256::from(gross)),
+            router,
+            direct_shield_payload(aggregator)
+        )],
+        "one send: the gross amount to the router, carrying the router's payload"
+    );
+    Ok(())
+}
+
+/// What the shielder and the funder make of the chain API's own classification of a failed
+/// transaction: each answer maps to the failure that says what the float is left in, with the
+/// error's text as its reason, and a confirmation carries the transaction hash.
+#[tokio::test]
+async fn a_failed_shield_transaction_is_classified_by_the_chain_api() {
+    use hopr_api::chain::SubmissionFailure;
+
+    use super::{Confirmed, ShieldFailure};
+
+    let router: Address = [0xbb; 20].into();
+    let hash = hopr_api::chain::ChainReceipt::default().to_string();
+    for pending_fails in [
+        None,
+        Some(SubmissionFailure::NotSubmitted),
+        Some(SubmissionFailure::Reverted),
+        Some(SubmissionFailure::Unknown),
+    ] {
+        let api = RecordingChainApi {
+            pending_fails,
+            ..Default::default()
+        };
+        let shielder = super::safe_direct_shielder(api.clone());
+        let funder = super::safe_funder(api);
+        let outcomes = [
+            shielder(direct_shield_payload([0xcc; 20].into()), router, 25).await,
+            funder(router, HoprBalance::from(U256::from(25_u8))).await,
+        ];
+        for outcome in outcomes {
+            match (pending_fails, outcome) {
+                (None, Ok(confirmed)) => assert_eq!(confirmed, Confirmed { tx: hash.clone() }),
+                (Some(SubmissionFailure::NotSubmitted), Err(ShieldFailure::NotSubmitted(reason)))
+                | (Some(SubmissionFailure::Reverted), Err(ShieldFailure::Reverted { reason }))
+                | (Some(SubmissionFailure::Unknown), Err(ShieldFailure::Unconfirmed(reason))) => {
+                    assert_eq!(reason, "the transaction failed")
+                }
+                (script, outcome) => panic!("{script:?} became {outcome:?}"),
+            }
+        }
+    }
+}
+
+/// A direct shield that is settling, or confirmed and not yet indexed, is waited out by funding;
+/// any other failure of it is not.
+#[test]
+fn a_settling_direct_shield_is_lag() {
+    use super::sdk::RsSdkCurvyAdapterError as Error;
+    let settling = Error::ShieldSettling {
+        note: "0x01".into(),
+        gross: 7,
+        since: None,
+        resend_after: None,
+    };
+    let unindexed = Error::ShieldConfirmedUnindexed {
+        note: "0x01".into(),
+        gross: 7,
+        tx: "0x02".into(),
+        resend_after: None,
+    };
+    assert!(super::shield_lag(&settling).is_some(), "{settling}");
+    assert!(super::shield_lag(&unindexed).is_some(), "{unindexed}");
+    assert!(super::shield_lag(&Error::Funding("refused".into())).is_none());
+}
+
 struct Harness {
     pool: CurvyDepositPool<ChainNodeOf, ScriptedIndex, RecordingAdapter, RedbCurvyDepositState>,
     index: Arc<ScriptedIndex>,
@@ -936,19 +1682,28 @@ struct Harness {
     _dir: tempfile::TempDir,
 }
 
+/// A pool whose deposit and funding budgets are both `tracking_time`.
 async fn harness(adapter: RecordingAdapter, tracking_time: Duration) -> anyhow::Result<Harness> {
+    harness_with_budgets(adapter, tracking_time, tracking_time).await
+}
+
+async fn harness_with_budgets(
+    adapter: RecordingAdapter,
+    tracking_time: Duration,
+    funding_time: Duration,
+) -> anyhow::Result<Harness> {
     let dir = tempfile::tempdir()?;
     let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), TEST_PASSWORD)?;
     let node = test_node().await?;
     let cfg = CurvyDepositPoolConfig {
         max_deposit_tracking_time: tracking_time,
+        max_funding_time: funding_time,
         token: Some(4),
         ..Default::default()
     };
     let pool = CurvyDepositPool::with_parts(
         node,
         cfg,
-        HoprBalance::new_base(100),
         ScriptedIndex::default(),
         adapter,
         RsCoreCurvyNoteDetector::for_token(4),
@@ -978,14 +1733,19 @@ async fn pool_round_trip_generate_deposit_notify_and_sweep() -> anyhow::Result<(
     assert_eq!(&stored.public(), data.scan_key());
     assert_eq!(pool.generate_deposit_data(&id).await?, data);
 
-    // Entry: the first deposit shields the float from the Safe (the portal's recovery address is
-    // the node's Safe, whatever the node says it is), then allocates.
-    pool.deposit_funds_to(&id, &address, ten(), data.clone()).await?;
+    // Entry: whoever decides to fund shields the float from the Safe (the portal's recovery
+    // address is the node's Safe, whatever the node says it is); a deposit then allocates from
+    // that funding and shields nothing itself.
+    assert!(pool.available_balance().await?.is_zero());
+    pool.fund(HoprBalance::new_base(100)).await?;
     let safe = pool.node.identity().safe_address;
     assert_eq!(
         harness.adapter.funded.lock().as_slice(),
         &[(HoprBalance::new_base(100), safe)]
     );
+    assert_eq!(pool.available_balance().await?, HoprBalance::new_base(100));
+    pool.deposit_funds_to(&id, &address, ten(), data.clone()).await?;
+    assert_eq!(harness.adapter.funded.lock().len(), 1, "a deposit does not shield");
     assert_eq!(
         harness.adapter.allocations.lock().as_slice(),
         &[(id, address, *data.scan_key(), ten())]
@@ -1211,7 +1971,10 @@ async fn a_batch_is_one_allocation_call() -> anyhow::Result<()> {
     assert!(matches!(outcomes[1], Ok((id, ())) if id == second));
     assert!(outcomes[2].is_err());
     assert_eq!(harness.adapter.allocations.lock().len(), 2);
-    assert_eq!(harness.adapter.funded.lock().len(), 1);
+    assert!(
+        harness.adapter.funded.lock().is_empty(),
+        "a transfer from the funding never shields"
+    );
     Ok(())
 }
 
@@ -1274,48 +2037,55 @@ async fn state_from_the_same_chain_is_kept() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn pool_transfer_is_not_supported() -> anyhow::Result<()> {
+async fn pool_transfer_from_a_deposit_is_not_supported() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let dst_id = pix_id(2);
     let data = harness.pool.generate_deposit_data(&dst_id).await?;
-    for src in [
-        PoolTransferSource::Deposit {
-            id: &pix_id(1),
-            key: &BjjKeypair::random(),
-        },
-        PoolTransferSource::Funding,
-    ] {
-        let result = harness
-            .pool
-            .pool_transfer(src, &dst_id, *BjjKeypair::random().public(), data.clone(), Some(ten()))
-            .await;
-        // The funding source is refused too: a deposit is paid by the allocation, not by a
-        // transfer, which is why this pool overrides `deposit_funds_to`.
-        assert!(result.is_err());
-    }
+    let src_id = pix_id(1);
+    let key = BjjKeypair::random();
+    let result = harness
+        .pool
+        .pool_transfer(
+            PoolTransferSource::Deposit { id: &src_id, key: &key },
+            &dst_id,
+            *BjjKeypair::random().public(),
+            data,
+            None,
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(harness.adapter.allocations.lock().is_empty());
     Ok(())
 }
 
-/// A top-up reaches the pool and is reported back: the funding the pool accounts for is the
-/// shielded notes, and a second shield adds to them rather than replacing them.
-#[test_log::test(tokio::test)]
-async fn funding_adds_up_and_is_reported_as_the_available_balance() -> anyhow::Result<()> {
+/// A transfer from the funding is an allocation of the given amount; without one it is refused,
+/// since an allocation is paid from one note plus fees and "all of it" is not such an amount.
+#[tokio::test]
+async fn pool_transfer_from_the_funding_allocates() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let pool = &harness.pool;
+    pool.fund(HoprBalance::new_base(30)).await?;
+    let dst_id = pix_id(2);
+    let dst = *BjjKeypair::random().public();
+    let data = pool.generate_deposit_data(&dst_id).await?;
 
-    assert_eq!(pool.available_balance().await?, HoprBalance::zero());
-    assert!(pool.accepts_funding(), "the Curvy pool takes a top-up");
-
-    pool.fund(ten()).await?;
-    assert_eq!(pool.available_balance().await?, ten());
-
-    pool.fund(ten()).await?;
-    assert_eq!(
-        pool.available_balance().await?,
-        ten() + ten(),
-        "a second top-up must add to the funding, not replace it"
+    pool.pool_transfer(PoolTransferSource::Funding, &dst_id, dst, data.clone(), Some(ten()))
+        .await?;
+    let refused = pool
+        .pool_transfer(PoolTransferSource::Funding, &dst_id, dst, data.clone(), None)
+        .await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("needs an amount")),
+        "{refused:?}"
     );
-    assert_eq!(harness.adapter.funded.lock().len(), 2, "each top-up shields once");
+
+    assert_eq!(
+        harness.adapter.allocations.lock().as_slice(),
+        &[(dst_id, dst, *data.scan_key(), ten())]
+    );
+    assert_eq!(harness.adapter.funded.lock().len(), 1);
     Ok(())
 }
 
@@ -1323,18 +2093,203 @@ async fn funding_adds_up_and_is_reported_as_the_available_balance() -> anyhow::R
 // Mode configuration
 // ---------------------------------------------------------------------------
 
+/// Funding waits out a pending finality within the pool's own budget, as a deposit does, rather
+/// than handing the lag to whoever funds. A deposit never funds.
 #[test_log::test(tokio::test)]
-async fn a_deposit_waits_for_finality_before_funding() -> anyhow::Result<()> {
+async fn funding_waits_out_a_pending_finality() -> anyhow::Result<()> {
     let adapter = RecordingAdapter::consistent();
     *adapter.funding_finality_failures.lock() = 2;
     let harness = harness(adapter, Duration::from_secs(2)).await?;
     let id = pix_id(1);
     let owner = BjjKeypair::random();
     let data = harness.pool.generate_deposit_data(&id).await?;
+
+    harness.pool.fund(ten()).await?;
+    assert_eq!(
+        harness.adapter.funded.lock().len(),
+        3,
+        "two lagging attempts, then funded"
+    );
+
     harness.pool.deposit_funds_to(&id, owner.public(), ten(), data).await?;
-    assert_eq!(harness.adapter.funded.lock().len(), 3);
+    assert_eq!(harness.adapter.funded.lock().len(), 3, "the deposit did not fund");
     assert_eq!(*harness.adapter.allocate_attempts.lock(), 1);
     assert_eq!(harness.adapter.allocations.lock().len(), 1);
+    Ok(())
+}
+
+fn settling_shield() -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::ShieldSettling {
+        note: "0x01".into(),
+        gross: 10,
+        since: Some(1_700_000_000),
+        resend_after: Some(grace_ending_in(3600)),
+    }
+}
+
+/// A grace that ends `seconds` from now.
+fn grace_ending_in(seconds: u64) -> u64 {
+    super::sdk::unix_now().expect("a clock") + seconds
+}
+
+fn unindexed_shield() -> RsSdkCurvyAdapterError {
+    RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+        note: "0x01".into(),
+        gross: 10,
+        tx: "0x02".into(),
+        resend_after: Some(grace_ending_in(3600)),
+    }
+}
+
+/// A shield whose grace ends inside one `fund` call is waited for only until the grace ends: past
+/// it the next call may send the shield again, which a retry loop inside this one must not do or
+/// a shield that is merely slow to index would be paid for twice in one funding.
+#[test_log::test(tokio::test)]
+async fn funding_stops_waiting_for_a_shield_when_its_grace_ends() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter.fund_failures.lock().extend(
+        std::iter::repeat_with(|| RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+            note: "0x01".into(),
+            gross: 10,
+            tx: "0x02".into(),
+            resend_after: Some(grace_ending_in(1)),
+        })
+        .take(100),
+    );
+    let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(5)).await?;
+
+    let started = tokio::time::Instant::now();
+    let error = harness
+        .pool
+        .fund(ten())
+        .await
+        .expect_err("the grace ends before the funding budget");
+
+    assert!(error.to_string().contains("has not shown yet"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "it did not wait out the budget"
+    );
+    assert!(
+        harness.adapter.funded.lock().len() <= 3,
+        "a few reads, not a retry every poll"
+    );
+
+    // Without a time for the grace to end, there is nothing to wait for.
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend([RsSdkCurvyAdapterError::ShieldConfirmedUnindexed {
+            note: "0x01".into(),
+            gross: 10,
+            tx: "0x02".into(),
+            resend_after: None,
+        }]);
+    let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(5)).await?;
+    harness.pool.fund(ten()).await.expect_err("not retried");
+    assert_eq!(harness.adapter.funded.lock().len(), 1);
+    Ok(())
+}
+
+/// A direct shield that is settling, or confirmed but not yet indexed, is lag: `fund` keeps
+/// asking within its own budget until the note is there, instead of failing the flush that asked
+/// for the funding.
+#[test_log::test(tokio::test)]
+async fn funding_waits_out_a_settling_direct_shield() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend([settling_shield(), unindexed_shield()]);
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+
+    harness.pool.fund(ten()).await?;
+    assert_eq!(
+        harness.adapter.funded.lock().len(),
+        3,
+        "settling, then unindexed, then funded"
+    );
+    assert_eq!(harness.pool.available_balance().await?, ten());
+    Ok(())
+}
+
+/// Only the first attempt of a funding may send a shield again whose grace is over; every retry
+/// only looks. The grace is checked before the sleep, and a retry's own reads can carry it past
+/// the grace, while lag that is not the shield's own — a transient chain read here — is retried
+/// whatever the grace: either way a retry that could resend would pay for the shield twice.
+#[test_log::test(tokio::test)]
+async fn a_funding_sends_a_shield_again_only_on_its_first_attempt() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter.fund_failures.lock().extend([
+        settling_shield(),
+        RsSdkCurvyAdapterError::Sdk(anyhow::anyhow!("RPC_ERROR: upstream unavailable")),
+        unindexed_shield(),
+    ]);
+    let harness = harness(adapter, Duration::from_secs(2)).await?;
+
+    harness.pool.fund(ten()).await?;
+    assert_eq!(
+        harness.adapter.resends.lock().as_slice(),
+        &[
+            ShieldResend::AfterGrace,
+            ShieldResend::ObserveOnly,
+            ShieldResend::ObserveOnly,
+            ShieldResend::ObserveOnly,
+        ],
+        "only the first attempt may send again"
+    );
+
+    // The next funding is a first attempt again.
+    harness.pool.fund(ten()).await?;
+    assert_eq!(harness.adapter.resends.lock().last(), Some(&ShieldResend::AfterGrace));
+    Ok(())
+}
+
+/// Funding's budget is [`CurvyDepositPoolConfig::max_funding_time`], not the deposit's, in both
+/// directions: a deposit budget too short for a single retry does not make funding give up, and
+/// a deposit budget long enough to wait out everything does not keep funding going past its own.
+#[test_log::test(tokio::test)]
+async fn funding_waits_on_its_own_budget() -> anyhow::Result<()> {
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend([settling_shield(), settling_shield()]);
+    // The poll is a tenth of the budget but at least 50ms, so a 50ms budget has no room for a
+    // retry: funding gets through only if it waits on its own two seconds.
+    let harness = harness_with_budgets(adapter, Duration::from_millis(50), Duration::from_secs(2)).await?;
+    harness.pool.fund(ten()).await?;
+    assert_eq!(harness.adapter.funded.lock().len(), 3, "retried twice, then funded");
+
+    let adapter = RecordingAdapter::consistent();
+    adapter
+        .fund_failures
+        .lock()
+        .extend(std::iter::repeat_with(settling_shield).take(100));
+    let harness = harness_with_budgets(adapter, Duration::from_secs(30), Duration::from_secs(1)).await?;
+    let started = std::time::Instant::now();
+    let error = harness
+        .pool
+        .fund(ten())
+        .await
+        .expect_err("the funding budget runs out first");
+    // Funding on the deposit's thirty seconds would also give up, after about ten attempts: only
+    // the time it took tells the two budgets apart.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "gave up on its own second, not the deposit's thirty: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.to_string().contains("has not shown yet"),
+        "the last lag is what is reported: {error}"
+    );
+    let attempts = harness.adapter.funded.lock().len();
+    assert!(
+        (2..=11).contains(&attempts),
+        "a second's budget polled every tenth of it: {attempts} attempts"
+    );
     Ok(())
 }
 
@@ -1467,7 +2422,6 @@ fn only_a_reconciliation_block_is_a_pending_deposit() {
         super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::RelayAttemptLimit.into()),
         super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::RelayFinalityPending.into()),
         super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::RelayFinalityUnavailable("rpc".into()).into()),
-        super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::ShieldInProgress.into()),
     ] {
         assert!(pending.is_reconciliation_pending(), "{pending}");
         // The class survives the conversion into `StrategyError`, which is what the flush sees.
@@ -1506,8 +2460,6 @@ fn only_a_reconciliation_block_is_a_pending_deposit() {
 /// classifier has to be right in both directions.
 #[test]
 fn only_fund_free_failures_release_the_spend_budget() {
-    use super::sdk::RsSdkCurvyAdapterError;
-
     // Nothing was allocated: the input notes could not cover the request.
     let no_funding = super::CurvyDepositPoolError::Adapter(RsSdkCurvyAdapterError::NoFunding { required: 10 }.into());
     assert!(no_funding.moved_no_funds());
@@ -1518,6 +2470,9 @@ fn only_fund_free_failures_release_the_spend_budget() {
         actual: pix_id(2),
     };
     assert!(mismatched.moved_no_funds());
+
+    // A funding transfer with no amount is refused before the adapter is touched.
+    assert!(super::CurvyDepositPoolError::FundingTransferNeedsAmount.moved_no_funds());
 
     // The reported Curvy failure: local validation, refused before any proof was submitted.
     let fee_owner = super::CurvyDepositPoolError::Adapter(
@@ -1783,6 +2738,24 @@ fn a_config_without_the_mode_keys_still_parses() -> anyhow::Result<()> {
     )?;
     assert_eq!(cfg.shielding, CurvyShielding::Direct);
     assert_eq!(cfg.submission, CurvySubmission::Relayer);
+    assert_eq!(cfg.max_deposit_tracking_time, Duration::from_secs(30));
+    assert_eq!(
+        cfg.max_funding_time,
+        Duration::from_secs(300),
+        "funding keeps its own budget when the file only sizes the deposit's"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_funding_budget_is_stated_apart_and_must_be_at_least_a_second() -> anyhow::Result<()> {
+    let cfg: CurvyDepositPoolConfig = serde_json::from_str(r#"{"max_funding_time":"2m"}"#)?;
+    assert_eq!(cfg.max_funding_time, Duration::from_secs(120));
+    StrategyError::validate_config(&cfg)?;
+
+    let zero: CurvyDepositPoolConfig = serde_json::from_str(r#"{"max_funding_time":"0s"}"#)?;
+    let error = StrategyError::validate_config(&zero).expect_err("a budget of nothing is refused");
+    assert!(error.to_string().contains("max_funding_time"), "{error}");
     Ok(())
 }
 
@@ -1876,7 +2849,6 @@ async fn replay_pool_watch_against_staging() -> anyhow::Result<()> {
     let pool = CurvyDepositPool::with_parts(
         node,
         cfg,
-        HoprBalance::new_base(100),
         CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64))),
         RecordingAdapter::consistent(),
         RsCoreCurvyNoteDetector::for_token(2),
@@ -1992,7 +2964,6 @@ async fn staging_watcher_catches_up_on_gnosis() -> anyhow::Result<()> {
     let pool = CurvyDepositPool::with_parts(
         node,
         cfg,
-        HoprBalance::new_base(100),
         CurvyIndexerSource(CurvyIndexerClient::new(api, Arc::new(100u64))),
         RecordingAdapter::consistent(),
         RsCoreCurvyNoteDetector::for_token(2),
@@ -2165,7 +3136,7 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         *index.head.lock() = (5, 1);
         tokio::time::timeout(
             Duration::from_secs(10),
-            super::lifecycle::catch_up(&index, &tracker, true),
+            super::lifecycle::catch_up(&index, &tracker, Some(&ReplayFrom::default())),
         )
         .await?
         .map_err(anyhow::Error::msg)?;
@@ -2198,13 +3169,13 @@ async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Resul
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(index.pending_calls.load(Ordering::SeqCst), count);
-        assert!(tracker.replay_history.load(Ordering::SeqCst));
+        assert!(tracker.replay.lock().is_some());
     }
     index.fail_pending.store(false, Ordering::SeqCst);
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
     assert_eq!(index.pending_calls.load(Ordering::SeqCst), 6);
-    assert!(!tracker.replay_history.load(Ordering::SeqCst));
+    assert!(tracker.replay.lock().is_none());
     tokio::time::advance(Duration::from_millis(250)).await;
     tokio::task::yield_now().await;
     assert_eq!(index.pending_calls.load(Ordering::SeqCst), 7);

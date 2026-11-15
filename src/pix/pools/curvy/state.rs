@@ -68,6 +68,16 @@ pub(super) const SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], V
 /// [`SCAN_SECRETS_TABLE`] and dropped on open.
 pub(super) const LEGACY_SCAN_SECRETS_TABLE: TableDefinition<[u8; PixAddressId::SIZE], Vec<u8>> =
     TableDefinition::new("curvy_pix_scan_secrets");
+/// Where a scan secret's historical replay starts, keyed by allocation id and event family. See
+/// [`CurvyDepositState::replay_floor`].
+const REPLAY_FLOOR_KEY_SIZE: usize = PixAddressId::SIZE + 1;
+const REPLAY_FLOORS_TABLE: TableDefinition<[u8; REPLAY_FLOOR_KEY_SIZE], Vec<u8>> =
+    TableDefinition::new("curvy_pix_replay_floors");
+/// How many blocks [`unanchored_before`] moves a position back: a new allocation's pending replay
+/// floor sits this far before the pending cursor, and a cursor whose block was reorganised away is
+/// rescanned from this far before it, so that a reorganisation cannot place an event just before
+/// either.
+const REPLAY_FLOOR_REORG_MARGIN: u64 = 64;
 const KDF_SALT_TABLE: TableDefinition<u8, [u8; 16]> = TableDefinition::new("curvy_pix_kdf_salt");
 const KDF_VERIFIER_TABLE: TableDefinition<u8, [u8; SEALED_32_SIZE]> = TableDefinition::new("curvy_pix_kdf_verifier");
 const PASSWORD_SLOTS: PasswordSlots = PasswordSlots {
@@ -102,6 +112,27 @@ pub enum CurvyStateError {
 
 fn state_db_error(error: impl std::fmt::Display) -> CurvyStateError {
     CurvyStateError::Database(error.to_string())
+}
+
+/// A position a reorg margin of blocks before `cursor`, without a block anchor; `None` (genesis)
+/// when the cursor is within the margin of genesis.
+///
+/// The event item index is kept. A chain-position source (Blokli) orders by block first, so it
+/// re-reads every event of the margin, the old position's replacements included. Curvy's indexer
+/// reads a committed cursor as that leaf index alone and serves finalized checkpoints only, so it
+/// resumes exactly where it was, rather than re-reading the tree or skipping its first leaf.
+pub(super) fn unanchored_before(cursor: &CurvyEventCursor) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+    let block = cursor_component(&cursor.block, "block")?;
+    let item = cursor_component(&cursor.event_item_index, "event item index")?;
+    Ok((block > REPLAY_FLOOR_REORG_MARGIN)
+        .then(|| CurvyEventCursor::new(block - REPLAY_FLOOR_REORG_MARGIN, 0, 0, item)))
+}
+
+fn replay_floor_key(id: &PixAddressId, kind: CurvyEventKind) -> [u8; REPLAY_FLOOR_KEY_SIZE] {
+    let mut key = [0_u8; REPLAY_FLOOR_KEY_SIZE];
+    key[..PixAddressId::SIZE].copy_from_slice(&id_bytes(id));
+    key[PixAddressId::SIZE] = kind.cursor_key();
+    key
 }
 
 fn scan_secret_aad(id: &PixAddressId) -> Vec<u8> {
@@ -367,6 +398,32 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// Forgets the scan secret for `id`, once nothing can arrive for it any more.
     fn remove_scan_secret(&self, id: &PixAddressId) -> Result<(), CurvyStateError>;
 
+    /// Where a historical replay for `id` has to start in the `kind` family: no later than the
+    /// position the shared cursor had when the allocation's scan secret was first stored, since
+    /// no note for it can predate that. `None` means "replay from genesis", which is also what
+    /// the default answers (allocations stored before floors existed, and stores that do not
+    /// keep them).
+    ///
+    /// ```
+    /// # use hopr_api::node::PixAddressId;
+    /// # use hopr_api::types::primitive::prelude::BytesRepresentable;
+    /// # use hopr_strategy::pix::pools::curvy::{CurvyDepositState, CurvyEventKind, RedbCurvyDepositState};
+    /// let dir = tempfile::tempdir()?;
+    /// let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), "correct horse battery")?;
+    /// // No scan secret was stored for this allocation: its replay starts at genesis.
+    /// let id = PixAddressId::try_from(&[7u8; PixAddressId::SIZE][..])?;
+    /// assert_eq!(state.replay_floor(&id, CurvyEventKind::Pending)?, None);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    fn replay_floor(
+        &self,
+        id: &PixAddressId,
+        kind: CurvyEventKind,
+    ) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+        let _ = (id, kind);
+        Ok(None)
+    }
+
     /// Drops everything that describes a particular chain — cursors, notes and scan secrets — so
     /// the store can be reused against a chain that knows none of it. See
     /// [`CurvyDepositPool`](super::CurvyDepositPool) for when that is decided.
@@ -428,6 +485,7 @@ impl RedbCurvyDepositState {
         write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
         write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
         write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+        write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
         write.commit().map_err(state_db_error)?;
         Ok(Self {
             db: Arc::new(db),
@@ -664,7 +722,26 @@ impl CurvyDepositState for RedbCurvyDepositState {
                 .sealer
                 .seal(&scan_secret_aad(id), secret.to_bytes().as_ref())
                 .map_err(state_db_error)?;
-            table.insert(id_bytes(id), sealed).map_err(state_db_error)?;
+            let existed = table.insert(id_bytes(id), sealed).map_err(state_db_error)?.is_some();
+            if !existed {
+                let cursors = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
+                let mut floors = write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
+                for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+                    let Some(stored) = cursors.get(kind.cursor_key()).map_err(state_db_error)? else {
+                        continue;
+                    };
+                    let cursor = decode_cursor(&stored.value())?;
+                    let floor = match kind {
+                        CurvyEventKind::Pending => unanchored_before(&cursor)?,
+                        CurvyEventKind::Committed => Some(cursor),
+                    };
+                    if let Some(floor) = floor {
+                        floors
+                            .insert(replay_floor_key(id, kind), encode_cursor(&floor)?)
+                            .map_err(state_db_error)?;
+                    }
+                }
+            }
         }
         write.commit().map_err(state_db_error)
     }
@@ -691,8 +768,29 @@ impl CurvyDepositState for RedbCurvyDepositState {
         {
             let mut table = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
             table.remove(id_bytes(id)).map_err(state_db_error)?;
+            let mut floors = write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
+            floors
+                .remove(replay_floor_key(id, CurvyEventKind::Pending))
+                .map_err(state_db_error)?;
+            floors
+                .remove(replay_floor_key(id, CurvyEventKind::Committed))
+                .map_err(state_db_error)?;
         }
         write.commit().map_err(state_db_error)
+    }
+
+    fn replay_floor(
+        &self,
+        id: &PixAddressId,
+        kind: CurvyEventKind,
+    ) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+        let read = self.db.begin_read().map_err(state_db_error)?;
+        let table = read.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
+        table
+            .get(replay_floor_key(id, kind))
+            .map_err(state_db_error)?
+            .map(|value| decode_cursor(&value.value()))
+            .transpose()
     }
 
     fn wipe_chain_state(&self) -> Result<(), CurvyStateError> {
@@ -701,10 +799,12 @@ impl CurvyDepositState for RedbCurvyDepositState {
         write.delete_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
         write.delete_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
         write.delete_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+        write.delete_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
         write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
         write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
         write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
         write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
+        write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
         write.commit().map_err(state_db_error)
     }
 }

@@ -99,13 +99,6 @@ impl RsCoreCurvyNoteDetector {
         // secret. Integrity is established separately by recomputing the note ID with the
         // SSA-derived public owner.
         for (id, address, scan_secret) in watched_allocations {
-            let expected_owner = match bjj_point(address) {
-                Ok(owner) => owner,
-                Err(error) => {
-                    tracing::warn!(allocation = ?id, %error, "skipping invalid local Curvy watch owner");
-                    continue;
-                }
-            };
             let spend_meta_key = spend_meta_key_dec(scan_secret.spend_meta_key());
             let view_secret = view_secret_hex(scan_secret);
             let matches = stealth::viewer_scan(
@@ -135,6 +128,15 @@ impl RsCoreCurvyNoteDetector {
             if token != self.expected_token {
                 continue;
             }
+
+            // The conversion runs a subgroup check (~3 ms), so it only runs for notes that passed the scan.
+            let expected_owner = match bjj_point(address) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    tracing::warn!(allocation = ?id, %error, "skipping invalid local Curvy watch owner");
+                    continue;
+                }
+            };
 
             let note = KnownOwner::new(expected_owner, shared_secret).note(
                 amount.into_inner(),

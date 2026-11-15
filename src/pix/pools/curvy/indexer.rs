@@ -1156,6 +1156,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cursor_rewound_for_a_reorg_resumes_at_the_same_leaf() -> anyhow::Result<()> {
+        // Reorg recovery moves a rejected cursor's block back and drops its anchor; this source
+        // reads only the leaf index and is never reorganised, so it must resume where it was.
+        struct RecordingApi(parking_lot::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl SyncApi for RecordingApi {
+            async fn get_json(&self, query: &str) -> Result<serde_json::Value, String> {
+                self.0.lock().push(query.to_owned());
+                Ok(serde_json::json!({
+                    "checkpoint": CHECKPOINT, "fromIndex": 42, "nextIndex": 42, "total": 42, "notes": [],
+                }))
+            }
+        }
+
+        let api = Arc::new(RecordingApi(Default::default()));
+        let source = CurvyIndexerSource(CurvyIndexerClient::new(api.clone(), Arc::new(42161u64)));
+        let mut leaf = CurvyEventCursor::new(479_248_392, 0, 0, 41);
+        leaf.block_hash = Some(Hex32(CHECKPOINT.to_owned()));
+        let rewound = super::super::state::unanchored_before(&leaf)?.expect("far from genesis");
+        source
+            .committed_notes(Some(rewound.clone()), 100)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        source
+            .committed_candidates(Some(rewound), 100)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let queries = api.0.lock().clone();
+        assert_eq!(queries.len(), 2);
+        assert!(
+            queries.iter().all(|query| query.contains("fromIndex=42&")),
+            "{queries:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn the_head_is_the_finalized_checkpoint_with_no_extra_finality() -> anyhow::Result<()> {
         let source = CurvyIndexerSource(client());
         assert_eq!(source.indexed_head().await.map_err(anyhow::Error::msg)?, (504771934, 0));

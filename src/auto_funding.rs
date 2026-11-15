@@ -38,7 +38,7 @@ use hopr_api::{
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use tracing::{Instrument, debug, info, trace, warn};
-use validator::{Validate, ValidationError};
+use validator::Validate;
 
 use crate::{errors::StrategyError, strategy::Strategy as StrategyTrait};
 
@@ -48,13 +48,6 @@ lazy_static::lazy_static! {
         hopr_api::types::telemetry::SimpleCounter::new("hopr_strategy_auto_funding_funding_count", "Count of initiated automatic fundings").unwrap();
     static ref METRIC_COUNT_AUTO_FUNDING_FAILURES: hopr_api::types::telemetry::SimpleCounter =
         hopr_api::types::telemetry::SimpleCounter::new("hopr_strategy_auto_funding_failure_count", "Count of failed automatic funding attempts").unwrap();
-}
-
-fn validate_funding_amount(amount: &HoprBalance) -> std::result::Result<(), ValidationError> {
-    if amount.is_zero() {
-        return Err(ValidationError::new("funding_amount must be greater than zero"));
-    }
-    Ok(())
 }
 
 /// Configuration for `AutoFundingStrategy`.
@@ -87,7 +80,7 @@ pub struct AutoFundingStrategyConfig {
     /// Default is 10 wxHOPR.
     #[serde_as(as = "DisplayFromStr")]
     #[default(HoprBalance::new_base(10))]
-    #[validate(custom(function = "validate_funding_amount"))]
+    #[validate(custom(function = "crate::validation::validate_positive_balance"))]
     pub funding_amount: HoprBalance,
 }
 

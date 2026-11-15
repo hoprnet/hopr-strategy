@@ -239,7 +239,7 @@ pub fn pool_deposit_data(id: PixAddressId) -> PixDepositData {
 /// Creates the channel the Exit hands the strategy through
 /// `PixDepositDataRequest::deposit_data_created`, and on which the generated payloads come back.
 ///
-/// Sibling of [`deposit_notifier`](super::deposit_notifier) — same shape, other direction.
+/// Same shape as the tests' `deposit_notifier`, other direction.
 pub fn deposit_data_channel() -> (DepositDataCreated, futures::channel::mpsc::Receiver<PixDepositData>) {
     futures::channel::mpsc::channel(1)
 }

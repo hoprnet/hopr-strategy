@@ -45,6 +45,12 @@ pub mod channel_finalizer;
 pub mod channel_lifecycle;
 pub mod errors;
 pub mod strategy;
+// Used by whichever strategies are enabled; none may be.
+#[cfg_attr(
+    not(any(feature = "strategy-auto-funding", feature = "strategy-pix")),
+    allow(dead_code)
+)]
+pub(crate) mod validation;
 
 /// Test-support node adapters, shared with the integration-test crate.
 #[cfg(any(test, feature = "testing"))]
