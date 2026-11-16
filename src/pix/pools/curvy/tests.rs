@@ -1485,10 +1485,67 @@ impl CurvyDepositState for FloorlessState {
 
 #[derive(Default)]
 struct RacySecretGate {
-    initial_checks: std::sync::atomic::AtomicUsize,
-    both_checked: AtomicBool,
-    store_waiters: std::sync::atomic::AtomicUsize,
-    release_store: AtomicBool,
+    state: std::sync::Mutex<RacySecretGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct RacySecretGateState {
+    initial_checks: usize,
+    both_checked: bool,
+    store_waiters: usize,
+    release_store: bool,
+}
+
+impl RacySecretGate {
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn wait_for_both_initial_checks(&self) {
+        let mut state = self.state.lock().expect("racy secret gate");
+        state.initial_checks += 1;
+        if state.initial_checks >= 2 {
+            state.both_checked = true;
+            self.changed.notify_all();
+            return;
+        }
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, Self::WAIT_TIMEOUT, |state| !state.both_checked)
+            .expect("racy secret gate");
+        assert!(!wait.timed_out(), "both callers did not reach scan_secret in time");
+        drop(state);
+    }
+
+    fn wait_for_store_waiters(&self, waiters: usize) {
+        let state = self.state.lock().expect("racy secret gate");
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, Self::WAIT_TIMEOUT, |state| state.store_waiters < waiters)
+            .expect("racy secret gate");
+        assert!(
+            !wait.timed_out(),
+            "both callers did not reach store_scan_secret in time"
+        );
+        drop(state);
+    }
+
+    fn wait_for_store_release(&self) {
+        let mut state = self.state.lock().expect("racy secret gate");
+        state.store_waiters += 1;
+        self.changed.notify_all();
+        let (state, wait) = self
+            .changed
+            .wait_timeout_while(state, Self::WAIT_TIMEOUT, |state| !state.release_store)
+            .expect("racy secret gate");
+        assert!(!wait.timed_out(), "the test did not release the secret store in time");
+        drop(state);
+    }
+
+    fn release_store(&self) {
+        let mut state = self.state.lock().expect("racy secret gate");
+        state.release_store = true;
+        self.changed.notify_all();
+    }
 }
 
 /// A store whose initial secret check is a check-then-store: both callers pass it before either
@@ -1547,11 +1604,7 @@ impl CurvyDepositState for RacySecretState {
     fn store_scan_secret(&self, id: &PixAddressId, secret: &CurvyScanSecret) -> Result<(), CurvyStateError> {
         // Hold the first write until the test has released it: without the pool's guard both
         // callers must reach this point, as a plain check-then-store would.
-        self.1.store_waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
-        while !self.1.release_store.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
+        self.1.wait_for_store_release();
         self.0.store_scan_secret(id, secret)
     }
 
@@ -1559,16 +1612,7 @@ impl CurvyDepositState for RacySecretState {
         let secret = self.0.scan_secret(id)?;
         // Hold both callers at their initial miss check, so neither can insert before the other
         // has also seen the absence.
-        if self.1.initial_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
-            if self.1.initial_checks.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
-                self.1.both_checked.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while !self.1.both_checked.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
-            }
-        }
+        self.1.wait_for_both_initial_checks();
         Ok(secret)
     }
 
@@ -2485,7 +2529,7 @@ async fn concurrent_generate_deposit_data_agrees() -> anyhow::Result<()> {
                 .expect("caller runtime");
             start.wait();
             let data = runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(300), pool.generate_deposit_data(&id)).await
+                tokio::time::timeout(Duration::from_secs(10), pool.generate_deposit_data(&id)).await
             });
             data.expect("deposit data generation timed out")
                 .map_err(anyhow::Error::from)
@@ -2497,19 +2541,12 @@ async fn concurrent_generate_deposit_data_agrees() -> anyhow::Result<()> {
     // holds the pool's guard (so the second cannot reach the write).
     let releaser_pool = Arc::clone(&pool);
     let releaser = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
-        while gate.store_waiters.load(std::sync::atomic::Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline
-        {
-            std::thread::yield_now();
+        gate.wait_for_store_waiters(1);
+        if let Ok(guard) = releaser_pool.scan_secret_init.try_lock() {
+            drop(guard);
+            gate.wait_for_store_waiters(2);
         }
-        if releaser_pool.scan_secret_init.try_lock().is_ok() {
-            while gate.store_waiters.load(std::sync::atomic::Ordering::SeqCst) < 2
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
-            }
-        }
-        gate.release_store.store(true, std::sync::atomic::Ordering::SeqCst);
+        gate.release_store();
     });
     start.wait();
     let a = first.join().expect("first caller")?;

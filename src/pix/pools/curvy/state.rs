@@ -679,6 +679,14 @@ impl CurvyDepositState for RedbCurvyDepositState {
         note: DetectedCurvyNote,
         cursor: &CurvyEventCursor,
     ) -> Result<bool, CurvyStateError> {
+        let key = owned_note_key(&note.deposit.id, note_id)?;
+        {
+            let read = self.db.begin_read().map_err(state_db_error)?;
+            let notes = read.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
+            if notes.get(key).map_err(state_db_error)?.is_some() {
+                return Ok(false);
+            }
+        }
         self.record_owned_candidate_tx(note_id, note, cursor, true)
     }
 
