@@ -95,9 +95,21 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
     /// queues a committed replay from the allocation's floor and correlates it in that pass.
     /// Blokli's pending stream is complete (empty candidates); Curvy's indexer relies on committed
     /// candidates.
+    ///
+    /// Replay completion is inferred from the head sampled at the start of a pass, not from the
+    /// rows this returns. A pending view older than the head reported in the same pass can
+    /// therefore end a pending replay before its whole window was served. The forward-phase
+    /// self-heal covers a pending view that lags the committed view, not a replay window served
+    /// short.
     async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
+    ///
+    /// Replay completion is inferred from the head sampled at the start of a pass, not from the
+    /// rows this returns. A committed view older than the head reported in the same pass can
+    /// therefore end a committed replay before its whole window was served. The forward-phase
+    /// self-heal covers a pending view that lags the committed view, not a replay window served
+    /// short.
     async fn committed_notes(
         &self,
         after: Option<CurvyEventCursor>,
@@ -106,6 +118,12 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
 
     /// The highest block the indexer has processed, and the number of confirmations it treats as
     /// final.
+    ///
+    /// Discovery samples this at the start of a pass and infers replay completion from it. The
+    /// notes queries of that pass must therefore see a view at least as fresh as the head reported
+    /// here: a source whose notes view is older than the head it reported in the same pass can end
+    /// a replay early. The forward-phase self-heal covers a pending view that lags the committed
+    /// view, not a replay window served short.
     async fn indexed_head(&self) -> Result<(u64, u64), String>;
 
     /// Whether the chain has already seen `nullifier` (a `0x`-prefixed 32-byte hex string).
@@ -232,8 +250,6 @@ enum Detector {
 pub(super) struct ReplayFrom {
     pub(super) pending: Option<CurvyEventCursor>,
     pub(super) committed: Option<CurvyEventCursor>,
-    /// A request from the pending self-heal, whose committed start carries no pending replay.
-    pub(super) committed_only: bool,
 }
 
 /// Position of a cursor in the index order, `(block, transaction, log, item)`.
@@ -261,23 +277,32 @@ fn is_beyond(cursor: &CurvyEventCursor, end: Option<&CurvyEventCursor>) -> bool 
     matches!((cursor_order(cursor), cursor_order(end)), (Ok(cursor), Ok(end)) if cursor > end)
 }
 
+/// The earlier of two requested floors; a request that is absent yields the other.
+fn merge_floor(
+    first: Option<Option<CurvyEventCursor>>,
+    second: Option<Option<CurvyEventCursor>>,
+) -> Option<Option<CurvyEventCursor>> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(earlier(a, b)),
+        (first, second) => first.or(second),
+    }
+}
+
 /// Whether `window_end` lies at or before `through`, so a replay of the window can finish.
+///
+/// A pass infers this from the head it sampled at the start, not from what its notes query
+/// served. A source whose notes view is older than the head it reported in the same pass can
+/// therefore end a replay early. The forward-phase self-heal covers a pending view that lags the
+/// committed view, not a replay window served short.
 fn window_covered(window_end: Option<&CurvyEventCursor>, through: u64) -> bool {
     window_end.is_none_or(|end| cursor_component(&end.block, "window end block").is_ok_and(|block| block <= through))
 }
 
 impl ReplayFrom {
     pub(super) fn merge(self, other: Self) -> Self {
-        let pending = match (self.committed_only, other.committed_only) {
-            (true, true) => None,
-            (true, false) => other.pending,
-            (false, true) => self.pending,
-            (false, false) => earlier(self.pending, other.pending),
-        };
         Self {
-            pending,
+            pending: earlier(self.pending, other.pending),
             committed: earlier(self.committed, other.committed),
-            committed_only: self.committed_only && other.committed_only,
         }
     }
 }
@@ -296,6 +321,7 @@ pub struct CurvyLifecycleTracker<S> {
     pub(super) state: Arc<S>,
     waiters: parking_lot::Mutex<HashMap<PixAddressId, WatchedAllocation>>,
     pub(super) replay: parking_lot::Mutex<Option<ReplayFrom>>,
+    late_committed: parking_lot::Mutex<Option<Option<CurvyEventCursor>>>,
 }
 
 impl<S> CurvyLifecycleTracker<S>
@@ -323,6 +349,7 @@ where
             state,
             waiters: Default::default(),
             replay: Default::default(),
+            late_committed: Default::default(),
         }
     }
 
@@ -369,7 +396,6 @@ where
             let request = ReplayFrom {
                 pending: self.state.replay_floor(&id, CurvyEventKind::Pending)?,
                 committed: self.state.replay_floor(&id, CurvyEventKind::Committed)?,
-                committed_only: false,
             };
             match waiters.entry(id) {
                 Entry::Occupied(mut entry) => {
@@ -414,7 +440,7 @@ where
             .collect()
     }
 
-    /// Takes the pending historical replay request, if any.
+    /// Takes the registration historical replay request, if any.
     pub(super) fn take_replay(&self) -> Option<ReplayFrom> {
         self.replay.lock().take()
     }
@@ -443,11 +469,16 @@ where
                 None
             }
         };
-        self.restore_failed_replay(Some(ReplayFrom {
-            committed: floor,
-            committed_only: true,
-            ..Default::default()
-        }));
+        self.restore_late_committed_replay(Some(floor));
+    }
+
+    pub(super) fn take_late_committed_replay(&self) -> Option<Option<CurvyEventCursor>> {
+        self.late_committed.lock().take()
+    }
+
+    pub(super) fn restore_late_committed_replay(&self, replay: Option<Option<CurvyEventCursor>>) {
+        let mut slot = self.late_committed.lock();
+        *slot = merge_floor(slot.take(), replay);
     }
 
     fn notify_waiters(&self, id: PixAddressId, committed: HoprBalance) {
@@ -704,10 +735,10 @@ where
                 .state
                 .cursor(CurvyEventKind::Pending)
                 .map_err(|error| error.to_string())?;
-            let hold = pending.unwrap_or_else(|| CurvyEventCursor::new(0, 0, 0, 0));
+            let pending_hold = pending.unwrap_or_else(|| CurvyEventCursor::new(0, 0, 0, 0));
             for candidate in candidates {
                 if !tracker
-                    .process_candidate(candidate, Some(&hold))
+                    .process_candidate(candidate, Some(&pending_hold))
                     .await
                     .map_err(|error| error.to_string())?
                     .continue_processing
@@ -844,8 +875,7 @@ where
             return Ok(());
         }
 
-        let mut request = replay.cloned();
-        let mut unfinished = false;
+        let mut pending_unfinished = false;
         if let (Some(replay), Some(_)) = (replay, p0_end) {
             let pending = recovering_anchor("pending", replay.pending.clone(), move |from| {
                 pending_phase(client, tracker, from, p0_end, c0_end, true, indexed_block)
@@ -854,7 +884,7 @@ where
             if !pending.watching {
                 return Ok(());
             }
-            unfinished = !pending.reached_end;
+            pending_unfinished = !pending.reached_end;
         }
 
         let committed = recovering_anchor("committed", c0.clone(), move |from| {
@@ -866,17 +896,13 @@ where
         }
 
         // Take the self-heal request after every pending phase ran, so a note first seen behind
-        // the committed cursor is replayed in this pass. It shares the replay slot with a
-        // late-registration request, so one take and one restore cover both.
-        let additions = tracker.take_replay();
-        replayed |= additions.is_some();
-        request = match (request, additions) {
-            (Some(first), Some(second)) => Some(first.merge(second)),
-            (first, second) => first.or(second),
-        };
-
-        if let (Some(current), Some(window_end)) = (request.as_ref(), c0_end) {
-            let floor = current.committed.clone();
+        // the committed cursor is replayed in this pass. A late-registration committed floor and
+        // the self-heal floor cover the same window: merge their starts and run it once.
+        let late_committed = tracker.take_late_committed_replay();
+        replayed |= late_committed.is_some();
+        let merged_floor = merge_floor(replay.map(|replay| replay.committed.clone()), late_committed.clone());
+        let mut committed_unfinished = false;
+        if let (Some(floor), Some(window_end)) = (merged_floor.clone(), c0_end) {
             let committed = match recovering_anchor("committed", floor, move |from| {
                 committed_phase(client, tracker, from, Some(window_end), finalized_through, true)
             })
@@ -884,7 +910,7 @@ where
             {
                 Ok(committed) => committed,
                 Err(error) => {
-                    tracker.restore_failed_replay(request);
+                    tracker.restore_late_committed_replay(late_committed);
                     return Err(error);
                 }
             };
@@ -892,10 +918,20 @@ where
                 // The watch set ran empty: there is nobody to resume the replay for.
                 return Ok(());
             }
-            unfinished |= !committed.reached_end;
+            committed_unfinished = !committed.reached_end;
+        } else if merged_floor.is_some() {
+            // A self-heal floor was taken but there is no committed window to replay it against
+            // yet; keep it for the next pass.
+            tracker.restore_late_committed_replay(late_committed);
         }
-        if unfinished {
-            tracker.restore_failed_replay(request);
+        if pending_unfinished {
+            // The pending half has not finished, so the whole registration replay is owed again.
+            tracker.restore_failed_replay(replay.cloned());
+        }
+        if committed_unfinished {
+            // Only the committed window is unfinished; its merged start also covers any
+            // self-heal floor that was part of it.
+            tracker.restore_late_committed_replay(merged_floor);
         }
         Ok(())
     }
@@ -905,19 +941,12 @@ where
 
 /// A failed catch-up pass and whether it took a replay request. The watcher warning uses the
 /// latter rather than peeking at the slots after the pass restored them.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
 pub(super) struct PassError {
     error: String,
     replayed: bool,
 }
-
-impl std::fmt::Display for PassError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl std::error::Error for PassError {}
 
 /// Runs one watcher pass, taking the replay slot and restoring it if the pass fails. This is the
 /// exact envelope `run_watcher` uses; tests drive it directly so production wiring is covered.

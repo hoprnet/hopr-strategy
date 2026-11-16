@@ -679,18 +679,6 @@ impl CurvyDepositState for RedbCurvyDepositState {
         note: DetectedCurvyNote,
         cursor: &CurvyEventCursor,
     ) -> Result<bool, CurvyStateError> {
-        let id = note.deposit.id;
-        let owned_note_key = owned_note_key(&id, note_id)?;
-
-        // A snapshot source re-serves pending notes every pass. Read once so a duplicate costs no
-        // write transaction and no cursor churn; the helper re-checks inside its transaction.
-        {
-            let read = self.db.begin_read().map_err(state_db_error)?;
-            let notes = read.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
-            if notes.get(owned_note_key).map_err(state_db_error)?.is_some() {
-                return Ok(false);
-            }
-        }
         self.record_owned_candidate_tx(note_id, note, cursor, true)
     }
 

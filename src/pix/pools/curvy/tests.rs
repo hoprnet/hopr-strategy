@@ -603,6 +603,57 @@ async fn a_lagging_pending_note_self_heals_its_committed_replay() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn a_registration_landing_mid_pass_is_replayed_from_its_pending_half() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let a = owned_candidate(20)?;
+    let b = owned_candidate(1)?;
+    let tracker = Arc::new(CurvyLifecycleTracker::new(
+        Arc::new(RsCoreCurvyNoteDetector::for_token(4)),
+        state.clone(),
+    ));
+    state.store_scan_secret(&a.id, &a.scan_secret)?;
+    // The shared cursors are already past A's note, so only a replay can find it.
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        state.advance_cursor(kind, &CurvyEventCursor::from(&position(100)))?;
+    }
+    let other_secret = scan_secret("05", "06")?;
+    let _b_receiver = tracker.watch(b.id, b.address, other_secret, ten())?;
+
+    let index = ScriptedIndex::default();
+    *index.head.lock() = (110, 1);
+    index.pending.lock().push(a.note.clone());
+    index.committed.lock().push(completion(&a.note_id, 30));
+    let receiver = Arc::new(parking_lot::Mutex::new(None));
+    let slot = receiver.clone();
+    let hook_tracker = tracker.clone();
+    let (id, address, secret) = (a.id, a.address, a.scan_secret.clone());
+    *index.on_committed.lock() = Some(Box::new(move || {
+        *slot.lock() = Some(
+            hook_tracker
+                .watch(id, address, secret, ten())
+                .expect("mid-pass registration succeeds"),
+        );
+    }));
+
+    // B's registration replay already ran its pending half before A registered; A's request
+    // must survive this pass and be served, pending half included, by the next one.
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(state.owned_note_ids()?.is_empty());
+    assert!(tracker.replay.lock().is_some(), "A's registration replay is kept");
+
+    super::lifecycle::run_pass_once(&index, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(state.owned_note_ids()?, vec![a.note_id.clone()]);
+    let receiver = receiver.lock().take().expect("A's waiter was registered");
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&a.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_replay_held_back_by_finality_is_kept_for_the_next_pass() -> anyhow::Result<()> {
     let state = Arc::new(RedbCurvyDepositState::in_memory()?);
     let fixture = owned_candidate(2)?;
@@ -624,14 +675,24 @@ async fn a_replay_held_back_by_finality_is_kept_for_the_next_pass() -> anyhow::R
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
-    assert!(tracker.replay.lock().is_some(), "the unfinished replay is kept");
+    assert!(tracker.replay.lock().is_none(), "the finished pending half is not kept");
+    let kept = tracker
+        .take_late_committed_replay()
+        .expect("the unfinished committed replay is kept");
+    assert_eq!(kept, Some(CurvyEventCursor::from(&position(5))));
+    tracker.restore_late_committed_replay(Some(kept));
 
-    // Once the index catches up, the kept replay reaches the commit without advancing the
-    // durable cursor past it in between.
+    // Once the index catches up, the kept committed replay reaches the commit without issuing a
+    // pending replay again.
     *index.head.lock() = (10, 1);
+    index.pending_afters.lock().clear();
     super::lifecycle::run_pass_once(&index, &tracker)
         .await
         .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        index.pending_afters.lock().as_slice(),
+        &[Some(CurvyEventCursor::from(&position(5)))]
+    );
     assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
     assert_eq!(state.committed_amount(&fixture.id)?, ten());
     Ok(())
@@ -680,8 +741,17 @@ async fn a_failed_committed_replay_keeps_the_self_heal_request() -> anyhow::Resu
     state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(3)))?;
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
 
+    // Consume the registration replay before the note is visible, so only the self-heal request
+    // can be the one left after the failure.
+    let earlier = ScriptedIndex::default();
+    *earlier.head.lock() = (5, 1);
+    super::lifecycle::run_pass_once(&earlier, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(tracker.take_replay().is_none());
+
     // Pending discovers the note behind the committed cursor and queues the self-heal. The
-    // committed replay then fails, after the slot was taken, so it must be put back.
+    // committed replay then fails, after the request was taken, so it must be put back.
     let index = ScriptedIndex::default();
     *index.head.lock() = (5, 1);
     index.pending.lock().push(fixture.note);
@@ -695,8 +765,11 @@ async fn a_failed_committed_replay_keeps_the_self_heal_request() -> anyhow::Resu
             .map_err(anyhow::Error::msg)
             .is_err()
     );
-    let kept = tracker.take_replay().expect("the self-heal request is kept");
-    assert_eq!(kept.committed, Some(CurvyEventCursor::from(&position(1))));
+    assert!(tracker.take_replay().is_none());
+    assert_eq!(
+        tracker.take_late_committed_replay(),
+        Some(Some(CurvyEventCursor::from(&position(1))))
+    );
     assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
     Ok(())
 }
@@ -712,11 +785,7 @@ async fn a_registration_replay_merged_with_a_self_heal_uses_the_earlier_floor() 
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
     let replay = tracker.take_replay().expect("the registration requests a replay");
     assert_eq!(replay.committed, Some(CurvyEventCursor::from(&position(3))));
-    tracker.restore_failed_replay(Some(ReplayFrom {
-        committed: Some(CurvyEventCursor::from(&position(1))),
-        committed_only: true,
-        ..Default::default()
-    }));
+    tracker.restore_late_committed_replay(Some(Some(CurvyEventCursor::from(&position(1)))));
 
     let index = ScriptedIndex::default();
     *index.head.lock() = (10, 1);
@@ -974,12 +1043,10 @@ fn merged_replay_requests_keep_the_earlier_floor_and_genesis_wins() -> anyhow::R
         ReplayFrom {
             pending: at(100),
             committed: at(50),
-            ..Default::default()
         },
         ReplayFrom {
             pending: at(80),
             committed: at(60),
-            ..Default::default()
         },
     );
     assert_eq!((both.pending, both.committed), (at(80), at(50)));
@@ -989,12 +1056,10 @@ fn merged_replay_requests_keep_the_earlier_floor_and_genesis_wins() -> anyhow::R
         ReplayFrom {
             pending: Some(CurvyEventCursor::new(5, 1, 0, 0)),
             committed: None,
-            ..Default::default()
         },
         ReplayFrom {
             pending: Some(CurvyEventCursor::new(5, 0, 9, 9)),
             committed: at(1),
-            ..Default::default()
         },
     );
     assert_eq!(tie.pending, Some(CurvyEventCursor::new(5, 0, 9, 9)));
@@ -1007,33 +1072,14 @@ fn merged_replay_requests_keep_the_earlier_floor_and_genesis_wins() -> anyhow::R
         ReplayFrom {
             pending: at(100),
             committed: at(100),
-            ..Default::default()
         },
         ReplayFrom {
             pending: Some(garbled),
             committed: at(200),
-            ..Default::default()
         },
     );
     assert_eq!(unparsable.pending, None);
     assert_eq!(unparsable.committed, at(100));
-
-    // A self-heal only contributes its committed start; the registration's pending replay stays.
-    let self_heal = merged(
-        ReplayFrom {
-            pending: at(100),
-            committed: at(50),
-            ..Default::default()
-        },
-        ReplayFrom {
-            pending: None,
-            committed: at(20),
-            committed_only: true,
-        },
-    );
-    assert_eq!(self_heal.pending, at(100));
-    assert_eq!(self_heal.committed, at(20));
-    assert!(!self_heal.committed_only);
     Ok(())
 }
 
@@ -1135,7 +1181,6 @@ async fn replay_is_bounded_by_the_floor_and_never_rewinds_the_cursors() -> anyho
         Some(ReplayFrom {
             pending: Some(CurvyEventCursor::new(136, 0, 0, 0)),
             committed: Some(CurvyEventCursor::from(&position(200))),
-            ..Default::default()
         })
     );
 
@@ -1301,6 +1346,7 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     // Pending forward.
     let (state, tracker, fixture) = new_tracker()?;
     let index = ScriptedIndex::default();
+    *index.head.lock() = (10, 1);
     index.pending.lock().push(fixture.note.clone());
     super::lifecycle::catch_up(&index, &tracker, None)
         .await
@@ -1312,6 +1358,7 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     let held = CurvyEventCursor::from(&position(300));
     state.advance_cursor(CurvyEventKind::Pending, &held)?;
     let index = ScriptedIndex::default();
+    *index.head.lock() = (10, 1);
     index.pending.lock().push(fixture.note.clone());
     let replay = ReplayFrom::default();
     super::lifecycle::catch_up(&index, &tracker, Some(&replay))
@@ -1345,6 +1392,8 @@ async fn an_unfinished_replay_is_not_kept_for_an_empty_watch_set() -> anyhow::Re
     // Registered and then abandoned: nobody is waiting.
     drop(tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?);
     assert!(tracker.watched_allocations().is_empty());
+    // The pass envelope takes the registration request before the explicit replay below.
+    assert!(tracker.take_replay().is_some());
 
     // A committed candidate meets the empty watch set during the replay. The replay window
     // reaches past the sampled head, but there is nobody left to finish it for.
@@ -1357,7 +1406,6 @@ async fn an_unfinished_replay_is_not_kept_for_an_empty_watch_set() -> anyhow::Re
     let replay = ReplayFrom {
         pending: Some(CurvyEventCursor::from(&position(1))),
         committed: Some(CurvyEventCursor::from(&position(1))),
-        ..Default::default()
     };
     super::lifecycle::catch_up(&index, &tracker, Some(&replay))
         .await
@@ -1367,6 +1415,7 @@ async fn an_unfinished_replay_is_not_kept_for_an_empty_watch_set() -> anyhow::Re
         Some(CurvyEventCursor::from(&position(5)))
     );
     assert!(tracker.take_replay().is_none());
+    assert!(tracker.take_late_committed_replay().is_none());
     Ok(())
 }
 
@@ -1605,6 +1654,8 @@ struct ScriptedIndex {
     committed: parking_lot::Mutex<Vec<CurvyCommittedNote>>,
     /// The `after` of every `committed_notes` call, in order.
     committed_afters: parking_lot::Mutex<Vec<Option<CurvyEventCursor>>>,
+    /// A registration to run on the first committed query, simulating one landing mid-pass.
+    on_committed: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     committed_calls: std::sync::atomic::AtomicUsize,
     /// Fails every `committed_notes` call from the second one on, as an endpoint outage.
     fail_committed_on_second: AtomicBool,
@@ -1686,6 +1737,9 @@ impl CurvyIndexSource for ScriptedIndex {
         after: Option<CurvyEventCursor>,
         first: u32,
     ) -> Result<Vec<CurvyCommittedNote>, String> {
+        if let Some(on_committed) = self.on_committed.lock().take() {
+            on_committed();
+        }
         self.committed_afters.lock().push(after.clone());
         let call = self.committed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if self.fail_committed_on_second.load(std::sync::atomic::Ordering::SeqCst) && call >= 2 {
