@@ -419,26 +419,6 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// allocation. Must be durable before the public half leaves the node.
     fn store_scan_secret(&self, id: &PixAddressId, secret: &CurvyScanSecret) -> Result<(), CurvyStateError>;
 
-    /// Returns the stored secret for `id`, inserting `generated` and recording its replay floors
-    /// when no secret exists yet.
-    ///
-    /// The default is a check-then-store and is not atomic on its own: concurrent callers can each
-    /// store a different secret. The pool serializes its miss path with one per-pool lock. The Redb
-    /// store overrides it with one atomic write transaction that returns the stored secret;
-    /// external stores should do the same when they can.
-    fn get_or_insert_scan_secret(
-        &self,
-        id: &PixAddressId,
-        generated: &CurvyScanSecret,
-    ) -> Result<CurvyScanSecret, CurvyStateError> {
-        if let Some(stored) = self.scan_secret(id)? {
-            return Ok(stored);
-        }
-        self.store_scan_secret(id, generated)?;
-        self.scan_secret(id)?
-            .ok_or_else(|| CurvyStateError::Corrupt("scan secret vanished during get-or-insert".to_owned()))
-    }
-
     /// The scan secret stored for `id`, if [`store_scan_secret`](Self::store_scan_secret) ran.
     fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError>;
 
@@ -847,28 +827,6 @@ impl CurvyDepositState for RedbCurvyDepositState {
             }
         }
         write.commit().map_err(state_db_error)
-    }
-
-    fn get_or_insert_scan_secret(
-        &self,
-        id: &PixAddressId,
-        generated: &CurvyScanSecret,
-    ) -> Result<CurvyScanSecret, CurvyStateError> {
-        let write = self.db.begin_write().map_err(state_db_error)?;
-        let stored = {
-            let mut table = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
-            if let Some(value) = table.get(id_bytes(id)).map_err(state_db_error)? {
-                self.unseal_scan_secret(id, &value.value())?
-            } else {
-                table
-                    .insert(id_bytes(id), self.seal_scan_secret(id, generated)?)
-                    .map_err(state_db_error)?;
-                Self::write_replay_floors(&write, id)?;
-                generated.clone()
-            }
-        };
-        write.commit().map_err(state_db_error)?;
-        Ok(stored)
     }
 
     fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError> {

@@ -1655,9 +1655,8 @@ where
         {
             Some(existing) => existing,
             None => {
-                // Only the miss path is serialized: a hit never waits. This one per-pool lock
-                // makes the trait's non-atomic check-then-store safe for every store; Redb's
-                // override is atomic on its own.
+                // Only the miss path is serialized: a hit never waits. The re-check under this
+                // one per-pool lock keeps every store from overwriting another caller's secret.
                 let _initializing = self.scan_secret_init.lock().await;
                 match self
                     .tracker
@@ -1670,8 +1669,9 @@ where
                         let generated = Self::generate_scan_secret()?;
                         self.tracker
                             .state
-                            .get_or_insert_scan_secret(id, &generated)
-                            .map_err(CurvyDepositPoolError::from)?
+                            .store_scan_secret(id, &generated)
+                            .map_err(CurvyDepositPoolError::from)?;
+                        generated
                     }
                 }
             }
