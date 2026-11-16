@@ -367,9 +367,10 @@ pub trait CurvyDepositState: Send + Sync + 'static {
 
     /// Records an owned candidate, returning `true` only when it was not already present.
     ///
-    /// The default is a check-then-record and is non-atomic; the Redb store overrides it and
-    /// returns the insert result from the same write transaction. The watcher is the only
-    /// inserter, so even the default is race-free inside the pool.
+    /// When the note is already present this method makes no state change and does not advance
+    /// the cursor; that matches the Redb override. The default is a check-then-record and is
+    /// non-atomic; Redb returns the insert result from the same write transaction. The watcher is
+    /// the only inserter, so the default is race-free inside the pool.
     fn record_owned_candidate_if_new(
         &self,
         note_id: &str,
@@ -382,8 +383,11 @@ pub trait CurvyDepositState: Send + Sync + 'static {
             .iter()
             .filter_map(|id| note_id_key(id).ok())
             .any(|existing| existing == key);
+        if existed {
+            return Ok(false);
+        }
         self.record_owned_candidate(note_id, note, cursor)?;
-        Ok(!existed)
+        Ok(true)
     }
 
     /// Marks a known note committed and advances the cursor atomically.
@@ -626,11 +630,12 @@ impl RedbCurvyDepositState {
         Ok(())
     }
 
-    fn record_owned_candidate_insert(
+    fn record_owned_candidate_tx(
         &self,
         note_id: &str,
         note: DetectedCurvyNote,
         cursor: &CurvyEventCursor,
+        only_if_new: bool,
     ) -> Result<bool, CurvyStateError> {
         let id = note.deposit.id;
         let note_id_key = note_id_key(note_id)?;
@@ -639,6 +644,9 @@ impl RedbCurvyDepositState {
         let inserted = {
             let mut notes = write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
             let inserted = notes.get(owned_note_key).map_err(state_db_error)?.is_none();
+            if only_if_new && !inserted {
+                return Ok(false);
+            }
             if inserted {
                 notes
                     .insert(
@@ -679,7 +687,7 @@ impl CurvyDepositState for RedbCurvyDepositState {
         note: DetectedCurvyNote,
         cursor: &CurvyEventCursor,
     ) -> Result<(), CurvyStateError> {
-        self.record_owned_candidate_insert(note_id, note, cursor).map(|_| ())
+        self.record_owned_candidate_tx(note_id, note, cursor, false).map(|_| ())
     }
 
     fn record_owned_candidate_if_new(
@@ -689,11 +697,10 @@ impl CurvyDepositState for RedbCurvyDepositState {
         cursor: &CurvyEventCursor,
     ) -> Result<bool, CurvyStateError> {
         let id = note.deposit.id;
-        let note_id_key = note_id_key(note_id)?;
         let owned_note_key = owned_note_key(&id, note_id)?;
 
         // A snapshot source re-serves pending notes every pass. Read once so a duplicate costs no
-        // write transaction and no cursor churn.
+        // write transaction and no cursor churn; the helper re-checks inside its transaction.
         {
             let read = self.db.begin_read().map_err(state_db_error)?;
             let notes = read.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
@@ -701,31 +708,7 @@ impl CurvyDepositState for RedbCurvyDepositState {
                 return Ok(false);
             }
         }
-
-        let write = self.db.begin_write().map_err(state_db_error)?;
-        {
-            let mut notes = write.open_table(OWNED_NOTES_TABLE).map_err(state_db_error)?;
-            // Re-check inside the write transaction: the read above is only a fast path.
-            if notes.get(owned_note_key).map_err(state_db_error)?.is_some() {
-                return Ok(false);
-            }
-            notes
-                .insert(
-                    owned_note_key,
-                    encode_owned_note(&StoredOwnedNote {
-                        detected: note,
-                        committed: false,
-                        leaf_index: None,
-                    }),
-                )
-                .map_err(state_db_error)?;
-            let mut sessions = write.open_table(NOTE_SESSIONS_TABLE).map_err(state_db_error)?;
-            sessions.insert(note_id_key, id_bytes(&id)).map_err(state_db_error)?;
-            let mut cursor_table = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
-            Self::put_cursor(&mut cursor_table, CurvyEventKind::Pending, cursor)?;
-        }
-        write.commit().map_err(state_db_error)?;
-        Ok(true)
+        self.record_owned_candidate_tx(note_id, note, cursor, true)
     }
 
     fn record_completion(
@@ -857,7 +840,6 @@ impl CurvyDepositState for RedbCurvyDepositState {
                 .map_err(state_db_error)?
                 .is_some();
             if !existed {
-                drop(table);
                 Self::write_replay_floors(&write, id)?;
             }
         }
@@ -878,7 +860,6 @@ impl CurvyDepositState for RedbCurvyDepositState {
                 table
                     .insert(id_bytes(id), self.seal_scan_secret(id, generated)?)
                     .map_err(state_db_error)?;
-                drop(table);
                 Self::write_replay_floors(&write, id)?;
                 generated.clone()
             }

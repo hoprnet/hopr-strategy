@@ -536,8 +536,47 @@ async fn a_head_snapshot_before_pending_prevents_the_commit_race() -> anyhow::Re
     // The pending view catches up; the note is discovered before its commit is processed.
     index.pending.lock().push(fixture.note);
     run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
-    assert_eq!(receiver.await?, ten());
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
     assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_candidates_cover_a_commit_below_the_sampled_head() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    state.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(1)))?;
+    state.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // The pending view lags, but the source honours the other half of the contract: the note is
+    // served as a committed candidate together with its commit. Ownership is recorded before the
+    // page's completion is correlated, even though the commit is below the sampled bound.
+    let index = ScriptedIndex::default();
+    *index.head.lock() = (5, 1);
+    *index.head_after_pending.lock() = Some((10, 1));
+    index.committed_candidates.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    run_pass(&index, &tracker).await.map_err(anyhow::Error::msg)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
+#[test]
+fn the_default_get_or_insert_reuses_the_stored_secret() -> anyhow::Result<()> {
+    let state = FloorlessState(RedbCurvyDepositState::in_memory()?);
+    let id = pix_id(1);
+    let first = scan_secret("01", "02")?;
+    let second = scan_secret("03", "04")?;
+    let stored = state.get_or_insert_scan_secret(&id, &first)?;
+    let again = state.get_or_insert_scan_secret(&id, &second)?;
+    assert_eq!(stored.public(), again.public());
+    assert_eq!(
+        state.scan_secret(&id)?.expect("stored secret").public(),
+        stored.public()
+    );
     Ok(())
 }
 
@@ -588,8 +627,10 @@ async fn process_candidate_reports_only_the_first_insert() -> anyhow::Result<()>
 
     assert!(tracker.process_candidate(fixture.note.clone(), None).await?);
     assert_eq!(tracker.state.owned_note_ids()?.len(), 1);
+    assert_eq!(tracker.discovered_logs.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(tracker.process_candidate(fixture.note, None).await?);
     assert_eq!(tracker.state.owned_note_ids()?.len(), 1);
+    assert_eq!(tracker.discovered_logs.load(std::sync::atomic::Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -1202,14 +1243,6 @@ impl CurvyDepositState for FloorlessState {
         self.0.store_scan_secret(id, secret)
     }
 
-    fn get_or_insert_scan_secret(
-        &self,
-        id: &PixAddressId,
-        generated: &CurvyScanSecret,
-    ) -> Result<CurvyScanSecret, CurvyStateError> {
-        self.0.get_or_insert_scan_secret(id, generated)
-    }
-
     fn scan_secret(&self, id: &PixAddressId) -> Result<Option<CurvyScanSecret>, CurvyStateError> {
         self.0.scan_secret(id)
     }
@@ -1421,12 +1454,7 @@ where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
-    let replay = tracker.take_replay();
-    let result = super::lifecycle::catch_up(index, tracker, replay.as_ref()).await;
-    if result.is_err() {
-        tracker.restore_failed_replay(replay);
-    }
-    result
+    super::lifecycle::run_pass_once(index, tracker).await
 }
 
 /// Records what the pool asked of the SDK instead of proving and submitting it.

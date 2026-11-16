@@ -81,11 +81,13 @@ impl PendingNotesPage {
 pub trait CurvyIndexSource: Send + Sync + 'static {
     /// Pending events after `after`, or one complete pinned snapshot for snapshot sources.
     ///
-    /// Contract: the result must contain every pending event whose position is at or before the
-    /// head reported by [`indexed_head`](Self::indexed_head), or be pinned to a snapshot at that
-    /// head. Discovery samples the head before pending and uses it to bound the committed phase;
-    /// a source that serves a newer head with a lagging pending view can let a commit overtake
-    /// its note. Pages must also be in increasing chain-position order.
+    /// Contract: pages are in increasing chain-position order. The pending view may be older
+    /// than [`indexed_head`](Self::indexed_head); any note that commits before it appears pending
+    /// must then be served by [`committed_candidates`](Self::committed_candidates). Discovery
+    /// samples the head before pending and uses it to bound the committed phase, so a source that
+    /// serves a newer committed head with a lagging pending view *and* omits the note from
+    /// committed candidates can let the commit overtake its note. Blokli's pending stream is
+    /// complete (empty candidates); Curvy's indexer relies on committed candidates.
     async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
@@ -265,6 +267,8 @@ pub struct CurvyLifecycleTracker<S> {
     pub(super) state: Arc<S>,
     waiters: parking_lot::Mutex<HashMap<PixAddressId, WatchedAllocation>>,
     pub(super) replay: parking_lot::Mutex<Option<ReplayFrom>>,
+    #[cfg(test)]
+    pub(super) discovered_logs: std::sync::atomic::AtomicUsize,
 }
 
 impl<S> CurvyLifecycleTracker<S>
@@ -292,6 +296,8 @@ where
             state,
             waiters: Default::default(),
             replay: Default::default(),
+            #[cfg(test)]
+            discovered_logs: Default::default(),
         }
     }
 
@@ -466,6 +472,8 @@ where
                     allocation = ?allocation,
                     "discovered Curvy PIX pending note through Blokli"
                 );
+                #[cfg(test)]
+                self.discovered_logs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
         Ok(true)
@@ -756,6 +764,23 @@ where
     Ok(())
 }
 
+/// Runs one watcher pass, taking the replay slot and restoring it if the pass fails. This is the
+/// exact envelope `run_watcher` uses; tests drive it directly so the production wiring is covered.
+pub(super) async fn run_pass_once<I, S>(client: &I, tracker: &CurvyLifecycleTracker<S>) -> Result<(), String>
+where
+    I: CurvyIndexSource,
+    S: CurvyDepositState,
+{
+    let replay = tracker.take_replay();
+    match catch_up(client, tracker, replay.as_ref()).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracker.restore_failed_replay(replay);
+            Err(error)
+        }
+    }
+}
+
 /// The watcher loop: polls Blokli while anybody is waiting, and idles otherwise.
 ///
 /// Runs until aborted. Captures only the client and the tracker — never the pool — so that
@@ -775,15 +800,13 @@ where
             continue;
         }
 
-        let replay = tracker.take_replay();
-        let delay = match catch_up(client.as_ref(), tracker.as_ref(), replay.as_ref()).await {
+        let replayed = tracker.replay.lock().is_some();
+        let delay = match run_pass_once(client.as_ref(), tracker.as_ref()).await {
             Ok(()) => {
                 retry_delay = RECONNECT_DELAY;
                 RECONNECT_DELAY
             }
             Err(error) => {
-                let replayed = replay.is_some();
-                tracker.restore_failed_replay(replay);
                 let delay = retry_delay;
                 retry_delay = retry_delay.saturating_mul(2).min(cap);
                 tracing::warn!(%error, replayed, retry_in = ?delay,
