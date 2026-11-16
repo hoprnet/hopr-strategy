@@ -10,7 +10,8 @@
 //! The watcher is one task per pool, started on the first registration and aborted when the pool
 //! is dropped. Each pass catches pending notes up *first*, then committed ones, so that a
 //! commitment can only ever correlate against an ownership decision that is already durable.
-//! Committed events are consumed only up to `indexed_block − finality`.
+//! Committed events are consumed up to the source's indexed head, less any further finality the
+//! source asks for; Blokli and the Curvy indexer serve only final blocks and ask for none.
 //!
 //! Every allocation registers its own scan secret, so the watcher's candidate set is exactly the
 //! set of allocations somebody is waiting on. While that set is empty the pending cursor is
@@ -51,9 +52,9 @@ use super::{
 const QUERY_PAGE_SIZE: u32 = 1_000;
 /// Normal polling interval between successful passes over the index.
 ///
-/// Short, because it sits directly on the confirmation latency: a commitment becomes final one
-/// block after it lands, and every pass that starts just before that block wastes a whole
-/// interval. Blokli answers these pages locally, so the cost of asking often is small.
+/// Short, because it sits directly on the confirmation latency: a commitment is accepted as soon
+/// as the source has indexed its block, and every pass that starts just before that block wastes
+/// a whole interval. Blokli answers these pages locally, so the cost of asking often is small.
 const RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 /// A pending-note traversal step. Snapshot sources return their entire pinned snapshot
@@ -88,8 +89,8 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
         first: u32,
     ) -> Result<Vec<CurvyCommittedNote>, String>;
 
-    /// The highest block the indexer has processed, and the number of confirmations it treats as
-    /// final.
+    /// The highest block the indexer has processed, and how many further confirmations a committed
+    /// note at that block still needs: zero for a source that serves only final blocks.
     async fn indexed_head(&self) -> Result<(u64, u64), String>;
 
     /// Whether the chain has already seen `nullifier` (a `0x`-prefixed 32-byte hex string).
@@ -144,8 +145,9 @@ where
         let chain_info = self.0.query_chain_info().await.map_err(|error| error.to_string())?;
         let indexed_block = u64::try_from(chain_info.block_number)
             .map_err(|_| "Blokli returned a negative indexed block number".to_owned())?;
-        let finality = cursor_component(&chain_info.finality, "finality").map_err(|error| error.to_string())?;
-        Ok((indexed_block, finality))
+        // Blokli indexes only blocks that are already `finality` deep, so its block number needs no
+        // further finality.
+        Ok((indexed_block, 0))
     }
 
     async fn nullifier_spent(&self, nullifier: String) -> Result<bool, String> {

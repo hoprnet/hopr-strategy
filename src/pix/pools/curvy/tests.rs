@@ -3146,6 +3146,37 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn blokli_head_needs_no_further_finality() -> anyhow::Result<()> {
+    // The test client reports finality 3.
+    let client = BlokliTestStateBuilder::default().build_static_client();
+    let index = super::lifecycle::BlokliIndex(Arc::new(client));
+    assert_eq!(index.indexed_head().await.map_err(anyhow::Error::msg)?, (1, 0));
+    Ok(())
+}
+
+/// A committed note at exactly the indexed head is accepted.
+#[tokio::test]
+async fn a_committed_note_at_the_indexed_head_is_confirmed() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    *index.head.lock() = (3, 0);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        super::lifecycle::catch_up(&index, &tracker, None),
+    )
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
