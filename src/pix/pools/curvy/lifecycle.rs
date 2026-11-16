@@ -80,6 +80,12 @@ impl PendingNotesPage {
 #[async_trait]
 pub trait CurvyIndexSource: Send + Sync + 'static {
     /// Pending events after `after`, or one complete pinned snapshot for snapshot sources.
+    ///
+    /// Contract: the result must contain every pending event whose position is at or before the
+    /// head reported by [`indexed_head`](Self::indexed_head), or be pinned to a snapshot at that
+    /// head. Discovery samples the head before pending and uses it to bound the committed phase;
+    /// a source that serves a newer head with a lagging pending view can let a commit overtake
+    /// its note. Pages must also be in increasing chain-position order.
     async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
@@ -251,13 +257,6 @@ impl ReplayFrom {
             committed: earlier(self.committed, other.committed),
         }
     }
-}
-
-/// The result of judging one candidate. The discovery log fires only on the first insert, even
-/// when a snapshot source re-serves the note.
-#[derive(Debug)]
-pub(super) struct CandidateOutcome {
-    pub(super) continue_processing: bool,
 }
 
 /// Correlates Blokli's public note events with the allocations this node is waiting on.
@@ -432,12 +431,10 @@ where
         &self,
         candidate: CurvyPendingNote,
         hold: Option<&CurvyEventCursor>,
-    ) -> Result<CandidateOutcome, CurvyLifecycleError> {
+    ) -> Result<bool, CurvyLifecycleError> {
         let watched = self.watched_allocations();
         if watched.is_empty() {
-            return Ok(CandidateOutcome {
-                continue_processing: false,
-            });
+            return Ok(false);
         }
 
         let cursor = CurvyEventCursor::from(&candidate.position);
@@ -453,9 +450,7 @@ where
                     %error,
                     "quarantining malformed public Curvy pending-note event"
                 );
-                return Ok(CandidateOutcome {
-                    continue_processing: true,
-                });
+                return Ok(true);
             }
         };
 
@@ -473,9 +468,7 @@ where
                 );
             }
         }
-        Ok(CandidateOutcome {
-            continue_processing: true,
-        })
+        Ok(true)
     }
 
     /// Like [`process_candidate`](Self::process_candidate): malformed events are quarantined
@@ -557,11 +550,10 @@ where
                 stopped = true;
                 break;
             }
-            let outcome = tracker
+            watching = tracker
                 .process_candidate(note, hold.as_ref())
                 .await
                 .map_err(|error| error.to_string())?;
-            watching = outcome.continue_processing;
             if !watching {
                 stopped = true;
                 break;
@@ -621,11 +613,11 @@ where
                     .state
                     .cursor(CurvyEventKind::Pending)
                     .map_err(|error| error.to_string())?;
-                let outcome = tracker
+                if !tracker
                     .process_candidate(candidate, pending.as_ref())
                     .await
-                    .map_err(|error| error.to_string())?;
-                if !outcome.continue_processing {
+                    .map_err(|error| error.to_string())?
+                {
                     return Ok(false);
                 }
             }
@@ -682,14 +674,14 @@ where
 /// anchor, so the events of replacement blocks are seen, the old position's included; a forward
 /// phase also replaces its durable cursor with canonical positions as it goes. The error cannot
 /// be told apart from an outage, so an outage costs one more query: a second failure is returned.
-async fn recovering_anchor<F, Fut, T>(
+async fn recovering_anchor<F, Fut>(
     family: &'static str,
     start: Option<CurvyEventCursor>,
     mut phase: F,
-) -> Result<T, String>
+) -> Result<bool, String>
 where
     F: FnMut(Option<CurvyEventCursor>) -> Fut,
-    Fut: Future<Output = Result<T, String>>,
+    Fut: Future<Output = Result<bool, String>>,
 {
     let anchored = start.as_ref().filter(|cursor| cursor.block_hash.is_some()).cloned();
     match (phase(start).await, anchored) {
