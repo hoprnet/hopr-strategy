@@ -110,10 +110,6 @@ pub enum CurvyStateError {
     WrongPassword,
 }
 
-/// Serializes the trait default's check-then-store across every non-Redb store. Redb overrides
-/// the method atomically and does not need it.
-static DEFAULT_SCAN_SECRET_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn state_db_error(error: impl std::fmt::Display) -> CurvyStateError {
     CurvyStateError::Database(error.to_string())
 }
@@ -371,10 +367,12 @@ pub trait CurvyDepositState: Send + Sync + 'static {
 
     /// Records an owned candidate, returning `true` only when it was not already present.
     ///
-    /// When the note is already present this method makes no state change and does not advance
-    /// the cursor; that matches the Redb override. The default is a check-then-record and is
-    /// non-atomic; Redb returns the insert result from the same write transaction. The watcher is
-    /// the only inserter, so the default is race-free inside the pool.
+    /// A first insert writes `note` and advances the pending cursor to `cursor`, and returns
+    /// `true`. A duplicate writes nothing and does not advance the cursor, and returns `false`.
+    /// The default checks the id against [`owned_note_ids`](Self::owned_note_ids) before calling
+    /// [`record_owned_candidate`](Self::record_owned_candidate); the Redb override checks and
+    /// inserts in one write transaction. This check-then-record is not atomic on its own; the
+    /// watcher is the only inserter, so the default is race-free inside the pool.
     fn record_owned_candidate_if_new(
         &self,
         note_id: &str,
@@ -382,12 +380,12 @@ pub trait CurvyDepositState: Send + Sync + 'static {
         cursor: &CurvyEventCursor,
     ) -> Result<bool, CurvyStateError> {
         let key = note_id_key(note_id)?;
-        let existed = self
+        let wanted = format!("0x{}", const_hex::encode(key));
+        if self
             .owned_note_ids()?
             .iter()
-            .filter_map(|id| note_id_key(id).ok())
-            .any(|existing| existing == key);
-        if existed {
+            .any(|existing| existing.eq_ignore_ascii_case(&wanted))
+        {
             return Ok(false);
         }
         self.record_owned_candidate(note_id, note, cursor)?;
@@ -424,17 +422,15 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// Returns the stored secret for `id`, inserting `generated` and recording its replay floors
     /// when no secret exists yet.
     ///
-    /// The default serializes check-then-store with a process-wide lock. The Redb store overrides
-    /// it with one atomic write transaction; external stores should do the same when they can.
-    /// This keeps the method additive for implementors of this public trait.
+    /// The default is a check-then-store and is not atomic on its own: concurrent callers can each
+    /// store a different secret. The pool serializes its miss path with one per-pool lock. The Redb
+    /// store overrides it with one atomic write transaction that returns the stored secret;
+    /// external stores should do the same when they can.
     fn get_or_insert_scan_secret(
         &self,
         id: &PixAddressId,
         generated: &CurvyScanSecret,
     ) -> Result<CurvyScanSecret, CurvyStateError> {
-        let _guard = DEFAULT_SCAN_SECRET_INIT
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(stored) = self.scan_secret(id)? {
             return Ok(stored);
         }
