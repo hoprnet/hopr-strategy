@@ -110,6 +110,10 @@ pub enum CurvyStateError {
     WrongPassword,
 }
 
+/// Serializes the trait default's check-then-store across every non-Redb store. Redb overrides
+/// the method atomically and does not need it.
+static DEFAULT_SCAN_SECRET_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn state_db_error(error: impl std::fmt::Display) -> CurvyStateError {
     CurvyStateError::Database(error.to_string())
 }
@@ -420,14 +424,17 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// Returns the stored secret for `id`, inserting `generated` and recording its replay floors
     /// when no secret exists yet.
     ///
-    /// The default is a best-effort check-then-store. The Redb store overrides it with one atomic
-    /// write transaction; external stores should do the same when they can. This keeps the
-    /// method additive for implementors of this public trait.
+    /// The default serializes check-then-store with a process-wide lock. The Redb store overrides
+    /// it with one atomic write transaction; external stores should do the same when they can.
+    /// This keeps the method additive for implementors of this public trait.
     fn get_or_insert_scan_secret(
         &self,
         id: &PixAddressId,
         generated: &CurvyScanSecret,
     ) -> Result<CurvyScanSecret, CurvyStateError> {
+        let _guard = DEFAULT_SCAN_SECRET_INIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(stored) = self.scan_secret(id)? {
             return Ok(stored);
         }

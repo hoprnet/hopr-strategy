@@ -1066,9 +1066,6 @@ pub struct CurvyDepositPool<N, I = NoteIndex, A = RsSdkCurvyAdapter<BlokliClient
     cfg: CurvyDepositPoolConfig,
     reconciled: tokio::sync::OnceCell<()>,
     watcher: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Serializes the miss path of `generate_deposit_data`, so even a non-atomic external
-    /// `CurvyDepositState` cannot let two callers overwrite each other's secret.
-    scan_secret_init: tokio::sync::Mutex<()>,
 }
 
 impl<N> CurvyDepositPool<N>
@@ -1305,7 +1302,6 @@ where
             cfg,
             reconciled: tokio::sync::OnceCell::new(),
             watcher: parking_lot::Mutex::new(None),
-            scan_secret_init: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1647,9 +1643,6 @@ where
     /// public half. Idempotent: asking twice for one allocation returns the same identity.
     async fn generate_deposit_data(&self, id: &PixAddressId) -> Result<Self::PoolDepositData, Self::Error> {
         self.ensure_reconciled().await?;
-        // Serialize the check-then-insert path for every store. Redb's override is atomic on its
-        // own; this mutex also makes the trait's best-effort default safe through the pool.
-        let _initializing = self.scan_secret_init.lock().await;
         let secret = match self
             .tracker
             .state
