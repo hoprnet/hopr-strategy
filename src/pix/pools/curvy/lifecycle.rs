@@ -8,9 +8,10 @@
 //! passed.
 //!
 //! The watcher is one task per pool, started on the first registration and aborted when the pool
-//! is dropped. Each pass catches pending notes up *first*, then committed ones, so that a
-//! commitment can only ever correlate against an ownership decision that is already durable.
-//! Committed events are consumed only up to `indexed_block − finality`.
+//! is dropped. Each pass samples the indexed head, catches pending notes up *first*, then committed
+//! ones, so that a commitment can only ever correlate against an ownership decision that is already
+//! durable. Committed events are consumed only up to that observation minus `finality`, so a commit
+//! that lands while pending is running cannot overtake the note discovered by the same pass.
 //!
 //! Every allocation registers its own scan secret, so the watcher's candidate set is exactly the
 //! set of allocations somebody is waiting on. While that set is empty the pending cursor is
@@ -24,7 +25,7 @@
 //! history. Foreign notes cost one cursor commit per page, not one each.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
     time::Duration,
 };
@@ -252,61 +253,11 @@ impl ReplayFrom {
     }
 }
 
-/// A committed-family replay start. `Genesis` is the lowest possible position; `After` is an
-/// exclusive cursor in the committed family's own coordinate system.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum ReplayStart {
-    Genesis,
-    After(CurvyEventCursor),
-}
-
-impl ReplayStart {
-    fn as_cursor(&self) -> Option<CurvyEventCursor> {
-        match self {
-            Self::Genesis => None,
-            Self::After(cursor) => Some(cursor.clone()),
-        }
-    }
-}
-
-/// First-discovery committed replays queued for a future pass, plus the resolved merged start.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct CommittedReplay {
-    pub(super) ids: BTreeSet<PixAddressId>,
-    pub(super) start: Option<ReplayStart>,
-}
-
-fn earlier_start(a: ReplayStart, b: ReplayStart) -> ReplayStart {
-    match (a, b) {
-        (ReplayStart::Genesis, _) | (_, ReplayStart::Genesis) => ReplayStart::Genesis,
-        (ReplayStart::After(a), ReplayStart::After(b)) => match (cursor_order(&a), cursor_order(&b)) {
-            (Ok(order_a), Ok(order_b)) => {
-                if order_b < order_a {
-                    ReplayStart::After(b)
-                } else {
-                    ReplayStart::After(a)
-                }
-            }
-            _ => ReplayStart::Genesis,
-        },
-    }
-}
-
-fn merge_start(existing: Option<ReplayStart>, incoming: Option<ReplayStart>) -> Option<ReplayStart> {
-    match (existing, incoming) {
-        (Some(a), Some(b)) => Some(earlier_start(a, b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-/// The result of judging one pending candidate. `discovered` is set only on the first insert of
-/// an owned note; committed-candidate passes ignore it.
+/// The result of judging one candidate. The discovery log fires only on the first insert, even
+/// when a snapshot source re-serves the note.
 #[derive(Debug)]
 pub(super) struct CandidateOutcome {
     pub(super) continue_processing: bool,
-    pub(super) discovered: Option<PixAddressId>,
 }
 
 /// Correlates Blokli's public note events with the allocations this node is waiting on.
@@ -315,7 +266,6 @@ pub struct CurvyLifecycleTracker<S> {
     pub(super) state: Arc<S>,
     waiters: parking_lot::Mutex<HashMap<PixAddressId, WatchedAllocation>>,
     pub(super) replay: parking_lot::Mutex<Option<ReplayFrom>>,
-    committed_replay: parking_lot::Mutex<CommittedReplay>,
 }
 
 impl<S> CurvyLifecycleTracker<S>
@@ -343,7 +293,6 @@ where
             state,
             waiters: Default::default(),
             replay: Default::default(),
-            committed_replay: Default::default(),
         }
     }
 
@@ -452,25 +401,6 @@ where
         }
     }
 
-    /// Queues a committed replay for an allocation whose note was just inserted. This is an
-    /// in-memory operation and must not fail; resolving the floor happens inside the next pass.
-    pub(super) fn queue_committed_replay(&self, id: PixAddressId) {
-        self.committed_replay.lock().ids.insert(id);
-    }
-
-    pub(super) fn take_committed_replay(&self) -> CommittedReplay {
-        std::mem::take(&mut *self.committed_replay.lock())
-    }
-
-    pub(super) fn restore_committed_replay(&self, replay: CommittedReplay) {
-        if replay.ids.is_empty() && replay.start.is_none() {
-            return;
-        }
-        let mut slot = self.committed_replay.lock();
-        slot.ids.extend(replay.ids);
-        slot.start = merge_start(slot.start.take(), replay.start);
-    }
-
     fn notify_waiters(&self, id: PixAddressId, committed: HoprBalance) {
         let mut waiters = self.waiters.lock();
         let mut remove_allocation = false;
@@ -507,7 +437,6 @@ where
         if watched.is_empty() {
             return Ok(CandidateOutcome {
                 continue_processing: false,
-                discovered: None,
             });
         }
 
@@ -526,12 +455,11 @@ where
                 );
                 return Ok(CandidateOutcome {
                     continue_processing: true,
-                    discovered: None,
                 });
             }
         };
 
-        let discovered = if let Some(note) = detected {
+        if let Some(note) = detected {
             let allocation = note.deposit.id;
             let inserted = self
                 .state
@@ -543,16 +471,10 @@ where
                     allocation = ?allocation,
                     "discovered Curvy PIX pending note through Blokli"
                 );
-                Some(allocation)
-            } else {
-                None
             }
-        } else {
-            None
-        };
+        }
         Ok(CandidateOutcome {
             continue_processing: true,
-            discovered,
         })
     }
 
@@ -639,9 +561,6 @@ where
                 .process_candidate(note, hold.as_ref())
                 .await
                 .map_err(|error| error.to_string())?;
-            if let Some(id) = outcome.discovered {
-                tracker.queue_committed_replay(id);
-            }
             watching = outcome.continue_processing;
             if !watching {
                 stopped = true;
@@ -663,18 +582,6 @@ where
     }
 }
 
-/// How a committed-family phase stopped. Only the replay path uses the distinction: a replay
-/// stopped by finality before its window end has to be queued again.
-#[derive(Clone, Debug, PartialEq)]
-enum CommittedPhaseOutcome {
-    /// The page range was exhausted (or the replay window end was reached).
-    Done(Option<CurvyEventCursor>),
-    /// No watched allocation remained; the pass must stop.
-    Unwatched,
-    /// The next event is not final yet. The cursor is the first unfinalized event.
-    StoppedAtFinality(CurvyEventCursor),
-}
-
 /// One committed-family phase, shaped like [`pending_phase`]. Only notes this store owns (or
 /// whose ids are malformed, to be quarantined) are correlated; the rest are skipped.
 async fn committed_phase<I, S>(
@@ -684,7 +591,7 @@ async fn committed_phase<I, S>(
     window_end: Option<&CurvyEventCursor>,
     finalized_through: u64,
     replay: bool,
-) -> Result<CommittedPhaseOutcome, String>
+) -> Result<bool, String>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
@@ -719,7 +626,7 @@ where
                     .await
                     .map_err(|error| error.to_string())?;
                 if !outcome.continue_processing {
-                    return Ok(CommittedPhaseOutcome::Unwatched);
+                    return Ok(false);
                 }
             }
         }
@@ -736,18 +643,12 @@ where
             HashSet::new()
         };
         let mut stop = false;
-        let mut stopped_at_finality = None;
         let mut last = None;
         for note in page {
             let event_block =
                 cursor_component(&note.position.block, "completion block").map_err(|error| error.to_string())?;
             let position = CurvyEventCursor::from(&note.position);
-            if event_block > finalized_through {
-                stopped_at_finality = Some(position);
-                stop = true;
-                break;
-            }
-            if replay && is_beyond(&position, window_end) {
+            if event_block > finalized_through || (replay && is_beyond(&position, window_end)) {
                 stop = true;
                 break;
             }
@@ -767,10 +668,7 @@ where
                 .map_err(|error| error.to_string())?;
         }
         if stop || page_len < QUERY_PAGE_SIZE as usize {
-            return Ok(match stopped_at_finality {
-                Some(position) => CommittedPhaseOutcome::StoppedAtFinality(position),
-                None => CommittedPhaseOutcome::Done(last),
-            });
+            return Ok(true);
         }
     }
 }
@@ -803,56 +701,6 @@ where
     }
 }
 
-/// Resolve the queued first-discovery allocations to one committed replay start. A corrupt
-/// floor counts as genesis, matching [`earlier`]'s rule for unorderable positions.
-fn resolve_committed_replay<S>(tracker: &CurvyLifecycleTracker<S>, replay: &mut CommittedReplay) -> Option<ReplayStart>
-where
-    S: CurvyDepositState,
-{
-    if let Some(start) = replay.start.clone() {
-        return Some(start);
-    }
-    if replay.ids.is_empty() {
-        return None;
-    }
-    let mut start = None;
-    for id in &replay.ids {
-        let floor = match tracker.state.replay_floor(id, CurvyEventKind::Committed) {
-            Ok(floor) => floor.map(ReplayStart::After).unwrap_or(ReplayStart::Genesis),
-            Err(error) => {
-                tracing::warn!(allocation = ?id, %error, "unreadable Curvy committed replay floor; replaying from genesis");
-                ReplayStart::Genesis
-            }
-        };
-        start = Some(match start {
-            Some(existing) => earlier_start(existing, floor),
-            None => floor,
-        });
-    }
-    replay.ids.clear();
-    replay.start = start.clone();
-    start
-}
-
-fn start_before(cursor: &ReplayStart, end: &CurvyEventCursor) -> bool {
-    match cursor {
-        ReplayStart::Genesis => true,
-        ReplayStart::After(start) => {
-            matches!((cursor_order(start), cursor_order(end)), (Ok(start), Ok(end)) if start < end)
-        }
-    }
-}
-
-fn should_requeue(outcome: &CommittedPhaseOutcome, start: &ReplayStart, window_end: &CurvyEventCursor) -> bool {
-    if !start_before(start, window_end) {
-        return false;
-    }
-    match outcome {
-        CommittedPhaseOutcome::StoppedAtFinality(position) => !is_beyond(position, Some(window_end)),
-        CommittedPhaseOutcome::Done(_) | CommittedPhaseOutcome::Unwatched => false,
-    }
-}
-
 /// One catch-up pass over both event families. See the module docs for the ordering.
 ///
 /// The forward phases consume what is new since the durable cursors; the replay phases, when
@@ -863,14 +711,17 @@ pub(super) async fn catch_up<I, S>(
     client: &I,
     tracker: &CurvyLifecycleTracker<S>,
     replay: Option<&ReplayFrom>,
-    committed_replay: Option<&mut CommittedReplay>,
 ) -> Result<(), String>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
-    let mut empty_committed_replay = CommittedReplay::default();
-    let committed_replay = committed_replay.unwrap_or(&mut empty_committed_replay);
+    // Sample the indexed head before the pending phases. Every committed event this pass is
+    // allowed to process was final at this observation. A commit that lands while pending is
+    // running therefore cannot be consumed before the note discovered in that same pass; it is
+    // processed on a later pass, after the ownership decision is durable.
+    let (indexed_block, finality) = client.indexed_head().await?;
+    let finalized_through = indexed_block.saturating_sub(finality);
     let p0 = tracker
         .state
         .cursor(CurvyEventKind::Pending)
@@ -892,43 +743,23 @@ where
         return Ok(());
     }
 
-    let (indexed_block, finality) = client.indexed_head().await?;
-    let finalized_through = indexed_block.saturating_sub(finality);
     let c0 = tracker
         .state
         .cursor(CurvyEventKind::Committed)
         .map_err(|error| error.to_string())?;
     let c0_end = c0.as_ref();
-    if matches!(
-        recovering_anchor("committed", c0.clone(), move |from| {
-            committed_phase(client, tracker, from, None, finalized_through, false)
-        })
-        .await?,
-        CommittedPhaseOutcome::Unwatched
-    ) {
+    if !recovering_anchor("committed", c0.clone(), move |from| {
+        committed_phase(client, tracker, from, None, finalized_through, false)
+    })
+    .await?
+    {
         return Ok(());
     }
-
-    let registration_start = replay.map(|replay| {
-        replay
-            .committed
-            .clone()
-            .map(ReplayStart::After)
-            .unwrap_or(ReplayStart::Genesis)
-    });
-    let discovery_start = resolve_committed_replay(tracker, committed_replay);
-    let merged_start = merge_start(registration_start, discovery_start);
-
-    if let (Some(start), Some(window_end)) = (merged_start, c0_end) {
-        let outcome = recovering_anchor("committed", start.as_cursor(), move |from| {
-            committed_phase(client, tracker, from, Some(window_end), finalized_through, true)
+    if let (Some(replay), Some(_)) = (replay, c0_end) {
+        recovering_anchor("committed", replay.committed.clone(), move |from| {
+            committed_phase(client, tracker, from, c0_end, finalized_through, true)
         })
         .await?;
-        if should_requeue(&outcome, &start, window_end) {
-            committed_replay.ids.clear();
-            committed_replay.start = Some(start);
-            tracker.restore_committed_replay(committed_replay.clone());
-        }
     }
     Ok(())
 }
@@ -953,23 +784,14 @@ where
         }
 
         let replay = tracker.take_replay();
-        let mut committed_replay = tracker.take_committed_replay();
-        let delay = match catch_up(
-            client.as_ref(),
-            tracker.as_ref(),
-            replay.as_ref(),
-            Some(&mut committed_replay),
-        )
-        .await
-        {
+        let delay = match catch_up(client.as_ref(), tracker.as_ref(), replay.as_ref()).await {
             Ok(()) => {
                 retry_delay = RECONNECT_DELAY;
                 RECONNECT_DELAY
             }
             Err(error) => {
-                let replayed = replay.is_some() || committed_replay.start.is_some() || !committed_replay.ids.is_empty();
+                let replayed = replay.is_some();
                 tracker.restore_failed_replay(replay);
-                tracker.restore_committed_replay(committed_replay);
                 let delay = retry_delay;
                 retry_delay = retry_delay.saturating_mul(2).min(cap);
                 tracing::warn!(%error, replayed, retry_in = ?delay,
