@@ -527,7 +527,7 @@ async fn a_head_snapshot_before_pending_prevents_the_commit_race() -> anyhow::Re
     // bound. The committed phase must still use the earlier observation; otherwise it consumes
     // the commit as foreign before the note is ever known.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (5, 1);
+    *index.head.lock() = Some((5, 1));
     *index.head_after_pending.lock() = Some((10, 1));
     index.committed.lock().push(completion(&fixture.note_id, 6));
     super::lifecycle::run_pass_once(&index, &tracker)
@@ -557,7 +557,6 @@ async fn a_committed_candidate_without_a_pending_cursor_stays_at_genesis() -> an
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
     let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
     let index = ScriptedIndex::default();
-    *index.head.lock() = (10, 1);
     index.committed_candidates.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 6));
     super::lifecycle::run_pass_once(&index, &tracker)
@@ -583,7 +582,7 @@ async fn a_lagging_pending_note_self_heals_its_committed_replay() -> anyhow::Res
     // phase consumes it as foreign. The next pending pass must notice the note is behind the
     // committed cursor and queue a committed replay from the allocation's floor.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (5, 1);
+    *index.head.lock() = Some((5, 1));
     *index.head_after_pending.lock() = Some((10, 1));
     index.committed.lock().push(completion(&fixture.note_id, 3));
     super::lifecycle::run_pass_once(&index, &tracker)
@@ -620,7 +619,6 @@ async fn a_registration_landing_mid_pass_is_replayed_from_its_pending_half() -> 
     let _b_receiver = tracker.watch(b.id, b.address, other_secret, ten())?;
 
     let index = ScriptedIndex::default();
-    *index.head.lock() = (110, 1);
     index.pending.lock().push(a.note.clone());
     index.committed.lock().push(completion(&a.note_id, 30));
     let receiver = Arc::new(parking_lot::Mutex::new(None));
@@ -668,7 +666,7 @@ async fn a_replay_held_back_by_finality_is_kept_for_the_next_pass() -> anyhow::R
     // The index is behind the durable cursor and serves no row above its head: the note is
     // discovered, but its commit at block 9 is not in the replica yet.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (8, 1);
+    *index.head.lock() = Some((8, 1));
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 9));
     super::lifecycle::run_pass_once(&index, &tracker)
@@ -684,7 +682,7 @@ async fn a_replay_held_back_by_finality_is_kept_for_the_next_pass() -> anyhow::R
 
     // Once the index catches up, the kept committed replay reaches the commit without issuing a
     // pending replay again.
-    *index.head.lock() = (10, 1);
+    *index.head.lock() = Some((10, 1));
     index.pending_afters.lock().clear();
     super::lifecycle::run_pass_once(&index, &tracker)
         .await
@@ -711,21 +709,23 @@ async fn a_pending_replay_lagging_behind_the_pending_cursor_is_kept() -> anyhow:
     // cursor is not served yet. The pending replay page ends short; it must be kept rather than
     // consumed.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (8, 1);
+    *index.head.lock() = Some((8, 1));
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 9));
-    super::lifecycle::run_pass_once(&index, &tracker)
+    let kept = super::lifecycle::run_pass_once(&index, &tracker)
         .await
         .map_err(anyhow::Error::msg)?;
+    assert!(kept, "the unfinished replay is reported as kept");
     assert_eq!(state.committed_amount(&fixture.id)?, HoprBalance::zero());
     assert!(state.owned_note_ids()?.is_empty());
     assert!(tracker.replay.lock().is_some(), "the unfinished replay is kept");
 
     // Once the replica catches up, the kept pending replay scans the note and the commit.
-    *index.head.lock() = (10, 1);
-    super::lifecycle::run_pass_once(&index, &tracker)
+    *index.head.lock() = Some((10, 1));
+    let kept = super::lifecycle::run_pass_once(&index, &tracker)
         .await
         .map_err(anyhow::Error::msg)?;
+    assert!(!kept, "the finished replay is not reported as kept");
     assert_eq!(tokio::time::timeout(Duration::from_secs(2), receiver).await??, ten());
     assert_eq!(state.committed_amount(&fixture.id)?, ten());
     Ok(())
@@ -744,7 +744,6 @@ async fn a_failed_committed_replay_keeps_the_self_heal_request() -> anyhow::Resu
     // Consume the registration replay before the note is visible, so only the self-heal request
     // can be the one left after the failure.
     let earlier = ScriptedIndex::default();
-    *earlier.head.lock() = (5, 1);
     super::lifecycle::run_pass_once(&earlier, &tracker)
         .await
         .map_err(anyhow::Error::msg)?;
@@ -753,7 +752,6 @@ async fn a_failed_committed_replay_keeps_the_self_heal_request() -> anyhow::Resu
     // Pending discovers the note behind the committed cursor and queues the self-heal. The
     // committed replay then fails, after the request was taken, so it must be put back.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (5, 1);
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 3));
     index
@@ -788,7 +786,6 @@ async fn a_registration_replay_merged_with_a_self_heal_uses_the_earlier_floor() 
     tracker.restore_late_committed_replay(Some(Some(CurvyEventCursor::from(&position(1)))));
 
     let index = ScriptedIndex::default();
-    *index.head.lock() = (10, 1);
     super::lifecycle::catch_up(&index, &tracker, Some(&replay))
         .await
         .map_err(anyhow::Error::msg)?;
@@ -817,7 +814,7 @@ async fn committed_candidates_cover_a_commit_below_the_sampled_head() -> anyhow:
     // served as a committed candidate together with its commit. Ownership is recorded before the
     // page's completion is correlated, even though the commit is below the sampled bound.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (5, 1);
+    *index.head.lock() = Some((5, 1));
     *index.head_after_pending.lock() = Some((10, 1));
     index.committed_candidates.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 3));
@@ -1107,7 +1104,6 @@ async fn late_registration_replays_pending_and_committed_history() -> anyhow::Re
     let index = ScriptedIndex::default();
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 3));
-    *index.head.lock() = (10, 1);
     super::lifecycle::catch_up(&index, &tracker, replay.as_ref())
         .await
         .map_err(anyhow::Error::msg)?;
@@ -1155,7 +1151,6 @@ fn bounded_replay() -> anyhow::Result<BoundedReplay> {
     index.pending.lock().push(foreign);
     index.committed.lock().push(completion(&window_note_id, 250));
     index.committed.lock().push(completion(&format!("0x{:064x}", 99), 350));
-    *index.head.lock() = (400, 1);
     Ok(BoundedReplay {
         state,
         tracker,
@@ -1239,7 +1234,6 @@ async fn a_reorged_pending_anchor_is_rescanned_unanchored() -> anyhow::Result<()
     // Inside the margin before the stale cursor, so only the rewound rescan sees it.
     index.pending.lock().push(fixture.note);
     index.committed.lock().push(completion(&fixture.note_id, 295));
-    *index.head.lock() = (400, 1);
 
     for _ in 0..2 {
         super::lifecycle::catch_up(&index, &tracker, None)
@@ -1275,7 +1269,6 @@ async fn a_reorged_committed_anchor_is_rescanned_from_before_it() -> anyhow::Res
     // resuming after that position would skip.
     let replacement = in_replacement_block(completion(&fixture.note_id, 300));
     index.committed.lock().push(replacement.clone());
-    *index.head.lock() = (400, 1);
 
     for _ in 0..2 {
         super::lifecycle::catch_up(&index, &tracker, None)
@@ -1346,7 +1339,6 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     // Pending forward.
     let (state, tracker, fixture) = new_tracker()?;
     let index = ScriptedIndex::default();
-    *index.head.lock() = (10, 1);
     index.pending.lock().push(fixture.note.clone());
     super::lifecycle::catch_up(&index, &tracker, None)
         .await
@@ -1358,7 +1350,6 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     let held = CurvyEventCursor::from(&position(300));
     state.advance_cursor(CurvyEventKind::Pending, &held)?;
     let index = ScriptedIndex::default();
-    *index.head.lock() = (10, 1);
     index.pending.lock().push(fixture.note.clone());
     let replay = ReplayFrom::default();
     super::lifecycle::catch_up(&index, &tracker, Some(&replay))
@@ -1372,7 +1363,6 @@ async fn an_empty_watch_set_stops_every_phase_without_moving_cursors() -> anyhow
     let index = ScriptedIndex::default();
     index.committed.lock().push(completion(&fixture.note_id, 3));
     index.committed_candidates.lock().push(fixture.note);
-    *index.head.lock() = (10, 1);
     super::lifecycle::catch_up(&index, &tracker, None)
         .await
         .map_err(anyhow::Error::msg)?;
@@ -1398,7 +1388,7 @@ async fn an_unfinished_replay_is_not_kept_for_an_empty_watch_set() -> anyhow::Re
     // A committed candidate meets the empty watch set during the replay. The replay window
     // reaches past the sampled head, but there is nobody left to finish it for.
     let index = ScriptedIndex::default();
-    *index.head.lock() = (5, 1);
+    *index.head.lock() = Some((5, 1));
     let mut candidate = fixture.note;
     candidate.position = position(2);
     index.committed_candidates.lock().push(candidate);
@@ -1703,7 +1693,9 @@ struct ScriptedIndex {
     committed_calls: std::sync::atomic::AtomicUsize,
     /// Fails every `committed_notes` call from the second one on, as an endpoint outage.
     fail_committed_on_second: AtomicBool,
-    head: parking_lot::Mutex<(u64, u64)>,
+    /// The indexed head and finality, or `None` until a test sets one. An unset head serves every
+    /// row and treats the whole index as final.
+    head: parking_lot::Mutex<Option<(u64, u64)>>,
     spent_nullifiers: parking_lot::Mutex<HashSet<String>>,
     known_notes: parking_lot::Mutex<Option<HashSet<String>>>,
 }
@@ -1748,14 +1740,14 @@ impl CurvyIndexSource for ScriptedIndex {
         self.pending_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.pending_afters.lock().push(after.clone());
         if let Some(head) = self.head_after_pending.lock().take() {
-            *self.head.lock() = head;
+            *self.head.lock() = Some(head);
         }
         self.check_anchor(after.as_ref())?;
         if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("endpoint unavailable".to_owned());
         }
-        let head = self.head.lock().0;
-        let visible = |note: &&CurvyPendingNote| ordinal(&note.position).0 <= head;
+        let head = *self.head.lock();
+        let visible = |note: &&CurvyPendingNote| head.is_none_or(|(head, _)| ordinal(&note.position).0 <= head);
         if self.snapshot_pending {
             return Ok(super::PendingNotesPage {
                 notes: self.pending.lock().iter().filter(visible).cloned().collect(),
@@ -1791,12 +1783,12 @@ impl CurvyIndexSource for ScriptedIndex {
         }
         self.check_anchor(after.as_ref())?;
         let after = after.as_ref().map(cursor_ordinal);
-        let head = self.head.lock().0;
+        let head = *self.head.lock();
         Ok(self
             .committed
             .lock()
             .iter()
-            .filter(|note| ordinal(&note.position).0 <= head)
+            .filter(|note| head.is_none_or(|(head, _)| ordinal(&note.position).0 <= head))
             .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
             .take(first as usize)
             .cloned()
@@ -1809,12 +1801,12 @@ impl CurvyIndexSource for ScriptedIndex {
         first: u32,
     ) -> Result<Vec<CurvyPendingNote>, String> {
         let after = after.as_ref().map(cursor_ordinal);
-        let head = self.head.lock().0;
+        let head = *self.head.lock();
         Ok(self
             .committed_candidates
             .lock()
             .iter()
-            .filter(|note| ordinal(&note.position).0 <= head)
+            .filter(|note| head.is_none_or(|(head, _)| ordinal(&note.position).0 <= head))
             .filter(|note| after.is_none_or(|after| ordinal(&note.position) > after))
             .take(first as usize)
             .cloned()
@@ -1822,7 +1814,7 @@ impl CurvyIndexSource for ScriptedIndex {
     }
 
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
-        Ok(*self.head.lock())
+        Ok(self.head.lock().unwrap_or((u64::MAX, 0)))
     }
 
     async fn nullifier_spent(&self, nullifier: String) -> Result<bool, String> {
@@ -2332,7 +2324,6 @@ async fn pool_round_trip_generate_deposit_notify_and_sweep() -> anyhow::Result<(
     // Exit: waits for it to be committed and final.
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     let (confirmed_id, confirmed_address, confirmed) = notification.await?;
     assert_eq!((confirmed_id, confirmed_address, confirmed), (id, address, ten()));
     assert_eq!(pool.state().committed_amount(&id)?, ten());
@@ -2364,7 +2355,6 @@ async fn a_note_committed_before_it_was_seen_pending_is_still_discovered() -> an
     harness.index.committed_candidates.lock().push(candidate);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     let (confirmed_id, confirmed_address, confirmed) = notification.await?;
     assert_eq!((confirmed_id, confirmed_address, confirmed), (id, address, ten()));
     assert_eq!(pool.state().committed_amount(&id)?, ten());
@@ -2403,7 +2393,6 @@ async fn a_sweep_removes_zero_amount_notes_from_the_store() -> anyhow::Result<()
     harness.index.pending.lock().push(pending);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     notification.await?;
 
     // A zero-amount note, as a store written before the scan skipped them holds.
@@ -2455,7 +2444,6 @@ async fn already_spent_notes_are_reconciled_away_before_sweeping() -> anyhow::Re
     harness.index.pending.lock().push(pending);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     notification.await?;
 
     // The chain already knows the nullifier: a sweep whose outcome was lost.
@@ -2477,7 +2465,6 @@ async fn already_spent_notes_are_reconciled_away_before_sweeping() -> anyhow::Re
 #[tokio::test]
 async fn generate_deposit_data_records_its_replay_floors() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
-    *harness.index.head.lock() = (200, 1);
     let id = pix_id(1);
     let state = harness.pool.state();
     state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(100)))?;
@@ -2655,7 +2642,6 @@ async fn missing_notes_preserve_state_and_reconciliation_can_retry() -> anyhow::
     pool.state().store_scan_secret(&fixture.id, &fixture.scan_secret)?;
     // An incomplete/rebuilt index is not evidence of another chain.
     *harness.index.known_notes.lock() = Some(HashSet::new());
-    *harness.index.head.lock() = (10, 1);
     let first_id = pix_id(9);
     assert!(pool.generate_deposit_data(&first_id).await.is_err());
     assert_eq!(pool.state().owned_note_ids()?, vec![fixture.note_id.clone()]);
@@ -2686,7 +2672,6 @@ async fn state_from_the_same_chain_is_kept() -> anyhow::Result<()> {
     pool.state()
         .record_owned_candidate(&fixture.note_id, detected, &CurvyEventCursor::from(&position(1)))?;
     *harness.index.known_notes.lock() = Some(HashSet::from([fixture.note_id.clone()]));
-    *harness.index.head.lock() = (10, 1);
 
     let first_id = pix_id(9);
     pool.generate_deposit_data(&first_id).await?;
@@ -2998,7 +2983,6 @@ async fn a_sweep_waits_for_the_index_to_catch_up_instead_of_failing() -> anyhow:
     harness.index.pending.lock().push(pending);
     let notification = pool.notify_deposit(id, address, ten())?;
     harness.index.committed.lock().push(completion(&note_id, 6));
-    *harness.index.head.lock() = (8, 1);
     notification.await?;
 
     let started = std::time::Instant::now();
@@ -3724,11 +3708,11 @@ async fn an_index_behind_the_saved_cursor_preserves_recovery_state() -> anyhow::
         pool.state()
             .advance_cursor(kind, &CurvyEventCursor::from(&position(100)))?;
     }
-    *harness.index.head.lock() = (99, 1);
+    *harness.index.head.lock() = Some((99, 1));
     assert!(pool.generate_deposit_data(&id).await.is_err());
     assert_eq!(pool.state().scan_secret(&id)?.unwrap().public(), secret.public());
     assert_eq!(*harness.adapter.resets.lock(), 0);
-    *harness.index.head.lock() = (100, 1);
+    *harness.index.head.lock() = Some((100, 1));
     assert_eq!(*pool.generate_deposit_data(&id).await?.scan_key(), secret.public());
     Ok(())
 }
@@ -3793,7 +3777,6 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         index.pending.lock().extend(std::iter::repeat_n(unrelated, total - 1));
         index.pending.lock().push(fixture.note);
         index.committed.lock().push(completion(&fixture.note_id, 3));
-        *index.head.lock() = (5, 1);
         tokio::time::timeout(
             Duration::from_secs(10),
             super::lifecycle::catch_up(&index, &tracker, Some(&ReplayFrom::default())),

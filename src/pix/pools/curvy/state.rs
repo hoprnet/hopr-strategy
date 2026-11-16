@@ -577,42 +577,6 @@ impl RedbCurvyDepositState {
         Ok(())
     }
 
-    fn seal_scan_secret(&self, id: &PixAddressId, secret: &CurvyScanSecret) -> Result<Vec<u8>, CurvyStateError> {
-        self.sealer
-            .seal(&scan_secret_aad(id), secret.to_bytes().as_ref())
-            .map_err(state_db_error)
-    }
-
-    fn unseal_scan_secret(&self, id: &PixAddressId, sealed: &[u8]) -> Result<CurvyScanSecret, CurvyStateError> {
-        let secret = self
-            .sealer
-            .open(&scan_secret_aad(id), sealed)
-            .map_err(|error| CurvyStateError::Corrupt(format!("sealed Curvy scan secret: {error}")))?;
-        CurvyScanSecret::try_from(secret.as_slice())
-            .map_err(|error| CurvyStateError::Corrupt(format!("invalid stored Curvy scan secret: {error}")))
-    }
-
-    fn write_replay_floors(write: &redb::WriteTransaction, id: &PixAddressId) -> Result<(), CurvyStateError> {
-        let cursors = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
-        let mut floors = write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
-        for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
-            let Some(stored) = cursors.get(kind.cursor_key()).map_err(state_db_error)? else {
-                continue;
-            };
-            let cursor = decode_cursor(&stored.value())?;
-            let floor = match kind {
-                CurvyEventKind::Pending => unanchored_before(&cursor)?,
-                CurvyEventKind::Committed => Some(cursor),
-            };
-            if let Some(floor) = floor {
-                floors
-                    .insert(replay_floor_key(id, kind), encode_cursor(&floor)?)
-                    .map_err(state_db_error)?;
-            }
-        }
-        Ok(())
-    }
-
     fn record_owned_candidate_tx(
         &self,
         note_id: &str,
@@ -814,12 +778,29 @@ impl CurvyDepositState for RedbCurvyDepositState {
         let write = self.db.begin_write().map_err(state_db_error)?;
         {
             let mut table = write.open_table(SCAN_SECRETS_TABLE).map_err(state_db_error)?;
-            let existed = table
-                .insert(id_bytes(id), self.seal_scan_secret(id, secret)?)
-                .map_err(state_db_error)?
-                .is_some();
+            let sealed = self
+                .sealer
+                .seal(&scan_secret_aad(id), secret.to_bytes().as_ref())
+                .map_err(state_db_error)?;
+            let existed = table.insert(id_bytes(id), sealed).map_err(state_db_error)?.is_some();
             if !existed {
-                Self::write_replay_floors(&write, id)?;
+                let cursors = write.open_table(CURSOR_TABLE).map_err(state_db_error)?;
+                let mut floors = write.open_table(REPLAY_FLOORS_TABLE).map_err(state_db_error)?;
+                for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+                    let Some(stored) = cursors.get(kind.cursor_key()).map_err(state_db_error)? else {
+                        continue;
+                    };
+                    let cursor = decode_cursor(&stored.value())?;
+                    let floor = match kind {
+                        CurvyEventKind::Pending => unanchored_before(&cursor)?,
+                        CurvyEventKind::Committed => Some(cursor),
+                    };
+                    if let Some(floor) = floor {
+                        floors
+                            .insert(replay_floor_key(id, kind), encode_cursor(&floor)?)
+                            .map_err(state_db_error)?;
+                    }
+                }
             }
         }
         write.commit().map_err(state_db_error)
@@ -831,7 +812,14 @@ impl CurvyDepositState for RedbCurvyDepositState {
         table
             .get(id_bytes(id))
             .map_err(state_db_error)?
-            .map(|value| self.unseal_scan_secret(id, &value.value()))
+            .map(|value| {
+                let secret = self
+                    .sealer
+                    .open(&scan_secret_aad(id), &value.value())
+                    .map_err(|error| CurvyStateError::Corrupt(format!("sealed Curvy scan secret: {error}")))?;
+                CurvyScanSecret::try_from(secret.as_slice())
+                    .map_err(|error| CurvyStateError::Corrupt(format!("invalid stored Curvy scan secret: {error}")))
+            })
             .transpose()
     }
 

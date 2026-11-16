@@ -1066,8 +1066,9 @@ pub struct CurvyDepositPool<N, I = NoteIndex, A = RsSdkCurvyAdapter<BlokliClient
     cfg: CurvyDepositPoolConfig,
     reconciled: tokio::sync::OnceCell<()>,
     watcher: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Serializes the miss path of `generate_deposit_data`, so even a non-atomic external
-    /// `CurvyDepositState` cannot let two callers overwrite each other's secret.
+    /// Serializes this pool's miss path of `generate_deposit_data`, because `store_scan_secret`
+    /// replaces an existing secret. It does not protect callers that write the state outside this
+    /// pool.
     scan_secret_init: tokio::sync::Mutex<()>,
 }
 
@@ -1656,7 +1657,9 @@ where
             Some(existing) => existing,
             None => {
                 // Only the miss path is serialized: a hit never waits. The re-check under this
-                // one per-pool lock keeps every store from overwriting another caller's secret.
+                // one per-pool lock keeps this pool's callers from overwriting each other's secret;
+                // `store_scan_secret` replaces an existing secret, and a caller that writes the
+                // state outside this pool is not covered.
                 let _initializing = self.scan_secret_init.lock().await;
                 match self
                     .tracker

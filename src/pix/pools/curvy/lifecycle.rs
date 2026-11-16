@@ -82,34 +82,25 @@ impl PendingNotesPage {
 ///
 /// Narrow on purpose: it is what a test has to fake to drive the whole pool without a Blokli, and
 /// it is implemented for any [`BlokliQueryClient`] by [`BlokliIndex`].
+///
+/// Forward phases tolerate a pending view that lags the committed view: the first insert of an
+/// owned note at or before the committed cursor queues a committed replay from the allocation's
+/// floor, and that replay runs in the same pass.
+///
+/// Replays infer completion from the head sampled at the start of the pass, so the notes queries
+/// of a pass must be at least as fresh as that head. A source that serves a replay window from an
+/// older view can end the replay early.
 #[async_trait]
 pub trait CurvyIndexSource: Send + Sync + 'static {
     /// Pending events after `after`, or one complete pinned snapshot for snapshot sources.
     ///
-    /// Contract: pages are in increasing chain-position order. The pending view may be older
-    /// than [`indexed_head`](Self::indexed_head); any note that commits before it appears pending
-    /// should then be served by [`committed_candidates`](Self::committed_candidates). Discovery
-    /// samples the head before pending and uses it to bound the committed phase, so a source that
-    /// serves a newer committed head with a lagging pending view can let the commit overtake its
-    /// note. When the note later appears pending behind the durable committed cursor, discovery
-    /// queues a committed replay from the allocation's floor and correlates it in that pass.
-    /// Blokli's pending stream is complete (empty candidates); Curvy's indexer relies on committed
-    /// candidates.
-    ///
-    /// Replay completion is inferred from the head sampled at the start of a pass, not from the
-    /// rows this returns. A pending view older than the head reported in the same pass can
-    /// therefore end a pending replay before its whole window was served. The forward-phase
-    /// self-heal covers a pending view that lags the committed view, not a replay window served
-    /// short.
+    /// Pages are in increasing chain-position order; the trait documentation states the freshness
+    /// contract that forward phases and replays rely on.
     async fn pending_notes(&self, after: Option<CurvyEventCursor>, first: u32) -> Result<PendingNotesPage, String>;
 
     /// One page of committed notes strictly after `after`, oldest first.
     ///
-    /// Replay completion is inferred from the head sampled at the start of a pass, not from the
-    /// rows this returns. A committed view older than the head reported in the same pass can
-    /// therefore end a committed replay before its whole window was served. The forward-phase
-    /// self-heal covers a pending view that lags the committed view, not a replay window served
-    /// short.
+    /// See the trait documentation for the freshness contract.
     async fn committed_notes(
         &self,
         after: Option<CurvyEventCursor>,
@@ -119,11 +110,8 @@ pub trait CurvyIndexSource: Send + Sync + 'static {
     /// The highest block the indexer has processed, and the number of confirmations it treats as
     /// final.
     ///
-    /// Discovery samples this at the start of a pass and infers replay completion from it. The
-    /// notes queries of that pass must therefore see a view at least as fresh as the head reported
-    /// here: a source whose notes view is older than the head it reported in the same pass can end
-    /// a replay early. The forward-phase self-heal covers a pending view that lags the committed
-    /// view, not a replay window served short.
+    /// Discovery samples this at the start of a pass; see the trait documentation for the freshness
+    /// contract.
     async fn indexed_head(&self) -> Result<(u64, u64), String>;
 
     /// Whether the chain has already seen `nullifier` (a `0x`-prefixed 32-byte hex string).
@@ -290,10 +278,7 @@ fn merge_floor(
 
 /// Whether `window_end` lies at or before `through`, so a replay of the window can finish.
 ///
-/// A pass infers this from the head it sampled at the start, not from what its notes query
-/// served. A source whose notes view is older than the head it reported in the same pass can
-/// therefore end a replay early. The forward-phase self-heal covers a pending view that lags the
-/// committed view, not a replay window served short.
+/// See [`CurvyIndexSource`] for the source-freshness contract.
 fn window_covered(window_end: Option<&CurvyEventCursor>, through: u64) -> bool {
     window_end.is_none_or(|end| cursor_component(&end.block, "window end block").is_ok_and(|block| block <= through))
 }
@@ -839,18 +824,19 @@ where
 /// it queues a committed self-heal replay. That start is merged into the same replay request and
 /// replayed in the committed window. A replay that stopped before its window end is kept for the
 /// next pass. All pending phases precede all committed ones. Every phase recovers from a start
-/// whose block was reorganised away: see [`recovering_anchor`].
-pub(super) async fn catch_up<I, S>(
+/// whose block was reorganised away: see [`recovering_anchor`]. Reports whether an unfinished
+/// replay was kept for the next pass.
+async fn catch_up_pass<I, S>(
     client: &I,
     tracker: &CurvyLifecycleTracker<S>,
     replay: Option<&ReplayFrom>,
-) -> Result<(), PassError>
+) -> Result<bool, PassError>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
     let mut replayed = replay.is_some();
-    let result: Result<(), String> = async {
+    let result: Result<bool, String> = async {
         // Sample the indexed head before the pending phases. Every committed event this pass is
         // allowed to process was final at this observation. A commit that lands while pending is
         // running therefore cannot be consumed before the note discovered in that same pass; it is
@@ -872,7 +858,7 @@ where
         })
         .await?;
         if !pending.watching {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut pending_unfinished = false;
@@ -882,7 +868,7 @@ where
             })
             .await?;
             if !pending.watching {
-                return Ok(());
+                return Ok(false);
             }
             pending_unfinished = !pending.reached_end;
         }
@@ -892,7 +878,7 @@ where
         })
         .await?;
         if !committed.watching {
-            return Ok(());
+            return Ok(false);
         }
 
         // Take the self-heal request after every pending phase ran, so a note first seen behind
@@ -916,7 +902,7 @@ where
             };
             if !committed.watching {
                 // The watch set ran empty: there is nobody to resume the replay for.
-                return Ok(());
+                return Ok(false);
             }
             committed_unfinished = !committed.reached_end;
         } else if merged_floor.is_some() {
@@ -933,10 +919,33 @@ where
             // self-heal floor that was part of it.
             tracker.restore_late_committed_replay(merged_floor);
         }
-        Ok(())
+        let replay_kept = pending_unfinished || committed_unfinished;
+        if replay_kept {
+            tracing::debug!(
+                sampled_head = indexed_block,
+                pending = pending_unfinished,
+                committed = committed_unfinished,
+                "keeping an unfinished Curvy replay because the sampled head does not cover its window"
+            );
+        }
+        Ok(replay_kept)
     }
     .await;
     result.map_err(|error| PassError { error, replayed })
+}
+
+/// Test-facing wrapper around [`catch_up_pass`] for phases that do not inspect the outcome.
+#[cfg(test)]
+pub(super) async fn catch_up<I, S>(
+    client: &I,
+    tracker: &CurvyLifecycleTracker<S>,
+    replay: Option<&ReplayFrom>,
+) -> Result<(), PassError>
+where
+    I: CurvyIndexSource,
+    S: CurvyDepositState,
+{
+    catch_up_pass(client, tracker, replay).await.map(|_| ())
 }
 
 /// A failed catch-up pass and whether it took a replay request. The watcher warning uses the
@@ -950,14 +959,15 @@ pub(super) struct PassError {
 
 /// Runs one watcher pass, taking the replay slot and restoring it if the pass fails. This is the
 /// exact envelope `run_watcher` uses; tests drive it directly so production wiring is covered.
-pub(super) async fn run_pass_once<I, S>(client: &I, tracker: &CurvyLifecycleTracker<S>) -> Result<(), PassError>
+/// Returns whether the pass kept an unfinished replay for the next one.
+pub(super) async fn run_pass_once<I, S>(client: &I, tracker: &CurvyLifecycleTracker<S>) -> Result<bool, PassError>
 where
     I: CurvyIndexSource,
     S: CurvyDepositState,
 {
     let replay = tracker.take_replay();
-    match catch_up(client, tracker, replay.as_ref()).await {
-        Ok(()) => Ok(()),
+    match catch_up_pass(client, tracker, replay.as_ref()).await {
+        Ok(replay_kept) => Ok(replay_kept),
         Err(error) => {
             tracker.restore_failed_replay(replay);
             Err(error)
@@ -985,9 +995,15 @@ where
         }
 
         let delay = match run_pass_once(client.as_ref(), tracker.as_ref()).await {
-            Ok(()) => {
-                retry_delay = RECONNECT_DELAY;
-                RECONNECT_DELAY
+            Ok(replay_kept) => {
+                if replay_kept {
+                    let delay = retry_delay;
+                    retry_delay = retry_delay.saturating_mul(2).min(cap);
+                    delay
+                } else {
+                    retry_delay = RECONNECT_DELAY;
+                    RECONNECT_DELAY
+                }
             }
             Err(error) => {
                 let delay = retry_delay;
