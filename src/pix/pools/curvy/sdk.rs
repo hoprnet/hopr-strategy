@@ -3193,17 +3193,24 @@ where
 
     /// The finalized tree's leaves, as the decimal note ids the SDK's build looks its inputs up by.
     /// It is read only to choose between funding notes, so a failure is never an allocation
-    /// failure: the choice is then made as before and the build finds out for itself.
+    /// failure: the choice is then made as before and the build finds out for itself. Every
+    /// failure warns, since losing the preference costs the allocation the tree lag.
     async fn finalized_leaves(client: &CurvyClient) -> Option<std::collections::HashSet<String>> {
         match tokio::time::timeout(FUNDING_SNAPSHOT_TIMEOUT, client.notes.notes_tree_snapshot()).await {
             Ok(Ok(Some(snapshot))) => Some(snapshot.leaves.into_iter().collect()),
-            Ok(Ok(None)) => None,
+            Ok(Ok(None)) => {
+                tracing::warn!("no finalized notes tree is available yet; choosing funding without it");
+                None
+            }
             Ok(Err(error)) => {
-                tracing::debug!(%error, "could not read the finalized notes tree; choosing funding without it");
+                tracing::warn!(%error, "could not read the finalized notes tree; choosing funding without it");
                 None
             }
             Err(_) => {
-                tracing::debug!("timed out reading the finalized notes tree; choosing funding without it");
+                tracing::warn!(
+                    timeout = ?FUNDING_SNAPSHOT_TIMEOUT,
+                    "timed out reading the finalized notes tree; choosing funding without it"
+                );
                 None
             }
         }
