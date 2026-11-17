@@ -602,6 +602,45 @@ async fn a_lagging_pending_note_self_heals_its_committed_replay() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn an_unreadable_self_heal_floor_replays_from_genesis() -> anyhow::Result<()> {
+    let inner = RedbCurvyDepositState::in_memory()?;
+    let fixture = owned_candidate(2)?;
+    inner.advance_cursor(CurvyEventKind::Committed, &CurvyEventCursor::from(&position(3)))?;
+    inner.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
+    let state = Arc::new(FloorlessState::new(inner));
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret.clone(), ten())?;
+
+    // Consume the registration replay before the note is visible, leaving only the self-heal
+    // request for the pass below.
+    let earlier = ScriptedIndex::default();
+    super::lifecycle::run_pass_once(&earlier, &tracker)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(tracker.take_replay().is_none());
+
+    state.fail_replay_floor();
+
+    // Pending discovers the note behind the committed cursor, but the floor read fails, so the
+    // self-heal falls back to genesis. The committed replay then fails after the request was
+    // taken, so it must be put back with that fallback intact.
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    index
+        .fail_committed_on_second
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        super::lifecycle::run_pass_once(&index, &tracker)
+            .await
+            .map_err(anyhow::Error::msg)
+            .is_err()
+    );
+    assert_eq!(tracker.take_late_committed_replay(), Some(None));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_registration_landing_mid_pass_is_replayed_from_its_pending_half() -> anyhow::Result<()> {
     let state = Arc::new(RedbCurvyDepositState::in_memory()?);
     let a = owned_candidate(20)?;
@@ -853,7 +892,7 @@ fn the_redb_insert_edge_reports_only_the_first_insert() -> anyhow::Result<()> {
 
 #[test]
 fn the_default_insert_edge_reports_only_the_first_insert() -> anyhow::Result<()> {
-    assert_insert_edge(&FloorlessState(RedbCurvyDepositState::in_memory()?))
+    assert_insert_edge(&FloorlessState::new(RedbCurvyDepositState::in_memory()?))
 }
 
 #[tokio::test]
@@ -1410,8 +1449,19 @@ async fn an_unfinished_replay_is_not_kept_for_an_empty_watch_set() -> anyhow::Re
 }
 
 /// A store that keeps no replay floors, like an external implementation written before they
-/// existed: it delegates everything and leaves `replay_floor` at its default.
-struct FloorlessState(RedbCurvyDepositState);
+/// existed: it delegates everything and leaves `replay_floor` at its default. Its flag makes the
+/// floor read fail, like an unreadable floor row.
+struct FloorlessState(RedbCurvyDepositState, AtomicBool);
+
+impl FloorlessState {
+    fn new(inner: RedbCurvyDepositState) -> Self {
+        Self(inner, AtomicBool::new(false))
+    }
+
+    fn fail_replay_floor(&self) {
+        self.1.store(true, Ordering::SeqCst);
+    }
+}
 
 impl CurvyDepositState for FloorlessState {
     fn cursor(&self, kind: CurvyEventKind) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
@@ -1466,6 +1516,20 @@ impl CurvyDepositState for FloorlessState {
 
     fn remove_scan_secret(&self, id: &PixAddressId) -> Result<(), CurvyStateError> {
         self.0.remove_scan_secret(id)
+    }
+
+    fn replay_floor(
+        &self,
+        id: &PixAddressId,
+        kind: CurvyEventKind,
+    ) -> Result<Option<CurvyEventCursor>, CurvyStateError> {
+        if self.1.load(Ordering::SeqCst) {
+            Err(CurvyStateError::Corrupt(format!(
+                "unreadable replay floor for {id:?} {kind:?}"
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     fn wipe_chain_state(&self) -> Result<(), CurvyStateError> {
@@ -1544,7 +1608,7 @@ struct RacySecretState(FloorlessState, Arc<RacySecretGate>);
 
 impl RacySecretState {
     fn new(inner: RedbCurvyDepositState) -> Self {
-        Self(FloorlessState(inner), Arc::new(RacySecretGate::default()))
+        Self(FloorlessState::new(inner), Arc::new(RacySecretGate::default()))
     }
 }
 
@@ -1625,7 +1689,7 @@ fn a_store_without_replay_floors_replays_from_genesis() -> anyhow::Result<()> {
     inner.store_scan_secret(&fixture.id, &fixture.scan_secret)?;
     // The inner store does keep a floor; the wrapper does not expose it.
     assert!(inner.replay_floor(&fixture.id, CurvyEventKind::Committed)?.is_some());
-    let state = Arc::new(FloorlessState(inner));
+    let state = Arc::new(FloorlessState::new(inner));
     assert_eq!(state.replay_floor(&fixture.id, CurvyEventKind::Pending)?, None);
 
     let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state);
@@ -3822,6 +3886,39 @@ async fn watcher_failures_back_off_and_success_resets_polling() -> anyhow::Resul
     tokio::time::advance(Duration::from_millis(250)).await;
     tokio::task::yield_now().await;
     assert_eq!(index.pending_calls.load(Ordering::SeqCst), 7);
+    worker.abort();
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn watcher_kept_replays_wait_the_normal_poll_delay() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(1)?;
+    state.advance_cursor(CurvyEventKind::Pending, &CurvyEventCursor::from(&position(10)))?;
+    let tracker = Arc::new(CurvyLifecycleTracker::new(Arc::new(fixture.detector), state));
+    let _receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    let index = Arc::new(ScriptedIndex::default());
+    // The replica is behind the pending replay window, so every pass keeps that replay.
+    *index.head.lock() = Some((8, 1));
+    let worker = tokio::spawn(super::lifecycle::run_watcher(
+        index.clone(),
+        tracker.clone(),
+        Duration::from_secs(10),
+    ));
+    tokio::task::yield_now().await;
+    // Each pass queries pending once forward and once for the kept replay.
+    assert_eq!(index.pending_calls.load(Ordering::SeqCst), 2);
+    // A kept replay is retried after the normal poll delay, without doubling the delay.
+    for pass in [2, 3, 4] {
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), 2 * (pass - 1));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(index.pending_calls.load(Ordering::SeqCst), 2 * pass);
+        assert!(tracker.replay.lock().is_some());
+    }
     worker.abort();
     Ok(())
 }

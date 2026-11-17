@@ -20,9 +20,11 @@
 //! families, because the shared cursors may already have moved past its note. The replay starts at
 //! the allocation's replay floor (see [`CurvyDepositState::replay_floor`]) — genesis when it has none
 //! — and is bounded by the durable cursors, which it never moves. Within each family a pass
-//! first scans what is new since the durable cursor and only then replays the window behind it;
-//! all pending phases still precede all committed ones, so a fresh deposit is not delayed by
-//! history. A pending phase compares each newly inserted note with the committed cursor sampled
+//! first scans what is new since the durable cursor and only then replays the window behind it.
+//! The head is sampled before the pending phases, so the forward committed bound is as old as
+//! this pass's pending forward and pending replay phases; all pending phases still precede all
+//! committed ones, and a commit that becomes final during them is confirmed by the next pass.
+//! A pending phase compares each newly inserted note with the committed cursor sampled
 //! before pending; a note that is already behind it, because the source's pending view lagged,
 //! queues a committed replay from that allocation's floor. The self-heal floor is taken after the
 //! pending phases, merged with any late-registration committed floor, and replayed in the same
@@ -995,15 +997,9 @@ where
         }
 
         let delay = match run_pass_once(client.as_ref(), tracker.as_ref()).await {
-            Ok(replay_kept) => {
-                if replay_kept {
-                    let delay = retry_delay;
-                    retry_delay = retry_delay.saturating_mul(2).min(cap);
-                    delay
-                } else {
-                    retry_delay = RECONNECT_DELAY;
-                    RECONNECT_DELAY
-                }
+            Ok(_) => {
+                retry_delay = RECONNECT_DELAY;
+                RECONNECT_DELAY
             }
             Err(error) => {
                 let delay = retry_delay;
