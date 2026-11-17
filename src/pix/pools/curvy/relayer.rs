@@ -1856,10 +1856,8 @@ pub(super) mod http_tests {
                 async move {
                     if path.starts_with("/relay/paymaster") {
                         Some((200, paymaster_body("16")))
-                    } else if path == "/relay/submit" {
-                        Some((200, serde_json::json!({"requestId":"queued", "status":"queued"})))
                     } else {
-                        None
+                        Some((200, serde_json::json!({"requestId":"queued", "status":"queued"})))
                     }
                 }
             }
@@ -1895,16 +1893,14 @@ pub(super) mod http_tests {
     /// so a caller's client cannot leave a hung relayer holding the pool.
     #[tokio::test]
     async fn the_request_timeout_bounds_an_injected_client_without_one() -> anyhow::Result<()> {
-        let server = Server::concurrent(|_| async {
-            std::future::pending::<()>().await;
-            None
-        })
-        .await;
+        use anyhow::Context as _;
+
+        let server = Server::concurrent(|_| std::future::pending::<Option<(u16, serde_json::Value)>>()).await;
         let client =
             RelayClient::with_http_client(server.url.clone(), reqwest::Client::new(), Duration::from_millis(200));
         let result = tokio::time::timeout(Duration::from_secs(5), client.protocol())
             .await
-            .map_err(|_| anyhow::anyhow!("the request was not bounded by the request timeout"))?;
+            .context("the request was not bounded by the request timeout")?;
         assert!(matches!(result, Err(RelayError::Transport(_))), "{result:?}");
         Ok(())
     }

@@ -2823,6 +2823,24 @@ fn the_note_source_defaults_to_blokli_and_the_indexer_needs_its_url() -> anyhow:
     Ok(())
 }
 
+/// The pool builds over a caller's HTTP client with both the relayer and the Curvy indexer in
+/// use. That their requests then go through it is checked on `RelayClient` and `HttpSyncApi`.
+#[tokio::test]
+async fn the_pool_builds_over_an_injected_http_client() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let cfg = CurvyDepositPoolConfig {
+        relayer_url: Some("http://127.0.0.1:1/".parse()?),
+        note_source: CurvyNoteSource::CurvyIndexer,
+        curvy_indexer_url: Some("http://127.0.0.1:1/".parse()?),
+        state_path: Some(state.path().join("curvy.redb")),
+        token: Some(2),
+        ..Default::default()
+    };
+    let pool = CurvyDepositPool::with_http_client(test_node().await?, cfg, TEST_PASSWORD, reqwest::Client::new())?;
+    assert!(matches!(pool.index.as_ref(), super::NoteIndex::CurvyIndexer(_)));
+    Ok(())
+}
+
 /// Against Curvy's staging indexer for Gnosis. Network; run by hand:
 /// The whole pool over a demo run's Exit state against Curvy staging: registering the watch
 /// must discover and complete the allocation's committed note.

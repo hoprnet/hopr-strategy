@@ -1281,7 +1281,8 @@ mod tests {
         Ok(())
     }
 
-    /// A caller-built client is the one that reaches the indexer: its default headers are sent.
+    /// A caller-built client is the one that reaches the indexer: its default headers are sent,
+    /// and the default client's are not.
     #[tokio::test]
     async fn an_injected_client_carries_its_own_transport() -> anyhow::Result<()> {
         use crate::pix::pools::curvy::relayer::http_tests::Server;
@@ -1302,7 +1303,10 @@ mod tests {
         let http = reqwest::Client::builder().default_headers(headers).build()?;
         let api = HttpSyncApi::with_http_client(server.url.clone(), http, std::time::Duration::from_secs(2));
         api.get_json("/sync/meta").await.map_err(anyhow::Error::msg)?;
-        assert_eq!(*seen.lock().unwrap(), vec![Some("injected".to_owned())]);
+        let default =
+            HttpSyncApi::new(server.url.clone(), std::time::Duration::from_secs(2)).map_err(anyhow::Error::msg)?;
+        default.get_json("/sync/meta").await.map_err(anyhow::Error::msg)?;
+        assert_eq!(*seen.lock().unwrap(), vec![Some("injected".to_owned()), None]);
         Ok(())
     }
 }
