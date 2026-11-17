@@ -85,6 +85,7 @@ pub trait SyncApi: Send + Sync + 'static {
 pub struct HttpSyncApi {
     base_url: Url,
     http: reqwest::Client,
+    request_timeout: std::time::Duration,
 }
 
 impl HttpSyncApi {
@@ -93,7 +94,19 @@ impl HttpSyncApi {
             .timeout(request_timeout)
             .build()
             .map_err(|error| format!("building the Curvy indexer client: {error}"))?;
-        Ok(Self { base_url, http })
+        Ok(Self::with_http_client(base_url, http, request_timeout))
+    }
+
+    /// Like [`Self::new`], over a caller-built client.
+    ///
+    /// The client carries the transport (proxy, local address, TLS roots, default headers);
+    /// `request_timeout` still bounds every request and overrides the client's own timeout.
+    pub fn with_http_client(base_url: Url, http: reqwest::Client, request_timeout: std::time::Duration) -> Self {
+        Self {
+            base_url,
+            http,
+            request_timeout,
+        }
     }
 }
 
@@ -107,6 +120,7 @@ impl SyncApi for HttpSyncApi {
         let response = self
             .http
             .get(url)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| format!("Curvy indexer {path_and_query}: {error}"))?;
@@ -1264,6 +1278,31 @@ mod tests {
         let nullifiers = notes.committed_nullifiers(0, u64::MAX).await?;
         assert_eq!(nullifiers.len(), 1);
         assert_eq!(nullifiers[0].nullifiers.len(), 2);
+        Ok(())
+    }
+
+    /// A caller-built client is the one that reaches the indexer: its default headers are sent.
+    #[tokio::test]
+    async fn an_injected_client_carries_its_own_transport() -> anyhow::Result<()> {
+        use crate::pix::pools::curvy::relayer::http_tests::Server;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = Server::concurrent({
+            let seen = seen.clone();
+            move |request| {
+                seen.lock()
+                    .unwrap()
+                    .push(request.header("x-pix-marker").map(str::to_owned));
+                async { Some((200, serde_json::json!({}))) }
+            }
+        })
+        .await;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-pix-marker", "injected".parse()?);
+        let http = reqwest::Client::builder().default_headers(headers).build()?;
+        let api = HttpSyncApi::with_http_client(server.url.clone(), http, std::time::Duration::from_secs(2));
+        api.get_json("/sync/meta").await.map_err(anyhow::Error::msg)?;
+        assert_eq!(*seen.lock().unwrap(), vec![Some("injected".to_owned())]);
         Ok(())
     }
 }

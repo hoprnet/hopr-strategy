@@ -1456,6 +1456,8 @@ pub struct RsSdkCurvyAdapter<C> {
     chain: Arc<tokio::sync::Mutex<()>>,
     /// Prevent repeated funding calls from downloading the notes tree in a tight loop.
     next_relay_finality_check: parking_lot::Mutex<Option<tokio::time::Instant>>,
+    /// A caller-built client for the Curvy indexer; `None` builds the default one.
+    indexer_http: Option<reqwest::Client>,
 }
 
 impl<C> RsSdkCurvyAdapter<C>
@@ -1504,7 +1506,14 @@ where
             client: tokio::sync::OnceCell::new(),
             chain: Arc::new(tokio::sync::Mutex::new(())),
             next_relay_finality_check: parking_lot::Mutex::new(None),
+            indexer_http: None,
         })
+    }
+
+    /// Routes the Curvy indexer's requests through `http` instead of a default client.
+    pub(super) fn with_indexer_http_client(mut self, http: Option<reqwest::Client>) -> Self {
+        self.indexer_http = http;
+        self
     }
 
     async fn client(&self) -> Result<&(Arc<CurvyClient>, CurvyChainEndpoints), RsSdkCurvyAdapterError> {
@@ -1528,8 +1537,15 @@ where
                                 "`note_source: curvy_indexer` needs `curvy_indexer_url`".to_owned(),
                             )
                         })?;
-                        let api = indexer::HttpSyncApi::new(url, super::INDEXER_REQUEST_TIMEOUT)
-                            .map_err(RsSdkCurvyAdapterError::InvalidValue)?;
+                        let api = match &self.indexer_http {
+                            Some(http) => indexer::HttpSyncApi::with_http_client(
+                                url,
+                                http.clone(),
+                                super::INDEXER_REQUEST_TIMEOUT,
+                            ),
+                            None => indexer::HttpSyncApi::new(url, super::INDEXER_REQUEST_TIMEOUT)
+                                .map_err(RsSdkCurvyAdapterError::InvalidValue)?,
+                        };
                         tracing::info!(
                             chain_id = endpoints.chain_id,
                             "reading Curvy notes from Curvy's indexer"

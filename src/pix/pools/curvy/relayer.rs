@@ -580,6 +580,7 @@ impl From<RelayError> for StrategyError {
 pub struct RelayClient {
     base_url: Url,
     http: reqwest::Client,
+    request_timeout: Duration,
 }
 
 impl RelayClient {
@@ -590,7 +591,19 @@ impl RelayClient {
             .timeout(request_timeout)
             .build()
             .map_err(|error| StrategyError::other(anyhow::anyhow!("building the relayer client: {error}")))?;
-        Ok(Self { base_url, http })
+        Ok(Self::with_http_client(base_url, http, request_timeout))
+    }
+
+    /// Like [`Self::new`], over a caller-built client.
+    ///
+    /// The client carries the transport (proxy, local address, TLS roots, default headers);
+    /// `request_timeout` still bounds every request and overrides the client's own timeout.
+    pub fn with_http_client(base_url: Url, http: reqwest::Client, request_timeout: Duration) -> Self {
+        Self {
+            base_url,
+            http,
+            request_timeout,
+        }
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, RelayError> {
@@ -625,6 +638,7 @@ impl RelayClient {
         let response = self
             .http
             .get(url)
+            .timeout(self.request_timeout)
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .header(reqwest::header::PRAGMA, "no-cache")
             .send()
@@ -773,6 +787,7 @@ impl RelayClient {
         let response = self
             .http
             .get(url)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
@@ -786,6 +801,7 @@ impl RelayClient {
         let response = self
             .http
             .get(url)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
@@ -849,6 +865,7 @@ impl RelayClient {
         let response = self
             .http
             .post(url)
+            .timeout(self.request_timeout)
             .json(&body)
             .send()
             .await
@@ -869,6 +886,7 @@ impl RelayClient {
         let response = self
             .http
             .get(url)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
@@ -888,6 +906,7 @@ impl RelayClient {
         let response = self
             .http
             .get(url)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| RelayError::Transport(error.to_string()))?;
@@ -1820,6 +1839,73 @@ pub(super) mod http_tests {
             )
             .await?;
         assert_eq!(submission.request_id, "queued");
+        Ok(())
+    }
+
+    /// A caller-built client is the one that sends the requests: its default headers reach the
+    /// relayer on both a read and a write.
+    #[tokio::test]
+    async fn an_injected_client_carries_its_own_transport() -> anyhow::Result<()> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = Server::concurrent({
+            let seen = seen.clone();
+            move |request| {
+                let marker = request.header("x-pix-marker").map(str::to_owned);
+                let path = request.path.clone();
+                seen.lock().unwrap().push((path.clone(), marker));
+                async move {
+                    if path.starts_with("/relay/paymaster") {
+                        Some((200, paymaster_body("16")))
+                    } else if path == "/relay/submit" {
+                        Some((200, serde_json::json!({"requestId":"queued", "status":"queued"})))
+                    } else {
+                        None
+                    }
+                }
+            }
+        })
+        .await;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-pix-marker", "injected".parse()?);
+        let http = reqwest::Client::builder().default_headers(headers).build()?;
+        let client = RelayClient::with_http_client(server.url.clone(), http, Duration::from_secs(2));
+        client.paymaster(100).await?;
+        client
+            .submit(
+                curvy_abi::RelayAction::Withdrawal,
+                100,
+                10,
+                PIX_1,
+                &proof(),
+                &[],
+                "request",
+                "spend",
+                "intent",
+            )
+            .await?;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for (path, marker) in seen.iter() {
+            assert_eq!(marker.as_deref(), Some("injected"), "{path}");
+        }
+        Ok(())
+    }
+
+    /// The pool's timeout bounds each request even when the injected client has none of its own,
+    /// so a caller's client cannot leave a hung relayer holding the pool.
+    #[tokio::test]
+    async fn the_request_timeout_bounds_an_injected_client_without_one() -> anyhow::Result<()> {
+        let server = Server::concurrent(|_| async {
+            std::future::pending::<()>().await;
+            None
+        })
+        .await;
+        let client =
+            RelayClient::with_http_client(server.url.clone(), reqwest::Client::new(), Duration::from_millis(200));
+        let result = tokio::time::timeout(Duration::from_secs(5), client.protocol())
+            .await
+            .map_err(|_| anyhow::anyhow!("the request was not bounded by the request timeout"))?;
+        assert!(matches!(result, Err(RelayError::Transport(_))), "{result:?}");
         Ok(())
     }
 
