@@ -819,15 +819,18 @@ where
 
 /// One catch-up pass over both event families. See the module docs for the ordering.
 ///
-/// The forward phases consume what is new since the durable cursors; the replay phases, when
-/// `replay` is requested, then revisit the window `(replay start, durable cursor before this
-/// pass]` for the allocations registered since. The pending phases also compare each newly
-/// inserted note with the committed cursor sampled at the start of the pass; a note already behind
-/// it queues a committed self-heal replay. That start is merged into the same replay request and
-/// replayed in the committed window. A replay that stopped before its window end is kept for the
-/// next pass. All pending phases precede all committed ones. Every phase recovers from a start
-/// whose block was reorganised away: see [`recovering_anchor`]. Reports whether an unfinished
-/// replay was kept for the next pass.
+/// The forward phases consume what is new since the durable cursors. A registration replay
+/// requested by `watch()` is taken by the pass envelope as `replay` and, after the forward phases,
+/// revisits both families from the requested floors up to the durable cursors before this pass,
+/// for the allocations registered since. The pending phases also compare each newly inserted note
+/// with the committed cursor sampled at the start of the pass; a first insert at or before that
+/// cursor queues a committed self-heal floor for its allocation in the tracker's late-committed
+/// slot. The pass takes that slot after all pending phases and merges it with the registration
+/// replay's committed start, the earlier floor winning; the merged start is replayed in the
+/// committed window, and it never starts a pending replay. A replay that stopped before its window
+/// end is kept for the next pass. All pending phases precede all committed ones. Every phase
+/// recovers from a start whose block was reorganised away: see [`recovering_anchor`]. Reports
+/// whether an unfinished replay was kept for the next pass.
 async fn catch_up_pass<I, S>(
     client: &I,
     tracker: &CurvyLifecycleTracker<S>,

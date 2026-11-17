@@ -372,7 +372,47 @@ pub trait CurvyDepositState: Send + Sync + 'static {
     /// The default checks the id against [`owned_note_ids`](Self::owned_note_ids) before calling
     /// [`record_owned_candidate`](Self::record_owned_candidate); the Redb override checks and
     /// inserts in one write transaction. This check-then-record is not atomic on its own; the
-    /// watcher is the only inserter, so the default is race-free inside the pool.
+    /// watcher is the only inserter, so the default is race-free inside the pool. A custom store
+    /// must override the default when something other than the pool's watcher can insert notes
+    /// concurrently.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use blokli_client::api::types::CurvyEventCursor;
+    /// # use hopr_api::node::PixAddressId;
+    /// # use hopr_api::types::crypto::prelude::BjjPublicKey;
+    /// # use hopr_api::types::primitive::prelude::{BytesRepresentable, HoprBalance};
+    /// # use hopr_strategy::pix::pools::curvy::{
+    /// #     CurvyDepositState, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState,
+    /// # };
+    /// let dir = tempfile::tempdir()?;
+    /// let state = RedbCurvyDepositState::open(dir.path().join("curvy-pix.redb"), "correct horse battery")?;
+    /// let id = PixAddressId::try_from(&[7u8; PixAddressId::SIZE][..])?;
+    /// let mut secret = [0u8; 32];
+    /// secret[31] = 1;
+    /// let address = BjjPublicKey::from_privkey(&secret)?;
+    /// let note = DetectedCurvyNote {
+    ///     deposit: OwnedCurvyDeposit {
+    ///         id,
+    ///         address,
+    ///         amount: HoprBalance::zero(),
+    ///     },
+    ///     note: curvy_core::witness::Note {
+    ///         amount: curvy_core::Fr::from(10u64),
+    ///         token: curvy_core::Fr::from(4u64),
+    ///         owner_pub: (curvy_core::Fr::from(1u64), curvy_core::Fr::from(2u64)),
+    ///         shared_secret: curvy_core::Fr::from(3u64),
+    ///         ephemeral_key: (curvy_core::Fr::from(4u64), curvy_core::Fr::from(5u64)),
+    ///         view_tag: curvy_core::Fr::from(6u64),
+    ///     },
+    /// };
+    /// let note_id = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    /// let cursor = CurvyEventCursor::new(1, 0, 0, 0);
+    /// assert!(state.record_owned_candidate_if_new(note_id, note.clone(), &cursor)?);
+    /// assert!(!state.record_owned_candidate_if_new(note_id, note, &cursor)?);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     fn record_owned_candidate_if_new(
         &self,
         note_id: &str,
