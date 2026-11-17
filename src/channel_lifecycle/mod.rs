@@ -139,13 +139,13 @@ lazy_static::lazy_static! {
             &["peer"],
         ).unwrap();
 
-    /// Channel balance below which the fund pass tops the channel up: the same resolved
+    /// Channel balance at or below which the fund pass tops the channel up: the same resolved
     /// figure the pass compares every channel against, so an alert on it fires only
     /// when the strategy itself would act.
     static ref METRIC_LOWER_BALANCE_THRESHOLD: hopr_api::types::telemetry::SimpleGauge =
         hopr_api::types::telemetry::SimpleGauge::new(
             "hopr_strategy_channel_lifecycle_lower_balance_threshold_hopr",
-            "wxHOPR channel balance below which the strategy tops the channel up, in base units, resolved from ticket price and winning probability at the most recent tick with known ticket economics (may be stale if a required chain read fails)",
+            "wxHOPR channel balance at or below which the strategy tops the channel up, in base units, resolved from ticket price and winning probability at the most recent tick with known ticket economics (may be stale if a required chain read fails)",
         ).unwrap();
 
     // ── Diversity / anonymity ─────────────────────────────────────────────────
