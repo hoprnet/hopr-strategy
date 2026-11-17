@@ -1,6 +1,7 @@
 //! Builder, `Display`, and `Strategy` trait implementation.
 
 use std::{
+    collections::HashSet,
     fmt::{Debug, Display, Formatter},
     sync::Arc,
     time::Duration,
@@ -121,6 +122,7 @@ impl ChannelLifecycleStrategy {
             )),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            emitted_channel_balances: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         }))
     }
 }

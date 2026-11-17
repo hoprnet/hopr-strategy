@@ -74,7 +74,7 @@ mod pipeline;
 pub mod selector;
 mod strategy;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hash,
     sync::{
         Arc,
@@ -127,6 +127,25 @@ lazy_static::lazy_static! {
         hopr_api::types::telemetry::SimpleGauge::new(
             "hopr_strategy_channel_lifecycle_required_safe_balance_hopr",
             "wxHOPR the safe must hold to satisfy the demand of the most recent successful tick, in base units (may be stale if a required chain read fails)",
+        ).unwrap();
+
+    /// wxHOPR balance of every open outgoing channel, labelled by destination peer.
+    /// The exporter is cumulative and cannot drop a label set, so a channel that is no
+    /// longer open is reset to 0 instead of disappearing.
+    static ref METRIC_CHANNEL_BALANCE: hopr_api::types::telemetry::MultiGauge =
+        hopr_api::types::telemetry::MultiGauge::new(
+            "hopr_strategy_channel_lifecycle_channel_balance_hopr",
+            "wxHOPR balance of each open outgoing channel to its destination peer, in base units, from the most recent successful tick (0 once the channel is no longer open)",
+            &["peer"],
+        ).unwrap();
+
+    /// Channel balance below which the fund pass tops the channel up: the same resolved
+    /// figure the pass compares every channel against, so an alert on it fires only
+    /// when the strategy itself would act.
+    static ref METRIC_LOWER_BALANCE_THRESHOLD: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_lower_balance_threshold_hopr",
+            "wxHOPR channel balance below which the strategy tops the channel up, in base units, resolved from ticket price and winning probability at the most recent tick with known ticket economics (may be stale if a required chain read fails)",
         ).unwrap();
 
     // ── Diversity / anonymity ─────────────────────────────────────────────────
@@ -435,6 +454,11 @@ struct ChannelLifecycleStrategyInner<N> {
     /// reset to zero on any tick the peer is connected, and pruned to live
     /// channels each tick so it cannot grow without bound.
     disconnect_streak: Arc<DashMap<Address, usize>>,
+    /// Destination peers whose channel balance was published on the previous
+    /// successful tick.  The exporter is cumulative and has no way to delete a label
+    /// set, so a channel that is no longer open is reset to 0 from here rather than
+    /// left reporting its last balance forever.
+    emitted_channel_balances: Arc<Mutex<HashSet<Address>>>,
 }
 
 impl<N> ChannelLifecycleStrategyInner<N> {

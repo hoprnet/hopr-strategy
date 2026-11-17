@@ -127,6 +127,53 @@ enum LoopbackVerdict {
     Unroutable,
 }
 
+/// One per-peer sample of the channel-balance gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChannelBalanceSample {
+    peer: Address,
+    balance: HoprBalance,
+}
+
+/// Samples the channel-balance gauge publishes this tick: every open channel's
+/// balance, plus a zero for every peer whose channel was open on the previous tick
+/// and is not any more.
+///
+/// The exporter is cumulative and has no way to drop a label set, so a channel that is
+/// no longer open must be reset explicitly or its last balance is reported forever.
+/// The result is ordered by peer so a tick's samples do not depend on map iteration.
+fn channel_balance_samples(
+    previously_open: &HashSet<Address>,
+    open_channels: &[&ChannelEntry],
+) -> Vec<ChannelBalanceSample> {
+    let open_peers: HashSet<Address> = open_channels.iter().map(|ch| ch.destination).collect();
+
+    let mut samples: Vec<ChannelBalanceSample> = open_channels
+        .iter()
+        .map(|ch| ChannelBalanceSample {
+            peer: ch.destination,
+            balance: ch.balance,
+        })
+        .chain(
+            previously_open
+                .iter()
+                .filter(|peer| !open_peers.contains(peer))
+                .map(|peer| ChannelBalanceSample {
+                    peer: *peer,
+                    balance: HoprBalance::zero(),
+                }),
+        )
+        .collect();
+    samples.sort_by_key(|sample| sample.peer);
+
+    samples
+}
+
+/// wxHOPR base units as an `f64`, the value type every telemetry gauge takes.
+#[cfg(any(test, feature = "telemetry"))]
+fn base_units(balance: HoprBalance) -> f64 {
+    balance.amount().low_u128() as f64
+}
+
 impl<N> ChannelLifecycleStrategyInner<N>
 where
     N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
@@ -913,6 +960,7 @@ where
             .filter(|c| c.status == ChannelStatus::Open)
             .collect();
         let open_count = open_channels.len() + self.open_in_flight.held_count();
+        self.emit_channel_balance_metrics(&open_channels);
         debug!(
             open = open_count,
             in_flight = self.total_in_flight(),
@@ -1027,6 +1075,8 @@ where
             );
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_REQUIRED_SAFE_BALANCE.set(required_safe.amount().low_u128() as f64);
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_LOWER_BALANCE_THRESHOLD.set(base_units(funding.lower_balance_threshold));
 
             // Stranded: the safe cannot meet the demand it can see. Only then does
             // the consolidation pass (hopr-strategy#85) take over the under-funded
@@ -1787,6 +1837,24 @@ where
         }
     }
 
+    /// Emit every open channel's balance, and reset the peers whose channel is no longer
+    /// open.  Called on every successful tick before the fund pass, so the figures are
+    /// fresh even when the pass is skipped for lack of chain reads.
+    #[allow(unused_variables)]
+    fn emit_channel_balance_metrics(&self, open_channels: &[&ChannelEntry]) {
+        let samples = {
+            let mut previously_open = self.emitted_channel_balances.lock();
+            let samples = channel_balance_samples(&previously_open, open_channels);
+            *previously_open = open_channels.iter().map(|ch| ch.destination).collect();
+            samples
+        };
+
+        #[cfg(all(feature = "telemetry", not(test)))]
+        for sample in samples {
+            super::METRIC_CHANNEL_BALANCE.set(&[sample.peer.to_string().as_str()], base_units(sample.balance));
+        }
+    }
+
     /// Emit per-axis score averages across open candidates, but only when the
     /// multi-objective selector is active.
     #[allow(unused_variables)]
@@ -1854,7 +1922,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -1889,7 +1957,7 @@ mod tests {
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
     // Private items (ChannelLifecycleStrategyInner, OpenAttempt) are accessible from
     // descendant modules.
-    use super::OpenAttempt;
+    use super::{ChannelBalanceSample, OpenAttempt, base_units, channel_balance_samples};
     use crate::{
         errors::StrategyError,
         strategy::{Strategy as _, StrategyState},
@@ -3302,6 +3370,7 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
+                emitted_channel_balances: Default::default(),
             }
         }
 
@@ -3428,6 +3497,7 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
+                emitted_channel_balances: Default::default(),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -3454,6 +3524,7 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            emitted_channel_balances: Default::default(),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -3862,6 +3933,7 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            emitted_channel_balances: Default::default(),
         }
     }
 
@@ -5080,5 +5152,94 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ── Per-channel balance telemetry (hopr-strategy#124) ─────────────────────
+
+    /// An open outgoing channel from this node (`BOB`) to `peer`, staked `stake` wei.
+    fn open_channel(peer: Address, stake: u32) -> anyhow::Result<ChannelEntry> {
+        Ok(ChannelEntry::builder()
+            .between(*BOB, peer)
+            .amount(stake)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?)
+    }
+
+    /// The exporter is cumulative and cannot drop a label set, so a channel that is
+    /// no longer open must be reset to 0 — otherwise the alert keeps comparing its
+    /// last balance against the threshold.
+    #[test]
+    fn channel_balance_samples_should_zero_a_closed_channel_and_report_an_opened_one() -> anyhow::Result<()> {
+        let previously_open: HashSet<Address> = [*ALICE, *DAVE].into_iter().collect();
+        let remained_open = open_channel(*ALICE, 7)?;
+        let newly_open = open_channel(*CHRIS, 11)?;
+
+        let samples = channel_balance_samples(&previously_open, &[&remained_open, &newly_open]);
+
+        let by_peer: HashMap<Address, HoprBalance> = samples.iter().map(|s| (s.peer, s.balance)).collect();
+        assert_eq!(by_peer.len(), 3, "one sample per peer, no duplicates: {by_peer:?}");
+        assert_eq!(by_peer[&*DAVE], HoprBalance::zero(), "a channel no longer open reads 0");
+        assert_eq!(
+            by_peer[&*ALICE],
+            HoprBalance::from(7_u32),
+            "a still-open channel keeps it"
+        );
+        assert_eq!(
+            by_peer[&*CHRIS],
+            HoprBalance::from(11_u32),
+            "a channel opened since the last tick is reported"
+        );
+        Ok(())
+    }
+
+    /// The first tick has nothing to reset: only the open channels are published.
+    #[test]
+    fn channel_balance_samples_should_publish_only_open_channels_when_nothing_was_published_before()
+    -> anyhow::Result<()> {
+        let only = open_channel(*ALICE, 3)?;
+
+        let samples = channel_balance_samples(&HashSet::new(), &[&only]);
+
+        assert_eq!(
+            samples,
+            vec![ChannelBalanceSample {
+                peer: *ALICE,
+                balance: HoprBalance::from(3_u32),
+            }]
+        );
+        Ok(())
+    }
+
+    /// The threshold gauge must report the strategy's own resolved threshold, in base
+    /// units, and follow the configured sizing mode.  An alert that re-derives the
+    /// threshold itself is exactly what this metric replaces.
+    #[test]
+    fn lower_balance_threshold_metric_should_follow_the_configured_sizing_mode() {
+        let price = HoprBalance::new_base(1);
+        let deterministic = FundingConfig::default().resolve::<TestTransport>(price, 0.5);
+        let probabilistic = FundingConfig {
+            sizing_mode: CapacitySizingMode::Probabilistic {
+                success_probability: 0.999,
+            },
+            ..FundingConfig::default()
+        }
+        .resolve::<TestTransport>(price, 0.5);
+
+        assert_eq!(
+            base_units(deterministic.lower_balance_threshold),
+            deterministic.lower_balance_threshold.amount().low_u128() as f64,
+            "deterministic: the gauge carries the resolved threshold in base units"
+        );
+        assert_eq!(
+            base_units(probabilistic.lower_balance_threshold),
+            probabilistic.lower_balance_threshold.amount().low_u128() as f64,
+            "probabilistic: the gauge carries the resolved threshold in base units"
+        );
+        assert!(
+            probabilistic.lower_balance_threshold > deterministic.lower_balance_threshold,
+            "the gauge must follow the configured mode, not assume deterministic sizing"
+        );
     }
 }
