@@ -3531,6 +3531,24 @@ fn the_note_source_defaults_to_blokli_and_the_indexer_needs_its_url() -> anyhow:
     Ok(())
 }
 
+/// The pool builds over a caller's HTTP client with both the relayer and the Curvy indexer in
+/// use. That their requests then go through it is checked on `RelayClient` and `HttpSyncApi`.
+#[tokio::test]
+async fn the_pool_builds_over_an_injected_http_client() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let cfg = CurvyDepositPoolConfig {
+        relayer_url: Some("http://127.0.0.1:1/".parse()?),
+        note_source: CurvyNoteSource::CurvyIndexer,
+        curvy_indexer_url: Some("http://127.0.0.1:1/".parse()?),
+        state_path: Some(state.path().join("curvy.redb")),
+        token: Some(2),
+        ..Default::default()
+    };
+    let pool = CurvyDepositPool::with_http_client(test_node().await?, cfg, TEST_PASSWORD, reqwest::Client::new())?;
+    assert!(matches!(pool.index.as_ref(), super::NoteIndex::CurvyIndexer(_)));
+    Ok(())
+}
+
 /// Against Curvy's staging indexer for Gnosis. Network; run by hand:
 /// The whole pool over a demo run's Exit state against Curvy staging: registering the watch
 /// must discover and complete the allocation's committed note.
@@ -3850,6 +3868,37 @@ async fn full_pending_snapshot_reaches_committed_notes() -> anyhow::Result<()> {
         assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver).await??, ten());
         assert_eq!(state.committed_amount(&fixture.id)?, ten());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn blokli_head_needs_no_further_finality() -> anyhow::Result<()> {
+    // The test client reports finality 3.
+    let client = BlokliTestStateBuilder::default().build_static_client();
+    let index = super::lifecycle::BlokliIndex(Arc::new(client));
+    assert_eq!(index.indexed_head().await.map_err(anyhow::Error::msg)?, (1, 0));
+    Ok(())
+}
+
+/// A committed note at exactly the indexed head is accepted.
+#[tokio::test]
+async fn a_committed_note_at_the_indexed_head_is_confirmed() -> anyhow::Result<()> {
+    let state = Arc::new(RedbCurvyDepositState::in_memory()?);
+    let fixture = owned_candidate(2)?;
+    let tracker = CurvyLifecycleTracker::new(Arc::new(fixture.detector), state.clone());
+    let receiver = tracker.watch(fixture.id, fixture.address, fixture.scan_secret, ten())?;
+    let index = ScriptedIndex::default();
+    index.pending.lock().push(fixture.note);
+    index.committed.lock().push(completion(&fixture.note_id, 3));
+    *index.head.lock() = Some((3, 0));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        super::lifecycle::catch_up(&index, &tracker, None),
+    )
+    .await?
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), receiver).await??, ten());
+    assert_eq!(state.committed_amount(&fixture.id)?, ten());
     Ok(())
 }
 

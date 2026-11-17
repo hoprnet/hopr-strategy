@@ -500,7 +500,7 @@ struct DepositTrackerSlot(Arc<AtomicUsize>);
 impl DepositTrackerSlot {
     fn try_acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < MAX_CONCURRENT_DEPOSIT_TRACKERS).then_some(n + 1)
             })
             .ok()

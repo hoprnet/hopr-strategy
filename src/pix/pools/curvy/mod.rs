@@ -1121,7 +1121,46 @@ where
     ///     Ok(pool)
     /// }
     /// ```
-    pub fn new(node: Arc<N>, mut cfg: CurvyDepositPoolConfig, state_password: &str) -> Result<Self, StrategyError> {
+    pub fn new(node: Arc<N>, cfg: CurvyDepositPoolConfig, state_password: &str) -> Result<Self, StrategyError> {
+        Self::build(node, cfg, state_password, None)
+    }
+
+    /// [`Self::new`], but the requests to the Curvy relayer and the Curvy indexer go through
+    /// `http`, for example to send them from a given local address or through a proxy, outside a
+    /// tunnel. Blokli traffic does not use it. Timeouts are the same as under [`Self::new`].
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use hopr_api::node::HasChainApi;
+    /// # use hopr_strategy::{
+    /// #     errors::StrategyError,
+    /// #     pix::pools::curvy::{CurvyDepositPool, CurvyDepositPoolConfig},
+    /// # };
+    /// # fn open<N>(node: Arc<N>, cfg: CurvyDepositPoolConfig, password: &str) -> anyhow::Result<CurvyDepositPool<N>>
+    /// # where
+    /// #     N: HasChainApi + Send + Sync + 'static,
+    /// # {
+    /// let http = reqwest::Client::builder()
+    ///     .local_address("192.0.2.10".parse::<std::net::IpAddr>()?)
+    ///     .build()?;
+    /// Ok(CurvyDepositPool::with_http_client(node, cfg, password, http)?)
+    /// # }
+    /// ```
+    pub fn with_http_client(
+        node: Arc<N>,
+        cfg: CurvyDepositPoolConfig,
+        state_password: &str,
+        http: reqwest::Client,
+    ) -> Result<Self, StrategyError> {
+        Self::build(node, cfg, state_password, Some(http))
+    }
+
+    fn build(
+        node: Arc<N>,
+        mut cfg: CurvyDepositPoolConfig,
+        state_password: &str,
+        http: Option<reqwest::Client>,
+    ) -> Result<Self, StrategyError> {
         // The pool never funds itself any more. Without `deny_unknown_fields` (see the config
         // docs) a leftover setting would be ignored without a word, and the first deposit would
         // fail for want of funding with nothing pointing at the setting.
@@ -1214,13 +1253,19 @@ where
                         .relayer_url
                         .clone()
                         .expect("validated: `relayer_url` is required for relayed submission");
-                    Some(Arc::new(relayer::RelayClient::new(url, RELAYER_REQUEST_TIMEOUT)?))
+                    Some(Arc::new(match &http {
+                        Some(http) => {
+                            relayer::RelayClient::with_http_client(url, http.clone(), RELAYER_REQUEST_TIMEOUT)
+                        }
+                        None => relayer::RelayClient::new(url, RELAYER_REQUEST_TIMEOUT)?,
+                    }))
                 }
                 CurvySubmission::Operator => None,
             },
             &state,
         )
-        .map_err(StrategyError::other)?;
+        .map_err(StrategyError::other)?
+        .with_indexer_http_client(http.clone());
         tracing::info!(
             state = %state_path.display(),
             blokli = %cfg.blokli_url,
@@ -1230,6 +1275,7 @@ where
             relayer = cfg.relayer_url.as_ref().map(|url| url.to_string()),
             note_source = ?cfg.note_source,
             curvy_indexer = cfg.curvy_indexer_url.as_ref().map(|url| url.to_string()),
+            custom_http_client = http.is_some(),
             "Curvy PIX deposit pool ready"
         );
         let index = match cfg.note_source {
@@ -1239,8 +1285,11 @@ where
                     .curvy_indexer_url
                     .clone()
                     .expect("validated: `curvy_indexer_url` is required for the Curvy indexer");
-                let api = indexer::HttpSyncApi::new(url, INDEXER_REQUEST_TIMEOUT)
-                    .map_err(|error| StrategyError::other(anyhow::anyhow!(error)))?;
+                let api = match &http {
+                    Some(http) => indexer::HttpSyncApi::with_http_client(url, http.clone(), INDEXER_REQUEST_TIMEOUT),
+                    None => indexer::HttpSyncApi::new(url, INDEXER_REQUEST_TIMEOUT)
+                        .map_err(|error| StrategyError::other(anyhow::anyhow!(error)))?,
+                };
                 // The chain id comes from the same Blokli the pool discovers the deployment through.
                 let chain = Arc::new(indexer::BlokliChainId::new(Arc::clone(&blokli)));
                 NoteIndex::CurvyIndexer(indexer::CurvyIndexerSource(indexer::CurvyIndexerClient::new(
