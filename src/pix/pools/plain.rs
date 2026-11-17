@@ -1040,7 +1040,9 @@ where
         Ok(Box::pin(async move {
             let _tracker_slot = tracker_slot;
 
-            let poll_interval = (max_tracking / 10).max(Duration::from_secs(1));
+            // Capped because the Exit's own sweep empties the address once the cycle recovers,
+            // and a poll that comes after it never sees the deposit.
+            let poll_interval = (max_tracking / 10).clamp(Duration::from_secs(1), Duration::from_secs(5));
 
             let phase_jitter = Duration::from_millis(hopr_api::types::crypto_random::random_integer(
                 0,
