@@ -101,6 +101,21 @@ impl HttpSyncApi {
     ///
     /// The client carries the transport (proxy, local address, TLS roots, default headers);
     /// `request_timeout` still bounds every request and overrides the client's own timeout.
+    /// Unlike `new`, this cannot fail: the client is already built.
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use hopr_strategy::pix::pools::curvy::indexer::HttpSyncApi;
+    /// # fn main() -> anyhow::Result<()> {
+    /// // Sent from this local address, for example to leave a VPN tunnel.
+    /// let http = reqwest::Client::builder()
+    ///     .local_address("192.0.2.10".parse::<std::net::IpAddr>()?)
+    ///     .build()?;
+    /// let api = HttpSyncApi::with_http_client("https://api.curvy.box".parse()?, http, Duration::from_secs(30));
+    /// # let _ = api;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_http_client(base_url: Url, http: reqwest::Client, request_timeout: std::time::Duration) -> Self {
         Self {
             base_url,
