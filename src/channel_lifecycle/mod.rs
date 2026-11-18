@@ -129,6 +129,34 @@ lazy_static::lazy_static! {
             "wxHOPR the safe must hold to satisfy the demand of the most recent successful tick, in base units (may be stale if a required chain read fails)",
         ).unwrap();
 
+    /// wxHOPR held by all open outgoing channels together, in base units: one series per
+    /// node, so the series space does not grow with the peers or the channels the node has
+    /// ever had.
+    static ref METRIC_CHANNELS_BALANCE_SUM: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_channels_balance_sum_hopr",
+            "wxHOPR held by all open outgoing channels together, in base units, from the most recent successful tick",
+        ).unwrap();
+
+    /// Open channels the fund pass would top up, counted against the threshold below.
+    ///
+    /// The sum above cannot answer this: it hides a single underfunded channel, and this
+    /// count is what the low-balance alert fires on.  One series per node.
+    static ref METRIC_CHANNELS_AT_OR_BELOW_THRESHOLD: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_channels_at_or_below_threshold",
+            "Number of open outgoing channels whose balance is at or below the lower balance threshold the strategy tops up at, on the most recent tick with known ticket economics (may be stale if a required chain read fails)",
+        ).unwrap();
+
+    /// Channel balance at or below which the fund pass tops the channel up: the same resolved
+    /// figure the pass compares every channel against, so an alert on it fires only
+    /// when the strategy itself would act.
+    static ref METRIC_LOWER_BALANCE_THRESHOLD: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_lower_balance_threshold_hopr",
+            "wxHOPR channel balance at or below which the strategy tops the channel up, in base units, resolved from ticket price and winning probability at the most recent tick with known ticket economics (may be stale if a required chain read fails)",
+        ).unwrap();
+
     // ── Diversity / anonymity ─────────────────────────────────────────────────
     /// Shannon-entropy-based effective number of distinct (latency, subnet) cells.
     static ref METRIC_EFFECTIVE_BUCKETS: hopr_api::types::telemetry::SimpleGauge =

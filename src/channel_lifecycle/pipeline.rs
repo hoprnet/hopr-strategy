@@ -127,6 +127,28 @@ enum LoopbackVerdict {
     Unroutable,
 }
 
+/// wxHOPR held by all open outgoing channels together.
+#[cfg(any(test, feature = "telemetry"))]
+fn total_channel_balance(open_channels: &[&ChannelEntry]) -> HoprBalance {
+    open_channels
+        .iter()
+        .map(|ch| ch.balance)
+        .fold(HoprBalance::zero(), |sum, b| sum + b)
+}
+
+/// Number of open channels the fund pass would top up: balance at or below `threshold`,
+/// the same comparison it makes.
+#[cfg(any(test, feature = "telemetry"))]
+fn channels_at_or_below(open_channels: &[&ChannelEntry], threshold: HoprBalance) -> usize {
+    open_channels.iter().filter(|ch| ch.balance <= threshold).count()
+}
+
+/// wxHOPR base units as an `f64`, the value type every telemetry gauge takes.
+#[cfg(any(test, feature = "telemetry"))]
+fn base_units(balance: HoprBalance) -> f64 {
+    balance.amount().low_u128() as f64
+}
+
 impl<N> ChannelLifecycleStrategyInner<N>
 where
     N: HasChainApi + HasNetworkView + HasGraphView + ActionableEventSource + PacketTransport + Send + Sync + 'static,
@@ -913,6 +935,7 @@ where
             .filter(|c| c.status == ChannelStatus::Open)
             .collect();
         let open_count = open_channels.len() + self.open_in_flight.held_count();
+        self.emit_channel_balance_metrics(&open_channels);
         debug!(
             open = open_count,
             in_flight = self.total_in_flight(),
@@ -1027,6 +1050,11 @@ where
             );
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_REQUIRED_SAFE_BALANCE.set(required_safe.amount().low_u128() as f64);
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_LOWER_BALANCE_THRESHOLD.set(base_units(funding.lower_balance_threshold));
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_CHANNELS_AT_OR_BELOW_THRESHOLD
+                .set(channels_at_or_below(&open_channels, funding.lower_balance_threshold) as f64);
 
             // Stranded: the safe cannot meet the demand it can see. Only then does
             // the consolidation pass (hopr-strategy#85) take over the under-funded
@@ -1787,6 +1815,15 @@ where
         }
     }
 
+    /// Publish the wxHOPR held by all open channels together.  Called on every successful
+    /// tick before the fund pass, so the figure is fresh even when the pass is skipped for
+    /// lack of chain reads.
+    #[allow(unused_variables)]
+    fn emit_channel_balance_metrics(&self, open_channels: &[&ChannelEntry]) {
+        #[cfg(all(feature = "telemetry", not(test)))]
+        super::METRIC_CHANNELS_BALANCE_SUM.set(base_units(total_channel_balance(open_channels)));
+    }
+
     /// Emit per-axis score averages across open candidates, but only when the
     /// multi-objective selector is active.
     #[allow(unused_variables)]
@@ -1889,7 +1926,7 @@ mod tests {
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
     // Private items (ChannelLifecycleStrategyInner, OpenAttempt) are accessible from
     // descendant modules.
-    use super::OpenAttempt;
+    use super::{OpenAttempt, base_units, channels_at_or_below, total_channel_balance};
     use crate::{
         errors::StrategyError,
         strategy::{Strategy as _, StrategyState},
@@ -5080,5 +5117,86 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ── Per-channel balance telemetry (hopr-strategy#124) ─────────────────────
+
+    /// An open outgoing channel from this node (`BOB`) to `peer`, staked `stake` wei.
+    fn open_channel(peer: Address, stake: u32) -> anyhow::Result<ChannelEntry> {
+        Ok(ChannelEntry::builder()
+            .between(*BOB, peer)
+            .amount(stake)
+            .ticket_index(0)
+            .status(ChannelStatus::Open)
+            .epoch(0)
+            .build()?)
+    }
+
+    /// The published figure is the wxHOPR of all open channels together, so one series
+    /// carries the node's allocation without a label per peer or per channel.
+    #[test]
+    fn total_channel_balance_should_sum_every_open_channel() -> anyhow::Result<()> {
+        let first = open_channel(*ALICE, 7)?;
+        let second = open_channel(*CHRIS, 11)?;
+
+        assert_eq!(
+            total_channel_balance(&[&first, &second]),
+            HoprBalance::from(18_u32),
+            "the sum of both channel balances"
+        );
+        assert_eq!(
+            total_channel_balance(&[]),
+            HoprBalance::zero(),
+            "no open channel holds nothing"
+        );
+        Ok(())
+    }
+
+    /// The count the alert fires on must use the fund pass's own comparison: a channel
+    /// sitting on the threshold is topped up, so it counts too.
+    #[test]
+    fn channels_at_or_below_should_count_the_threshold_itself() -> anyhow::Result<()> {
+        let threshold = HoprBalance::from(10_u32);
+        let below = open_channel(*ALICE, 4)?;
+        let at = open_channel(*CHRIS, 10)?;
+        let above = open_channel(*DAVE, 11)?;
+
+        assert_eq!(
+            channels_at_or_below(&[&below, &at, &above], threshold),
+            2,
+            "at or below the threshold is topped up; above it is left alone"
+        );
+        Ok(())
+    }
+
+    /// The threshold gauge must report the strategy's own resolved threshold, in base
+    /// units, and follow the configured sizing mode.  An alert that re-derives the
+    /// threshold itself is exactly what this metric replaces.
+    #[test]
+    fn lower_balance_threshold_metric_should_follow_the_configured_sizing_mode() {
+        let price = HoprBalance::new_base(1);
+        let deterministic = FundingConfig::default().resolve::<TestTransport>(price, 0.5);
+        let probabilistic = FundingConfig {
+            sizing_mode: CapacitySizingMode::Probabilistic {
+                success_probability: 0.999,
+            },
+            ..FundingConfig::default()
+        }
+        .resolve::<TestTransport>(price, 0.5);
+
+        assert_eq!(
+            base_units(deterministic.lower_balance_threshold),
+            deterministic.lower_balance_threshold.amount().low_u128() as f64,
+            "deterministic: the gauge carries the resolved threshold in base units"
+        );
+        assert_eq!(
+            base_units(probabilistic.lower_balance_threshold),
+            probabilistic.lower_balance_threshold.amount().low_u128() as f64,
+            "probabilistic: the gauge carries the resolved threshold in base units"
+        );
+        assert!(
+            probabilistic.lower_balance_threshold > deterministic.lower_balance_threshold,
+            "the gauge must follow the configured mode, not assume deterministic sizing"
+        );
     }
 }
