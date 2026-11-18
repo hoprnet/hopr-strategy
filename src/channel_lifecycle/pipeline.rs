@@ -127,45 +127,18 @@ enum LoopbackVerdict {
     Unroutable,
 }
 
-/// One per-peer sample of the channel-balance gauge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChannelBalanceSample {
-    peer: Address,
-    balance: HoprBalance,
+/// One balance observation per open channel, in wxHOPR base units: the tick's sample of
+/// the channel-balance distribution.
+#[cfg(any(test, feature = "telemetry"))]
+fn channel_balances(open_channels: &[&ChannelEntry]) -> Vec<f64> {
+    open_channels.iter().map(|ch| base_units(ch.balance)).collect()
 }
 
-/// Samples the channel-balance gauge publishes this tick: every open channel's
-/// balance, plus a zero for every peer whose channel was open on the previous tick
-/// and is not any more.
-///
-/// The exporter is cumulative and has no way to drop a label set, so a channel that is
-/// no longer open must be reset explicitly or its last balance is reported forever.
-/// The result is ordered by peer so a tick's samples do not depend on map iteration.
-fn channel_balance_samples(
-    previously_open: &HashSet<Address>,
-    open_channels: &[&ChannelEntry],
-) -> Vec<ChannelBalanceSample> {
-    let open_peers: HashSet<Address> = open_channels.iter().map(|ch| ch.destination).collect();
-
-    let mut samples: Vec<ChannelBalanceSample> = open_channels
-        .iter()
-        .map(|ch| ChannelBalanceSample {
-            peer: ch.destination,
-            balance: ch.balance,
-        })
-        .chain(
-            previously_open
-                .iter()
-                .filter(|peer| !open_peers.contains(peer))
-                .map(|peer| ChannelBalanceSample {
-                    peer: *peer,
-                    balance: HoprBalance::zero(),
-                }),
-        )
-        .collect();
-    samples.sort_by_key(|sample| sample.peer);
-
-    samples
+/// Number of open channels the fund pass would top up: balance at or below `threshold`,
+/// the same comparison it makes.
+#[cfg(any(test, feature = "telemetry"))]
+fn channels_at_or_below(open_channels: &[&ChannelEntry], threshold: HoprBalance) -> usize {
+    open_channels.iter().filter(|ch| ch.balance <= threshold).count()
 }
 
 /// wxHOPR base units as an `f64`, the value type every telemetry gauge takes.
@@ -1077,6 +1050,9 @@ where
             super::METRIC_REQUIRED_SAFE_BALANCE.set(required_safe.amount().low_u128() as f64);
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_LOWER_BALANCE_THRESHOLD.set(base_units(funding.lower_balance_threshold));
+            #[cfg(all(feature = "telemetry", not(test)))]
+            super::METRIC_CHANNELS_AT_OR_BELOW_THRESHOLD
+                .set(channels_at_or_below(&open_channels, funding.lower_balance_threshold) as f64);
 
             // Stranded: the safe cannot meet the demand it can see. Only then does
             // the consolidation pass (hopr-strategy#85) take over the under-funded
@@ -1837,21 +1813,14 @@ where
         }
     }
 
-    /// Emit every open channel's balance, and reset the peers whose channel is no longer
-    /// open.  Called on every successful tick before the fund pass, so the figures are
-    /// fresh even when the pass is skipped for lack of chain reads.
+    /// Observe every open channel's balance as one sample of the balance distribution.
+    /// Called on every successful tick before the fund pass, so the sample is fresh even
+    /// when the pass is skipped for lack of chain reads.
     #[allow(unused_variables)]
     fn emit_channel_balance_metrics(&self, open_channels: &[&ChannelEntry]) {
-        let samples = {
-            let mut previously_open = self.emitted_channel_balances.lock();
-            let samples = channel_balance_samples(&previously_open, open_channels);
-            *previously_open = open_channels.iter().map(|ch| ch.destination).collect();
-            samples
-        };
-
         #[cfg(all(feature = "telemetry", not(test)))]
-        for sample in samples {
-            super::METRIC_CHANNEL_BALANCE.set(&[sample.peer.to_string().as_str()], base_units(sample.balance));
+        for balance in channel_balances(open_channels) {
+            super::METRIC_CHANNEL_BALANCE.observe(balance);
         }
     }
 
@@ -1922,7 +1891,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -1957,7 +1926,7 @@ mod tests {
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
     // Private items (ChannelLifecycleStrategyInner, OpenAttempt) are accessible from
     // descendant modules.
-    use super::{ChannelBalanceSample, OpenAttempt, base_units, channel_balance_samples};
+    use super::{OpenAttempt, base_units, channel_balances, channels_at_or_below};
     use crate::{
         errors::StrategyError,
         strategy::{Strategy as _, StrategyState},
@@ -3370,7 +3339,6 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
-                emitted_channel_balances: Default::default(),
             }
         }
 
@@ -3497,7 +3465,6 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
-                emitted_channel_balances: Default::default(),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -3524,7 +3491,6 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
-            emitted_channel_balances: Default::default(),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -3933,7 +3899,6 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
-            emitted_channel_balances: Default::default(),
         }
     }
 
@@ -5167,47 +5132,35 @@ mod tests {
             .build()?)
     }
 
-    /// The exporter is cumulative and cannot drop a label set, so a channel that is
-    /// no longer open must be reset to 0 — otherwise the alert keeps comparing its
-    /// last balance against the threshold.
+    /// Every open channel contributes one sample of the distribution, in base units.
+    /// This is what replaces a per-peer series: the cumulative exporter would keep a
+    /// peer label set for the life of the process.
     #[test]
-    fn channel_balance_samples_should_zero_a_closed_channel_and_report_an_opened_one() -> anyhow::Result<()> {
-        let previously_open: HashSet<Address> = [*ALICE, *DAVE].into_iter().collect();
-        let remained_open = open_channel(*ALICE, 7)?;
-        let newly_open = open_channel(*CHRIS, 11)?;
+    fn channel_balances_should_sample_every_open_channel_in_base_units() -> anyhow::Result<()> {
+        let first = open_channel(*ALICE, 7)?;
+        let second = open_channel(*CHRIS, 11)?;
 
-        let samples = channel_balance_samples(&previously_open, &[&remained_open, &newly_open]);
-
-        let by_peer: HashMap<Address, HoprBalance> = samples.iter().map(|s| (s.peer, s.balance)).collect();
-        assert_eq!(by_peer.len(), 3, "one sample per peer, no duplicates: {by_peer:?}");
-        assert_eq!(by_peer[&*DAVE], HoprBalance::zero(), "a channel no longer open reads 0");
         assert_eq!(
-            by_peer[&*ALICE],
-            HoprBalance::from(7_u32),
-            "a still-open channel keeps it"
-        );
-        assert_eq!(
-            by_peer[&*CHRIS],
-            HoprBalance::from(11_u32),
-            "a channel opened since the last tick is reported"
+            channel_balances(&[&first, &second]),
+            vec![7.0, 11.0],
+            "one observation per open channel"
         );
         Ok(())
     }
 
-    /// The first tick has nothing to reset: only the open channels are published.
+    /// The count the alert fires on must use the fund pass's own comparison: a channel
+    /// sitting on the threshold is topped up, so it counts too.
     #[test]
-    fn channel_balance_samples_should_publish_only_open_channels_when_nothing_was_published_before()
-    -> anyhow::Result<()> {
-        let only = open_channel(*ALICE, 3)?;
-
-        let samples = channel_balance_samples(&HashSet::new(), &[&only]);
+    fn channels_at_or_below_should_count_the_threshold_itself() -> anyhow::Result<()> {
+        let threshold = HoprBalance::from(10_u32);
+        let below = open_channel(*ALICE, 4)?;
+        let at = open_channel(*CHRIS, 10)?;
+        let above = open_channel(*DAVE, 11)?;
 
         assert_eq!(
-            samples,
-            vec![ChannelBalanceSample {
-                peer: *ALICE,
-                balance: HoprBalance::from(3_u32),
-            }]
+            channels_at_or_below(&[&below, &at, &above], threshold),
+            2,
+            "at or below the threshold is topped up; above it is left alone"
         );
         Ok(())
     }
