@@ -314,7 +314,9 @@ pub struct PixStrategyConfig {
 /// reads [`DepositPool::available_balance`]
 /// and, when that is below `min_available`, asks the pool to [`fund`](DepositPool::fund) `top_up`
 /// from the Safe — and, with [`PixFundingPolicy::fund_at_startup`], also once when `run` starts.
-/// The tail check spares the next deposit the shield wait; the head check covers a lazy start and a failed refill.
+/// The tail check usually pays the shield wait before the next deposit arrives; a deposit that comes in
+/// mid-refill still waits on it. No flush starts a tail refill once shutdown has begun. The head check
+/// covers a lazy start and a failed refill.
 /// Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; and one flush at a time, from its
 /// funding decision through its batch and its refill, so that concurrent flushes cannot each top up and
@@ -1549,9 +1551,11 @@ where
                 batch,
             )
             .await;
+            // A closed signal is a dropped strategy or an ended run, which is stopping as well.
+            let stopped = *stop.borrow() || stop.has_changed().is_err();
             // Refill now, not at the next deposit's flush, which would wait out the shield and the commitment.
             if let Some(policy) = policy.as_ref()
-                && !*stop.borrow()
+                && !stopped
             {
                 fund_below_floor::<D, K>(&pool, policy).await;
             }
@@ -2190,8 +2194,8 @@ where
         // it — including the one a zero buffer period triggers from inside a handler. See
         // `detach_flushes`.
         self.detach_flushes = true;
-        // A strategy that ran before has set the stop signal; this run funds again.
-        self.funding_stop.send_replace(false);
+        // A fresh signal, not a reset: dropping the old sender stops what the previous run left in flight.
+        self.funding_stop = tokio::sync::watch::channel(false).0;
 
         let mut event_stream = self
             .node
@@ -6625,8 +6629,9 @@ mod tests {
 
                 if detached {
                     strategy.detach_flush_deposits();
-                    settle(|| pool.funded.lock().len() == expected.len() && !pool.made.lock().is_empty()).await;
-                    tokio::time::sleep(StdDuration::from_millis(50)).await;
+                    settle(|| !pool.made.lock().is_empty()).await;
+                    // The flush holds the gate through its tail refill.
+                    tokio::time::timeout(StdDuration::from_secs(5), strategy.funding_gate.lock()).await?;
                 } else {
                     strategy.flush_deposits().await;
                 }
@@ -6660,7 +6665,33 @@ mod tests {
         strategy.shut_down().await;
         pool.proving.add_permits(1);
         settle(|| !pool.made.lock().is_empty()).await;
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        tokio::time::timeout(StdDuration::from_secs(5), strategy.funding_gate.lock()).await?;
+
+        assert_eq!(*pool.made.lock(), vec![true], "the batch was made");
+        assert!(pool.funded.lock().is_empty(), "and nothing refilled after it");
+        Ok(())
+    }
+
+    /// A dropped strategy, like an ended run, starts no refill shield after its in-flight batch.
+    #[test_log::test(tokio::test)]
+    async fn a_flush_finishing_after_the_strategy_is_dropped_does_not_refill() -> anyhow::Result<()> {
+        let (_cc, node, _pool) = entry_side(&[]).await?;
+        let pool = proving_pool(60, 0);
+        let mut strategy = PixStrategyInner::new(Arc::clone(&pool), node, floor_50_top_up_100(), *BOB, None);
+        let id = pix_id(1);
+        let amount = HoprBalance::new_base(40);
+        let spend = strategy.commit_spend(amount);
+        strategy
+            .deposit_buffer
+            .push((id, *BOB, amount, crate::pix::ByteDepositData::for_id(id), spend));
+        strategy.detach_flush_deposits();
+        settle(|| pool.started.load(std::sync::atomic::Ordering::SeqCst) > 0).await;
+
+        let gate = Arc::clone(&strategy.funding_gate);
+        drop(strategy);
+        pool.proving.add_permits(1);
+        settle(|| !pool.made.lock().is_empty()).await;
+        tokio::time::timeout(StdDuration::from_secs(5), gate.lock()).await?;
 
         assert_eq!(*pool.made.lock(), vec![true], "the batch was made");
         assert!(pool.funded.lock().is_empty(), "and nothing refilled after it");
