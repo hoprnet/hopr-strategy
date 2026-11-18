@@ -1523,15 +1523,16 @@ where
     /// not something to do. Returns how many deposits were not made.
     async fn flush_buffered_deposits(&mut self) -> usize {
         let batch = std::mem::take(&mut self.deposit_buffer);
-        let failed = flush_deposit_batch::<D, K>(
+        let (failed, refused) = flush_deposit_batch::<D, K>(
             self.pool.clone(),
             self.processed_deposits.clone(),
             self.in_flight_destinations.clone(),
             batch,
         )
         .await;
-        let not_made = failed.len();
+        let not_made = failed.len() + refused.len();
         abandon_deposits::<D, K>(failed, &self.in_flight_destinations, &self.spend_ledger);
+        abandon_deposits::<D, K>(refused, &self.in_flight_destinations, &self.spend_ledger);
         not_made
     }
 
@@ -1561,6 +1562,7 @@ where
         let refill_owed = Arc::clone(&self.refill_owed);
         let spend_ledger = Arc::clone(&self.spend_ledger);
         let stop = self.funding_stop.subscribe();
+        let requeue_window = DEPOSIT_REQUEUE_WINDOW.min(self.cfg.spend_window);
 
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
         // what it is funding for, and the loop must not wait on the funding any more than on them.
@@ -1568,9 +1570,8 @@ where
         // refilled balance: see `apply_funding_policy`. It is released before the requeue, which can
         // take minutes and must not hold up the flushes behind it.
         hopr_utils::runtime::prelude::spawn(async move {
-            let funded_for_this_batch =
-                apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, &refill_owed, None).await;
-            let failed = flush_deposit_batch::<D, K>(
+            let funded_for_this_batch = apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, &refill_owed, None).await;
+            let (failed, refused) = flush_deposit_batch::<D, K>(
                 pool.clone(),
                 processed_deposits.clone(),
                 in_flight_destinations.clone(),
@@ -1586,12 +1587,15 @@ where
                 fund_below_floor::<D, K>(&pool, policy, &refill_owed).await;
             }
             drop(funded_for_this_batch);
+            abandon_deposits::<D, K>(refused, &in_flight_destinations, &spend_ledger);
             requeue_failed_deposits::<D, K>(
                 pool,
                 processed_deposits,
                 in_flight_destinations,
                 spend_ledger,
-                DEPOSIT_REQUEUE_WINDOW,
+                policy,
+                gate,
+                requeue_window,
                 stop,
                 failed,
             )
@@ -1758,8 +1762,9 @@ fn report_deposit_flush_failure(error: &StrategyError, id: Option<&PixAddressId>
     }
 }
 
-/// Deposit one drained buffer through the pool, returning the deposits that were not made. They
-/// still hold their destination and spend reservation: the caller requeues or abandons them.
+/// Deposit one drained buffer through the pool, returning the deposits that were not made: those
+/// worth a retry, then those the pool refused for good. They still hold their destination and
+/// spend reservation: the caller requeues or abandons them.
 ///
 /// A free function so that both the awaiting and the detached caller share one body: the loop
 /// must not block on the pool (see [`PixStrategyInner::detach_flush_deposits`]), while shutdown
@@ -1770,7 +1775,7 @@ async fn flush_deposit_batch<D, K>(
     processed_deposits: Cache<PixAddressId, ()>,
     in_flight_destinations: Cache<K::Public, ()>,
     batch: Vec<BufferedDeposit<D, K>>,
-) -> Vec<FailedDeposit<D, K>>
+) -> (Vec<FailedDeposit<D, K>>, Vec<FailedDeposit<D, K>>)
 where
     // `Send + Sync + 'static` beyond what the work itself needs, so the future is spawnable. The
     // `StrategyTrait` impl already requires exactly this of `D`, so no caller gains a bound.
@@ -1789,8 +1794,9 @@ where
 {
     let count = batch.len();
     let mut failed = Vec::new();
+    let mut refused = Vec::new();
     if count == 0 {
-        return failed;
+        return (failed, refused);
     }
 
     if count == 1 {
@@ -1810,8 +1816,12 @@ where
             }
             Err(error) => {
                 report_deposit_flush_failure(&error, Some(&id), 1);
-                let moved_no_funds = error.moved_no_funds();
-                failed.push(((id, dest_addr, amount, deposit_data, spend), moved_no_funds));
+                let deposit = ((id, dest_addr, amount, deposit_data, spend), error.moved_no_funds());
+                if is_permanent_refusal(&error) {
+                    refused.push(deposit);
+                } else {
+                    failed.push(deposit);
+                }
             }
         }
     } else {
@@ -1840,6 +1850,7 @@ where
                 let outcomes_len = outcomes.len();
                 let batch_ids: std::collections::HashSet<PixAddressId> = deposits.iter().map(|(id, ..)| *id).collect();
                 let mut everything_failed_fund_free = true;
+                let mut everything_refused_for_good = true;
                 let mut failures = 0usize;
                 let mut pending = 0usize;
                 // Only ids that are in the batch and appear once: a repeated or foreign id would
@@ -1858,6 +1869,7 @@ where
                             let error: StrategyError = error.into();
                             failures += 1;
                             everything_failed_fund_free &= error.moved_no_funds();
+                            everything_refused_for_good &= is_permanent_refusal(&error);
                             pending += usize::from(error.is_reconciliation_pending());
                             report_deposit_flush_failure(&error, None, 1);
                         }
@@ -1873,11 +1885,16 @@ where
                 // id, either of which would otherwise make an unaccounted deposit look failed.
                 let moved_no_funds =
                     everything_failed_fund_free && outcomes_len == settled.len() + failures && failures == unaccounted;
+                let unpaid = if moved_no_funds && everything_refused_for_good {
+                    &mut refused
+                } else {
+                    &mut failed
+                };
                 for ((id, dest_addr, amount, deposit_data), spend) in deposits.into_iter().zip(spends) {
                     if settled.contains(&id) {
                         in_flight_destinations.invalidate(&dest_addr);
                     } else {
-                        failed.push(((id, dest_addr, amount, deposit_data, spend), moved_no_funds));
+                        unpaid.push(((id, dest_addr, amount, deposit_data, spend), moved_no_funds));
                     }
                 }
 
@@ -1898,7 +1915,12 @@ where
                 report_deposit_flush_failure(&error, None, count as u64);
                 // A pool-wide failure is one error for every item.
                 let moved_no_funds = error.moved_no_funds();
-                failed.extend(deposits.into_iter().zip(spends).map(
+                let unpaid = if is_permanent_refusal(&error) {
+                    &mut refused
+                } else {
+                    &mut failed
+                };
+                unpaid.extend(deposits.into_iter().zip(spends).map(
                     |((id, dest_addr, amount, deposit_data), spend)| {
                         ((id, dest_addr, amount, deposit_data, spend), moved_no_funds)
                     },
@@ -1906,7 +1928,12 @@ where
             }
         }
     }
-    failed
+    (failed, refused)
+}
+
+/// Deposit data the pool cannot read: no retry of the same payload can land.
+fn is_permanent_refusal(error: &StrategyError) -> bool {
+    matches!(error, StrategyError::GeneralError(GeneralError::InvalidInput))
 }
 
 /// Gives up on failed deposits: frees their destinations and, when no attempt can have moved
@@ -1933,11 +1960,14 @@ fn abandon_deposits<D, K>(
 /// Retries failed deposits with backoff until each lands or its requeue window, counted from when
 /// it was buffered, runs out. Neither the pool nor the Exit asks again for a deposit the pool gave
 /// up on, so without this a transient outage leaves the Session unpaid until the Exit closes it.
+#[allow(clippy::too_many_arguments)]
 async fn requeue_failed_deposits<D, K>(
     pool: D,
     processed_deposits: Cache<PixAddressId, ()>,
     in_flight_destinations: Cache<K::Public, ()>,
     spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
+    policy: Option<PixFundingPolicy>,
+    gate: Arc<futures::lock::Mutex<()>>,
     window: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
     mut failed: Vec<FailedDeposit<D, K>>,
@@ -1976,8 +2006,16 @@ async fn requeue_failed_deposits<D, K>(
             _ = tokio::time::sleep(wait) => {}
         }
 
+        // The gate is held through the retries, so a new batch never funds on a balance they spend.
+        let funded_for_these_retries =
+            apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, Some(stop.clone())).await;
         failed = Vec::new();
+        let mut given_up = Vec::new();
         for ((id, dest_addr, amount, deposit_data, spend), moved_no_funds) in live {
+            if *stop.borrow() || std::time::Instant::now() >= spend.at + window {
+                given_up.push(((id, dest_addr, amount, deposit_data, spend), moved_no_funds));
+                continue;
+            }
             let result = pool
                 .deposit_funds_to(&id, &dest_addr, amount, deposit_data.clone())
                 .await
@@ -1992,11 +2030,20 @@ async fn requeue_failed_deposits<D, K>(
                 }
                 Err(error) => {
                     report_deposit_flush_failure(&error, Some(&id), 1);
-                    let moved_no_funds = moved_no_funds && error.moved_no_funds();
-                    failed.push(((id, dest_addr, amount, deposit_data, spend), moved_no_funds));
+                    let deposit = (
+                        (id, dest_addr, amount, deposit_data, spend),
+                        moved_no_funds && error.moved_no_funds(),
+                    );
+                    if is_permanent_refusal(&error) {
+                        given_up.push(deposit);
+                    } else {
+                        failed.push(deposit);
+                    }
                 }
             }
         }
+        drop(funded_for_these_retries);
+        abandon_deposits::<D, K>(given_up, &in_flight_destinations, &spend_ledger);
         backoff = (backoff * 2).min(DEPOSIT_REQUEUE_MAX_BACKOFF);
     }
 }
@@ -3821,7 +3868,7 @@ mod tests {
         batch: Vec<super::BufferedDeposit<Arc<ScriptedBatchPool>, EthDepositKey>>,
     ) {
         let in_flight = moka::sync::Cache::builder().max_capacity(1).build();
-        let failed = flush_deposit_batch::<_, EthDepositKey>(
+        let (failed, refused) = flush_deposit_batch::<_, EthDepositKey>(
             pool,
             moka::sync::Cache::builder().max_capacity(1).build(),
             in_flight.clone(),
@@ -3829,6 +3876,7 @@ mod tests {
         )
         .await;
         super::abandon_deposits::<Arc<ScriptedBatchPool>, EthDepositKey>(failed, &in_flight, ledger);
+        super::abandon_deposits::<Arc<ScriptedBatchPool>, EthDepositKey>(refused, &in_flight, ledger);
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -3974,9 +4022,9 @@ mod tests {
         (id, address, amount, ByteDepositData::new(id, DEPOSIT_MARKER_PAYLOAD))
     }
 
-    fn failing_pool() -> Arc<ScriptedBatchPool> {
+    fn scripted_pool(script: (bool, bool)) -> Arc<ScriptedBatchPool> {
         Arc::new(ScriptedBatchPool {
-            script: parking_lot::Mutex::new(vec![(true, true)]),
+            script: parking_lot::Mutex::new(vec![script]),
             whole_call_fails: false,
             whole_batch_fails: false,
             raw_outcomes: None,
@@ -3990,7 +4038,7 @@ mod tests {
         let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
         let (id, address, amount, data) = buffered([0x42u8; 20].into(), HoprBalance::new_base(30));
         let spend = ledger.lock().commit(amount, std::time::Instant::now());
-        let pool = failing_pool();
+        let pool = scripted_pool((false, true));
         let processed: moka::sync::Cache<PixAddressId, ()> = moka::sync::Cache::builder().max_capacity(8).build();
         let in_flight: moka::sync::Cache<Address, ()> = moka::sync::Cache::builder().max_capacity(8).build();
         in_flight.insert(address, ());
@@ -4001,6 +4049,8 @@ mod tests {
             processed.clone(),
             in_flight.clone(),
             Arc::clone(&ledger),
+            None,
+            Default::default(),
             StdDuration::from_secs(60),
             stop,
             vec![((id, address, amount, data, spend), true)],
@@ -4028,7 +4078,7 @@ mod tests {
     }
 
     /// Past the window the deposit is abandoned like before the requeue existed: destination
-    /// freed, fund-free spend refunded.
+    /// freed, fund-free spend refunded. The pool would accept it, so it must not even be tried.
     #[test_log::test(tokio::test)]
     async fn a_requeued_deposit_is_abandoned_once_its_window_runs_out() -> anyhow::Result<()> {
         let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
@@ -4042,10 +4092,12 @@ mod tests {
         tokio::time::timeout(
             StdDuration::from_secs(10),
             super::requeue_failed_deposits::<_, EthDepositKey>(
-                failing_pool(),
+                scripted_pool((true, false)),
                 processed.clone(),
                 in_flight.clone(),
                 Arc::clone(&ledger),
+                None,
+                Default::default(),
                 StdDuration::from_millis(300),
                 stop,
                 vec![((id, address, amount, data, spend), true)],
@@ -4053,7 +4105,7 @@ mod tests {
         )
         .await?;
 
-        assert!(!processed.contains_key(&id));
+        assert!(!processed.contains_key(&id), "an expired deposit is not retried");
         assert!(!in_flight.contains_key(&address));
         assert_eq!(
             ledger
@@ -4077,10 +4129,12 @@ mod tests {
         tokio::time::timeout(
             StdDuration::from_secs(1),
             super::requeue_failed_deposits::<_, EthDepositKey>(
-                failing_pool(),
+                scripted_pool((false, true)),
                 moka::sync::Cache::builder().max_capacity(8).build(),
                 in_flight.clone(),
                 Arc::clone(&ledger),
+                None,
+                Default::default(),
                 StdDuration::from_secs(3600),
                 stop,
                 vec![((id, address, amount, data, spend), true)],
@@ -4089,6 +4143,23 @@ mod tests {
         .await?;
         assert!(!in_flight.contains_key(&address));
         Ok(())
+    }
+
+    /// Deposit data the pool cannot read is not requeued: a corrected event for the same
+    /// destination must find it free.
+    #[test_log::test(tokio::test)]
+    async fn a_permanently_refused_deposit_is_not_requeued() {
+        let (id, address, amount, data) = buffered([0x42u8; 20].into(), HoprBalance::new_base(30));
+        let spend = SpendLedger::default().commit(amount, std::time::Instant::now());
+        let (failed, refused) = flush_deposit_batch::<_, EthDepositKey>(
+            scripted_pool((true, true)),
+            moka::sync::Cache::builder().max_capacity(8).build(),
+            moka::sync::Cache::builder().max_capacity(8).build(),
+            vec![(id, address, amount, data, spend)],
+        )
+        .await;
+        assert!(failed.is_empty());
+        assert_eq!(refused.len(), 1);
     }
 
     /// A flush blocked on an earlier operation is reported as pending, not as a failed deposit.
