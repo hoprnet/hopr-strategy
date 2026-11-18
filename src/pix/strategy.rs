@@ -2017,7 +2017,8 @@ async fn requeue_failed_deposits<D, K>(
         failed = Vec::new();
         let mut given_up = Vec::new();
         for ((id, dest_addr, amount, deposit_data, spend), moved_no_funds) in live {
-            if *stop.borrow() || std::time::Instant::now() >= spend.at + window {
+            let stopping = *stop.borrow() || stop.has_changed().is_err();
+            if stopping || std::time::Instant::now() >= spend.at + window {
                 given_up.push(((id, dest_addr, amount, deposit_data, spend), moved_no_funds));
                 continue;
             }
@@ -6326,10 +6327,13 @@ mod tests {
         Ok(())
     }
 
-    /// Shutdown while the first retry of a round is in flight: it finishes and records its outcome,
-    /// and the second never starts.
+    /// Shutdown, or a dropped strategy, while the first retry of a round is in flight: it finishes
+    /// and records its outcome, and the second never starts.
+    #[rstest::rstest]
+    #[case::shutdown(true)]
+    #[case::dropped(false)]
     #[test_log::test(tokio::test(start_paused = true))]
-    async fn shutdown_during_a_retry_call_starts_no_further_deposit() -> anyhow::Result<()> {
+    async fn shutdown_during_a_retry_call_starts_no_further_deposit(#[case] shutdown: bool) -> anyhow::Result<()> {
         let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
         let hold = Arc::new(tokio::sync::Notify::new());
         let pool = probe_pool(None, Some(Arc::clone(&hold)));
@@ -6361,7 +6365,11 @@ mod tests {
         while pool.deposits.lock().is_empty() {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
-        stop_tx.send_replace(true);
+        if shutdown {
+            stop_tx.send_replace(true);
+        } else {
+            drop(stop_tx);
+        }
         hold.notify_one();
         tokio::time::timeout(StdDuration::from_secs(30), requeue).await??;
 
