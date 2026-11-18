@@ -5824,8 +5824,8 @@ mod tests {
     /// A pool that records what the funding policy asks of it and answers with a scripted
     /// available balance. Everything else is unreachable from the policy.
     struct FundingProbePool {
-        /// Raised by every `fund`, as a real pool's is; deposits leave it alone.
-        available: parking_lot::Mutex<HoprBalance>,
+        /// Before any `fund`; each recorded funding adds to it, as on a real pool.
+        available: HoprBalance,
         funded: Arc<parking_lot::Mutex<Vec<HoprBalance>>>,
         /// When set, `fund` waits on it before it records anything: a funding that is still on the
         /// chain.
@@ -5860,12 +5860,16 @@ mod tests {
                 hold.notified().await;
             }
             self.funded.lock().push(amount);
-            *self.available.lock() += amount;
             Ok(())
         }
 
         async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
-            Ok(*self.available.lock())
+            let funded = self
+                .funded
+                .lock()
+                .iter()
+                .fold(HoprBalance::zero(), |sum, amount| sum + *amount);
+            Ok(self.available + funded)
         }
 
         async fn deposit_funds_to(
@@ -5918,7 +5922,7 @@ mod tests {
         let (_cc, node, _pool) = entry_side(&[]).await?;
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(available),
+            available,
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
@@ -5959,7 +5963,7 @@ mod tests {
 
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
@@ -6018,7 +6022,7 @@ mod tests {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
@@ -6061,7 +6065,7 @@ mod tests {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
@@ -6102,7 +6106,7 @@ mod tests {
         for accepts_funding in [false, true] {
             let (_cc, node, _pool) = entry_side(&[]).await?;
             let pool = Arc::new(FundingProbePool {
-                available: parking_lot::Mutex::new(HoprBalance::zero()),
+                available: HoprBalance::zero(),
                 funded: Default::default(),
                 hold: None,
                 deposits: Default::default(),
@@ -6131,7 +6135,7 @@ mod tests {
     async fn a_second_run_funds_again() -> anyhow::Result<()> {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
@@ -6146,13 +6150,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut strategy = PixStrategyInner::new(Arc::clone(&pool), Arc::new(ClosingEvents), cfg, *BOB, None);
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), cfg, *BOB, None);
 
         crate::strategy::Strategy::run(&mut strategy).await?;
         // The first run's startup funding is detached: let it finish before clearing.
         settle(|| !funded.lock().is_empty()).await;
         funded.lock().clear();
-        *pool.available.lock() = HoprBalance::zero();
         crate::strategy::Strategy::run(&mut strategy).await?;
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -6224,7 +6227,7 @@ mod tests {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
@@ -6258,7 +6261,7 @@ mod tests {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
@@ -6304,7 +6307,7 @@ mod tests {
         for fund_at_startup in [false, true] {
             let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let pool = Arc::new(FundingProbePool {
-                available: parking_lot::Mutex::new(HoprBalance::zero()),
+                available: HoprBalance::zero(),
                 funded: Arc::clone(&funded),
                 hold: None,
                 deposits: Default::default(),
@@ -6354,7 +6357,7 @@ mod tests {
     async fn a_startup_funding_queued_at_shutdown_never_starts() -> anyhow::Result<()> {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Default::default(),
@@ -6382,7 +6385,7 @@ mod tests {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let hold = Arc::new(tokio::sync::Notify::new());
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: Some(Arc::clone(&hold)),
             deposits: Default::default(),
@@ -6413,7 +6416,7 @@ mod tests {
         let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let deposits = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pool = Arc::new(FundingProbePool {
-            available: parking_lot::Mutex::new(HoprBalance::zero()),
+            available: HoprBalance::zero(),
             funded: Arc::clone(&funded),
             hold: None,
             deposits: Arc::clone(&deposits),
