@@ -162,10 +162,9 @@ fn default_withdrawal_buffer_period() -> Duration {
     Duration::from_millis(500)
 }
 
-fn default_deposit_requeue_window() -> Duration {
-    Duration::from_secs(180)
-}
-
+/// How long a deposit whose flush failed keeps being retried, counted from when it was
+/// buffered: the deployed Exit's `max_deposit_wait`, after which it has closed the Session.
+const DEPOSIT_REQUEUE_WINDOW: Duration = Duration::from_secs(180);
 const DEPOSIT_REQUEUE_FIRST_BACKOFF: Duration = Duration::from_secs(5);
 const DEPOSIT_REQUEUE_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -310,11 +309,6 @@ pub struct PixStrategyConfig {
     #[default(default_withdrawal_buffer_period())]
     #[serde(with = "humantime_serde", default = "default_withdrawal_buffer_period")]
     pub withdrawal_buffer_period: Duration,
-    /// How long a deposit whose flush failed keeps being retried, counted from when it was
-    /// buffered. Default: 3 min, the deployed Exit's `max_deposit_wait`; zero disables it.
-    #[default(default_deposit_requeue_window())]
-    #[serde(with = "humantime_serde", default = "default_deposit_requeue_window")]
-    pub deposit_requeue_window: Duration,
     /// When set, the strategy keeps the pool funded: see [`PixFundingPolicy`]. Default: unset,
     /// and the pool is funded only by whoever calls [`DepositPool::fund`] from outside.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1566,7 +1560,6 @@ where
         let gate = Arc::clone(&self.funding_gate);
         let refill_owed = Arc::clone(&self.refill_owed);
         let spend_ledger = Arc::clone(&self.spend_ledger);
-        let requeue_window = self.cfg.deposit_requeue_window;
         let stop = self.funding_stop.subscribe();
 
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
@@ -1598,7 +1591,7 @@ where
                 processed_deposits,
                 in_flight_destinations,
                 spend_ledger,
-                requeue_window,
+                DEPOSIT_REQUEUE_WINDOW,
                 stop,
                 failed,
             )
