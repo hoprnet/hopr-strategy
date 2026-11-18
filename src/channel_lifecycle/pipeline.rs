@@ -127,22 +127,20 @@ enum LoopbackVerdict {
     Unroutable,
 }
 
-/// One balance observation per open channel, in wxHOPR base units: the tick's sample of
-/// the channel-balance distribution.
-#[cfg(any(test, feature = "telemetry"))]
-fn channel_balances(open_channels: &[&ChannelEntry]) -> Vec<f64> {
-    open_channels.iter().map(|ch| base_units(ch.balance)).collect()
-}
+/// Values to publish on the positional channel-balance gauge: one per open channel, in
+/// wxHOPR base units, followed by a zero for every slot the previous tick published that
+/// this one does not fill.
+///
+/// The exporter cannot delete a label set, so a slot left by a closed channel has to be
+/// overwritten or it keeps reporting that channel's last balance.
+fn channel_balance_slots(open_channels: &[&ChannelEntry], previously_published: usize) -> Vec<f64> {
+    let mut slots: Vec<f64> = open_channels.iter().map(|ch| base_units(ch.balance)).collect();
+    slots.resize(slots.len().max(previously_published), 0.0);
 
-/// Number of open channels the fund pass would top up: balance at or below `threshold`,
-/// the same comparison it makes.
-#[cfg(any(test, feature = "telemetry"))]
-fn channels_at_or_below(open_channels: &[&ChannelEntry], threshold: HoprBalance) -> usize {
-    open_channels.iter().filter(|ch| ch.balance <= threshold).count()
+    slots
 }
 
 /// wxHOPR base units as an `f64`, the value type every telemetry gauge takes.
-#[cfg(any(test, feature = "telemetry"))]
 fn base_units(balance: HoprBalance) -> f64 {
     balance.amount().low_u128() as f64
 }
@@ -1050,9 +1048,6 @@ where
             super::METRIC_REQUIRED_SAFE_BALANCE.set(required_safe.amount().low_u128() as f64);
             #[cfg(all(feature = "telemetry", not(test)))]
             super::METRIC_LOWER_BALANCE_THRESHOLD.set(base_units(funding.lower_balance_threshold));
-            #[cfg(all(feature = "telemetry", not(test)))]
-            super::METRIC_CHANNELS_AT_OR_BELOW_THRESHOLD
-                .set(channels_at_or_below(&open_channels, funding.lower_balance_threshold) as f64);
 
             // Stranded: the safe cannot meet the demand it can see. Only then does
             // the consolidation pass (hopr-strategy#85) take over the under-funded
@@ -1813,14 +1808,17 @@ where
         }
     }
 
-    /// Observe every open channel's balance as one sample of the balance distribution.
-    /// Called on every successful tick before the fund pass, so the sample is fresh even
-    /// when the pass is skipped for lack of chain reads.
+    /// Publish every open channel's balance as a positional list, and zero the slots a
+    /// previous, longer tick left behind.  Called on every successful tick before the fund
+    /// pass, so the figures are fresh even when the pass is skipped for lack of chain reads.
     #[allow(unused_variables)]
     fn emit_channel_balance_metrics(&self, open_channels: &[&ChannelEntry]) {
+        let published = self.emitted_balance_slots.swap(open_channels.len(), Ordering::Relaxed);
+        let slots = channel_balance_slots(open_channels, published);
+
         #[cfg(all(feature = "telemetry", not(test)))]
-        for balance in channel_balances(open_channels) {
-            super::METRIC_CHANNEL_BALANCE.observe(balance);
+        for (slot, balance) in slots.iter().enumerate() {
+            super::METRIC_CHANNEL_BALANCE.set(&[slot.to_string().as_str()], *balance);
         }
     }
 
@@ -1926,7 +1924,7 @@ mod tests {
     // `super` here is `pipeline`; `super::super` is `channel_lifecycle`.
     // Private items (ChannelLifecycleStrategyInner, OpenAttempt) are accessible from
     // descendant modules.
-    use super::{OpenAttempt, base_units, channel_balances, channels_at_or_below};
+    use super::{OpenAttempt, base_units, channel_balance_slots};
     use crate::{
         errors::StrategyError,
         strategy::{Strategy as _, StrategyState},
@@ -3339,6 +3337,7 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
+                emitted_balance_slots: Default::default(),
             }
         }
 
@@ -3465,6 +3464,7 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
+                emitted_balance_slots: Default::default(),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -3491,6 +3491,7 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            emitted_balance_slots: Default::default(),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -3899,6 +3900,7 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            emitted_balance_slots: Default::default(),
         }
     }
 
@@ -5132,35 +5134,36 @@ mod tests {
             .build()?)
     }
 
-    /// Every open channel contributes one sample of the distribution, in base units.
-    /// This is what replaces a per-peer series: the cumulative exporter would keep a
-    /// peer label set for the life of the process.
+    /// Every open channel contributes one positional value, in base units, so the series
+    /// space follows the channel count instead of the set of peers ever seen.
     #[test]
-    fn channel_balances_should_sample_every_open_channel_in_base_units() -> anyhow::Result<()> {
+    fn channel_balance_slots_should_list_every_open_channel_in_base_units() -> anyhow::Result<()> {
         let first = open_channel(*ALICE, 7)?;
         let second = open_channel(*CHRIS, 11)?;
 
         assert_eq!(
-            channel_balances(&[&first, &second]),
+            channel_balance_slots(&[&first, &second], 0),
             vec![7.0, 11.0],
-            "one observation per open channel"
+            "one slot per open channel"
+        );
+        assert_eq!(
+            channel_balance_slots(&[&first, &second], 1),
+            vec![7.0, 11.0],
+            "a growing channel count adds slots, it does not truncate"
         );
         Ok(())
     }
 
-    /// The count the alert fires on must use the fund pass's own comparison: a channel
-    /// sitting on the threshold is topped up, so it counts too.
+    /// The exporter cannot delete a series, so a slot a longer previous tick published has
+    /// to be reset once its channel closes.
     #[test]
-    fn channels_at_or_below_should_count_the_threshold_itself() -> anyhow::Result<()> {
-        let threshold = HoprBalance::from(10_u32);
-        let below = open_channel(*ALICE, 4)?;
-        let at = open_channel(*CHRIS, 10)?;
-        let above = open_channel(*DAVE, 11)?;
+    fn channel_balance_slots_should_zero_the_slots_a_longer_tick_published() -> anyhow::Result<()> {
+        let only = open_channel(*ALICE, 7)?;
 
         assert_eq!(
-            channels_at_or_below(&[&below, &at, &above], threshold),
-            2,
-            "at or below the threshold is topped up; above it is left alone"
+            channel_balance_slots(&[&only], 3),
+            vec![7.0, 0.0, 0.0],
+            "slots past this tick's channels read 0 instead of a closed channel's balance"
         );
         Ok(())
     }

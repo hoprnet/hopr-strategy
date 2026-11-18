@@ -78,7 +78,7 @@ use std::{
     hash::Hash,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -95,15 +95,6 @@ use hopr_api::{
 use parking_lot::Mutex;
 use selector::Selector;
 pub use strategy::ChannelLifecycleStrategy;
-
-/// Bucket boundaries for [`METRIC_CHANNEL_BALANCE`], in wxHOPR base units.
-///
-/// Resolved channel balances span millions of wei on development networks and hundreds of
-/// wxHOPR on production ones, so the boundaries advance by one decade.
-#[cfg(all(feature = "telemetry", not(test)))]
-const CHANNEL_BALANCE_BOUNDARIES: [f64; 17] = [
-    1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
-];
 
 #[cfg(all(feature = "telemetry", not(test)))]
 lazy_static::lazy_static! {
@@ -138,18 +129,17 @@ lazy_static::lazy_static! {
             "wxHOPR the safe must hold to satisfy the demand of the most recent successful tick, in base units (may be stale if a required chain read fails)",
         ).unwrap();
 
-    /// Distribution of open-channel balances: one observation per open outgoing channel,
-    /// on every successful tick, in wxHOPR base units.  Peer labels are deliberately
-    /// absent: the exporter is cumulative, so a per-peer series would live for the
-    /// lifetime of the process and grow with every channel the node ever opened.
+    /// Balance of every open outgoing channel, in wxHOPR base units, as a positional list:
+    /// `index` 0 is one open channel, `index` 1 the next, and so on.
     ///
-    /// Read the current tick with
-    /// `increase(hopr_strategy_channel_lifecycle_channel_balance_hopr_count[...])`.
-    static ref METRIC_CHANNEL_BALANCE: hopr_api::types::telemetry::SimpleHistogram =
-        hopr_api::types::telemetry::SimpleHistogram::new(
+    /// Labels are positions, not peers, so the series space is bounded by the channel count
+    /// instead of growing with every peer the node ever opened.  The exporter cannot delete
+    /// a series, so a tick with fewer channels than the previous one resets the tail to 0.
+    static ref METRIC_CHANNEL_BALANCE: hopr_api::types::telemetry::MultiGauge =
+        hopr_api::types::telemetry::MultiGauge::new(
             "hopr_strategy_channel_lifecycle_channel_balance_hopr",
-            "wxHOPR balance of each open outgoing channel, in base units, observed once per channel on each successful tick",
-            CHANNEL_BALANCE_BOUNDARIES.to_vec(),
+            "wxHOPR balance of each open outgoing channel, in base units, as a positional list on the most recent successful tick (a slot left by a closed channel reads 0)",
+            &["index"],
         ).unwrap();
 
     /// Channel balance at or below which the fund pass tops the channel up: the same resolved
@@ -159,16 +149,6 @@ lazy_static::lazy_static! {
         hopr_api::types::telemetry::SimpleGauge::new(
             "hopr_strategy_channel_lifecycle_lower_balance_threshold_hopr",
             "wxHOPR channel balance at or below which the strategy tops the channel up, in base units, resolved from ticket price and winning probability at the most recent tick with known ticket economics (may be stale if a required chain read fails)",
-        ).unwrap();
-
-    /// Open channels the fund pass would top up, counted against the threshold above.
-    ///
-    /// A histogram cannot answer this: the threshold moves with ticket economics, while
-    /// histogram bucket boundaries are fixed.
-    static ref METRIC_CHANNELS_AT_OR_BELOW_THRESHOLD: hopr_api::types::telemetry::SimpleGauge =
-        hopr_api::types::telemetry::SimpleGauge::new(
-            "hopr_strategy_channel_lifecycle_channels_at_or_below_threshold",
-            "Number of open outgoing channels whose balance is at or below the lower balance threshold the strategy tops up at, on the most recent tick with known ticket economics (may be stale if a required chain read fails)",
         ).unwrap();
 
     // ── Diversity / anonymity ─────────────────────────────────────────────────
@@ -477,6 +457,10 @@ struct ChannelLifecycleStrategyInner<N> {
     /// reset to zero on any tick the peer is connected, and pruned to live
     /// channels each tick so it cannot grow without bound.
     disconnect_streak: Arc<DashMap<Address, usize>>,
+    /// Number of per-channel balance slots published on the previous successful tick.
+    /// The exporter cannot delete a series, so slots past this tick's channel count must be
+    /// written as 0 rather than keep the balance of a channel that has since closed.
+    emitted_balance_slots: AtomicUsize,
 }
 
 impl<N> ChannelLifecycleStrategyInner<N> {
