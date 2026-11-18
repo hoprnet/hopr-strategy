@@ -267,6 +267,76 @@ async fn sweeps_recovered_deposit_to_safe(fixture: IntegrationFixture) -> Result
     Ok(())
 }
 
+/// gnosis/gnosis_vpn#843: a deposit refused while the Safe is empty lands once the Safe is
+/// refilled, here by the strategy's own sweep, with no new event for it.
+#[rstest]
+#[test_log::test(tokio::test)]
+async fn retries_a_deposit_refused_while_the_safe_was_empty(fixture: IntegrationFixture) -> Result<()> {
+    let timeouts = fixture.timeouts();
+    let [node, deposit, refill] = fixture.claim_accounts::<3>();
+
+    let scenario = fixture
+        .open_pix_scenario(
+            &node,
+            PixScenarioOpts {
+                safe_funding: HoprBalance::zero(),
+                ..PixScenarioOpts::new(&[deposit.address])?.with_deposited(refill.address, HoprBalance::new_base(40u32))
+            },
+        )
+        .await?;
+
+    let price_per_byte = HoprBalance::new_base(1u32);
+    let quota = 20u64;
+    let mut strategy = PixStrategy::new(pix_config(price_per_byte, HoprBalance::new_base(100u32)))
+        .build_non_anonymous_with_client::<_, Address, _>(
+            scenario.node.clone(),
+            scenario.node_key.clone(),
+            // Only the strategy's requeue may retry, not the pool's own short budget.
+            NonAnonymousDepositPoolConfig {
+                max_deposit_retries: 0,
+                ..pool_config(Duration::from_secs(60))
+            },
+            scenario.connector.client(),
+        )?;
+    let handle = StrategyTask::spawn_logged(async move { strategy.run().await });
+
+    let id = pix_address_id(0x11, 1);
+    scenario.inject(PixEvent::NewDepositAddress(PixNewDepositAddress {
+        id,
+        address: deposit.address.into(),
+        quota,
+        deposit_data: pool_deposit_data(id),
+    }));
+    scenario
+        .assert_hopr_balance_never(
+            deposit.address,
+            timeouts.stable,
+            "deposit paid from an empty Safe",
+            |balance| !balance.is_zero(),
+        )
+        .await?;
+
+    scenario.inject(PixEvent::PrivateKeyRecovered(PixPrivateKeyRecovered {
+        id: pix_address_id(0x44, 1),
+        secret: deposit_secret(&refill)?,
+    }));
+
+    let deposited = scenario
+        .await_hopr_balance(
+            deposit.address,
+            Duration::from_secs(60),
+            "deposit retried once the Safe was refilled",
+            |balance| !balance.is_zero(),
+        )
+        .await
+        .context("the refused deposit was not retried after the Safe was refilled")?;
+    assert_eq!(deposited, price_per_byte * quota);
+
+    assert!(!handle.is_finished(), "pix strategy exited unexpectedly");
+    handle.stop().await;
+    Ok(())
+}
+
 /// The gas top-up, exercised with the *shipped* `gas_xdai_per_sweep` rather than the zeroed
 /// [`pool_config`] every other test here uses.
 ///
