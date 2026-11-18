@@ -1567,8 +1567,7 @@ where
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
         // what it is funding for, and the loop must not wait on the funding any more than on them.
         // The gate stays held through the batch and its refill, so the next flush decides on the
-        // refilled balance: see `apply_funding_policy`. It is released before the requeue, which can
-        // take minutes and must not hold up the flushes behind it.
+        // refilled balance: see `apply_funding_policy`.
         hopr_utils::runtime::prelude::spawn(async move {
             let funded_for_this_batch = apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, &refill_owed, None).await;
             let (failed, refused) = flush_deposit_batch::<D, K>(
