@@ -121,7 +121,6 @@ impl ChannelLifecycleStrategy {
             )),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
-            emitted_balance_slots: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 }

@@ -78,7 +78,7 @@ use std::{
     hash::Hash,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -129,17 +129,23 @@ lazy_static::lazy_static! {
             "wxHOPR the safe must hold to satisfy the demand of the most recent successful tick, in base units (may be stale if a required chain read fails)",
         ).unwrap();
 
-    /// Balance of every open outgoing channel, in wxHOPR base units, as a positional list:
-    /// `index` 0 is one open channel, `index` 1 the next, and so on.
+    /// wxHOPR held by all open outgoing channels together, in base units: one series per
+    /// node, so the series space does not grow with the peers or the channels the node has
+    /// ever had.
+    static ref METRIC_CHANNELS_BALANCE_SUM: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_channels_balance_sum_hopr",
+            "wxHOPR held by all open outgoing channels together, in base units, from the most recent successful tick",
+        ).unwrap();
+
+    /// Open channels the fund pass would top up, counted against the threshold below.
     ///
-    /// Labels are positions, not peers, so the series space is bounded by the channel count
-    /// instead of growing with every peer the node ever opened.  The exporter cannot delete
-    /// a series, so a tick with fewer channels than the previous one resets the tail to 0.
-    static ref METRIC_CHANNEL_BALANCE: hopr_api::types::telemetry::MultiGauge =
-        hopr_api::types::telemetry::MultiGauge::new(
-            "hopr_strategy_channel_lifecycle_channel_balance_hopr",
-            "wxHOPR balance of each open outgoing channel, in base units, as a positional list on the most recent successful tick (a slot left by a closed channel reads 0)",
-            &["index"],
+    /// The sum above cannot answer this: it hides a single underfunded channel, and this
+    /// count is what the low-balance alert fires on.  One series per node.
+    static ref METRIC_CHANNELS_AT_OR_BELOW_THRESHOLD: hopr_api::types::telemetry::SimpleGauge =
+        hopr_api::types::telemetry::SimpleGauge::new(
+            "hopr_strategy_channel_lifecycle_channels_at_or_below_threshold",
+            "Number of open outgoing channels whose balance is at or below the lower balance threshold the strategy tops up at, on the most recent tick with known ticket economics (may be stale if a required chain read fails)",
         ).unwrap();
 
     /// Channel balance at or below which the fund pass tops the channel up: the same resolved
@@ -457,10 +463,6 @@ struct ChannelLifecycleStrategyInner<N> {
     /// reset to zero on any tick the peer is connected, and pruned to live
     /// channels each tick so it cannot grow without bound.
     disconnect_streak: Arc<DashMap<Address, usize>>,
-    /// Number of per-channel balance slots published on the previous successful tick.
-    /// The exporter cannot delete a series, so slots past this tick's channel count must be
-    /// written as 0 rather than keep the balance of a channel that has since closed.
-    emitted_balance_slots: AtomicUsize,
 }
 
 impl<N> ChannelLifecycleStrategyInner<N> {
