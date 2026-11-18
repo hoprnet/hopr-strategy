@@ -317,7 +317,7 @@ pub struct PixStrategyConfig {
 /// The tail check spares the next deposit the shield wait; the head check covers a lazy start and a failed refill.
 /// Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; and one flush at a time, from its
-/// funding decision to the end of its batch, so that concurrent flushes cannot each top up and
+/// funding decision through its batch and its refill, so that concurrent flushes cannot each top up and
 /// each decides on the balance the one before it left. Without the policy, deposits fail once the pool is
 /// empty until an operator funds it — with which error is the pool's own answer, wrapped in
 /// [`StrategyError::Other`]: the plain pool its affordability refusal, the Curvy pool a typed
@@ -1044,8 +1044,8 @@ where
     detach_flushes: bool,
     /// Held across one application of the funding policy — the balance read and the funding it
     /// decides on — so that concurrent flush tasks fund once between them, not once each; and by a
-    /// flush, on through the batch it funded for, so that the next flush's balance read already
-    /// sees this batch's spend and does not skip a top-up the next batch needs.
+    /// flush, on through the batch it funded for and its refill, so that the next flush's balance
+    /// read already sees this batch's spend and refill and does not skip a top-up the next batch needs.
     funding_gate: Arc<futures::lock::Mutex<()>>,
     /// Set to `true` when `run` is ending. It decides only whether a startup funding or a flush's
     /// tail refill may *start*: one that has not started by then does not. A funding that holds the gate
@@ -1518,8 +1518,8 @@ where
     /// populated in [`Self::on_pix_event`] before an entry is ever buffered and released by the
     /// flush that owns it, and its [`Cache`] clones share state — so a second event for the same
     /// destination is still refused while the first is in flight. Under a funding policy they run
-    /// one after the other, each holding `funding_gate` from its funding decision to the end of
-    /// its batch, so that each decides on the balance the one before it left; the Curvy pool
+    /// one after the other, each holding `funding_gate` from its funding decision through its
+    /// batch and its refill, so that each decides on the balance the one before it left; the Curvy pool
     /// makes one allocation at a time anyway, so this costs the batches nothing.
     fn detach_flush_deposits(&mut self) {
         if self.deposit_buffer.is_empty() {
@@ -1537,8 +1537,8 @@ where
 
         // The policy runs at the head of the flush, in the task: the deposits in this batch are
         // what it is funding for, and the loop must not wait on the funding any more than on them.
-        // The gate stays held through the batch, so the next flush decides on the balance this
-        // batch leaves: see `apply_funding_policy`.
+        // The gate stays held through the batch and its refill, so the next flush decides on the
+        // refilled balance: see `apply_funding_policy`.
         hopr_utils::runtime::prelude::spawn(async move {
             let _funded_for_this_batch = apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, None).await;
             flush_deposit_batch::<D, K>(
@@ -1615,7 +1615,7 @@ where
 /// rather than here.
 ///
 /// Returns the gate, still held, whenever there is a policy, funded or not: a flush keeps it
-/// through the batch it funded for, so that the next flush reads the balance only once this batch
+/// through the batch it funded for and its refill, so that the next flush reads the balance only once this batch
 /// has spent from it. The pool counts a spend only once its attempt is journalled, after the
 /// proof, so a balance read while that proof is made still holds what the batch is about to spend:
 /// with 60 available, a floor of 50 and two flushes of 40, both would read 60, neither would fund,
