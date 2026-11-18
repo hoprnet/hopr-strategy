@@ -4203,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "hopr-strategy"
-version = "9.1.1"
+version = "9.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
