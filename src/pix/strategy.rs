@@ -1583,6 +1583,7 @@ where
                 batch,
             )
             .await;
+            abandon_deposits::<D, K>(refused, &in_flight_destinations, &spend_ledger);
             // A closed signal is a dropped strategy or an ended run, which is stopping as well.
             let stopped = *stop.borrow() || stop.has_changed().is_err();
             // Refill now, not at the next deposit's flush, which would wait out the shield and the commitment.
@@ -1592,7 +1593,6 @@ where
                 fund_below_floor::<D, K>(&pool, policy, &refill_owed).await;
             }
             drop(funded_for_this_batch);
-            abandon_deposits::<D, K>(refused, &in_flight_destinations, &spend_ledger);
             requeue_failed_deposits::<D, K>(
                 pool,
                 processed_deposits,
@@ -1991,6 +1991,7 @@ async fn requeue_failed_deposits<D, K>(
     D::Error: Into<StrategyError>,
 {
     let mut backoff = DEPOSIT_REQUEUE_FIRST_BACKOFF;
+    let mut next_retry_at = tokio::time::Instant::now() + backoff;
     loop {
         let now = std::time::Instant::now();
         let (live, expired): (Vec<_>, Vec<_>) =
@@ -2000,7 +2001,9 @@ async fn requeue_failed_deposits<D, K>(
             return;
         };
 
-        let wait = backoff.min(earliest_deadline - now);
+        let wait = next_retry_at
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(earliest_deadline.saturating_duration_since(now));
         tracing::info!(count = live.len(), ?wait, "requeueing failed deposits");
         tokio::select! {
             biased;
@@ -2011,6 +2014,11 @@ async fn requeue_failed_deposits<D, K>(
             _ = tokio::time::sleep(wait) => {}
         }
 
+        // An expiry wake only drops the expired deposits: the retries keep their own schedule.
+        if tokio::time::Instant::now() < next_retry_at {
+            failed = live;
+            continue;
+        }
         // The gate is held through the retries, so a new batch never funds on a balance they spend.
         let funded_for_these_retries =
             apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, Some(stop.clone())).await;
@@ -2035,7 +2043,7 @@ async fn requeue_failed_deposits<D, K>(
                     METRIC_PIX_DEPOSITS.increment();
                 }
                 Err(error) => {
-                    report_deposit_flush_failure(&error, Some(&id), 1);
+                    tracing::warn!(%error, ?id, "requeued deposit failed again");
                     let deposit = (
                         (id, dest_addr, amount, deposit_data, spend),
                         moved_no_funds && error.moved_no_funds(),
@@ -2051,6 +2059,7 @@ async fn requeue_failed_deposits<D, K>(
         drop(funded_for_these_retries);
         abandon_deposits::<D, K>(given_up, &in_flight_destinations, &spend_ledger);
         backoff = (backoff * 2).min(DEPOSIT_REQUEUE_MAX_BACKOFF);
+        next_retry_at = tokio::time::Instant::now() + backoff;
     }
 }
 
@@ -6418,9 +6427,16 @@ mod tests {
             stop,
             failed,
         ));
-        while pool.deposits.lock().is_empty() {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            while pool.deposits.lock().is_empty() {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(
+            now.elapsed() < StdDuration::from_secs(1),
+            "the second deposit must still be live when the first call starts"
+        );
         // Deadlines are wall-clock, so the hold has to outlast the second one for real.
         std::thread::sleep(StdDuration::from_millis(1200));
         hold.notify_one();
@@ -6429,6 +6445,45 @@ mod tests {
         assert_eq!(pool.deposits.lock().len(), 1, "the expired deposit must not be retried");
         in_flight.run_pending_tasks();
         assert_eq!(in_flight.entry_count(), 0, "both destinations are freed");
+        Ok(())
+    }
+
+    /// Waking for one deposit's expiry does not pull the retry of the others ahead of their backoff.
+    #[test_log::test(tokio::test(start_paused = true))]
+    async fn an_expiry_wake_does_not_retry_early() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let pool = probe_pool(None, None);
+        let window = StdDuration::from_secs(60);
+        let now = std::time::Instant::now();
+        let in_flight: moka::sync::Cache<Address, ()> = moka::sync::Cache::builder().max_capacity(8).build();
+        // The second one's window ends a second from now, well before the first retry is due.
+        let failed = [(0x42u8, 1u32, now), (0x43, 2, now - window + StdDuration::from_secs(1))]
+            .into_iter()
+            .map(|(byte, n, at)| {
+                let id = pix_id(n);
+                let (_, address, amount, data) = buffered([byte; 20].into(), HoprBalance::new_base(1));
+                in_flight.insert(address, ());
+                let spend = ledger.lock().commit(amount, at);
+                ((id, address, amount, data, spend), true)
+            })
+            .collect();
+        let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+
+        let requeue = tokio::spawn(super::requeue_failed_deposits::<_, EthDepositKey>(
+            Arc::clone(&pool),
+            moka::sync::Cache::builder().max_capacity(8).build(),
+            in_flight.clone(),
+            Arc::clone(&ledger),
+            None,
+            Default::default(),
+            window,
+            stop,
+            failed,
+        ));
+        tokio::time::sleep(super::DEPOSIT_REQUEUE_FIRST_BACKOFF - StdDuration::from_millis(100)).await;
+        assert!(pool.deposits.lock().is_empty(), "no retry before the first backoff");
+        tokio::time::timeout(StdDuration::from_secs(30), requeue).await??;
+        assert!(!pool.deposits.lock().is_empty(), "the retry runs on its own schedule");
         Ok(())
     }
 
