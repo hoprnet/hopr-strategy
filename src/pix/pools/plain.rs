@@ -44,7 +44,10 @@ use backon::Retryable;
 use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
+    chain::{
+        ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource,
+        SubmissionFailure,
+    },
     node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
@@ -779,15 +782,18 @@ async fn deposit_once(
         }));
     }
 
-    if already_sent {
+    if !sent_to.entry(dest_addr).or_insert(()).is_fresh() {
         return Err(StrategyError::other(PlainDepositError::AlreadySent));
     }
-    sent_to.insert(dest_addr, ());
-    node.chain_api()
-        .withdraw(amount, &dest_addr)
-        .and_then(identity)
-        .await
-        .map_err(StrategyError::other)?;
+    let chain = node.chain_api();
+    if let Err(error) = chain.withdraw(amount, &dest_addr).and_then(identity).await {
+        // Refused before broadcast, so nothing can land and the next attempt may send. Only this
+        // call's own mark is cleared: an earlier attempt would have refused at the claim above.
+        if matches!(chain.submission_failure(&error), SubmissionFailure::NotSubmitted) {
+            sent_to.invalidate(&dest_addr);
+        }
+        return Err(StrategyError::other(error));
+    }
 
     Ok(())
 }
