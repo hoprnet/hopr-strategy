@@ -20,7 +20,10 @@
 
 use std::{
     fmt::{Debug, Display, Formatter},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -316,7 +319,7 @@ pub struct PixStrategyConfig {
 /// from the Safe — and, with [`PixFundingPolicy::fund_at_startup`], also once when `run` starts.
 /// The tail check usually pays the shield wait before the next deposit arrives; a deposit that comes in
 /// mid-refill still waits on it. No flush starts a tail refill once shutdown has begun. The head check
-/// covers a lazy start and a failed refill.
+/// covers a lazy start and a failed refill. A failed refill is also retried every minute until one succeeds.
 /// Both run off the event loop, in the task that flushes, so a funding that takes
 /// a shield and a commitment round never holds up PIX events; and one flush at a time, from its
 /// funding decision through its batch and its refill, so that concurrent flushes cannot each top up and
@@ -411,6 +414,9 @@ const IN_FLIGHT_GUARD_TTL: Duration = Duration::from_secs(600);
 /// admit an unbounded number of minute deposits. Coalescing keeps that bounded without ever
 /// under-counting.
 const SPEND_LEDGER_CAPACITY: usize = 4096;
+
+/// Retry period for a failed refill: nothing announces a Safe top-up, so the strategy polls.
+const REFILL_RETRY_PERIOD: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -780,6 +786,7 @@ impl PixStrategy {
             detach_flushes: false,
             funding_gate: Arc::new(futures::lock::Mutex::new(())),
             funding_stop: tokio::sync::watch::channel(false).0,
+            refill_owed: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -1057,6 +1064,8 @@ where
     /// final flush at shutdown funds nothing.
     /// Dropping the strategy reads as the same.
     funding_stop: tokio::sync::watch::Sender<bool>,
+    /// Set by a failed refill, cleared by a funded one or a pool above the floor; `run` retries while set.
+    refill_owed: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -1105,6 +1114,7 @@ where
             detach_flushes: false,
             funding_gate: Arc::new(futures::lock::Mutex::new(())),
             funding_stop: tokio::sync::watch::channel(false).0,
+            refill_owed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1419,26 +1429,29 @@ where
         Ok(())
     }
 
-    /// Hand the startup application of the funding policy to a task and return immediately.
+    /// Hand an application of the funding policy outside a flush to a task and return immediately.
     ///
-    /// Only called for a policy with [`PixFundingPolicy::fund_at_startup`]: an eager pool that
+    /// Called at startup for a policy with [`PixFundingPolicy::fund_at_startup`]: an eager pool that
     /// starts empty is funded before the first deposit arrives rather than at its
     /// flush, which is the moment the deposit is already waiting. Detached for the same reason
     /// every flush is: a funding can take a shield and a commitment round, and the event stream
     /// must be read meanwhile. The first flush's own application waits behind the gate and sees
     /// the funded balance, so the two do not fund twice.
     ///
+    /// Also called by `run` every [`REFILL_RETRY_PERIOD`] while `refill_owed` is set.
+    ///
     /// It obeys `funding_stop` (see [`Self::shut_down`]) while it waits for the gate: an event
     /// stream that closes at once does not leave it to start a funding for a strategy that has
     /// already stopped. Once it holds the gate it runs to its end and is journalled by the pool,
     /// `run` having returned or not.
-    fn detach_startup_funding(&self) {
+    fn detach_funding(&self) {
         let policy = self.cfg.funding.clone();
         let pool = self.pool.clone();
         let gate = Arc::clone(&self.funding_gate);
+        let refill_owed = Arc::clone(&self.refill_owed);
         let stop = self.funding_stop.subscribe();
         hopr_utils::runtime::prelude::spawn(async move {
-            apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, Some(stop)).await;
+            apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, &refill_owed, Some(stop)).await;
         });
     }
 
@@ -1486,12 +1499,12 @@ where
         // Held through the batch and its refill, as in the detached flush.
         let gate = Arc::clone(&self.funding_gate);
         let _funded_for_this_batch =
-            apply_funding_policy::<D, K>(&self.pool, self.cfg.funding.as_ref(), &gate, None).await;
+            apply_funding_policy::<D, K>(&self.pool, self.cfg.funding.as_ref(), &gate, &self.refill_owed, None).await;
         let failed = self.flush_buffered_deposits().await;
         if let Some(policy) = self.cfg.funding.as_ref()
             && !*self.funding_stop.borrow()
         {
-            fund_below_floor::<D, K>(&self.pool, policy).await;
+            fund_below_floor::<D, K>(&self.pool, policy, &self.refill_owed).await;
         }
         failed
     }
@@ -1534,6 +1547,7 @@ where
         let in_flight_destinations = self.in_flight_destinations.clone();
         let policy = self.cfg.funding.clone();
         let gate = Arc::clone(&self.funding_gate);
+        let refill_owed = Arc::clone(&self.refill_owed);
         let spend_ledger = Arc::clone(&self.spend_ledger);
         let stop = self.funding_stop.subscribe();
 
@@ -1542,7 +1556,8 @@ where
         // The gate stays held through the batch and its refill, so the next flush decides on the
         // refilled balance: see `apply_funding_policy`.
         hopr_utils::runtime::prelude::spawn(async move {
-            let _funded_for_this_batch = apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, None).await;
+            let _funded_for_this_batch =
+                apply_funding_policy::<D, K>(&pool, policy.as_ref(), &gate, &refill_owed, None).await;
             flush_deposit_batch::<D, K>(
                 pool.clone(),
                 processed_deposits,
@@ -1557,7 +1572,7 @@ where
             if let Some(policy) = policy.as_ref()
                 && !stopped
             {
-                fund_below_floor::<D, K>(&pool, policy).await;
+                fund_below_floor::<D, K>(&pool, policy, &refill_owed).await;
             }
         });
     }
@@ -1633,6 +1648,7 @@ async fn apply_funding_policy<'gate, D, K>(
     pool: &D,
     policy: Option<&PixFundingPolicy>,
     gate: &'gate futures::lock::Mutex<()>,
+    refill_owed: &AtomicBool,
     stop: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Option<futures::lock::MutexGuard<'gate, ()>>
 where
@@ -1656,12 +1672,12 @@ where
         }
         None => gate.lock().await,
     };
-    fund_below_floor::<D, K>(pool, policy).await;
+    fund_below_floor::<D, K>(pool, policy, refill_owed).await;
     Some(one_at_a_time)
 }
 
 /// Funds `top_up` when the pool can pay less than `min_available`. The caller holds the funding gate.
-async fn fund_below_floor<D, K>(pool: &D, policy: &PixFundingPolicy)
+async fn fund_below_floor<D, K>(pool: &D, policy: &PixFundingPolicy, refill_owed: &AtomicBool)
 where
     D: DepositPool<K> + Send + Sync,
     D::Error: Into<StrategyError>,
@@ -1671,11 +1687,13 @@ where
     let available = match pool.available_balance().await.map_err(Into::<StrategyError>::into) {
         Ok(available) => available,
         Err(error) => {
+            refill_owed.store(true, Ordering::Relaxed);
             tracing::warn!(%error, "could not read the deposit pool's available balance");
             return;
         }
     };
     if available >= policy.min_available {
+        refill_owed.store(false, Ordering::Relaxed);
         return;
     }
     tracing::info!(
@@ -1684,8 +1702,16 @@ where
         top_up = %policy.top_up,
         "funding the deposit pool from the Safe"
     );
-    if let Err(error) = pool.fund(policy.top_up).await.map_err(Into::<StrategyError>::into) {
-        tracing::error!(%error, "funding the deposit pool failed; the next flush retries");
+    match pool.fund(policy.top_up).await.map_err(Into::<StrategyError>::into) {
+        Ok(()) => refill_owed.store(false, Ordering::Relaxed),
+        Err(error) => {
+            refill_owed.store(true, Ordering::Relaxed);
+            tracing::error!(
+                %error,
+                retry_in = ?REFILL_RETRY_PERIOD,
+                "funding the deposit pool failed; it is retried on a timer and at the next flush"
+            );
+        }
     }
 }
 
@@ -2207,7 +2233,7 @@ where
         // a task spawned before it would still have debited the Safe. A lazy policy — the default —
         // funds at the first deposit's flush instead, so an idle node never touches the Safe.
         if self.cfg.funding.as_ref().is_some_and(|policy| policy.fund_at_startup) {
-            self.detach_startup_funding();
+            self.detach_funding();
         }
 
         let replay = self.recovery_store.clone().map(|store| {
@@ -2222,10 +2248,15 @@ where
         // Debounce deadlines. `None` = not armed (no items buffered).
         let mut deposit_flush_at: Option<tokio::time::Instant> = None;
         let mut withdrawal_flush_at: Option<tokio::time::Instant> = None;
+        // Ticks only with a policy; a tick retries only while a refill is owed.
+        let mut refill_retry_at = self
+            .cfg
+            .funding
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + REFILL_RETRY_PERIOD);
 
         loop {
-            // Compute sleep deadline from active deposit/withdrawal timers.
-            let sleep_deadline = [deposit_flush_at, withdrawal_flush_at]
+            let sleep_deadline = [deposit_flush_at, withdrawal_flush_at, refill_retry_at]
                 .iter()
                 .filter_map(|&d| d)
                 .min()
@@ -2267,6 +2298,15 @@ where
                         if withdrawal_flush_at.is_some_and(|d| d <= now) {
                             self.detach_flush_withdrawals();
                             withdrawal_flush_at = None;
+                        }
+                        if refill_retry_at.is_some_and(|d| d <= now) {
+                            let is_owed = self.refill_owed.load(Ordering::Relaxed);
+                            // A held gate is a funding or flush in progress; it updates `refill_owed` itself.
+                            let is_idle = self.funding_gate.try_lock().is_some();
+                            if is_owed && is_idle {
+                                self.detach_funding();
+                            }
+                            refill_retry_at = Some(now + REFILL_RETRY_PERIOD);
                         }
                     }
                 }
@@ -5838,6 +5878,10 @@ mod tests {
         deposits: Arc<parking_lot::Mutex<Vec<usize>>>,
         /// When set, every deposit fails with what it builds.
         deposit_failure: Option<fn() -> StrategyError>,
+        /// While set, `fund` fails without recording anything, as on a Safe short of the top-up.
+        refuse_funding: Arc<std::sync::atomic::AtomicBool>,
+        /// Every `fund` call, refused or not.
+        fund_attempts: Arc<std::sync::atomic::AtomicUsize>,
         /// What the pool answers to `accepts_funding`.
         accepts_funding: bool,
     }
@@ -5860,6 +5904,10 @@ mod tests {
         }
 
         async fn fund(&self, amount: HoprBalance) -> std::result::Result<(), StrategyError> {
+            self.fund_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.refuse_funding.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StrategyError::CriteriaNotSatisfied);
+            }
             if let Some(hold) = &self.hold {
                 hold.notified().await;
             }
@@ -5931,6 +5979,8 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
@@ -5942,6 +5992,7 @@ mod tests {
             &strategy.pool,
             strategy.cfg.funding.as_ref(),
             &strategy.funding_gate,
+            &strategy.refill_owed,
             None,
         )
         .await;
@@ -5972,6 +6023,8 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
@@ -6031,6 +6084,8 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
@@ -6074,6 +6129,8 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: Some(|| StrategyError::CriteriaNotSatisfied),
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
@@ -6115,6 +6172,8 @@ mod tests {
                 hold: None,
                 deposits: Default::default(),
                 deposit_failure: None,
+                refuse_funding: Default::default(),
+                fund_attempts: Default::default(),
                 accepts_funding,
             });
 
@@ -6144,6 +6203,8 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let cfg = PixStrategyConfig {
@@ -6223,6 +6284,106 @@ mod tests {
         }
     }
 
+    /// An event source whose stream never yields and never closes: the loop runs on its timers alone.
+    struct SilentEvents;
+
+    impl ActionableEventSource for SilentEvents {
+        fn subscribe_to_actionable_events(
+            &self,
+            _: Option<&[ActionableEventDiscriminant]>,
+        ) -> std::result::Result<futures::stream::BoxStream<'static, ActionableEvent>, String> {
+            Ok(futures::stream::pending().boxed())
+        }
+    }
+
+    struct RefillProbe {
+        refuse_funding: Arc<std::sync::atomic::AtomicBool>,
+        fund_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        funded: Arc<parking_lot::Mutex<Vec<HoprBalance>>>,
+        run: tokio::task::JoinHandle<()>,
+    }
+
+    impl RefillProbe {
+        fn attempts(&self) -> usize {
+            self.fund_attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Runs the strategy's loop with no events over an empty pool that refuses funding while `refused`.
+    fn run_refill_probe(cfg: PixStrategyConfig, refused: bool) -> RefillProbe {
+        let refuse_funding = Arc::new(std::sync::atomic::AtomicBool::new(refused));
+        let fund_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let funded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pool = Arc::new(FundingProbePool {
+            available: HoprBalance::zero(),
+            funded: Arc::clone(&funded),
+            hold: None,
+            deposits: Default::default(),
+            deposit_failure: None,
+            refuse_funding: Arc::clone(&refuse_funding),
+            fund_attempts: Arc::clone(&fund_attempts),
+            accepts_funding: true,
+        });
+        let mut strategy = PixStrategyInner::new(pool, Arc::new(SilentEvents), cfg, *BOB, None);
+        let run = tokio::spawn(async move {
+            let _ = crate::strategy::Strategy::run(&mut strategy).await;
+        });
+        RefillProbe {
+            refuse_funding,
+            fund_attempts,
+            funded,
+            run,
+        }
+    }
+
+    /// Once a short Safe can pay, a refused refill succeeds within one period, with no deposit.
+    #[test_log::test(tokio::test(start_paused = true))]
+    async fn a_refused_refill_is_retried_without_a_deposit() -> anyhow::Result<()> {
+        let probe = run_refill_probe(funding_cfg(), true);
+        settle(|| probe.attempts() == 1).await;
+        assert!(probe.funded.lock().is_empty(), "the startup refill was refused");
+
+        probe.refuse_funding.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(super::REFILL_RETRY_PERIOD).await;
+        settle(|| !probe.funded.lock().is_empty()).await;
+
+        assert_eq!(*probe.funded.lock(), vec![HoprBalance::new_base(2)], "one top-up");
+        assert_eq!(probe.attempts(), 2, "the startup attempt and one retry");
+
+        tokio::time::sleep(3 * super::REFILL_RETRY_PERIOD).await;
+        assert_eq!(probe.attempts(), 2, "nothing is retried once the refill succeeded");
+        probe.run.abort();
+        Ok(())
+    }
+
+    /// While the Safe stays short, every period tries once more.
+    #[test_log::test(tokio::test(start_paused = true))]
+    async fn a_refill_refused_for_good_is_retried_every_period() -> anyhow::Result<()> {
+        let probe = run_refill_probe(funding_cfg(), true);
+        settle(|| probe.attempts() == 1).await;
+
+        tokio::time::sleep(3 * super::REFILL_RETRY_PERIOD).await;
+        settle(|| probe.attempts() == 4).await;
+
+        assert_eq!(probe.attempts(), 4, "the startup attempt and one per period");
+        assert!(probe.funded.lock().is_empty());
+        probe.run.abort();
+        Ok(())
+    }
+
+    /// A lazy policy on a node that never sees a deposit never touches the Safe, timer or not.
+    #[test_log::test(tokio::test(start_paused = true))]
+    async fn an_idle_lazy_node_is_never_retried() -> anyhow::Result<()> {
+        let probe = run_refill_probe(lazy_funding_cfg(), false);
+
+        tokio::time::sleep(3 * super::REFILL_RETRY_PERIOD).await;
+        settle(|| false).await;
+
+        assert_eq!(probe.attempts(), 0, "nothing failed, so nothing is retried");
+        probe.run.abort();
+        Ok(())
+    }
+
     /// The awaited flush — what a caller driving the strategy without its loop gets — funds ahead
     /// of its batch like a detached one. Only the flush at shutdown does not.
     #[test_log::test(tokio::test)]
@@ -6236,6 +6397,8 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
@@ -6270,6 +6433,8 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), lazy_funding_cfg(), *BOB, None);
@@ -6316,6 +6481,8 @@ mod tests {
                 hold: None,
                 deposits: Default::default(),
                 deposit_failure: None,
+                refuse_funding: Default::default(),
+                fund_attempts: Default::default(),
                 accepts_funding: true,
             });
             let cfg = PixStrategyConfig {
@@ -6366,6 +6533,8 @@ mod tests {
             hold: None,
             deposits: Default::default(),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
@@ -6394,6 +6563,8 @@ mod tests {
             hold: Some(Arc::clone(&hold)),
             deposits: Default::default(),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
@@ -6425,6 +6596,8 @@ mod tests {
             hold: None,
             deposits: Arc::clone(&deposits),
             deposit_failure: None,
+            refuse_funding: Default::default(),
+            fund_attempts: Default::default(),
             accepts_funding: true,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
