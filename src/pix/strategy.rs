@@ -1056,7 +1056,7 @@ where
     /// flush, on through the batch it funded for and its refill, so that the next flush's balance
     /// read already sees this batch's spend and refill and does not skip a top-up the next batch needs.
     funding_gate: Arc<futures::lock::Mutex<()>>,
-    /// Set to `true` when `run` is ending. It decides only whether a startup funding or a flush's
+    /// Set to `true` when `run` is ending. It decides only whether a startup or retry funding or a flush's
     /// tail refill may *start*: one that has not started by then does not. A funding that holds the gate
     /// always runs to the end and is journalled by the pool, whether or not `run` is still
     /// running — a Safe transaction cannot be un-sent, and dropping its future would only lose the
@@ -1458,7 +1458,7 @@ where
     /// The end of `run`.
     ///
     /// A funding that has acquired the gate always runs to completion and is journalled, whether
-    /// or not `run` is still running; shutdown abandons only a startup top-up or a flush's tail
+    /// or not `run` is still running; shutdown abandons only a startup or retry funding or a flush's tail
     /// refill that has not started (`funding_stop`). Each detached flush's head funding is left to
     /// finish too, since its batch depends on it.
     ///
@@ -1627,7 +1627,7 @@ where
 /// Applies the [`PixFundingPolicy`] once, if there is one: reads the pool's available balance and
 /// funds `top_up` when it is below `min_available`.
 ///
-/// A free function so that the startup task, the flush tasks and shutdown share one body. `gate`
+/// A free function so that the startup and retry task, the flush tasks and shutdown share one body. `gate`
 /// is held for the whole of it, so that two tasks applying the policy at once read the balance one
 /// after the other and the second sees the first's funding; a `fund` that fails is logged and left
 /// to the next application, and the deposits it was for then fail on their own, through the pool,
