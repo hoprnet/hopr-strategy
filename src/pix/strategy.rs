@@ -1030,7 +1030,9 @@ where
     cfg: PixStrategyConfig,
     safe_address: Address,
     recovery_store: Option<PixRecoveryStore>,
-    processed_deposits: Cache<PixAddressId, ()>,
+    /// Allocations deposited to, keyed with the address paid: a reset Entry reuses the id for a new
+    /// address, which must be paid, while a repeated event names the same one.
+    processed_deposits: Cache<(PixAddressId, PixDepositAddress), ()>,
     in_flight_sweeps: Cache<PixAddressId, ()>,
     in_flight_destinations: Cache<K::Public, ()>,
     /// Debounced deposit buffer. See [`BufferedDeposit`].
@@ -1162,7 +1164,12 @@ where
             PixEvent::NewDepositAddress(new_deposit_address) => {
                 tracing::info!(?new_deposit_address, "new deposit address");
 
-                if self.processed_deposits.contains_key(&new_deposit_address.id) {
+                // Keyed with the address: an Entry that reset its PIX state, because the Exit
+                // started the Session over, reuses the id for a new cycle at a new address.
+                if self
+                    .processed_deposits
+                    .contains_key(&(new_deposit_address.id, new_deposit_address.address))
+                {
                     tracing::warn!(id = ?new_deposit_address.id, "duplicate NewDepositAddress event, skipping");
                     return Ok(());
                 }
@@ -1744,7 +1751,7 @@ fn report_deposit_flush_failure(error: &StrategyError, id: Option<&PixAddressId>
 /// the buffer is emptied by the caller, on the event loop, and only this is spawned.
 async fn flush_deposit_batch<D, K>(
     pool: D,
-    processed_deposits: Cache<PixAddressId, ()>,
+    processed_deposits: Cache<(PixAddressId, PixDepositAddress), ()>,
     in_flight_destinations: Cache<K::Public, ()>,
     spend_ledger: Arc<parking_lot::Mutex<SpendLedger>>,
     batch: Vec<BufferedDeposit<D, K>>,
@@ -1782,7 +1789,7 @@ where
 
         match result {
             Ok(_) => {
-                processed_deposits.insert(id, ());
+                processed_deposits.insert((id, dest_addr.clone().into()), ());
                 in_flight_destinations.invalidate(&dest_addr);
                 tracing::info!(?id, %amount, "single deposit flushed successfully");
                 #[cfg(all(feature = "telemetry", not(test)))]
@@ -1829,7 +1836,8 @@ where
                 // failed item is never located by position. It is identified by elimination: a
                 // deposit with no success echo, once exactly one failure can be paired with it.
                 let outcomes_len = outcomes.len();
-                let batch_ids: std::collections::HashSet<PixAddressId> = deposits.iter().map(|(id, ..)| *id).collect();
+                let batch_addresses: std::collections::HashMap<PixAddressId, &K::Public> =
+                    deposits.iter().map(|(id, dest_addr, ..)| (*id, dest_addr)).collect();
                 let mut everything_failed_fund_free = true;
                 let mut failures = 0usize;
                 let mut pending = 0usize;
@@ -1839,8 +1847,9 @@ where
                 for outcome in outcomes {
                     match outcome {
                         Ok((id, _receipt)) => {
-                            processed_deposits.insert(id, ());
-                            if batch_ids.contains(&id) {
+                            // A foreign id has no address in this batch to record as paid.
+                            if let Some(dest_addr) = batch_addresses.get(&id) {
+                                processed_deposits.insert((id, (*dest_addr).clone().into()), ());
                                 // A second echo of the same id fails to insert, so it is excluded.
                                 settled.insert(id);
                             }
@@ -2358,7 +2367,7 @@ mod tests {
     use hopr_api::{
         chain::{
             AccountSelector, ChainEvents, ChainReadAccountOperations, ChainReadChannelOperations, ChainValues,
-            ChainWriteAccountOperations, DepositPool, HoprChainApi, PoolTransferSource,
+            ChainWriteAccountOperations, DepositPool, HoprChainApi, PixDepositAddress, PoolTransferSource,
         },
         node::{
             ActionableEvent, ActionableEventDiscriminant, ActionableEventSource, ComponentStatus,
@@ -2829,7 +2838,8 @@ mod tests {
             "a payload this pool cannot read must not be settled"
         );
         assert!(
-            !s.processed_deposits.contains_key(&id),
+            !s.processed_deposits
+                .contains_key(&(id, PixDepositAddress::from(dest_addr))),
             "a refused deposit must not be recorded as processed"
         );
         assert!(s.deposit_buffer.is_empty(), "a refused deposit must not stay buffered");
@@ -4076,6 +4086,67 @@ mod tests {
         Ok(())
     }
 
+    /// A batch records each settled deposit with the address it paid, and nothing for a success
+    /// id it did not hold.
+    #[test_log::test(tokio::test)]
+    async fn a_batch_records_each_settled_deposit_with_its_address() -> anyhow::Result<()> {
+        let ledger = Arc::new(parking_lot::Mutex::new(SpendLedger::default()));
+        let addresses: [Address; 2] = [[0x42u8; 20].into(), [0x43u8; 20].into()];
+        let mut batch = Vec::new();
+        for address in addresses {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let ids: Vec<PixAddressId> = batch.iter().map(|(id, ..)| *id).collect();
+        let processed = moka::sync::Cache::builder().max_capacity(8).build();
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(vec![(true, false), (true, false)]),
+            whole_call_fails: false,
+            whole_batch_fails: false,
+            raw_outcomes: None,
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            processed.clone(),
+            moka::sync::Cache::builder().max_capacity(2).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        for (id, address) in ids.iter().zip(addresses) {
+            assert!(processed.contains_key(&(*id, PixDepositAddress::from(address))));
+        }
+        assert!(
+            !processed.contains_key(&(ids[0], PixDepositAddress::from(addresses[1]))),
+            "an id is recorded with its own address only"
+        );
+
+        let processed = moka::sync::Cache::builder().max_capacity(8).build();
+        let mut batch = Vec::new();
+        for address in addresses {
+            let (id, address, amount, data) = buffered(address, HoprBalance::new_base(10));
+            let spend = ledger.lock().commit(amount, std::time::Instant::now());
+            batch.push((id, address, amount, data, spend));
+        }
+        let pool = Arc::new(ScriptedBatchPool {
+            script: parking_lot::Mutex::new(Vec::new()),
+            whole_call_fails: false,
+            whole_batch_fails: false,
+            raw_outcomes: Some(vec![RawOutcome::Success(pix_id(1)), RawOutcome::FundFreeFailure]),
+        });
+        flush_deposit_batch::<_, EthDepositKey>(
+            pool,
+            processed.clone(),
+            moka::sync::Cache::builder().max_capacity(2).build(),
+            Arc::clone(&ledger),
+            batch,
+        )
+        .await;
+        assert_eq!(processed.iter().count(), 0, "a foreign success id records nothing");
+        Ok(())
+    }
+
     /// A short `BatchOutcomes` leaves items unaccounted for, so nothing is refunded.
     #[test_log::test(tokio::test)]
     async fn test_short_batch_outcomes_refund_nothing() -> anyhow::Result<()> {
@@ -4431,6 +4502,72 @@ mod tests {
         s.on_pix_event(mk(id)).await?;
         s.flush_deposits().await;
         assert_eq!(hopr_balance(&*cc, *BOB).await?, bb - HoprBalance::new_base(20));
+        Ok(())
+    }
+
+    /// An Entry that reset its PIX state reuses the allocation id at a new address, which is paid;
+    /// a repeated event for either address is not.
+    #[test_log::test(tokio::test)]
+    async fn a_reused_allocation_id_at_a_new_address_is_deposited() -> anyhow::Result<()> {
+        let first: Address = [0x42u8; 20].into();
+        let second: Address = [0x43u8; 20].into();
+        let sim = BlokliTestStateBuilder::default().with_generated_accounts(
+            &[&*ALICE, &*CHRIS],
+            false,
+            XDaiBalance::new_base(1),
+            HoprBalance::new_base(1000),
+        );
+        let sim = with_self_safed_node(sim, *BOB, 9, HoprBalance::new_base(1000))
+            .with_balances([(first, HoprBalance::zero()), (second, HoprBalance::zero())])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut cc = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        cc.connect().await?;
+        let client = cc.client();
+        let cc = Arc::new(cc);
+        let node = Arc::new(ChainNode(Arc::clone(&cc)));
+        let pool = Arc::new(NonAnonymousDepositPool::with_client(
+            Arc::clone(&node),
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(5), XDaiBalance::zero()),
+            client,
+        ));
+        let cfg = PixStrategyConfig {
+            price_per_byte: HoprBalance::new_base(1),
+            max_ssa_allocation: HoprBalance::new_base(100),
+            pix_recovery_db_path: None,
+            pix_recovery_password_env: None,
+            deposit_buffer_period: StdDuration::ZERO,
+            withdrawal_buffer_period: StdDuration::ZERO,
+            ..Default::default()
+        };
+        let mut s = PixStrategyInner::new(pool, node, cfg, *BOB, None);
+        let id = pix_id(1);
+        let mk = |address: Address| {
+            PixEvent::NewDepositAddress(hopr_api::node::PixNewDepositAddress {
+                id,
+                address: address.into(),
+                quota: 20,
+                deposit_data: pool_deposit_data(id),
+            })
+        };
+        let bb: HoprBalance = hopr_balance(&*cc, *BOB).await?;
+
+        for address in [first, second, first, second] {
+            s.on_pix_event(mk(address)).await?;
+            s.flush_deposits().await;
+        }
+
+        assert_eq!(hopr_balance(&*cc, first).await?, HoprBalance::new_base(20));
+        assert_eq!(
+            hopr_balance(&*cc, second).await?,
+            HoprBalance::new_base(20),
+            "the new address under the same id must be paid"
+        );
+        assert_eq!(
+            hopr_balance(&*cc, *BOB).await?,
+            bb - HoprBalance::new_base(40),
+            "a repeated event for either address must not be paid again"
+        );
         Ok(())
     }
 
