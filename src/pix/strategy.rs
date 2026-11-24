@@ -405,8 +405,8 @@ pub struct PixFundingPolicy {
     #[serde(default)]
     pub fund_at_startup: bool,
     /// Pool balance below which a [`SafeReserve`] asks the channel strategy to close channels
-    /// to cover it, early enough for their stake to return before the next refill. Default:
-    /// half of `top_up`.
+    /// to cover it, early enough for their stake to return before the next refill. Must be
+    /// above `min_available` and at most `top_up`. Default: half of `top_up`.
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaim_below: Option<HoprBalance>,
