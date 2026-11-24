@@ -28,6 +28,7 @@ use super::{
 };
 use crate::{
     errors::{Result, StrategyError},
+    safe_reserve::SafeReserve,
     strategy::Strategy as StrategyTrait,
 };
 
@@ -41,12 +42,23 @@ use crate::{
 /// a runnable `Box<dyn Strategy + Send>`.
 pub struct ChannelLifecycleStrategy {
     cfg: ChannelLifecycleConfig,
+    safe_reserve: SafeReserve,
 }
 
 impl ChannelLifecycleStrategy {
     /// Create a new builder with the given configuration.
     pub fn new(cfg: ChannelLifecycleConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            safe_reserve: SafeReserve::default(),
+        }
+    }
+
+    /// Leave the Safe wxHOPR another strategy reserves alone, and close the worst channels to
+    /// cover it when it asks to reclaim.
+    pub fn with_safe_reserve(mut self, safe_reserve: SafeReserve) -> Self {
+        self.safe_reserve = safe_reserve;
+        self
     }
 
     /// Wire in a node and return a running-ready strategy.
@@ -121,6 +133,7 @@ impl ChannelLifecycleStrategy {
             )),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            safe_reserve: self.safe_reserve,
         }))
     }
 }

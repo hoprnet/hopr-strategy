@@ -463,6 +463,8 @@ struct ChannelLifecycleStrategyInner<N> {
     /// reset to zero on any tick the peer is connected, and pruned to live
     /// channels each tick so it cannot grow without bound.
     disconnect_streak: Arc<DashMap<Address, usize>>,
+    /// Safe wxHOPR the PIX strategy keeps for its next pool refill.
+    safe_reserve: crate::safe_reserve::SafeReserve,
 }
 
 impl<N> ChannelLifecycleStrategyInner<N> {

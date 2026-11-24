@@ -12,9 +12,8 @@ use hopr_api::types::{
     primitive::prelude::{HoprBalance, U256},
 };
 
-/// An open, under-funded channel (balance `< face_value`) considered for
-/// consolidation. Healthy channels (`>= face_value`) are never passed in, the
-/// caller filters them out, and they are never closed to consolidate.
+/// An open channel considered for consolidation. [`consolidation_closes`] gets only
+/// under-funded ones (balance `< face_value`); [`reserve_closes`] gets every open one.
 pub(crate) struct ConsolidationCandidate {
     pub id: ChannelId,
     pub balance: HoprBalance,
@@ -83,6 +82,26 @@ pub(crate) fn consolidation_closes(
     // the result is deterministic without a secondary key.
     ranked.sort_by(|a, b| a.rank.partial_cmp(&b.rank).unwrap_or(std::cmp::Ordering::Equal));
     ranked.into_iter().take(close_count).map(|c| c.id).collect()
+}
+
+/// Chooses the channels to close so their stake covers `shortfall` of the Safe reserve,
+/// worst-ranked first. The best-ranked funded channel is always kept, and an empty one
+/// returns nothing, so neither is chosen.
+pub(crate) fn reserve_closes(candidates: &[ConsolidationCandidate], shortfall: HoprBalance) -> Vec<ChannelId> {
+    let mut ranked: Vec<&ConsolidationCandidate> = candidates.iter().filter(|c| !c.balance.is_zero()).collect();
+    ranked.sort_by(|a, b| a.rank.partial_cmp(&b.rank).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.pop();
+
+    let mut covered = HoprBalance::zero();
+    let mut closes = Vec::new();
+    for c in ranked {
+        if covered >= shortfall {
+            break;
+        }
+        covered += c.balance;
+        closes.push(c.id);
+    }
+    closes
 }
 
 #[cfg(test)]
@@ -197,5 +216,36 @@ mod tests {
         let channels = uniform(3, bal(10));
         let closes = consolidation_closes(&channels, bal(0), bal(0), bal(0));
         assert!(closes.is_empty());
+    }
+
+    #[test]
+    fn reserve_closes_the_worst_until_the_shortfall_is_covered() {
+        let channels = uniform(5, bal(10));
+        let ids: Vec<ChannelId> = channels.iter().map(|c| c.id).collect();
+        assert_eq!(reserve_closes(&channels, bal(15)), ids[..2].to_vec());
+        assert_eq!(reserve_closes(&channels, bal(10)), ids[..1].to_vec());
+    }
+
+    #[test]
+    fn reserve_closes_healthy_channels_but_keeps_the_best() {
+        let channels = uniform(3, bal(100));
+        let ids: Vec<ChannelId> = channels.iter().map(|c| c.id).collect();
+        assert_eq!(reserve_closes(&channels, bal(1_000)), ids[..2].to_vec());
+        assert!(reserve_closes(&uniform(1, bal(100)), bal(1_000)).is_empty());
+    }
+
+    #[test]
+    fn reserve_closes_skips_empty_channels() {
+        let channels = vec![
+            candidate(0, bal(0), 0.0),
+            candidate(1, bal(10), 0.5),
+            candidate(2, bal(10), 0.9),
+        ];
+        assert_eq!(reserve_closes(&channels, bal(5)), vec![channels[1].id]);
+    }
+
+    #[test]
+    fn reserve_closes_nothing_without_a_shortfall() {
+        assert!(reserve_closes(&uniform(4, bal(10)), bal(0)).is_empty());
     }
 }

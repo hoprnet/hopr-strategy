@@ -44,6 +44,7 @@ pub mod channel_finalizer;
 #[cfg(feature = "strategy-channel-lifecycle")]
 pub mod channel_lifecycle;
 pub mod errors;
+pub mod safe_reserve;
 pub mod strategy;
 // Used by whichever strategies are enabled; none may be.
 #[cfg_attr(

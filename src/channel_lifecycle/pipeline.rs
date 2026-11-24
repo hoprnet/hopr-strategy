@@ -33,13 +33,13 @@ use tracing::{Instrument as _, debug, info, warn};
 use super::{
     ActionLeases, ChannelLifecycleStrategyInner, ChannelObservation, PeerAddrCache,
     config::{ResolvedFunding, StartupPhase},
-    consolidation::{ConsolidationCandidate, consolidation_closes},
+    consolidation::{ConsolidationCandidate, consolidation_closes, reserve_closes},
     selector::{
         BucketCell, BucketView, CloseCandidate, ForwardingView, LatencyBucket, OpenCandidate, PeerEdgeInfo,
         SelectorContext, SignalSet, StakeView, SubnetBucket,
     },
 };
-use crate::strategy::StrategyState;
+use crate::{safe_reserve::Reservation, strategy::StrategyState};
 
 /// TTL for the cached peer-id → (offchain key, chain address) map.  On-chain
 /// account registrations change rarely; refreshing every 5 minutes is more
@@ -74,10 +74,14 @@ enum OpenAttempt {
 /// or `try_open_channel`. A Safe with ample balance but a too-small allowance must
 /// never read as stranded: that would close channels to reclaim stake that was never
 /// actually scarce, over a problem an operator fixes by raising the allowance.
+///
+/// `reservation` is what the PIX strategy keeps for its next pool refill: `spendable`
+/// already excludes it, `balance` does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SafeBudget {
     pub(super) balance: HoprBalance,
     pub(super) spendable: HoprBalance,
+    pub(super) reservation: Reservation,
 }
 
 /// Publishes one tick's accumulated [`StrategyState`] exactly once, when this guard
@@ -198,6 +202,7 @@ where
             return Some(SafeBudget {
                 balance: HoprBalance::zero(),
                 spendable: HoprBalance::zero(),
+                reservation: Reservation::default(),
             });
         };
 
@@ -218,9 +223,12 @@ where
             );
         }
 
+        // The PIX shield does not draw on the allowance, so the reserve comes off the balance only.
+        let reservation = self.safe_reserve.get();
         Some(SafeBudget {
             balance,
-            spendable: balance.min(allowance),
+            spendable: (balance - reservation.reserved).min(allowance),
+            reservation,
         })
     }
 
@@ -766,6 +774,55 @@ where
         }
     }
 
+    /// Closes the worst-ranked open channels, healthy ones included, until their stake
+    /// covers what the Safe reserve is short of. `available` is the Safe plus the stake
+    /// already returning from closures. Like consolidation it overrides `min_open_channels`
+    /// and waits out the startup guard, but always keeps the best-ranked channel.
+    fn reclaim_for_reserve(
+        &self,
+        close_candidates: &[CloseCandidate],
+        reservation: Reservation,
+        available: HoprBalance,
+        startup_phase: StartupPhase,
+        state: &mut StatePublisher<'_, N>,
+    ) {
+        if !reservation.reclaim || reservation.reserved <= available || startup_phase != StartupPhase::Expired {
+            return;
+        }
+        let shortfall = reservation.reserved - available;
+
+        let candidates: Vec<ConsolidationCandidate> = close_candidates
+            .iter()
+            .filter(|c| {
+                !self.fund_in_flight.is_held(c.channel.get_id()) && !self.close_in_flight.is_held(c.channel.get_id())
+            })
+            .map(|c| ConsolidationCandidate {
+                id: *c.channel.get_id(),
+                balance: c.channel.balance,
+                rank: self
+                    .cfg
+                    .eligibility
+                    .composite_quality_score(c.edge_info.quality_score(), c.ticket_score),
+            })
+            .collect();
+
+        let by_id: HashMap<ChannelId, &CloseCandidate> =
+            close_candidates.iter().map(|c| (*c.channel.get_id(), c)).collect();
+        let mut close_count = self.close_in_flight.held_count();
+        for id in reserve_closes(&candidates, shortfall) {
+            if close_count >= self.cfg.closure.close_max_concurrent {
+                break;
+            }
+            if let Some(c) = by_id.get(&id)
+                && self.try_close_channel(&c.channel)
+            {
+                close_count += 1;
+                state.set(StrategyState::Degraded);
+                info!(channel = %c.channel, %shortfall, "channel-lifecycle: closing for the PIX Safe reserve");
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Pipeline
     // ─────────────────────────────────────────────────────────────────────
@@ -811,6 +868,7 @@ where
         // below) are kept apart on purpose — see `SafeBudget`.
         let safe_balance = safe_budget.map(|b| b.balance);
         let safe_spendable = safe_budget.map(|b| b.spendable);
+        let reservation = safe_budget.map(|b| b.reservation).unwrap_or_default();
 
         // The channel list is the one input no pass can do without.
         let Some(all_channels) = self
@@ -1063,7 +1121,7 @@ where
             // rather than let this pass pour whole face values into the neediest one.
             // When the safe can meet demand, this pass funds them toward capacity as
             // usual, so the common case is unchanged.
-            let stranded = safe_balance < required_safe;
+            let stranded = safe_balance - reservation.reserved < required_safe;
 
             if funding.topup_balance.is_zero() || funding.face_value.is_zero() {
                 debug!("channel-lifecycle: fund pass skipped: resolved topup is zero");
@@ -1450,24 +1508,36 @@ where
         // economics for `face_value` and a known safe balance; otherwise there is
         // nothing to size against and the channels wait for a tick that can read the
         // chain.
-        if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
-            // Stake from closures already in flight (PendingToClose, or an open
-            // channel whose close was initiated), not yet back in the Safe. Counted
-            // in the pool so the pass does not over-close while they finalize.
-            let reclaiming: HoprBalance = all_channels
-                .iter()
-                .filter(|c| {
-                    matches!(c.status, ChannelStatus::PendingToClose(_)) || self.close_in_flight.is_held(c.get_id())
-                })
-                .fold(HoprBalance::zero(), |acc, c| acc + c.balance);
+        //
+        // Stake from closures already in flight (PendingToClose, or an open
+        // channel whose close was initiated), not yet back in the Safe. Counted
+        // in the pool so the pass does not over-close while they finalize.
+        let reclaiming: HoprBalance = all_channels
+            .iter()
+            .filter(|c| {
+                matches!(c.status, ChannelStatus::PendingToClose(_)) || self.close_in_flight.is_held(c.get_id())
+            })
+            .fold(HoprBalance::zero(), |acc, c| acc + c.balance);
 
+        if let Some(safe_balance) = safe_balance {
+            self.reclaim_for_reserve(
+                &close_candidates,
+                reservation,
+                safe_balance + reclaiming,
+                startup_phase,
+                &mut state,
+            );
+        }
+
+        if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
+            // The reserve is a debt on the pool, so what it claims never lifts a channel.
             self.consolidate_stranded_stake(
                 &close_candidates,
                 &deferred_to_consolidation,
                 funding.face_value,
-                reclaiming,
+                HoprBalance::zero(),
                 startup_phase,
-                safe_balance,
+                safe_balance + reclaiming - reservation.reserved,
                 &mut safe_remaining,
                 &mut state,
             );
@@ -3339,6 +3409,7 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
+                safe_reserve: Default::default(),
             }
         }
 
@@ -3465,6 +3536,7 @@ mod tests {
                 state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
                 tick_counter: std::sync::atomic::AtomicU64::new(0),
                 disconnect_streak: Arc::new(DashMap::new()),
+                safe_reserve: Default::default(),
             };
             old.close_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
             old.finalize_in_flight.acquire(*ch_close.get_id(), TEST_LEASE);
@@ -3491,6 +3563,7 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            safe_reserve: Default::default(),
         };
 
         assert!(fresh.close_in_flight.is_empty());
@@ -3754,6 +3827,87 @@ mod tests {
         Ok(())
     }
 
+    fn reserve(reserved: u32, reclaim: bool) -> crate::safe_reserve::Reservation {
+        crate::safe_reserve::Reservation {
+            reserved: HoprBalance::from(reserved),
+            reclaim,
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_budget_spendable_excludes_the_reserve() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(1, 2, 1000).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.safe_reserve.set(reserve(400, false));
+
+        let budget = inner
+            .safe_balance_budget(inner.read_deadline())
+            .await
+            .expect("safe readable");
+
+        assert_eq!(budget.balance, HoprBalance::from(1000_u32));
+        assert_eq!(budget.spendable, HoprBalance::from(600_u32));
+        Ok(())
+    }
+
+    /// The same 7 under-funded channels the fund pass tops up from a 1000-wei Safe are
+    /// consolidated exactly as under an empty Safe once all 1000 is reserved.
+    #[tokio::test]
+    async fn a_reserve_covering_the_safe_reads_as_an_empty_safe() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(7, 2, 1000).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.safe_reserve.set(reserve(1000, false));
+
+        inner.run_pipeline().await;
+
+        assert!(
+            inner.fund_in_flight.is_empty(),
+            "nothing may be funded from the reserve"
+        );
+        assert_eq!(inner.close_in_flight.held_count(), 3, "as under an empty Safe");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_closes_healthy_channels_to_cover_the_reserve() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(3, 100, 0).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.safe_reserve.set(reserve(150, true));
+
+        inner.run_pipeline().await;
+
+        assert_eq!(inner.close_in_flight.held_count(), 2, "two cover 150; the best is kept");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reclaim_counts_the_safe_toward_the_reserve() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(3, 100, 100).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.safe_reserve.set(reserve(150, true));
+
+        inner.run_pipeline().await;
+
+        assert_eq!(
+            inner.close_in_flight.held_count(),
+            1,
+            "the Safe's 100 leaves 50 to reclaim"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reserve_without_reclaim_closes_no_healthy_channel() -> anyhow::Result<()> {
+        let connector = stranded_stake_scenario(3, 100, 0).await?;
+        let inner = fresh_inner_with_chain(consolidation_cfg(), Arc::clone(&connector));
+        inner.safe_reserve.set(reserve(150, false));
+
+        inner.run_pipeline().await;
+
+        assert_eq!(inner.close_in_flight.held_count(), 0);
+        Ok(())
+    }
+
     fn fresh_inner_with_chain<C>(
         cfg: ChannelLifecycleConfig,
         connector: Arc<C>,
@@ -3899,6 +4053,7 @@ mod tests {
             state: Arc::new(crate::strategy::AtomicStrategyState::new(StrategyState::Running)),
             tick_counter: std::sync::atomic::AtomicU64::new(0),
             disconnect_streak: Arc::new(DashMap::new()),
+            safe_reserve: Default::default(),
         }
     }
 
