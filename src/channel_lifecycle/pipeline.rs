@@ -663,6 +663,7 @@ where
         deferred: &HashSet<ChannelId>,
         face_value: HoprBalance,
         reclaiming: HoprBalance,
+        reserved: HoprBalance,
         startup_phase: StartupPhase,
         safe_balance: HoprBalance,
         safe_remaining: &mut HoprBalance,
@@ -718,7 +719,7 @@ where
         // biases `achievable` up and `close_count` down: this pass may defer a close
         // to a later, more accurately-sized tick, but it never over-closes.
         let closes_ranked: Vec<ChannelId> = if startup_phase == StartupPhase::Expired {
-            consolidation_closes(&underfunded, safe_balance, reclaiming, face_value)
+            consolidation_closes(&underfunded, safe_balance, reclaiming, reserved, face_value)
         } else {
             Vec::new()
         };
@@ -776,13 +777,15 @@ where
 
     /// Closes the worst-ranked open channels, healthy ones included, until their stake
     /// covers what the Safe reserve is short of. `available` is the Safe plus the stake
-    /// already returning from closures. Like consolidation it overrides `min_open_channels`
-    /// and waits out the startup guard, but always keeps the best-ranked channel.
+    /// already returning from closures; `closes_left` is what the selector's per-tick cap
+    /// still allows. Like consolidation it overrides `min_open_channels` and waits out the
+    /// startup guard, but always keeps the best-ranked channel.
     fn reclaim_for_reserve(
         &self,
         close_candidates: &[CloseCandidate],
         reservation: Reservation,
         available: HoprBalance,
+        mut closes_left: Option<usize>,
         startup_phase: StartupPhase,
         state: &mut StatePublisher<'_, N>,
     ) {
@@ -810,13 +813,14 @@ where
             close_candidates.iter().map(|c| (*c.channel.get_id(), c)).collect();
         let mut close_count = self.close_in_flight.held_count();
         for id in reserve_closes(&candidates, shortfall) {
-            if close_count >= self.cfg.closure.close_max_concurrent {
+            if close_count >= self.cfg.closure.close_max_concurrent || closes_left == Some(0) {
                 break;
             }
             if let Some(c) = by_id.get(&id)
                 && self.try_close_channel(&c.channel)
             {
                 close_count += 1;
+                closes_left = closes_left.map(|left| left - 1);
                 state.set(StrategyState::Degraded);
                 info!(channel = %c.channel, %shortfall, "channel-lifecycle: closing for the PIX Safe reserve");
             }
@@ -858,19 +862,9 @@ where
         // One budget for every read this tick makes, not one each: see `read`.
         let deadline = self.read_deadline();
 
-        // `safe_budget` is `None` when the chain could not answer: the fund and
-        // open passes are skipped for this tick, close and finalize still run.
-        let (est_tx_time_val, safe_budget) =
-            futures::join!(self.est_tx_time(deadline), self.safe_balance_budget(deadline));
-        let est_tx_secs = est_tx_time_val.as_secs_f64();
-        // `safe_balance` (actual scarcity, used by `stranded` and consolidation) and
-        // `safe_spendable` (allowance-capped, used to seed the per-tick spend budget
-        // below) are kept apart on purpose — see `SafeBudget`.
-        let safe_balance = safe_budget.map(|b| b.balance);
-        let safe_spendable = safe_budget.map(|b| b.spendable);
-        let reservation = safe_budget.map(|b| b.reservation).unwrap_or_default();
-
-        // The channel list is the one input no pass can do without.
+        // The channel list is the one input no pass can do without. Read before the Safe, so a
+        // channel finalizing in between is counted twice rather than missed: reserve reclaim then
+        // closes too few for a tick, never too many.
         let Some(all_channels) = self
             .read("stream_channels", deadline, async {
                 let mut all_channels: Vec<ChannelEntry> = Vec::new();
@@ -886,6 +880,18 @@ where
             state.set(StrategyState::Failed);
             return Ok(());
         };
+
+        // `safe_budget` is `None` when the chain could not answer: the fund and
+        // open passes are skipped for this tick, close and finalize still run.
+        let (est_tx_time_val, safe_budget) =
+            futures::join!(self.est_tx_time(deadline), self.safe_balance_budget(deadline));
+        let est_tx_secs = est_tx_time_val.as_secs_f64();
+        // `safe_balance` (actual scarcity, used by `stranded` and consolidation) and
+        // `safe_spendable` (allowance-capped, used to seed the per-tick spend budget
+        // below) are kept apart on purpose — see `SafeBudget`.
+        let safe_balance = safe_budget.map(|b| b.balance);
+        let safe_spendable = safe_budget.map(|b| b.spendable);
+        let reservation = safe_budget.map(|b| b.reservation).unwrap_or_default();
 
         // Capture the previous-tick observation snapshot *before* refreshing
         // `last_observed` — `proactive_fund_needed` needs to compare against
@@ -1371,6 +1377,8 @@ where
         let opens_ranked = self.selector.select_opens(&selector_ctx).await;
 
         // ── 3. Close pass ─────────────────────────────────────────────────────
+        // Shared with reserve reclaim, which counts against the selector's per-tick cap too.
+        let mut closes_this_tick = 0usize;
         // Startup is staged (see `RestartGuardConfig`): observe everything, then
         // retire only unconnected peers, then apply the usual rules.
         let startup_phase = self.cfg.restart.phase_at(self.start_epoch.elapsed());
@@ -1448,7 +1456,6 @@ where
             // an out-of-band close reason shares the budget rather than bypassing
             // it (`close_max_concurrent` is a separate in-flight ceiling).
             let per_tick_cap = self.selector.max_closes_per_tick();
-            let mut dispatched_this_tick = 0usize;
 
             for channel_id in candidates {
                 if close_count >= self.cfg.closure.close_max_concurrent {
@@ -1459,7 +1466,7 @@ where
                     );
                     break;
                 }
-                if per_tick_cap.is_some_and(|cap| dispatched_this_tick >= cap) {
+                if per_tick_cap.is_some_and(|cap| closes_this_tick >= cap) {
                     break;
                 }
                 let remaining_open = open_count.saturating_sub(close_count);
@@ -1488,7 +1495,7 @@ where
                     }
                     if self.try_close_channel(ch) {
                         close_count += 1;
-                        dispatched_this_tick += 1;
+                        closes_this_tick += 1;
                     }
                 }
             }
@@ -1520,24 +1527,29 @@ where
             .fold(HoprBalance::zero(), |acc, c| acc + c.balance);
 
         if let Some(safe_balance) = safe_balance {
+            let closes_left = self
+                .selector
+                .max_closes_per_tick()
+                .map(|cap| cap.saturating_sub(closes_this_tick));
             self.reclaim_for_reserve(
                 &close_candidates,
                 reservation,
                 safe_balance + reclaiming,
+                closes_left,
                 startup_phase,
                 &mut state,
             );
         }
 
         if let (Some(funding), Some(safe_balance)) = (funding, safe_balance) {
-            // The reserve is a debt on the pool, so what it claims never lifts a channel.
             self.consolidate_stranded_stake(
                 &close_candidates,
                 &deferred_to_consolidation,
                 funding.face_value,
-                HoprBalance::zero(),
+                reclaiming,
+                reservation.reserved,
                 startup_phase,
-                safe_balance + reclaiming - reservation.reserved,
+                safe_balance,
                 &mut safe_remaining,
                 &mut state,
             );

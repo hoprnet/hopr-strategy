@@ -135,12 +135,6 @@ fn default_spend_window() -> Duration {
 // `Result` in this module is the crate alias, which fixes the error type.
 
 fn validate_funding_policy(policy: &PixFundingPolicy) -> std::result::Result<(), validator::ValidationError> {
-    if let Some(reclaim_below) = policy.reclaim_below
-        && (reclaim_below <= policy.min_available || reclaim_below > policy.top_up)
-    {
-        return Err(validator::ValidationError::new("reclaim_below_out_of_range")
-            .with_message("`reclaim_below` must be above `min_available` and at most `top_up`".into()));
-    }
     if policy.min_available >= policy.top_up {
         return Err(
             validator::ValidationError::new("min_available_not_below_top_up").with_message(
@@ -404,17 +398,28 @@ pub struct PixFundingPolicy {
     /// then funds at that flush. Threshold and renewal behaviour are the same either way.
     #[serde(default)]
     pub fund_at_startup: bool,
-    /// Pool balance below which a [`SafeReserve`] asks the channel strategy to close channels
-    /// to cover it, early enough for their stake to return before the next refill. Must be
-    /// above `min_available` and at most `top_up`. Default: half of `top_up`.
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reclaim_below: Option<HoprBalance>,
 }
 
 impl PixFundingPolicy {
     /// The Safe share the next refill keeps while the pool can pay `available`: none while it holds
     /// `top_up`, growing as it spends to one whole `top_up` by the time it falls to `min_available`.
+    /// Below half of `top_up`, early enough for closed channels' stake to return before the refill,
+    /// it also asks to reclaim; so does an owed refill if `min_available` sits above that.
+    ///
+    /// ```
+    /// use hopr_api::types::primitive::prelude::HoprBalance;
+    /// use hopr_strategy::pix::strategy::PixFundingPolicy;
+    ///
+    /// let policy = PixFundingPolicy {
+    ///     min_available: HoprBalance::new_base(50),
+    ///     top_up: HoprBalance::new_base(200),
+    ///     fund_at_startup: false,
+    /// };
+    /// assert!(policy.reservation(HoprBalance::new_base(200)).reserved.is_zero());
+    /// let at_the_floor = policy.reservation(HoprBalance::new_base(50));
+    /// assert_eq!(at_the_floor.reserved, HoprBalance::new_base(200));
+    /// assert!(at_the_floor.reclaim);
+    /// ```
     pub fn reservation(&self, available: HoprBalance) -> Reservation {
         let spent = (self.top_up - available).amount();
         let runway = (self.top_up - self.min_available).amount();
@@ -425,10 +430,7 @@ impl PixFundingPolicy {
         };
         Reservation {
             reserved,
-            reclaim: available
-                < self
-                    .reclaim_below
-                    .unwrap_or_else(|| HoprBalance::from(self.top_up.amount() / 2)),
+            reclaim: available < HoprBalance::from(self.top_up.amount() / 2).max(self.min_available),
         }
     }
 }
@@ -1768,13 +1770,17 @@ where
         "funding the deposit pool from the Safe"
     );
     match pool.fund(policy.top_up).await.map_err(Into::<StrategyError>::into) {
-        Ok(()) => {
-            refill.owed.store(false, Ordering::Relaxed);
-            // Until this read the reserve still covers the shield just sent.
-            if let Ok(available) = pool.available_balance().await.map_err(Into::<StrategyError>::into) {
+        Ok(()) => match pool.available_balance().await.map_err(Into::<StrategyError>::into) {
+            Ok(available) => {
+                refill.owed.store(false, Ordering::Relaxed);
                 refill.publish(policy, available);
             }
-        }
+            // The retry re-reads the refilled pool, which is above its floor, so it only republishes.
+            Err(error) => {
+                refill.owed.store(true, Ordering::Relaxed);
+                tracing::warn!(%error, "could not read the deposit pool after funding it; the reserve is re-read on a timer");
+            }
+        },
         Err(error) => {
             refill.owed.store(true, Ordering::Relaxed);
             tracing::error!(
@@ -2303,8 +2309,13 @@ where
         // Only now that there is a strategy to fund for: a failed subscription returns above, and
         // a task spawned before it would still have debited the Safe. A lazy policy — the default —
         // funds at the first deposit's flush instead, so an idle node never touches the Safe.
-        if self.cfg.funding.as_ref().is_some_and(|policy| policy.fund_at_startup) {
-            self.detach_funding();
+        if let Some(policy) = self.cfg.funding.as_ref() {
+            if policy.fund_at_startup {
+                self.detach_funding();
+            } else if let Ok(available) = self.pool.available_balance().await.map_err(Into::<StrategyError>::into) {
+                // Lazy funds nothing yet, but the channels must already leave the next refill alone.
+                self.refill.publish(policy, available);
+            }
         }
 
         let replay = self.recovery_store.clone().map(|store| {
@@ -4252,7 +4263,6 @@ mod tests {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
                 fund_at_startup: false,
-                reclaim_below: None,
             }),
             ..Default::default()
         };
@@ -5956,6 +5966,8 @@ mod tests {
         fund_attempts: Arc<std::sync::atomic::AtomicUsize>,
         /// What the pool answers to `accepts_funding`.
         accepts_funding: bool,
+        /// Once anything is funded, every balance read fails.
+        unreadable_after_funding: bool,
     }
 
     #[async_trait::async_trait]
@@ -5988,12 +6000,11 @@ mod tests {
         }
 
         async fn available_balance(&self) -> std::result::Result<HoprBalance, StrategyError> {
-            let funded = self
-                .funded
-                .lock()
-                .iter()
-                .fold(HoprBalance::zero(), |sum, amount| sum + *amount);
-            Ok(self.available + funded)
+            let funded = self.funded.lock();
+            if self.unreadable_after_funding && !funded.is_empty() {
+                return Err(StrategyError::CriteriaNotSatisfied);
+            }
+            Ok(self.available + funded.iter().fold(HoprBalance::zero(), |sum, amount| sum + *amount))
         }
 
         async fn deposit_funds_to(
@@ -6054,6 +6065,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let cfg = PixStrategyConfig {
             funding,
@@ -6098,13 +6110,13 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(50),
                 top_up: HoprBalance::new_base(200),
                 fund_at_startup: true,
-                reclaim_below: None,
             }),
             ..Default::default()
         };
@@ -6130,7 +6142,6 @@ mod tests {
             min_available: HoprBalance::new_base(min),
             top_up: HoprBalance::new_base(top),
             fund_at_startup: false,
-            reclaim_below: None,
         };
         assert!(validator::Validate::validate(&policy(250, 100)).is_err());
         assert!(validator::Validate::validate(&policy(101, 100)).is_err());
@@ -6161,13 +6172,13 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
                 fund_at_startup: true,
-                reclaim_below: None,
             }),
             ..Default::default()
         };
@@ -6207,6 +6218,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let amount = HoprBalance::new_base(1);
@@ -6250,6 +6262,7 @@ mod tests {
                 refuse_funding: Default::default(),
                 fund_attempts: Default::default(),
                 accepts_funding,
+                unreadable_after_funding: false,
             });
 
             let result = PixStrategy::new(funding_cfg())
@@ -6281,13 +6294,13 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let cfg = PixStrategyConfig {
             funding: Some(crate::pix::strategy::PixFundingPolicy {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
                 fund_at_startup: true,
-                reclaim_below: None,
             }),
             ..Default::default()
         };
@@ -6333,7 +6346,6 @@ mod tests {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
                 fund_at_startup: true,
-                reclaim_below: None,
             }),
             ..Default::default()
         }
@@ -6346,7 +6358,6 @@ mod tests {
                 min_available: HoprBalance::new_base(1),
                 top_up: HoprBalance::new_base(2),
                 fund_at_startup: false,
-                reclaim_below: None,
             }),
             ..Default::default()
         }
@@ -6401,6 +6412,7 @@ mod tests {
             refuse_funding: Arc::clone(&refuse_funding),
             fund_attempts: Arc::clone(&fund_attempts),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(SilentEvents), cfg, *BOB, None);
         let run = tokio::spawn(async move {
@@ -6478,6 +6490,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let id = pix_id(1);
@@ -6514,6 +6527,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), lazy_funding_cfg(), *BOB, None);
 
@@ -6562,13 +6576,13 @@ mod tests {
                 refuse_funding: Default::default(),
                 fund_attempts: Default::default(),
                 accepts_funding: true,
+                unreadable_after_funding: false,
             });
             let cfg = PixStrategyConfig {
                 funding: Some(crate::pix::strategy::PixFundingPolicy {
                     min_available: HoprBalance::new_base(1),
                     top_up: HoprBalance::new_base(2),
                     fund_at_startup,
-                    reclaim_below: None,
                 }),
                 ..Default::default()
             };
@@ -6615,6 +6629,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
         let gate = Arc::clone(&strategy.funding_gate);
@@ -6645,6 +6660,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, Arc::new(ClosingEvents), funding_cfg(), *BOB, None);
 
@@ -6678,6 +6694,7 @@ mod tests {
             refuse_funding: Default::default(),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         });
         let mut strategy = PixStrategyInner::new(pool, node, funding_cfg(), *BOB, None);
         let gate = Arc::clone(&strategy.funding_gate);
@@ -6815,7 +6832,6 @@ mod tests {
                 min_available: HoprBalance::new_base(50),
                 top_up: HoprBalance::new_base(100),
                 fund_at_startup: false,
-                reclaim_below: None,
             }),
             ..Default::default()
         };
@@ -6860,7 +6876,6 @@ mod tests {
                 min_available: HoprBalance::new_base(50),
                 top_up: HoprBalance::new_base(100),
                 fund_at_startup: false,
-                reclaim_below: None,
             }),
             ..Default::default()
         }
@@ -6960,7 +6975,6 @@ mod tests {
             min_available: HoprBalance::new_base(50),
             top_up: HoprBalance::new_base(200),
             fund_at_startup: false,
-            reclaim_below: None,
         };
 
         let low = funding_policy_run(HoprBalance::new_base(49), Some(policy.clone())).await?;
@@ -6982,7 +6996,6 @@ mod tests {
             min_available: HoprBalance::new_base(50),
             top_up: HoprBalance::new_base(200),
             fund_at_startup: false,
-            reclaim_below: None,
         }
     }
 
@@ -7000,6 +7013,7 @@ mod tests {
             refuse_funding: Arc::new(std::sync::atomic::AtomicBool::new(refuse_funding)),
             fund_attempts: Default::default(),
             accepts_funding: true,
+            unreadable_after_funding: false,
         };
         (pool, funded)
     }
@@ -7034,18 +7048,56 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_below_must_sit_above_the_floor_and_within_the_top_up() {
-        let with = |reclaim_below: u64| crate::pix::strategy::PixFundingPolicy {
-            reclaim_below: Some(HoprBalance::new_base(reclaim_below)),
-            ..reserve_policy()
+    fn the_reclaim_threshold_never_falls_to_the_floor() {
+        let policy = crate::pix::strategy::PixFundingPolicy {
+            min_available: HoprBalance::new_base(75),
+            top_up: HoprBalance::new_base(100),
+            fund_at_startup: false,
         };
-        assert!(validator::Validate::validate(&with(50)).is_err());
-        assert!(validator::Validate::validate(&with(201)).is_err());
-        assert!(validator::Validate::validate(&with(120)).is_ok());
-        assert_eq!(
-            with(120).reservation(HoprBalance::new_base(110)),
-            reservation(120, true)
+        assert!(
+            policy.reservation(HoprBalance::new_base(60)).reclaim,
+            "a refill is owed below 75"
         );
+        assert!(!policy.reservation(HoprBalance::new_base(80)).reclaim);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn a_lazy_policy_publishes_the_reserve_at_startup_without_funding() -> anyhow::Result<()> {
+        let (pool, funded) = probe_pool(0, false);
+        let reserve = crate::safe_reserve::SafeReserve::default();
+        let mut strategy =
+            PixStrategyInner::new(Arc::new(pool), Arc::new(ClosingEvents), lazy_funding_cfg(), *BOB, None);
+        strategy.refill.reserve = Some(reserve.clone());
+
+        crate::strategy::Strategy::run(&mut strategy).await?;
+
+        assert!(funded.lock().is_empty());
+        assert_eq!(reserve.get(), reservation(2, true));
+        Ok(())
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn an_unreadable_pool_after_a_refill_is_read_again_on_the_retry() -> anyhow::Result<()> {
+        let (pool, funded) = probe_pool(10, false);
+        let pool = FundingProbePool {
+            unreadable_after_funding: true,
+            ..pool
+        };
+        let (refill, reserve) = reserving_refill();
+
+        super::fund_below_floor::<_, crate::pix::pools::plain::EthDepositKey>(&pool, &reserve_policy(), &refill).await;
+
+        assert_eq!(*funded.lock(), vec![HoprBalance::new_base(200)]);
+        assert!(
+            refill.owed.load(std::sync::atomic::Ordering::SeqCst),
+            "the retry timer re-reads it"
+        );
+        assert_eq!(
+            reserve.get(),
+            reservation(200, true),
+            "the pre-refill reserve until then"
+        );
+        Ok(())
     }
 
     #[test_log::test(tokio::test)]
