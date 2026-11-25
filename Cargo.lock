@@ -2132,9 +2132,9 @@ dependencies = [
 
 [[package]]
 name = "blokli-client"
-version = "0.37.0"
+version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0316ef1a89d3d089b8534c12fa77403702dbbbef24a64361f74f4b5ec7e2edd"
+checksum = "a8cfcc781081aec5a39862d898704b5876ba28114fb01e8c61650fca413f8fda"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -2157,6 +2157,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smart-default",
+ "strum",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4148,9 +4149,9 @@ dependencies = [
 
 [[package]]
 name = "hopr-chain-connector"
-version = "0.33.0"
+version = "0.36.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78529ed81814e91606f74426b20fe46c7d63ebadea6ec7a4dd3fdd851748cf17"
+checksum = "fcc23cbbd381916ccf6f0cb5eaab22ff1c2673ff002a5dddb12e81e24c256bec"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4164,7 +4165,7 @@ dependencies = [
  "futures-concurrency",
  "futures-time",
  "hopr-api",
- "hopr-utilities",
+ "hopr-utilities 0.21.0",
  "moka",
  "parking_lot 0.12.5",
  "petgraph",
@@ -4180,15 +4181,15 @@ dependencies = [
 
 [[package]]
 name = "hopr-network-graph"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5ef2106012c61eff5f9be5efb3b248cd7f734fee80dfe27c56ea9bfde39073a"
+checksum = "0d4f9e796207f6ea3812f22b7c4f16a33d0d5fbadc086e5f5d8765f00b5e017a"
 dependencies = [
  "anyhow",
  "bimap",
  "futures",
  "hopr-api",
- "hopr-utilities",
+ "hopr-utilities 0.20.0",
  "indexmap 2.14.2",
  "lazy_static",
  "parking_lot 0.12.5",
@@ -4197,8 +4198,10 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "smart-default",
  "thiserror 2.0.21",
  "tracing",
+ "validator",
 ]
 
 [[package]]
@@ -4227,7 +4230,7 @@ dependencies = [
  "hex-literal",
  "hopr-api",
  "hopr-chain-connector",
- "hopr-utilities",
+ "hopr-utilities 0.21.0",
  "humantime-serde",
  "insta",
  "lazy_static",
@@ -4387,6 +4390,19 @@ name = "hopr-utilities"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "825b377e33396ca5254dfe961dc7d45270de33f800753d413be18c303392a5fd"
+dependencies = [
+ "auto_impl",
+ "const-hex",
+ "futures",
+ "indexmap 2.14.2",
+ "serde_json",
+]
+
+[[package]]
+name = "hopr-utilities"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ed1c4a451c00ed120c634720701b8773a028e8d60d2795f13084fd894bc1a69"
 dependencies = [
  "anyhow",
  "async-broadcast",
