@@ -936,6 +936,18 @@ where
             .collect();
         let open_count = open_channels.len() + self.open_in_flight.held_count();
         self.emit_channel_balance_metrics(&open_channels);
+
+        // Channels the operator retired by leaving them off the allowlist: the close
+        // pass retires them first and the fund pass no longer tops them up.
+        let outside_allowlist = |ch: &ChannelEntry| -> bool {
+            self.cfg.closure.close_outside_allowlist
+                && self
+                    .cfg
+                    .eligibility
+                    .allowlist
+                    .as_ref()
+                    .is_some_and(|l| !l.contains(&ch.destination))
+        };
         debug!(
             open = open_count,
             in_flight = self.total_in_flight(),
@@ -1010,6 +1022,7 @@ where
                 .filter(|ch| {
                     !self.fund_in_flight.is_held(ch.get_id())
                         && !self.close_in_flight.is_held(ch.get_id())
+                        && !outside_allowlist(ch)
                         && refundable(ch)
                 })
                 .filter_map(|ch| {
@@ -1380,6 +1393,26 @@ where
                 })
                 .map(|ch| *ch.get_id())
                 .collect();
+
+            // Retired by the operator, so neither the population floor nor the
+            // startup shielding keeps them; only the in-flight ceiling paces them.
+            for ch in open_channels.iter().copied().filter(|ch| outside_allowlist(ch)) {
+                if close_count >= self.cfg.closure.close_max_concurrent {
+                    debug!(
+                        close_count,
+                        cap = self.cfg.closure.close_max_concurrent,
+                        "channel-lifecycle: outside-allowlist closes stopped: concurrency cap reached"
+                    );
+                    break;
+                }
+                if self.close_in_flight.is_held(ch.get_id()) || self.fund_in_flight.is_held(ch.get_id()) {
+                    continue;
+                }
+                debug!(dest = %ch.destination, "channel-lifecycle: closing channel outside the allowlist");
+                if self.try_close_channel(ch) {
+                    close_count += 1;
+                }
+            }
 
             let ranked: HashSet<ChannelId> = closes_ranked.iter().copied().collect();
             let candidates = closes_ranked.iter().chain(disconnected.difference(&ranked));
@@ -3871,6 +3904,115 @@ mod tests {
             1,
             "connectivity closes must share the selector's close_per_tick=1 budget, not reach close_max_concurrent=2"
         );
+        Ok(())
+    }
+
+    /// Runs one tick over open channels to ALICE, CHRIS and DAVE, every peer connected, an
+    /// allowlist of ALICE only, and a population floor above the channel count. Returns
+    /// whether a close, then whether a top-up, is in flight for each channel, in that order.
+    async fn tick_with_allowlist_of_alice(
+        configure: impl FnOnce(&mut ChannelLifecycleConfig),
+    ) -> anyhow::Result<([bool; 3], [bool; 3])> {
+        let peers = [*ALICE, *CHRIS, *DAVE];
+        let channels = peers
+            .iter()
+            .map(|peer| {
+                ChannelEntry::builder()
+                    .between(*BOB, *peer)
+                    .amount(5_u32)
+                    .ticket_index(0)
+                    .status(ChannelStatus::Open)
+                    .epoch(0)
+                    .build()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let blokli_sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS, &*DAVE],
+                true,
+                XDaiBalance::new_base(1),
+                HoprBalance::new_base(1000),
+            )
+            .with_channels(channels.clone())
+            .build_dynamic_client([1; Address::SIZE].into())
+            .with_tx_simulation_delay(std::time::Duration::ZERO);
+        let connector = Arc::new(create_test_blokli_connector(&BOB_KP, blokli_sim, [1; Address::SIZE].into()).await?);
+        register_test_safe(&*connector, *BOB).await?;
+
+        let mut cfg = ChannelLifecycleConfig::default();
+        cfg.population.min_open_channels = 5;
+        cfg.restart.startup_observation_period = Duration::ZERO;
+        cfg.restart.startup_close_grace_period = Duration::ZERO;
+        cfg.closure.close_max_concurrent = 4;
+        cfg.eligibility.allowlist = Some(HashSet::from([*ALICE]));
+        configure(&mut cfg);
+
+        // Every peer connected, so no connectivity close muddies the result.
+        let network = crate::testing::TestNetworkView::new();
+        for peer in &peers {
+            network.connect(peer);
+        }
+        let node = Arc::new(crate::testing::LifecycleNode::with_views(
+            Arc::clone(&connector),
+            crate::testing::TestGraph::new(&BOB),
+            network,
+        ));
+        let inner = fresh_inner_over(cfg, Arc::new(selector::DefaultSelector), node);
+
+        inner.run_pipeline().await;
+
+        Ok((
+            [0, 1, 2].map(|i| inner.close_in_flight.is_held(channels[i].get_id())),
+            [0, 1, 2].map(|i| inner.fund_in_flight.is_held(channels[i].get_id())),
+        ))
+    }
+
+    #[tokio::test]
+    async fn close_outside_allowlist_closes_every_channel_not_on_it() -> anyhow::Result<()> {
+        let ([alice, chris, dave], _) =
+            tick_with_allowlist_of_alice(|cfg| cfg.closure.close_outside_allowlist = true).await?;
+
+        assert!(!alice, "the allowlisted channel must stay");
+        assert!(
+            chris && dave,
+            "channels outside the allowlist must close, even below the floor"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_outside_allowlist_obeys_close_max_concurrent() -> anyhow::Result<()> {
+        let (closing, _) = tick_with_allowlist_of_alice(|cfg| {
+            cfg.closure.close_outside_allowlist = true;
+            cfg.closure.close_max_concurrent = 1;
+        })
+        .await?;
+
+        assert_eq!(closing.iter().filter(|c| **c).count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allowlist_alone_closes_nothing() -> anyhow::Result<()> {
+        let (closing, _) = tick_with_allowlist_of_alice(|_| {}).await?;
+
+        assert_eq!(closing, [false; 3]);
+        Ok(())
+    }
+
+    /// The fund pass runs before the close pass; a top-up it dispatched would make the
+    /// close pass skip the channel as fund-in-flight.
+    #[tokio::test]
+    async fn close_outside_allowlist_stops_top_ups_outside_it() -> anyhow::Result<()> {
+        let (_, [alice, chris, dave]) = tick_with_allowlist_of_alice(|cfg| {
+            cfg.closure.close_outside_allowlist = true;
+            cfg.closure.close_max_concurrent = 0; // isolate the fund pass
+        })
+        .await?;
+
+        assert!(alice, "the allowlisted channel is drained and must still be topped up");
+        assert!(!chris && !dave, "channels outside the allowlist must not be topped up");
         Ok(())
     }
 
