@@ -41,6 +41,9 @@ where
         if self.fund_in_flight.is_held(ch.get_id()) {
             return;
         }
+        if self.is_outside_allowlist(&ch.destination) {
+            return;
+        }
 
         self.last_observed
             .entry(*ch.get_id())
@@ -113,6 +116,16 @@ where
     pub(super) fn start_reopen_cooldown(&self, dest: Address) {
         self.cooldown
             .insert(dest, Instant::now() + self.cfg.population.peer_reopen_cooldown);
+    }
+
+    /// Whether the operator retired channels to `dest` by leaving it off the allowlist:
+    /// they are closed and never topped up.
+    pub(super) fn is_outside_allowlist(&self, dest: &Address) -> bool {
+        self.cfg
+            .eligibility
+            .allowlist
+            .as_ref()
+            .is_some_and(|l| !l.contains(dest))
     }
 
     /// Whether `dest` is still within an active reopen cooldown window.

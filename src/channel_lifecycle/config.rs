@@ -90,8 +90,12 @@ pub struct EligibilityConfig {
     #[default = true]
     pub require_observed_since_start: bool,
 
-    /// If set, only open channels to addresses in this list.  `None` means
-    /// all peers are eligible.  Default: None.
+    /// If set, only open channels to addresses in this list, and close every
+    /// open channel to an address outside it.  Those closes ignore
+    /// `min_open_channels` and the startup shielding, but obey
+    /// `close_max_concurrent`, and such channels are not topped up.  An empty
+    /// list therefore closes every channel; `None` means all peers are
+    /// eligible.  Default: None.
     #[default(None)]
     pub allowlist: Option<HashSet<Address>>,
 
@@ -827,6 +831,9 @@ pub struct FinalizerConfig {
 /// | before `startup_observation_period` | none — the strategy only observes |
 /// | before `startup_close_grace_period` | only those to peers that are not connected |
 /// | after `startup_close_grace_period`  | all, by the usual closure rules |
+///
+/// Channels outside [`EligibilityConfig::allowlist`] may close in the second
+/// phase too, connected or not.
 ///
 /// A channel to a peer whose connectivity cannot be resolved counts as
 /// connected, i.e. shielded: a failed account read must not read as "nothing is
