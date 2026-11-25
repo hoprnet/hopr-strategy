@@ -90,10 +90,12 @@ pub struct EligibilityConfig {
     #[default = true]
     pub require_observed_since_start: bool,
 
-    /// If set, only open channels to addresses in this list.  `None` means
-    /// all peers are eligible.  It gates opens only; set
-    /// [`ClosureConfig::close_outside_allowlist`] to also close existing
-    /// channels to peers outside it.  Default: None.
+    /// If set, only open channels to addresses in this list, and close every
+    /// open channel to an address outside it.  Those closes ignore
+    /// `min_open_channels` and the startup shielding, but obey
+    /// `close_max_concurrent`, and such channels are not topped up.  An empty
+    /// list therefore closes every channel; `None` means all peers are
+    /// eligible.  Default: None.
     #[default(None)]
     pub allowlist: Option<HashSet<Address>>,
 
@@ -791,16 +793,6 @@ pub struct ClosureConfig {
     /// [`NetworkView::is_connected`]: hopr_api::network::NetworkView::is_connected
     #[default = 3]
     pub close_after_disconnected_ticks: usize,
-
-    /// Close every open channel whose destination is not in
-    /// [`EligibilityConfig::allowlist`].  Without it the allowlist only gates
-    /// opens, so channels from before the allowlist can fill the population and
-    /// keep the open pass from ever reaching an allowlisted peer.  These closes
-    /// ignore `min_open_channels` and the startup shielding, but obey
-    /// `close_max_concurrent`.  No effect when the allowlist is `None`.
-    /// Default: false.
-    #[default = false]
-    pub close_outside_allowlist: bool,
 }
 
 /// Controls the finalizer phase (second `close_channel` call for `PendingToClose`
@@ -840,8 +832,8 @@ pub struct FinalizerConfig {
 /// | before `startup_close_grace_period` | only those to peers that are not connected |
 /// | after `startup_close_grace_period`  | all, by the usual closure rules |
 ///
-/// With [`ClosureConfig::close_outside_allowlist`], channels outside the
-/// allowlist may close in the second phase too, connected or not.
+/// Channels outside [`EligibilityConfig::allowlist`] may close in the second
+/// phase too, connected or not.
 ///
 /// A channel to a peer whose connectivity cannot be resolved counts as
 /// connected, i.e. shielded: a failed account read must not read as "nothing is
