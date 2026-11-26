@@ -2766,9 +2766,13 @@ async fn startup_reconciliation_takes_the_check_off_the_first_request() -> anyho
     record_owned_notes(pool.state(), 5)?;
 
     pool.start_reconciliation();
-    while !pool.reconciled.initialized() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !pool.reconciled.initialized() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the startup reconciliation did not complete"))?;
     assert_eq!(harness.index.note_known_calls.load(Ordering::SeqCst), 5);
 
     harness.index.note_known_calls.store(0, Ordering::SeqCst);
