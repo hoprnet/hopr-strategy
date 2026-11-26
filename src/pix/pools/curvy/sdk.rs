@@ -72,7 +72,8 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
+    BlokliDnsOverride, CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
+    Url,
     detect::{bjj_point, scan_public_key_dec},
     indexer,
     relayer::{self, RelayClient},
@@ -1420,15 +1421,44 @@ impl CurvyChainEndpoints {
     }
 }
 
+/// Builds the HTTP client [`BlokliChain`] reads and submits through, matching the 30 s timeout
+/// of `BlokliChain::new` — which [`curvy_chain_blokli::BlokliChain::with_client`] does **not**
+/// re-apply — and pinning `dns`'s hostname to its address when given.
+///
+/// The host and port are derived the way `blokli-client`'s own override does: the URL's host, and
+/// the override's port, falling back to the URL's port or the scheme's default — refused when
+/// neither can be derived, because a pinned address nobody can name is worse than a startup
+/// error. A client without an override is exactly what `BlokliChain::new` builds internally.
+pub(super) fn blokli_http_client(url: &Url, dns: Option<&BlokliDnsOverride>) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if let Some(dns) = dns {
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("DNS override requires a Blokli base URL host"))?;
+        let port = dns
+            .port
+            .or_else(|| url.port_or_known_default())
+            .ok_or_else(|| anyhow::anyhow!("DNS override requires a Blokli base URL port or known default"))?;
+        builder = builder.resolve(host, std::net::SocketAddr::new(dns.ip, port));
+    }
+    builder
+        .build()
+        .map_err(|error| anyhow::anyhow!("could not build the Curvy pool's Blokli HTTP client: {error}"))
+}
+
 /// Constructs a Curvy client whose reads and submissions go through Blokli — except, when
 /// `notes` is given, the note index the SDK rebuilds its tree from (see
 /// [`CurvyNoteSource::CurvyIndexer`]).
+///
+/// `blokli` is the chain itself rather than a URL so the caller decides which HTTP client its
+/// requests go through — with [`curvy_chain_blokli::BlokliChain::with_client`] and
+/// [`blokli_http_client`] when the node pins Blokli's hostname, with
+/// [`curvy_chain_blokli::BlokliChain::new`] otherwise.
 pub fn blokli_curvy_client(
-    blokli_url: impl Into<String>,
+    blokli: Arc<curvy_chain_blokli::BlokliChain>,
     endpoints: &CurvyChainEndpoints,
     notes: Option<Arc<dyn curvy_chain_api::NoteIndexSource>>,
 ) -> Arc<CurvyClient> {
-    let blokli = Arc::new(curvy_chain_blokli::BlokliChain::new(blokli_url));
     let notes: Arc<dyn curvy_chain_api::NoteIndexSource> = notes.unwrap_or_else(|| blokli.clone());
     Arc::new(CurvyClient::new(
         blokli.clone(),
@@ -1473,6 +1503,10 @@ pub struct RsSdkCurvyAdapter<C> {
     next_relay_finality_check: parking_lot::Mutex<Option<tokio::time::Instant>>,
     /// A caller-built client for the Curvy indexer; `None` builds the default one.
     indexer_http: Option<reqwest::Client>,
+    /// A caller-built client for the SDK's Blokli chain (tree reads, fees, anchors, submissions);
+    /// `None` lets `BlokliChain::new` build the default one. Read by the pool's tests to check
+    /// the config actually reaches it.
+    pub(super) blokli_http: Option<reqwest::Client>,
 }
 
 impl<C> RsSdkCurvyAdapter<C>
@@ -1522,12 +1556,22 @@ where
             chain: Arc::new(tokio::sync::Mutex::new(())),
             next_relay_finality_check: parking_lot::Mutex::new(None),
             indexer_http: None,
+            blokli_http: None,
         })
     }
 
     /// Routes the Curvy indexer's requests through `http` instead of a default client.
     pub(super) fn with_indexer_http_client(mut self, http: Option<reqwest::Client>) -> Self {
         self.indexer_http = http;
+        self
+    }
+
+    /// Routes the SDK's Blokli chain — the committed-tree reads, fees, aggregator anchors and
+    /// transaction submissions — through `http` instead of a default client, for the node's
+    /// Blokli DNS override. The pool builds it with [`blokli_http_client`] from the config; a
+    /// caller that hands over its own client keeps the relayer and indexer traffic as it was.
+    pub(super) fn with_blokli_http_client(mut self, http: Option<reqwest::Client>) -> Self {
+        self.blokli_http = http;
         self
     }
 
@@ -1571,7 +1615,14 @@ where
                         ))))
                     }
                 };
-                let client = blokli_curvy_client(self.blokli_url.clone(), &endpoints, notes);
+                // The chain the SDK reads and submits through: on the caller's client when one
+                // was handed over (the node's Blokli DNS override pins the hostname there), on
+                // `BlokliChain`'s own default client otherwise.
+                let chain = Arc::new(match &self.blokli_http {
+                    Some(http) => curvy_chain_blokli::BlokliChain::with_client(self.blokli_url.clone(), http.clone()),
+                    None => curvy_chain_blokli::BlokliChain::new(self.blokli_url.clone()),
+                });
+                let client = blokli_curvy_client(chain, &endpoints, notes);
                 Ok((client, endpoints))
             })
             .await
@@ -3964,7 +4015,11 @@ mod tests {
             adapter
                 .client
                 .set((
-                    blokli_curvy_client(url.as_str().trim_end_matches('/'), &endpoints, None),
+                    blokli_curvy_client(
+                        Arc::new(curvy_chain_blokli::BlokliChain::new(url.as_str().trim_end_matches('/'))),
+                        &endpoints,
+                        None,
+                    ),
                     endpoints
                 ))
                 .is_ok()
@@ -4417,6 +4472,236 @@ mod tests {
             "{error}"
         );
         assert_eq!(reads, 2, "the failed selection read and the build's own: {error}");
+        Ok(())
+    }
+
+    // Blokli DNS override (hoprnet/hoprnet#8766): the SDK's chain must read and submit on the
+    // client the node pins Blokli's hostname to, not on one that asks system DNS.
+
+    /// A listener that answers one connection with the body `BlokliChain::is_ready` reads, and
+    /// returns the request it read — what a pinned Blokli answers at.
+    async fn readiness_listener() -> (u16, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+        let port = listener.local_addr().expect("an address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("the pinned address is dialed");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.expect("the request arrives");
+                assert!(read > 0, "the connection closed before the headers ended");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"status":"ready"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+                 close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("the answer goes out");
+            String::from_utf8(request).expect("an ASCII request")
+        });
+        (port, server)
+    }
+
+    /// The client the pool hands `BlokliChain::with_client` when the node pins Blokli's hostname
+    /// opens its connections at the pinned address without ever asking system DNS for the name —
+    /// `blokli.invalid` resolves nowhere — and still names the original hostname in `Host`.
+    #[tokio::test]
+    async fn the_blokli_http_client_reaches_the_pinned_address_without_dns() -> anyhow::Result<()> {
+        let (port, server) = readiness_listener().await;
+        let client = blokli_http_client(
+            &"http://blokli.invalid/".parse()?,
+            Some(&BlokliDnsOverride {
+                ip: "127.0.0.1".parse()?,
+                port: Some(port),
+            }),
+        )?;
+        let chain = curvy_chain_blokli::BlokliChain::with_client("http://blokli.invalid", client);
+        assert!(chain.is_ready().await, "the readiness probe never reached the listener");
+        let request = server.await?;
+        assert!(request.starts_with("GET /readyz "), "{request}");
+        // reqwest lowercases the header name, but the hostname it names is the original one.
+        assert!(request.contains("host: blokli.invalid"), "{request}");
+        Ok(())
+    }
+
+    /// Without an override the helper is `BlokliChain::new`'s own client — same 30 s timeout, and
+    /// it dials the address the URL itself names.
+    #[tokio::test]
+    async fn the_blokli_http_client_without_an_override_dials_the_url_it_names() -> anyhow::Result<()> {
+        let (port, server) = readiness_listener().await;
+        let url: Url = format!("http://127.0.0.1:{port}").parse()?;
+        let client = blokli_http_client(&url, None)?;
+        // The adapter trims the trailing slash the same way `RsSdkCurvyAdapter::new` does.
+        let chain = curvy_chain_blokli::BlokliChain::with_client(url.as_str().trim_end_matches('/'), client);
+        assert!(chain.is_ready().await, "the plain client never reached the listener");
+        let request = server.await?;
+        assert!(request.starts_with("GET /readyz "), "{request}");
+        Ok(())
+    }
+
+    /// A pinned address nobody can name is worse than a startup error: with no port from the URL
+    /// and none from the override — a scheme without a known default — the client is refused
+    /// rather than built. The override's own port settles it.
+    #[test]
+    fn a_pinned_address_needs_a_port_the_url_or_the_override_names() -> anyhow::Result<()> {
+        let url: Url = "curvy://blokli.invalid/".parse()?;
+        let error = blokli_http_client(
+            &url,
+            Some(&BlokliDnsOverride {
+                ip: "10.0.0.1".parse()?,
+                port: None,
+            }),
+        )
+        .expect_err("neither the URL nor the override names a port");
+        assert!(error.to_string().contains("port"), "{error}");
+        blokli_http_client(
+            &url,
+            Some(&BlokliDnsOverride {
+                ip: "10.0.0.1".parse()?,
+                port: Some(31415),
+            }),
+        )
+        .expect("the override names the port itself");
+        Ok(())
+    }
+
+    /// The `chainInfo` discovery reads: the three required contract names and a chain id.
+    fn discovery_chain_info() -> serde_json::Value {
+        serde_json::json!({"data":{"chainInfo":{
+            "__typename":"ChainInfo",
+            "channelClosureGracePeriod":"100","channelDst":null,"blockNumber":1,"chainId":100,
+            "gasPrice":"1","ledgerDst":null,"maxFeePerGas":null,"maxPriorityFeePerGas":null,
+            "minTicketWinningProbability":0.5,"keyBindingFee":"0.01 wxHOPR","safeRegistryDst":null,
+            "ticketPrice":"0.01 wxHOPR","network":"gnosis",
+            "contractAddresses":serde_json::json!({
+                "curvy_aggregator":format!("0x{}", "01".repeat(20)),
+                "curvy_vault":format!("0x{}", "02".repeat(20)),
+                "token":format!("0x{}", "03".repeat(20)),
+            })
+            .to_string(),
+            "expectedBlockTime":"5","finality":"2"
+        }}})
+    }
+
+    /// The adapter with no client preset: `client()` runs discovery for real, so a test can
+    /// judge which HTTP client the SDK's chain reads and submits through. The discovery read goes
+    /// through the shared Blokli client at `blokli_url`; the chain gets its own `chain_url` —
+    /// unreachable in the pinned test, so only the injected client can reach it.
+    fn unsealed_test_adapter(
+        state: &RedbCurvyDepositState,
+        blokli_url: Url,
+        chain_url: Url,
+    ) -> anyhow::Result<Adapter> {
+        let store = RedbCurvySdkStore::new(state)?;
+        let mut persisted = store.load()?;
+        if store.spender(&persisted)?.is_none() {
+            store.set_spender(
+                &mut persisted,
+                &StoredSpender {
+                    k: "01".repeat(32),
+                    v: "02".repeat(32),
+                },
+            )?;
+            store.save(&persisted)?;
+        }
+        let blokli = Arc::new(blokli_client::BlokliClient::new(blokli_url, Default::default()));
+        let config = RsSdkCurvyAdapterConfig::new(String::new(), 4).with_modes(
+            CurvyShielding::Direct,
+            CurvySubmission::Relayer,
+            Some(chain_url.clone()),
+        );
+        Ok(Adapter::new(
+            blokli,
+            chain_url.to_string(),
+            config,
+            Arc::new(|_, _| Box::pin(async { panic!("unexpected funding call") })),
+            None,
+            Some(Arc::new(RelayClient::new(
+                chain_url,
+                std::time::Duration::from_secs(2),
+            )?)),
+            state,
+        )?)
+    }
+
+    /// The bug itself (hoprnet/hoprnet#8766): under the node's override the SDK's chain — the
+    /// committed-tree reads, and from there the fees and submissions — must go through the pinned
+    /// client. The chain's URL names a host system DNS cannot resolve, so were `client()` still
+    /// building `BlokliChain::new` internally, the tree read below would fail and never arrive.
+    #[tokio::test]
+    async fn the_sdk_reads_blokli_through_the_pinned_client() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let discovery = relayer::http_tests::Server::concurrent(|request| async move {
+            assert_eq!(request.path, "/graphql");
+            assert!(
+                request.body["query"].as_str().unwrap().contains("chainInfo"),
+                "discovery reads only the chain info: {}",
+                request.body["query"]
+            );
+            Some((200, discovery_chain_info()))
+        })
+        .await;
+        let (tree, reads) = finalized_tree_server(Arc::new(parking_lot::Mutex::new(Vec::new())), 0).await;
+        // Deliberately no port in the chain's URL: when the URL spells one out, reqwest lets that
+        // win over a pinned address's port — the same behaviour the node's own Blokli client has
+        // under `blokli-client`'s override — so the pin below, which carries the port, is what
+        // has to say where to dial.
+        let adapter = unsealed_test_adapter(&state, discovery.url.clone(), "http://blokli.invalid".parse()?)?
+            .with_blokli_http_client(Some(blokli_http_client(
+                &"http://blokli.invalid".parse()?,
+                Some(&BlokliDnsOverride {
+                    ip: "127.0.0.1".parse()?,
+                    port: tree.url.port(),
+                }),
+            )?));
+        let (client, endpoints) = adapter.client().await?;
+        assert_eq!(
+            endpoints.chain_id, 100,
+            "discovery read the chain info from the test Blokli"
+        );
+        let snapshot = client
+            .notes
+            .notes_tree_snapshot()
+            .await?
+            .expect("the pinned server serves the tree");
+        assert!(snapshot.leaves.is_empty(), "{:?}", snapshot.leaves);
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the tree never reached the pinned server"
+        );
+        Ok(())
+    }
+
+    /// Nothing pinned, nothing changed: with no client handed over the chain keeps its own, and
+    /// the reads still land on the address the URL names.
+    #[tokio::test]
+    async fn the_sdk_keeps_its_own_chain_client_without_an_override() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let discovery = relayer::http_tests::Server::concurrent(|request| async move {
+            assert_eq!(request.path, "/graphql");
+            assert!(request.body["query"].as_str().unwrap().contains("chainInfo"));
+            Some((200, discovery_chain_info()))
+        })
+        .await;
+        let (tree, reads) = finalized_tree_server(Arc::new(parking_lot::Mutex::new(Vec::new())), 0).await;
+        let adapter = unsealed_test_adapter(&state, discovery.url.clone(), tree.url.clone())?;
+        let (client, _) = adapter.client().await?;
+        let snapshot = client
+            .notes
+            .notes_tree_snapshot()
+            .await?
+            .expect("the chain's own client serves the tree");
+        assert!(snapshot.leaves.is_empty(), "{:?}", snapshot.leaves);
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the tree never reached the server"
+        );
         Ok(())
     }
 

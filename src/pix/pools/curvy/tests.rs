@@ -40,9 +40,10 @@ use hopr_api::{
 };
 
 use super::{
-    CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
-    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
-    CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
+    BlokliDnsOverride, CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig,
+    CurvyDepositState, CurvyEventKind, CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding,
+    CurvyStateError, CurvySubmission, CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit,
+    RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker, ReplayFrom},
     sdk::{RsSdkCurvyAdapterError, ShieldResend},
@@ -3547,6 +3548,119 @@ async fn the_pool_builds_over_an_injected_http_client() -> anyhow::Result<()> {
     let pool = CurvyDepositPool::with_http_client(test_node().await?, cfg, TEST_PASSWORD, reqwest::Client::new())?;
     assert!(matches!(pool.index.as_ref(), super::NoteIndex::CurvyIndexer(_)));
     Ok(())
+}
+
+#[test]
+fn the_blokli_dns_override_parses_the_nodes_grammar_and_round_trips() -> anyhow::Result<()> {
+    // The spellings the file and the environment carry, and their canonical form. `Display` is
+    // what `serde_as` round-trips through, and what the startup line logs. A bare IPv6 carries
+    // no port — an unbracketed `addr:port` would leave the reader guessing where it ends.
+    for (text, ip, port, display) in [
+        ("1.2.3.4", "1.2.3.4", None, "1.2.3.4"),
+        ("1.2.3.4:8080", "1.2.3.4", Some(8080), "1.2.3.4:8080"),
+        ("[::1]:8080", "::1", Some(8080), "[::1]:8080"),
+        ("2001:db8::42", "2001:db8::42", None, "2001:db8::42"),
+        ("  10.0.0.1:3128  ", "10.0.0.1", Some(3128), "10.0.0.1:3128"),
+    ] {
+        let parsed: BlokliDnsOverride = text.parse()?;
+        assert_eq!(parsed, BlokliDnsOverride { ip: ip.parse()?, port }, "{text}");
+        assert_eq!(parsed.to_string(), display, "{text} displays back to the grammar");
+        // The canonical form parses to the same value the file spelled.
+        assert_eq!(parsed.to_string().parse::<BlokliDnsOverride>()?, parsed, "{text}");
+    }
+
+    // Unset is system DNS, and it does not clutter a written-out config.
+    assert_eq!(CurvyDepositPoolConfig::default().blokli_dns_override, None);
+    let unstated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_url":"http://127.0.0.1:8080/"}"#)?;
+    assert_eq!(unstated.blokli_dns_override, None);
+    StrategyError::validate_config(&unstated)?;
+
+    let stated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_dns_override":"10.20.30.40:8545"}"#)?;
+    assert_eq!(
+        stated.blokli_dns_override,
+        Some(BlokliDnsOverride {
+            ip: "10.20.30.40".parse()?,
+            port: Some(8545),
+        })
+    );
+    StrategyError::validate_config(&stated)?;
+    assert_eq!(
+        serde_json::from_str::<CurvyDepositPoolConfig>(&serde_json::to_string(&stated)?)?,
+        stated
+    );
+
+    // Not the grammar, refused rather than quietly pinning nowhere.
+    for spelling in [
+        "blokli.example.com",
+        "1.2.3.4:notaport",
+        "1.2.3.4:70000",
+        "[::1]8080",
+        "",
+    ] {
+        let error = spelling.parse::<BlokliDnsOverride>().unwrap_err();
+        assert!(error.to_string().contains("IP"), "{spelling}: {error}");
+    }
+    Ok(())
+}
+
+/// The environment override (hoprnet/hoprnet#8766): what the embedder feeds the node's own
+/// `--dns-blokli-override` must reach the pool's two Blokli clients too, or the Curvy pool keeps
+/// asking a system DNS the embedder cannot use while it holds the traffic.
+#[tokio::test]
+async fn the_dns_override_reaches_both_of_the_pools_blokli_clients() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Taken after the last await and dropped at the end keeps the guard off an await point; pool
+    // construction itself is synchronous.
+    let node = test_node().await?;
+    let _guard = test_env_lock().lock().expect("the lock is only poisoned by a panic");
+    let cfg = |name: &str| CurvyDepositPoolConfig {
+        // The address the name resolves to is irrelevant here; only what the clients were told.
+        blokli_url: "https://blokli.example/".parse().expect("valid static URL"),
+        relayer_url: Some("http://127.0.0.1:1/".parse().expect("valid static URL")),
+        state_path: Some(dir.path().join(name)),
+        token: Some(2),
+        ..Default::default()
+    };
+
+    // SAFETY: the env lock serialises every test that writes this variable.
+    unsafe { std::env::set_var(super::BLOKLI_DNS_OVERRIDE_ENV, "10.20.30.40:8545") };
+    let pool = CurvyDepositPool::new(node.clone(), cfg("pinned.redb"), TEST_PASSWORD)?;
+    // The shared query client carries the override into its own config...
+    let super::NoteIndex::Blokli(index) = pool.index.as_ref() else {
+        panic!("the default note source is Blokli");
+    };
+    assert_eq!(
+        index.0.config().dns_override,
+        Some(blokli_client::BlokliDnsOverride {
+            ip: "10.20.30.40".parse()?,
+            port: Some(8545),
+        }),
+        "the shared Blokli client lost the override"
+    );
+    // ... and the SDK's chain gets a client built from it; that `client()` then hands it to
+    // `BlokliChain::with_client` is driven end-to-end in the sdk tests' pinned tree read.
+    assert!(
+        pool.adapter.blokli_http.is_some(),
+        "the SDK's Blokli chain would build its own unpinned client"
+    );
+
+    // Without the variable the pool keeps plain system DNS on both clients.
+    // SAFETY: the env lock serialises every test that writes this variable.
+    unsafe { std::env::remove_var(super::BLOKLI_DNS_OVERRIDE_ENV) };
+    let pool = CurvyDepositPool::new(node, cfg("plain.redb"), TEST_PASSWORD)?;
+    let super::NoteIndex::Blokli(index) = pool.index.as_ref() else {
+        panic!("the default note source is Blokli");
+    };
+    assert_eq!(index.0.config().dns_override, None);
+    assert!(pool.adapter.blokli_http.is_none());
+    Ok(())
+}
+
+/// Tests that touch the process environment serialise on this lock: the variables are global,
+/// and `cargo test` runs tests in parallel.
+fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// Against Curvy's staging indexer for Gnosis. Network; run by hand:

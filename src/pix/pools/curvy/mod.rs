@@ -228,6 +228,14 @@ pub const NOTE_SOURCE_ENV: &str = "HOPRD_CURVY_NOTE_SOURCE";
 /// Environment variable that overrides [`CurvyDepositPoolConfig::curvy_indexer_url`].
 pub const INDEXER_URL_ENV: &str = "HOPRD_CURVY_INDEXER_URL";
 
+/// Environment variable that overrides [`CurvyDepositPoolConfig::blokli_dns_override`].
+///
+/// Accepts `<IP>`, `<IP>:<PORT>` or `[<IPv6>]:<PORT>`, the same grammar the node's own
+/// `--dns-blokli-override` takes, so an embedder can feed both from one value. Present for the
+/// same reason as the other overrides here: the localcluster harness builds its PIX stanza from
+/// the plain pool's config type, so a Curvy-only YAML key is unreachable from there.
+pub const BLOKLI_DNS_OVERRIDE_ENV: &str = "HOPRD_CURVY_BLOKLI_DNS_OVERRIDE";
+
 /// Where the pool reads Curvy notes from.
 ///
 /// Only the *notes* — pending, committed, nullifiers, and the committed-notes tree the SDK
@@ -325,6 +333,66 @@ impl FromStr for CurvySubmission {
     }
 }
 
+/// Where to send Blokli's hostname instead of where system DNS points.
+///
+/// An embedder that cannot use system DNS — GnosisVPN holds the traffic its resolver would need —
+/// pins the deployment's address and hands it to every client that talks to Blokli: the node's own
+/// connector does this through `hopr_chain_connector::create_blokli_client`, and the pool's two
+/// clients (its shared [`BlokliClient`] and the SDK's `BlokliChain`) do it through
+/// [`CurvyDepositPoolConfig::blokli_dns_override`]. Only the address the connection opens to is
+/// replaced; the `Host` header and the TLS SNI stay the original hostname, so a pinned edge or a
+/// certificate issued for the name keeps working.
+///
+/// The two spellings an operator sees — `<IP>`, or `<IP>:<PORT>` with IPv6 as `[<IPv6>]:<PORT>` —
+/// are the node's own `--dns-blokli-override` grammar, so one value feeds both. Without a port the
+/// URL's own port, or the scheme's default, is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlokliDnsOverride {
+    /// The address to open the connection to.
+    pub ip: std::net::IpAddr,
+    /// The port to open it to, or `None` to keep the one the Blokli URL names.
+    pub port: Option<u16>,
+}
+
+impl std::fmt::Display for BlokliDnsOverride {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.port {
+            // `IpAddr::Display` renders IPv6 bare, which a `host:port` reader would cut at the
+            // first colon — bracket it, the way a URL does.
+            Some(port) => {
+                if self.ip.is_ipv6() {
+                    write!(formatter, "[{}]:{port}", self.ip)
+                } else {
+                    write!(formatter, "{}:{port}", self.ip)
+                }
+            }
+            None => write!(formatter, "{}", self.ip),
+        }
+    }
+}
+
+impl FromStr for BlokliDnsOverride {
+    type Err = StrategyError;
+
+    /// Parses `<IP>`, `<IP>:<PORT>` or `[<IPv6>]:<PORT>` — the grammar of the node's own
+    /// `--dns-blokli-override`, so the embedder's one value reaches both.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+            return Ok(Self { ip, port: None });
+        }
+        if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+            return Ok(Self {
+                ip: addr.ip(),
+                port: Some(addr.port()),
+            });
+        }
+        Err(StrategyError::InvalidConfiguration(format!(
+            "Curvy Blokli DNS override must be `<IP>`, `<IP>:<PORT>` or `[<IPv6>]:<PORT>`, got `{value}`"
+        )))
+    }
+}
+
 fn default_blokli_url() -> Url {
     "http://localhost:8080/".parse().expect("valid static URL")
 }
@@ -408,6 +476,19 @@ pub struct CurvyDepositPoolConfig {
     #[serde(default = "default_blokli_url")]
     #[default(default_blokli_url())]
     pub blokli_url: Url,
+
+    /// Where to send `blokli_url`'s hostname instead of where system DNS points. Default:
+    /// `None`, plain system DNS. Overridden by [`BLOKLI_DNS_OVERRIDE_ENV`].
+    ///
+    /// For an embedder that pins Blokli to an address because its system DNS is unusable while
+    /// it holds the traffic (GnosisVPN): the node applies its own override to the connector's
+    /// Blokli client, and this is the pool's half of the same value — without it the pool's two
+    /// Blokli clients (its note index and the SDK's chain) still resolve through system DNS and
+    /// go nowhere once the tunnel is up. See [`BlokliDnsOverride`] for the grammar; the
+    /// `Host` header and the TLS SNI stay the original hostname either way.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(default)]
+    pub blokli_dns_override: Option<BlokliDnsOverride>,
 
     /// How long [`DepositPool::notify_deposit`]'s future waits for the allocation to be committed
     /// and final before resolving to an error. Default: 60 seconds.
@@ -1127,7 +1208,10 @@ where
 
     /// [`Self::new`], but the requests to the Curvy relayer and the Curvy indexer go through
     /// `http`, for example to send them from a given local address or through a proxy, outside a
-    /// tunnel. Blokli traffic does not use it. Timeouts are the same as under [`Self::new`].
+    /// tunnel. Blokli traffic does not use it: both of the pool's Blokli clients are built from
+    /// the URL alone, and the override that pins Blokli's hostname to an address is
+    /// [`CurvyDepositPoolConfig::blokli_dns_override`], not a client handed here. Timeouts are
+    /// the same as under [`Self::new`].
     ///
     /// ```no_run
     /// # use std::sync::Arc;
@@ -1206,6 +1290,13 @@ where
                 StrategyError::InvalidConfiguration(format!("{TOKEN_ENV} must be a vault token id: {error}"))
             })?);
         }
+        if let Ok(raw) = std::env::var(BLOKLI_DNS_OVERRIDE_ENV) {
+            cfg.blokli_dns_override = Some(raw.parse().map_err(|error| {
+                StrategyError::InvalidConfiguration(format!(
+                    "{BLOKLI_DNS_OVERRIDE_ENV} must be an IP or IP:PORT: {error}"
+                ))
+            })?);
+        }
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
@@ -1228,7 +1319,25 @@ where
             .unwrap_or_else(|| PathBuf::from(format!("curvy-pix-{}.redb", node.identity().node_address)));
         let state = RedbCurvyDepositState::open(&state_path, state_password)
             .map_err(|error| StrategyError::other(anyhow::anyhow!("{}: {error}", state_path.display())))?;
-        let blokli = Arc::new(BlokliClient::new(cfg.blokli_url.clone(), BlokliClientConfig::default()));
+        // Both of the pool's Blokli clients take the override: the shared query client below,
+        // and the SDK's chain, which the SDK reads its committed tree from and submits its
+        // transactions through. A node whose embedder pins Blokli's hostname (see
+        // `CurvyDepositPoolConfig::blokli_dns_override`) has no usable system DNS while it holds
+        // the traffic, so a client that still resolved the name would never pay a deposit.
+        let blokli = Arc::new(BlokliClient::new(
+            cfg.blokli_url.clone(),
+            BlokliClientConfig {
+                dns_override: cfg.blokli_dns_override.map(|dns| blokli_client::BlokliDnsOverride {
+                    ip: dns.ip,
+                    port: dns.port,
+                }),
+                ..Default::default()
+            },
+        ));
+        let blokli_http = match &cfg.blokli_dns_override {
+            Some(dns) => Some(sdk::blokli_http_client(&cfg.blokli_url, Some(dns)).map_err(StrategyError::other)?),
+            None => None,
+        };
         // One handle, shared by the bridge that stamps the id on notes and the tracker whose
         // detector filters on it, so an unstated id is looked up once and both use the same answer.
         let token = match cfg.token {
@@ -1265,10 +1374,12 @@ where
             &state,
         )
         .map_err(StrategyError::other)?
-        .with_indexer_http_client(http.clone());
+        .with_indexer_http_client(http.clone())
+        .with_blokli_http_client(blokli_http);
         tracing::info!(
             state = %state_path.display(),
             blokli = %cfg.blokli_url,
+            blokli_dns_override = cfg.blokli_dns_override.map(|dns| dns.to_string()),
             %token,
             shielding = ?cfg.shielding,
             submission = ?cfg.submission,
