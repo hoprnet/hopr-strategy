@@ -72,7 +72,8 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
+    BlokliDnsOverride, CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
+    Url,
     detect::{bjj_point, scan_public_key_dec},
     indexer,
     relayer::{self, RelayClient},
@@ -1420,15 +1421,31 @@ impl CurvyChainEndpoints {
     }
 }
 
-/// Constructs a Curvy client whose reads and submissions go through Blokli — except, when
+/// The HTTP client for the SDK's [`curvy_chain_blokli::BlokliChain`] under a DNS override:
+/// `BlokliChain::new`'s 30 s timeout, with the URL's host pinned to the override's address.
+pub(super) fn blokli_http_client(url: &Url, dns: &BlokliDnsOverride) -> anyhow::Result<reqwest::Client> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("the Blokli DNS override needs a host in the Blokli URL"))?;
+    let port = dns
+        .port
+        .or_else(|| url.port_or_known_default())
+        .ok_or_else(|| anyhow::anyhow!("the Blokli DNS override needs a port in the override or the Blokli URL"))?;
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .resolve(host, std::net::SocketAddr::new(dns.ip, port))
+        .build()
+        .map_err(|error| anyhow::anyhow!("could not build the Curvy pool's Blokli HTTP client: {error}"))
+}
+
+/// Constructs a Curvy client whose reads and submissions go through `blokli` — except, when
 /// `notes` is given, the note index the SDK rebuilds its tree from (see
 /// [`CurvyNoteSource::CurvyIndexer`]).
 pub fn blokli_curvy_client(
-    blokli_url: impl Into<String>,
+    blokli: Arc<curvy_chain_blokli::BlokliChain>,
     endpoints: &CurvyChainEndpoints,
     notes: Option<Arc<dyn curvy_chain_api::NoteIndexSource>>,
 ) -> Arc<CurvyClient> {
-    let blokli = Arc::new(curvy_chain_blokli::BlokliChain::new(blokli_url));
     let notes: Arc<dyn curvy_chain_api::NoteIndexSource> = notes.unwrap_or_else(|| blokli.clone());
     Arc::new(CurvyClient::new(
         blokli.clone(),
@@ -1473,6 +1490,8 @@ pub struct RsSdkCurvyAdapter<C> {
     next_relay_finality_check: parking_lot::Mutex<Option<tokio::time::Instant>>,
     /// A caller-built client for the Curvy indexer; `None` builds the default one.
     indexer_http: Option<reqwest::Client>,
+    /// A client for the SDK's Blokli chain; `None` lets `BlokliChain::new` build its own.
+    pub(super) blokli_http: Option<reqwest::Client>,
 }
 
 impl<C> RsSdkCurvyAdapter<C>
@@ -1522,12 +1541,19 @@ where
             chain: Arc::new(tokio::sync::Mutex::new(())),
             next_relay_finality_check: parking_lot::Mutex::new(None),
             indexer_http: None,
+            blokli_http: None,
         })
     }
 
     /// Routes the Curvy indexer's requests through `http` instead of a default client.
     pub(super) fn with_indexer_http_client(mut self, http: Option<reqwest::Client>) -> Self {
         self.indexer_http = http;
+        self
+    }
+
+    /// Routes the SDK's Blokli chain through `http`, for the Blokli DNS override.
+    pub(super) fn with_blokli_http_client(mut self, http: reqwest::Client) -> Self {
+        self.blokli_http = Some(http);
         self
     }
 
@@ -1571,7 +1597,11 @@ where
                         ))))
                     }
                 };
-                let client = blokli_curvy_client(self.blokli_url.clone(), &endpoints, notes);
+                let chain = Arc::new(match &self.blokli_http {
+                    Some(http) => curvy_chain_blokli::BlokliChain::with_client(self.blokli_url.clone(), http.clone()),
+                    None => curvy_chain_blokli::BlokliChain::new(self.blokli_url.clone()),
+                });
+                let client = blokli_curvy_client(chain, &endpoints, notes);
                 Ok((client, endpoints))
             })
             .await
@@ -3964,7 +3994,11 @@ mod tests {
             adapter
                 .client
                 .set((
-                    blokli_curvy_client(url.as_str().trim_end_matches('/'), &endpoints, None),
+                    blokli_curvy_client(
+                        Arc::new(curvy_chain_blokli::BlokliChain::new(url.as_str().trim_end_matches('/'))),
+                        &endpoints,
+                        None
+                    ),
                     endpoints
                 ))
                 .is_ok()
@@ -4417,6 +4451,54 @@ mod tests {
             "{error}"
         );
         assert_eq!(reads, 2, "the failed selection read and the build's own: {error}");
+        Ok(())
+    }
+
+    /// hoprnet/hoprnet#8766: under a DNS override the SDK's chain reads Blokli through the pinned
+    /// client. Its URL names a host nothing resolves, so only the pin can reach the tree server.
+    #[tokio::test]
+    async fn the_sdk_reads_blokli_through_the_pinned_client() -> anyhow::Result<()> {
+        let state = RedbCurvyDepositState::in_memory()?;
+        let discovery = relayer::http_tests::Server::concurrent(|_| async {
+            Some((
+                200,
+                serde_json::json!({"data":{"chainInfo":{
+                    "__typename":"ChainInfo","channelClosureGracePeriod":"100","channelDst":null,
+                    "blockNumber":1,"chainId":100,"gasPrice":"1","ledgerDst":null,"maxFeePerGas":null,
+                    "maxPriorityFeePerGas":null,"minTicketWinningProbability":0.5,
+                    "keyBindingFee":"0.01 wxHOPR","safeRegistryDst":null,"ticketPrice":"0.01 wxHOPR",
+                    "network":"gnosis","expectedBlockTime":"5","finality":"2",
+                    "contractAddresses":serde_json::json!({
+                        "curvy_aggregator":format!("0x{}", "01".repeat(20)),
+                        "curvy_vault":format!("0x{}", "02".repeat(20)),
+                        "token":format!("0x{}", "03".repeat(20)),
+                    }).to_string()
+                }}}),
+            ))
+        })
+        .await;
+        let (tree, reads) = finalized_tree_server(Arc::new(parking_lot::Mutex::new(Vec::new())), 0).await;
+        let url: Url = "http://blokli.invalid".parse()?;
+        let dns = BlokliDnsOverride {
+            ip: "127.0.0.1".parse()?,
+            port: tree.url.port(),
+        };
+        // Same adapter as the other tests, but with discovery left to run for real.
+        let mut adapter =
+            test_adapter(&state, discovery.url.clone())?.with_blokli_http_client(blokli_http_client(&url, &dns)?);
+        adapter.client = tokio::sync::OnceCell::new();
+        adapter.blokli_url = url.as_str().trim_end_matches('/').to_owned();
+        let (client, _) = adapter.client().await?;
+        let snapshot = client
+            .notes
+            .notes_tree_snapshot()
+            .await?
+            .expect("the pinned server serves the tree");
+        assert!(snapshot.leaves.is_empty(), "{:?}", snapshot.leaves);
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the tree never reached the pinned server"
+        );
         Ok(())
     }
 
