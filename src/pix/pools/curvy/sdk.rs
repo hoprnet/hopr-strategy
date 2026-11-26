@@ -59,7 +59,7 @@ use curvy_sdk::{
     PreparedDirectShield, Route, ScanRecipient, ShieldKind, TxLedger, ViewerIdentity,
 };
 use curvy_types::OnchainNote;
-use futures::future::BoxFuture;
+use futures::{StreamExt, future::BoxFuture};
 use hopr_api::{
     node::PixAddressId,
     types::{
@@ -72,7 +72,8 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome, Url,
+    CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
+    NOTE_CHECK_CONCURRENCY, Url,
     detect::{bjj_point, scan_public_key_dec},
     indexer,
     relayer::{self, RelayClient},
@@ -2552,6 +2553,35 @@ where
         Ok(true)
     }
 
+    /// Whether every note's status satisfies `accept`, asking Blokli about up to
+    /// [`NOTE_CHECK_CONCURRENCY`] notes at once. Used by the reconciliation check only.
+    ///
+    /// Each lookup is a Blokli round trip of a few hundred milliseconds, so asking one note at a
+    /// time makes a journal with a dozen notes cost seconds, past the Exit's deposit-data
+    /// deadline. The answer does not depend on the order, and the check stops at the first
+    /// rejected status or the first error, dropping the lookups still in flight. Notes that
+    /// cannot be converted fail before any request is made. The relay retry loops do not use it:
+    /// their usual answer is "not yet", which a sequential check gives after one lookup.
+    async fn all_notes_have_status<'a>(
+        client: &CurvyClient,
+        notes: impl IntoIterator<Item = &'a StoredNote>,
+        accept: impl Fn(u8) -> bool,
+    ) -> Result<bool, RsSdkCurvyAdapterError> {
+        let ids = notes
+            .into_iter()
+            .map(|stored| Ok(OwnedNote::try_from(stored)?.note_id()))
+            .collect::<Result<Vec<_>, RsSdkCurvyAdapterError>>()?;
+        let mut statuses = futures::stream::iter(ids)
+            .map(|id| async move { client.note_status(&id).await })
+            .buffer_unordered(NOTE_CHECK_CONCURRENCY);
+        while let Some(status) = statuses.next().await {
+            if !accept(status?) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Both supported note sources pin snapshots to finalized checkpoints. Keep every
     /// competing change note until the winning outputs are in that finalized tree.
     async fn check_relay_outputs_finalized(
@@ -3709,13 +3739,7 @@ where
             return Ok(true);
         }
         let (client, _) = self.client().await?;
-        for stored in funding.iter().chain(pending.iter()) {
-            let note = OwnedNote::try_from(stored)?;
-            if client.note_status(&note.note_id()).await? == 0 {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        Self::all_notes_have_status(client, funding.iter().chain(pending.iter()), |status| status != 0).await
     }
 
     fn reset_chain_state(&self) -> Result<(), Self::Error> {

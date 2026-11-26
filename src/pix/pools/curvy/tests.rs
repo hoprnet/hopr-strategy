@@ -1762,6 +1762,12 @@ struct ScriptedIndex {
     head: parking_lot::Mutex<Option<(u64, u64)>>,
     spent_nullifiers: parking_lot::Mutex<HashSet<String>>,
     known_notes: parking_lot::Mutex<Option<HashSet<String>>>,
+    /// How many times `note_known` has been called.
+    note_known_calls: std::sync::atomic::AtomicUsize,
+    /// How long every `note_known` call takes, standing in for a Blokli round trip.
+    note_known_delay: parking_lot::Mutex<Option<Duration>>,
+    /// How many upcoming `indexed_head` calls fail, as an endpoint that is not up yet.
+    head_failures: parking_lot::Mutex<usize>,
 }
 
 fn ordinal(position: &CurvyEventPosition) -> (u64, u64, u64, u64) {
@@ -1878,6 +1884,15 @@ impl CurvyIndexSource for ScriptedIndex {
     }
 
     async fn indexed_head(&self) -> Result<(u64, u64), String> {
+        let failing = {
+            let mut left = self.head_failures.lock();
+            let failing = *left > 0;
+            *left = left.saturating_sub(1);
+            failing
+        };
+        if failing {
+            return Err("endpoint not up yet".to_owned());
+        }
         Ok(self.head.lock().unwrap_or((u64::MAX, 0)))
     }
 
@@ -1886,6 +1901,11 @@ impl CurvyIndexSource for ScriptedIndex {
     }
 
     async fn note_known(&self, note_id: String) -> Result<bool, String> {
+        self.note_known_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = *self.note_known_delay.lock();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(self
             .known_notes
             .lock()
@@ -2718,6 +2738,104 @@ async fn missing_notes_preserve_state_and_reconciliation_can_retry() -> anyhow::
     assert!(pool.state().scan_secret(&first_id)?.is_some());
     assert!(pool.state().scan_secret(&fixture.id)?.is_some());
     assert_eq!(*harness.adapter.resets.lock(), 0);
+    Ok(())
+}
+
+/// Records `count` owned notes under distinct ids. The fixture's one detected note is stored
+/// under made-up ids, because the fixtures derive the same note id whatever the block.
+fn record_owned_notes(state: &impl CurvyDepositState, count: u64) -> anyhow::Result<Vec<String>> {
+    let fixture = owned_candidate(1)?;
+    let detected = fixture
+        .detector
+        .detect_owned_note(
+            &fixture.note,
+            &[(fixture.id, fixture.address, fixture.scan_secret.clone())],
+        )?
+        .expect("detected");
+    let ids = (1..=count).map(|i| format!("0x{i:064x}")).collect::<Vec<_>>();
+    for (block, id) in (1..).zip(&ids) {
+        state.record_owned_candidate(id, detected.clone(), &CurvyEventCursor::from(&position(block)))?;
+    }
+    Ok(ids)
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_reconciliation_takes_the_check_off_the_first_request() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let pool = &harness.pool;
+    record_owned_notes(pool.state(), 5)?;
+
+    pool.start_reconciliation();
+    while !pool.reconciled.initialized() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(harness.index.note_known_calls.load(Ordering::SeqCst), 5);
+
+    harness.index.note_known_calls.store(0, Ordering::SeqCst);
+    pool.generate_deposit_data(&pix_id(9)).await?;
+    assert_eq!(harness.index.note_known_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_reconciliation_retries_until_it_passes() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    *harness.index.head_failures.lock() = 3;
+
+    harness.pool.start_reconciliation();
+    // Attempts run at 0 s, 1 s, 3 s and 7 s: the waits double from one second.
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    assert!(!harness.pool.reconciled.initialized());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(harness.pool.reconciled.initialized());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_notes_are_checked_in_parallel() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    record_owned_notes(harness.pool.state(), 16)?;
+    *harness.index.note_known_delay.lock() = Some(Duration::from_secs(1));
+
+    let started = tokio::time::Instant::now();
+    harness.pool.ensure_reconciled().await?;
+
+    // Sixteen notes, eight at a time, one second each: two rounds, not sixteen.
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(harness.index.note_known_calls.load(Ordering::SeqCst), 16);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_note_still_refuses_under_the_parallel_check() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    let ids = record_owned_notes(harness.pool.state(), 16)?;
+    *harness.index.known_notes.lock() = Some(ids.iter().take(15).cloned().collect());
+
+    let error = harness.pool.ensure_reconciled().await.expect_err("one note is unknown");
+    assert!(error.is_reconciliation_pending(), "{error}");
+    assert!(!harness.pool.reconciled.initialized());
+
+    *harness.index.known_notes.lock() = None;
+    harness.pool.ensure_reconciled().await?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_pool_stops_the_startup_reconciliation() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    *harness.index.head_failures.lock() = usize::MAX;
+    harness.pool.start_reconciliation();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(Arc::strong_count(&harness.index) > 1, "the task holds the index");
+
+    drop(harness.pool);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(Arc::strong_count(&harness.index), 1);
     Ok(())
 }
 
