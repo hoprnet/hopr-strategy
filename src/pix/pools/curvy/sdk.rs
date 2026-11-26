@@ -1443,6 +1443,7 @@ pub(super) fn blokli_http_client(url: &Url, dns: Option<&BlokliDnsOverride>) -> 
 /// developer's `HTTP(S)_PROXY` would otherwise send a "pinned" request to the proxy instead of
 /// the test's listener — reqwest dials the proxy before it resolves. Production has no equivalent
 /// escape, and does not want one; see the proxy note on [`blokli_http_client`].
+#[cfg(test)]
 pub(super) fn blokli_http_client_without_proxy(
     url: &Url,
     dns: Option<&BlokliDnsOverride>,
