@@ -1105,8 +1105,8 @@ where
     /// state file cannot be opened, or an environment override does not parse.
     ///
     /// Inside a Tokio runtime it also starts reconciling the durable state with the endpoint in
-    /// the background, retrying until it passes (see [`Self::start_reconciliation`]), so that the
-    /// first deposit-data request does not spend the Exit's 3 s deadline on it.
+    /// the background, retrying until it passes, so that the first deposit-data request does not
+    /// spend the Exit's 3 s deadline on it.
     ///
     /// No chain key is taken: a direct shield is submitted by the node's chain API, which signs
     /// with the node's own key, and the portal path signs with the operator key from the
