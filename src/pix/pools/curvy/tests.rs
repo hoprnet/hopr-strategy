@@ -40,10 +40,9 @@ use hopr_api::{
 };
 
 use super::{
-    BlokliDnsOverride, CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig,
-    CurvyDepositState, CurvyEventKind, CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding,
-    CurvyStateError, CurvySubmission, CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit,
-    RedbCurvyDepositState, RsCoreCurvyNoteDetector,
+    CommittedCurvyNote, CurvyDepositData, CurvyDepositPool, CurvyDepositPoolConfig, CurvyDepositState, CurvyEventKind,
+    CurvyIndexSource, CurvyNoteSource, CurvySdkAdapter, CurvyShielding, CurvyStateError, CurvySubmission,
+    CurvyWithdrawalOutcome, DetectedCurvyNote, OwnedCurvyDeposit, RedbCurvyDepositState, RsCoreCurvyNoteDetector,
     detect::{bjj_point, public_key_from_dec, scan_public_key_dec, shared_secret_from_scan_match},
     lifecycle::{CurvyLifecycleError, CurvyLifecycleTracker, ReplayFrom},
     sdk::{RsSdkCurvyAdapterError, ShieldResend},
@@ -3709,50 +3708,36 @@ async fn the_pool_builds_over_an_injected_http_client() -> anyhow::Result<()> {
 }
 
 #[test]
-fn the_blokli_dns_override_parses_and_round_trips() -> anyhow::Result<()> {
-    for (text, ip, port) in [
-        ("1.2.3.4", "1.2.3.4", None),
-        ("1.2.3.4:8080", "1.2.3.4", Some(8080)),
-        ("[::1]:8080", "::1", Some(8080)),
-    ] {
-        let parsed: BlokliDnsOverride = text.parse()?;
-        assert_eq!(parsed, BlokliDnsOverride { ip: ip.parse()?, port }, "{text}");
-        assert_eq!(parsed.to_string(), text);
-    }
-    for spelling in ["blokli.example.com", "1.2.3.4:70000"] {
-        assert!(spelling.parse::<BlokliDnsOverride>().is_err(), "{spelling}");
-    }
-    let stated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_dns_override":"10.20.30.40:8545"}"#)?;
-    assert_eq!(
-        stated.blokli_dns_override,
-        Some(BlokliDnsOverride {
-            ip: "10.20.30.40".parse()?,
-            port: Some(8545),
-        })
-    );
+fn the_blokli_dns_override_reads_a_socket_address() -> anyhow::Result<()> {
+    let stated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_dns_override":"[::1]:8545"}"#)?;
+    assert_eq!(stated.blokli_dns_override, Some("[::1]:8545".parse()?));
     assert_eq!(
         serde_json::from_str::<CurvyDepositPoolConfig>("{}")?.blokli_dns_override,
         None
     );
+    assert!(
+        serde_json::from_str::<CurvyDepositPoolConfig>(r#"{"blokli_dns_override":"blokli.example:443"}"#).is_err(),
+        "a hostname would need the DNS the override is there to avoid"
+    );
     Ok(())
 }
 
-/// The override reaches both of the pool's Blokli clients, and only when set.
+/// The override reaches both of the pool's Blokli clients, and only when set; port `0` leaves
+/// the port to the URL.
 #[tokio::test]
 async fn the_blokli_dns_override_reaches_both_blokli_clients() -> anyhow::Result<()> {
-    for dns in [
-        None,
-        Some(BlokliDnsOverride {
-            ip: "10.20.30.40".parse()?,
-            port: Some(8545),
-        }),
+    for (addr, port) in [
+        (None, None),
+        (Some("10.20.30.40:8545"), Some(8545)),
+        (Some("10.20.30.40:0"), None),
     ] {
+        let addr: Option<std::net::SocketAddr> = addr.map(str::parse).transpose()?;
         let state = tempfile::tempdir()?;
         let pool = CurvyDepositPool::new(
             test_node().await?,
             CurvyDepositPoolConfig {
                 blokli_url: "https://blokli.example/".parse()?,
-                blokli_dns_override: dns,
+                blokli_dns_override: addr,
                 relayer_url: Some("http://127.0.0.1:1/".parse()?),
                 state_path: Some(state.path().join("curvy.redb")),
                 token: Some(2),
@@ -3765,12 +3750,9 @@ async fn the_blokli_dns_override_reaches_both_blokli_clients() -> anyhow::Result
         };
         assert_eq!(
             index.0.config().dns_override,
-            dns.map(|dns| blokli_client::BlokliDnsOverride {
-                ip: dns.ip,
-                port: dns.port
-            })
+            addr.map(|addr| blokli_client::BlokliDnsOverride { ip: addr.ip(), port })
         );
-        assert_eq!(pool.adapter.blokli_http.is_some(), dns.is_some());
+        assert_eq!(pool.adapter.blokli_http.is_some(), addr.is_some());
     }
     Ok(())
 }

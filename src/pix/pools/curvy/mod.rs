@@ -325,48 +325,6 @@ impl FromStr for CurvySubmission {
     }
 }
 
-/// Where Blokli's hostname is sent instead of where system DNS points. The `Host` header and
-/// TLS SNI keep the hostname; the grammar is the node's `--dns-blokli-override`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlokliDnsOverride {
-    /// The address to open the connection to.
-    pub ip: std::net::IpAddr,
-    /// The port to open it to, or `None` for the one the Blokli URL names. A port spelled out in
-    /// the Blokli URL wins over this one, as with the node's own override.
-    pub port: Option<u16>,
-}
-
-impl std::fmt::Display for BlokliDnsOverride {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.port, self.ip) {
-            (Some(port), std::net::IpAddr::V6(ip)) => write!(formatter, "[{ip}]:{port}"),
-            (Some(port), ip) => write!(formatter, "{ip}:{port}"),
-            (None, ip) => write!(formatter, "{ip}"),
-        }
-    }
-}
-
-impl FromStr for BlokliDnsOverride {
-    type Err = StrategyError;
-
-    /// Parses `<IP>`, `<IP>:<PORT>` or `[<IPv6>]:<PORT>`.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim();
-        if let Ok(ip) = value.parse() {
-            return Ok(Self { ip, port: None });
-        }
-        if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
-            return Ok(Self {
-                ip: addr.ip(),
-                port: Some(addr.port()),
-            });
-        }
-        Err(StrategyError::InvalidConfiguration(format!(
-            "Curvy Blokli DNS override must be `<IP>`, `<IP>:<PORT>` or `[<IPv6>]:<PORT>`, got `{value}`"
-        )))
-    }
-}
-
 fn default_blokli_url() -> Url {
     "http://localhost:8080/".parse().expect("valid static URL")
 }
@@ -451,13 +409,13 @@ pub struct CurvyDepositPoolConfig {
     #[default(default_blokli_url())]
     pub blokli_url: Url,
 
-    /// Where to send `blokli_url`'s hostname instead of where system DNS points. Default: `None`.
-    ///
-    /// Applies to both of the pool's Blokli clients, for an embedder whose system DNS is unusable
-    /// while it holds the traffic. See [`BlokliDnsOverride`].
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    /// The address both of the pool's Blokli clients connect to for `blokli_url`'s host instead of
+    /// asking system DNS, e.g. `10.0.0.1:443`, for an embedder whose system DNS is unusable while
+    /// it holds the traffic. `Host` and TLS SNI keep the hostname. Port `0` means the URL's port,
+    /// and a port spelled out in `blokli_url` always wins (reqwest's rule, as for the node's own
+    /// override). Default: `None`.
     #[serde(default)]
-    pub blokli_dns_override: Option<BlokliDnsOverride>,
+    pub blokli_dns_override: Option<std::net::SocketAddr>,
 
     /// How long [`DepositPool::notify_deposit`]'s future waits for the allocation to be committed
     /// and final before resolving to an error. Default: 60 seconds.
@@ -1306,9 +1264,9 @@ where
         let blokli = Arc::new(BlokliClient::new(
             cfg.blokli_url.clone(),
             BlokliClientConfig {
-                dns_override: cfg.blokli_dns_override.map(|dns| blokli_client::BlokliDnsOverride {
-                    ip: dns.ip,
-                    port: dns.port,
+                dns_override: cfg.blokli_dns_override.map(|addr| blokli_client::BlokliDnsOverride {
+                    ip: addr.ip(),
+                    port: Some(addr.port()).filter(|&port| port != 0),
                 }),
                 ..Default::default()
             },
@@ -1351,14 +1309,14 @@ where
         .map_err(StrategyError::other)?
         .with_indexer_http_client(http.clone());
         // The SDK's chain needs the override on its own HTTP client.
-        if let Some(dns) = &cfg.blokli_dns_override {
-            let blokli_http = sdk::blokli_http_client(&cfg.blokli_url, dns).map_err(StrategyError::other)?;
+        if let Some(addr) = cfg.blokli_dns_override {
+            let blokli_http = sdk::blokli_http_client(&cfg.blokli_url, addr).map_err(StrategyError::other)?;
             adapter = adapter.with_blokli_http_client(blokli_http);
         }
         tracing::info!(
             state = %state_path.display(),
             blokli = %cfg.blokli_url,
-            blokli_dns_override = cfg.blokli_dns_override.map(|dns| dns.to_string()),
+            blokli_dns_override = ?cfg.blokli_dns_override,
             %token,
             shielding = ?cfg.shielding,
             submission = ?cfg.submission,

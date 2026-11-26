@@ -72,7 +72,7 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BlokliDnsOverride, CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
+    CommittedCurvyNote, CurvyNoteSource, CurvyShielding, CurvySubmission, CurvyWithdrawalOutcome,
     NOTE_CHECK_CONCURRENCY, Url,
     detect::{bjj_point, scan_public_key_dec},
     indexer,
@@ -1422,18 +1422,14 @@ impl CurvyChainEndpoints {
 }
 
 /// The HTTP client for the SDK's [`curvy_chain_blokli::BlokliChain`] under a DNS override:
-/// `BlokliChain::new`'s 30 s timeout, with the URL's host pinned to the override's address.
-pub(super) fn blokli_http_client(url: &Url, dns: &BlokliDnsOverride) -> anyhow::Result<reqwest::Client> {
+/// `BlokliChain::new`'s 30 s timeout, with the URL's host pinned to `addr`.
+pub(super) fn blokli_http_client(url: &Url, addr: std::net::SocketAddr) -> anyhow::Result<reqwest::Client> {
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("the Blokli DNS override needs a host in the Blokli URL"))?;
-    let port = dns
-        .port
-        .or_else(|| url.port_or_known_default())
-        .ok_or_else(|| anyhow::anyhow!("the Blokli DNS override needs a port in the override or the Blokli URL"))?;
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .resolve(host, std::net::SocketAddr::new(dns.ip, port))
+        .resolve(host, addr)
         .build()
         .map_err(|error| anyhow::anyhow!("could not build the Curvy pool's Blokli HTTP client: {error}"))
 }
@@ -4502,13 +4498,10 @@ mod tests {
         .await;
         let (tree, reads) = finalized_tree_server(Arc::new(parking_lot::Mutex::new(Vec::new())), 0).await;
         let url: Url = "http://blokli.invalid".parse()?;
-        let dns = BlokliDnsOverride {
-            ip: "127.0.0.1".parse()?,
-            port: tree.url.port(),
-        };
+        let addr = std::net::SocketAddr::new("127.0.0.1".parse()?, tree.url.port().expect("a test server port"));
         // Same adapter as the other tests, but with discovery left to run for real.
         let mut adapter =
-            test_adapter(&state, discovery.url.clone())?.with_blokli_http_client(blokli_http_client(&url, &dns)?);
+            test_adapter(&state, discovery.url.clone())?.with_blokli_http_client(blokli_http_client(&url, addr)?);
         adapter.client = tokio::sync::OnceCell::new();
         adapter.blokli_url = url.as_str().trim_end_matches('/').to_owned();
         let (client, _) = adapter.client().await?;
