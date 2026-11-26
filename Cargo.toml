@@ -108,6 +108,7 @@ serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
   "macros",
   "rt",
+  "rt-multi-thread",
   "sync",
   "time",
 ] }
