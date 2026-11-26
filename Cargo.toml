@@ -11,7 +11,7 @@ name         = "hopr-strategy"
 readme       = "README.md"
 repository   = "https://github.com/hoprnet/hopr-strategy"
 rust-version = "1.98"
-version      = "9.2.4"
+version      = "10.0.0"
 
 [lib]
 crate-type = ["rlib"]

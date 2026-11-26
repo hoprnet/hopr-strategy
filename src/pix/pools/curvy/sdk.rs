@@ -1429,8 +1429,36 @@ impl CurvyChainEndpoints {
 /// the override's port, falling back to the URL's port or the scheme's default — refused when
 /// neither can be derived, because a pinned address nobody can name is worse than a startup
 /// error. A client without an override is exactly what `BlokliChain::new` builds internally.
+///
+/// Proxies: reqwest dials the proxy the environment names (`HTTP(S)_PROXY`, `ALL_PROXY`) before
+/// it resolves anything, and `.resolve` keys on the *proxy's* hostname — with a proxy in the
+/// environment the pin is bypassed. That is deliberately kept: `blokli-client`'s own
+/// `build_reqwest_client` has the same behaviour, so the shared client, this one and the node's
+/// connector's client all pin the same way or none of them do.
 pub(super) fn blokli_http_client(url: &Url, dns: Option<&BlokliDnsOverride>) -> anyhow::Result<reqwest::Client> {
+    blokli_http_client_with(url, dns, false)
+}
+
+/// [`blokli_http_client`] with the environment's proxy variables ignored, for the tests: a
+/// developer's `HTTP(S)_PROXY` would otherwise send a "pinned" request to the proxy instead of
+/// the test's listener — reqwest dials the proxy before it resolves. Production has no equivalent
+/// escape, and does not want one; see the proxy note on [`blokli_http_client`].
+pub(super) fn blokli_http_client_without_proxy(
+    url: &Url,
+    dns: Option<&BlokliDnsOverride>,
+) -> anyhow::Result<reqwest::Client> {
+    blokli_http_client_with(url, dns, true)
+}
+
+fn blokli_http_client_with(
+    url: &Url,
+    dns: Option<&BlokliDnsOverride>,
+    no_proxy: bool,
+) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
     if let Some(dns) = dns {
         let host = url
             .host_str()
@@ -4514,7 +4542,9 @@ mod tests {
     #[tokio::test]
     async fn the_blokli_http_client_reaches_the_pinned_address_without_dns() -> anyhow::Result<()> {
         let (port, server) = readiness_listener().await;
-        let client = blokli_http_client(
+        // The no-proxy variant: the environment's proxy variables would dial the proxy rather
+        // than the listener, defeating what the test is about (see `blokli_http_client`'s note).
+        let client = blokli_http_client_without_proxy(
             &"http://blokli.invalid/".parse()?,
             Some(&BlokliDnsOverride {
                 ip: "127.0.0.1".parse()?,
@@ -4536,7 +4566,7 @@ mod tests {
     async fn the_blokli_http_client_without_an_override_dials_the_url_it_names() -> anyhow::Result<()> {
         let (port, server) = readiness_listener().await;
         let url: Url = format!("http://127.0.0.1:{port}").parse()?;
-        let client = blokli_http_client(&url, None)?;
+        let client = blokli_http_client_without_proxy(&url, None)?;
         // The adapter trims the trailing slash the same way `RsSdkCurvyAdapter::new` does.
         let chain = curvy_chain_blokli::BlokliChain::with_client(url.as_str().trim_end_matches('/'), client);
         assert!(chain.is_ready().await, "the plain client never reached the listener");
@@ -4653,7 +4683,7 @@ mod tests {
         // under `blokli-client`'s override — so the pin below, which carries the port, is what
         // has to say where to dial.
         let adapter = unsealed_test_adapter(&state, discovery.url.clone(), "http://blokli.invalid".parse()?)?
-            .with_blokli_http_client(Some(blokli_http_client(
+            .with_blokli_http_client(Some(blokli_http_client_without_proxy(
                 &"http://blokli.invalid".parse()?,
                 Some(&BlokliDnsOverride {
                     ip: "127.0.0.1".parse()?,

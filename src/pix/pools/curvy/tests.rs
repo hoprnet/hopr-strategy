@@ -3603,64 +3603,128 @@ fn the_blokli_dns_override_parses_the_nodes_grammar_and_round_trips() -> anyhow:
     Ok(())
 }
 
-/// The environment override (hoprnet/hoprnet#8766): what the embedder feeds the node's own
-/// `--dns-blokli-override` must reach the pool's two Blokli clients too, or the Curvy pool keeps
-/// asking a system DNS the embedder cannot use while it holds the traffic.
-#[tokio::test]
-async fn the_dns_override_reaches_both_of_the_pools_blokli_clients() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Taken after the last await and dropped at the end keeps the guard off an await point; pool
-    // construction itself is synchronous.
-    let node = test_node().await?;
-    let _guard = test_env_lock().lock().expect("the lock is only poisoned by a panic");
-    let cfg = |name: &str| CurvyDepositPoolConfig {
-        // The address the name resolves to is irrelevant here; only what the clients were told.
-        blokli_url: "https://blokli.example/".parse().expect("valid static URL"),
-        relayer_url: Some("http://127.0.0.1:1/".parse().expect("valid static URL")),
-        state_path: Some(dir.path().join(name)),
-        token: Some(2),
+/// The application of `build()`'s environment override as a pure function: a set variable
+/// replaces what the file said, an unset one leaves it exactly as written, and a spelling that
+/// is not the grammar is refused at startup without having changed anything.
+#[test]
+fn the_dns_override_env_replaces_the_files_value_only_when_set() -> anyhow::Result<()> {
+    let file_value = BlokliDnsOverride {
+        ip: "192.0.2.9".parse()?,
+        port: Some(8080),
+    };
+    let base = || CurvyDepositPoolConfig {
+        blokli_dns_override: Some(file_value),
         ..Default::default()
     };
 
-    // SAFETY: the env lock serialises every test that writes this variable.
-    unsafe { std::env::set_var(super::BLOKLI_DNS_OVERRIDE_ENV, "10.20.30.40:8545") };
-    let pool = CurvyDepositPool::new(node.clone(), cfg("pinned.redb"), TEST_PASSWORD)?;
-    // The shared query client carries the override into its own config...
-    let super::NoteIndex::Blokli(index) = pool.index.as_ref() else {
-        panic!("the default note source is Blokli");
-    };
+    let mut cfg = base();
+    super::apply_blokli_dns_override_env(&mut cfg, Some("10.20.30.40:8545".to_owned()))?;
     assert_eq!(
-        index.0.config().dns_override,
-        Some(blokli_client::BlokliDnsOverride {
+        cfg.blokli_dns_override,
+        Some(BlokliDnsOverride {
             ip: "10.20.30.40".parse()?,
             port: Some(8545),
-        }),
-        "the shared Blokli client lost the override"
-    );
-    // ... and the SDK's chain gets a client built from it; that `client()` then hands it to
-    // `BlokliChain::with_client` is driven end-to-end in the sdk tests' pinned tree read.
-    assert!(
-        pool.adapter.blokli_http.is_some(),
-        "the SDK's Blokli chain would build its own unpinned client"
+        })
     );
 
-    // Without the variable the pool keeps plain system DNS on both clients.
-    // SAFETY: the env lock serialises every test that writes this variable.
-    unsafe { std::env::remove_var(super::BLOKLI_DNS_OVERRIDE_ENV) };
-    let pool = CurvyDepositPool::new(node, cfg("plain.redb"), TEST_PASSWORD)?;
-    let super::NoteIndex::Blokli(index) = pool.index.as_ref() else {
-        panic!("the default note source is Blokli");
-    };
-    assert_eq!(index.0.config().dns_override, None);
-    assert!(pool.adapter.blokli_http.is_none());
+    // Unset: the file's setting stays as written — neither pinned nor cleared — and so does
+    // nothing when the file said nothing either.
+    let mut cfg = base();
+    super::apply_blokli_dns_override_env(&mut cfg, None)?;
+    assert_eq!(cfg.blokli_dns_override, Some(file_value));
+    let mut none = CurvyDepositPoolConfig::default();
+    super::apply_blokli_dns_override_env(&mut none, None)?;
+    assert_eq!(none.blokli_dns_override, None);
+
+    let mut cfg = base();
+    let error = super::apply_blokli_dns_override_env(&mut cfg, Some("blokli.example.com".to_owned()))
+        .expect_err("an override that is not the grammar is refused at startup");
+    let message = error.to_string();
+    assert!(message.contains(super::BLOKLI_DNS_OVERRIDE_ENV), "{message}");
+    assert!(message.contains("IP"), "{message}");
+    assert_eq!(
+        cfg.blokli_dns_override,
+        Some(file_value),
+        "a refused override changes nothing"
+    );
     Ok(())
 }
 
-/// Tests that touch the process environment serialise on this lock: the variables are global,
-/// and `cargo test` runs tests in parallel.
-fn test_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+/// The environment override's reach (hoprnet/hoprnet#8766): what the embedder feeds the node's
+/// own `--dns-blokli-override` must reach the pool's two Blokli clients too, or the Curvy pool
+/// keeps asking a system DNS the embedder cannot use while it holds the traffic.
+///
+/// The variable is never set in this process — `set_var` races every `env::var` the other tests
+/// make — the test instead re-execs itself and the child is *spawned* with the variable set, or
+/// with it removed. Same shape as `database_is_private`'s umask dance.
+#[tokio::test]
+async fn the_dns_override_env_reaches_both_of_the_pools_blokli_clients() -> anyhow::Result<()> {
+    use std::process::Command;
+    const CHILD: &str = "CURVY_BLOKLI_DNS_OVERRIDE_TEST_CHILD";
+    if let Some(mode) = std::env::var_os(CHILD) {
+        // The child: the variable is present, or removed, exactly as the parent spawned it.
+        let dir = tempfile::tempdir()?;
+        let pool = CurvyDepositPool::new(
+            test_node().await?,
+            CurvyDepositPoolConfig {
+                // The address the name resolves to is irrelevant here; only what the clients
+                // were told.
+                blokli_url: "https://blokli.example/".parse()?,
+                relayer_url: Some("http://127.0.0.1:1/".parse()?),
+                state_path: Some(dir.path().join("curvy.redb")),
+                token: Some(2),
+                ..Default::default()
+            },
+            TEST_PASSWORD,
+        )?;
+        let super::NoteIndex::Blokli(index) = pool.index.as_ref() else {
+            panic!("the default note source is Blokli");
+        };
+        if mode == "pinned" {
+            // The shared query client carries the override into its own config...
+            assert_eq!(
+                index.0.config().dns_override,
+                Some(blokli_client::BlokliDnsOverride {
+                    ip: "10.20.30.40".parse()?,
+                    port: Some(8545),
+                }),
+                "the shared Blokli client lost the override"
+            );
+            // ... and the SDK's chain gets a client built from it; that `client()` then hands
+            // that client to `BlokliChain::with_client` is driven end-to-end in the sdk tests'
+            // pinned tree read.
+            assert!(
+                pool.adapter.blokli_http.is_some(),
+                "the SDK's Blokli chain would build its own unpinned client"
+            );
+        } else {
+            // Without the variable the pool keeps plain system DNS on both clients.
+            assert_eq!(index.0.config().dns_override, None);
+            assert!(pool.adapter.blokli_http.is_none());
+        }
+        return Ok(());
+    }
+    // The parent: the test's own path, minus the crate name the filter does not take.
+    let (_, this_test) = concat!(
+        module_path!(),
+        "::the_dns_override_env_reaches_both_of_the_pools_blokli_clients"
+    )
+    .split_once("::")
+    .expect("test module path has a crate prefix");
+    let exe = std::env::current_exe()?;
+    let pinned = Command::new(&exe)
+        .args(["--exact", this_test])
+        .env(CHILD, "pinned")
+        .env(super::BLOKLI_DNS_OVERRIDE_ENV, "10.20.30.40:8545")
+        .status()?;
+    assert!(pinned.success(), "the child spawned with the override set failed");
+    let plain = Command::new(&exe)
+        .args(["--exact", this_test])
+        .env(CHILD, "plain")
+        .env_remove(super::BLOKLI_DNS_OVERRIDE_ENV)
+        .status()?;
+    assert!(plain.success(), "the child spawned without the override failed");
+    Ok(())
 }
 
 /// Against Curvy's staging indexer for Gnosis. Network; run by hand:

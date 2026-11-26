@@ -345,7 +345,13 @@ impl FromStr for CurvySubmission {
 ///
 /// The two spellings an operator sees — `<IP>`, or `<IP>:<PORT>` with IPv6 as `[<IPv6>]:<PORT>` —
 /// are the node's own `--dns-blokli-override` grammar, so one value feeds both. Without a port the
-/// URL's own port, or the scheme's default, is used.
+/// URL's own port, or the scheme's default, is used; spelling `:0` is the one oddity — reqwest
+/// reads a pinned port of 0 as "none" and takes the conventional one, like the node's own override.
+///
+/// The pin is a case-sensitive map match: reqwest lowercases the pinned name when it registers
+/// it, and the request's host arrives lowercased through `url`, but nothing guarantees the two
+/// meet on a mixed-case host — an all-lowercase `blokli_url` host is the safe spelling, as with
+/// `blokli-client`'s own override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlokliDnsOverride {
     /// The address to open the connection to.
@@ -391,6 +397,20 @@ impl FromStr for BlokliDnsOverride {
             "Curvy Blokli DNS override must be `<IP>`, `<IP>:<PORT>` or `[<IPv6>]:<PORT>`, got `{value}`"
         )))
     }
+}
+
+/// The [`BLOKLI_DNS_OVERRIDE_ENV`] half of [`CurvyDepositPool::build`]'s override block, as a
+/// pure function of the raw value: `Some` parses and replaces the file's setting, `None` — the
+/// variable unset — leaves it alone. Kept apart from `build` so the grammar and both cases are
+/// tested without the test process touching its own environment (the reach of the override into
+/// the two clients is checked by a re-exec test, which sets the variable before spawning).
+fn apply_blokli_dns_override_env(cfg: &mut CurvyDepositPoolConfig, raw: Option<String>) -> Result<(), StrategyError> {
+    if let Some(raw) = raw {
+        cfg.blokli_dns_override = Some(raw.parse().map_err(|error| {
+            StrategyError::InvalidConfiguration(format!("{BLOKLI_DNS_OVERRIDE_ENV} must be an IP or IP:PORT: {error}"))
+        })?);
+    }
+    Ok(())
 }
 
 fn default_blokli_url() -> Url {
@@ -1290,13 +1310,7 @@ where
                 StrategyError::InvalidConfiguration(format!("{TOKEN_ENV} must be a vault token id: {error}"))
             })?);
         }
-        if let Ok(raw) = std::env::var(BLOKLI_DNS_OVERRIDE_ENV) {
-            cfg.blokli_dns_override = Some(raw.parse().map_err(|error| {
-                StrategyError::InvalidConfiguration(format!(
-                    "{BLOKLI_DNS_OVERRIDE_ENV} must be an IP or IP:PORT: {error}"
-                ))
-            })?);
-        }
+        apply_blokli_dns_override_env(&mut cfg, std::env::var(BLOKLI_DNS_OVERRIDE_ENV).ok())?;
         StrategyError::validate_config(&cfg)?;
         // After the overrides, so an env-selected mode is judged rather than the file's default.
         validate_mode_requirements(&cfg)?;
