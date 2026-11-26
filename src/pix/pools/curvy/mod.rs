@@ -990,6 +990,22 @@ where
 /// How long one request to Curvy's indexer may take.
 pub(super) const INDEXER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many Blokli note lookups one reconciliation check keeps in flight.
+///
+/// Every lookup is a round trip of a few hundred milliseconds up to over a second, and the check
+/// asks about every owned, funding and pending note. Asked one at a time, a journal of a dozen
+/// notes takes longer than the Exit's 3 s deposit-data deadline. Eight overlaps those waits
+/// without turning one check into a burst against Blokli.
+pub(super) const NOTE_CHECK_CONCURRENCY: usize = 8;
+
+/// The first wait between two attempts of the startup reconciliation.
+const RECONCILE_RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// The longest wait between two attempts of the startup reconciliation. The wait doubles from
+/// [`RECONCILE_RETRY_MIN`] up to this, so an endpoint that stays down is asked about once a
+/// minute rather than hammered.
+const RECONCILE_RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// The production note index: whichever [`CurvyNoteSource`] the config selected.
 pub enum NoteIndex {
     Blokli(BlokliIndex<BlokliClient>),
@@ -1064,7 +1080,11 @@ pub struct CurvyDepositPool<N, I = NoteIndex, A = RsSdkCurvyAdapter<BlokliClient
     adapter: Arc<A>,
     tracker: Arc<CurvyLifecycleTracker<S>>,
     cfg: CurvyDepositPoolConfig,
-    reconciled: tokio::sync::OnceCell<()>,
+    /// Set once the durable state has been checked against the endpoint. Shared (an [`Arc`]) with
+    /// the startup task, which must not hold the pool itself; see [`Self::start_reconciliation`].
+    reconciled: Arc<tokio::sync::OnceCell<()>>,
+    /// The startup reconciliation task, aborted on drop like `watcher`.
+    reconciler: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     watcher: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Serializes this pool's miss path of `generate_deposit_data`, because `store_scan_secret`
     /// replaces an existing secret. It does not protect callers that write the state outside this
@@ -1083,6 +1103,10 @@ where
     ///
     /// Fails — rather than deferring to the first deposit — when the operator key is not set, the
     /// state file cannot be opened, or an environment override does not parse.
+    ///
+    /// Inside a Tokio runtime it also starts reconciling the durable state with the endpoint in
+    /// the background, retrying until it passes, so that the first deposit-data request does not
+    /// spend the Exit's 3 s deadline on it.
     ///
     /// No chain key is taken: a direct shield is submitted by the node's chain API, which signs
     /// with the node's own key, and the portal path signs with the operator key from the
@@ -1312,7 +1336,9 @@ where
             });
         }
         let tracker = CurvyLifecycleTracker::for_vault_token(token, Arc::new(state));
-        Ok(Self::assemble(node, cfg, index, adapter, tracker))
+        let pool = Self::assemble(node, cfg, index, adapter, tracker);
+        pool.start_reconciliation();
+        Ok(pool)
     }
 }
 
@@ -1353,7 +1379,8 @@ where
             adapter: Arc::new(adapter),
             tracker: Arc::new(tracker),
             cfg,
-            reconciled: tokio::sync::OnceCell::new(),
+            reconciled: Arc::new(tokio::sync::OnceCell::new()),
+            reconciler: parking_lot::Mutex::new(None),
             watcher: parking_lot::Mutex::new(None),
             scan_secret_init: tokio::sync::Mutex::new(()),
         }
@@ -1367,50 +1394,67 @@ where
     /// Complete reconciliation once the endpoint can account for our durable state.
     /// A failed check leaves the cell uninitialized, so the next operation retries it.
     async fn ensure_reconciled(&self) -> Result<(), CurvyDepositPoolError> {
-        self.reconciled
-            .get_or_try_init(|| async {
-                if self.state_needs_sync().await? {
-                    return Err(CurvyDepositPoolError::ReconciliationPending);
-                }
-                Ok(())
-            })
-            .await
-            .map(|_| ())
+        reconcile_once(&self.reconciled, &*self.index, &*self.tracker.state, &*self.adapter).await
     }
 
-    async fn state_needs_sync(&self) -> Result<bool, CurvyDepositPoolError> {
-        let (head, _) = self
-            .index
-            .indexed_head()
-            .await
-            .map_err(CurvyDepositPoolError::Indexer)?;
-        for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
-            if let Some(cursor) = self.tracker.state.cursor(kind)? {
-                let block = cursor
-                    .block
-                    .0
-                    .parse::<u64>()
-                    .map_err(|error| CurvyStateError::Corrupt(format!("invalid Curvy cursor block: {error}")))?;
-                if block > head {
-                    return Ok(true);
+    /// Runs the reconciliation in the background so that the first request does not pay for it.
+    ///
+    /// The check is a series of Blokli round trips that took 4.7 to 6.3 s in the field, past the
+    /// Exit's fixed 3 s deadline for deposit data, so an Exit whose first request ran it refused
+    /// the Session. Started from [`Self::new`], it is normally finished before any request
+    /// arrives. A request that does arrive earlier waits for the running attempt through the
+    /// shared cell (or retries it if that attempt fails), exactly as before.
+    ///
+    /// The task retries with a doubling wait, from [`RECONCILE_RETRY_MIN`] up to
+    /// [`RECONCILE_RETRY_MAX`], until the check passes, because Blokli may not be reachable yet
+    /// when the node starts. It stops as soon as the cell is set, including when a request set it
+    /// first. Only the pieces the check needs are captured, never `self`, so that dropping the
+    /// pool is what ends the task (see `Drop`), as with [`Self::ensure_watcher`].
+    ///
+    /// Does nothing without a Tokio runtime, like the vault-token head start in [`Self::new`];
+    /// the first operation then reconciles, as it always did.
+    pub(crate) fn start_reconciliation(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Like `ensure_watcher`: a task that is still running is not replaced, so calling this
+        // twice never detaches the first task from `Drop`.
+        let mut reconciler = self.reconciler.lock();
+        if reconciler.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return;
+        }
+        let reconciled = Arc::clone(&self.reconciled);
+        let index = Arc::clone(&self.index);
+        let tracker = Arc::clone(&self.tracker);
+        let adapter = Arc::clone(&self.adapter);
+        let started = tokio::time::Instant::now();
+        *reconciler = Some(runtime.spawn(async move {
+            let mut delay = RECONCILE_RETRY_MIN;
+            let mut attempts = 0_u32;
+            while !reconciled.initialized() {
+                attempts += 1;
+                match reconcile_once(&reconciled, &*index, &*tracker.state, &*adapter).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            elapsed = ?started.elapsed(),
+                            attempts,
+                            "Curvy state reconciled with the endpoint"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            retry_in = ?delay,
+                            attempts,
+                            "could not reconcile the Curvy state with the endpoint yet"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(RECONCILE_RETRY_MAX);
+                    }
                 }
             }
-        }
-        for note_id in self.tracker.state.owned_note_ids()? {
-            if !self
-                .index
-                .note_known(note_id)
-                .await
-                .map_err(CurvyDepositPoolError::Indexer)?
-            {
-                return Ok(true);
-            }
-        }
-        self.adapter
-            .chain_state_is_consistent()
-            .await
-            .map(|consistent| !consistent)
-            .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))
+        }));
     }
 
     /// A fresh discovery identity. The Exit keeps `v` and `K`; the Entry gets `K` and `V`.
@@ -1673,9 +1717,83 @@ fn tree_lag_poll_interval(budget: Duration) -> Duration {
     (budget / 10).min(Duration::from_secs(5)).max(Duration::from_millis(50))
 }
 
+/// Completes the reconciliation held in `reconciled` if it has not been completed yet.
+///
+/// A free function over the pool's shared pieces, so the startup task can run it without holding
+/// the pool. `get_or_try_init` makes a caller that arrives while an attempt is running wait for
+/// it, and run the check itself if that attempt fails; a failure leaves the cell empty.
+async fn reconcile_once<I, A, S>(
+    reconciled: &tokio::sync::OnceCell<()>,
+    index: &I,
+    state: &S,
+    adapter: &A,
+) -> Result<(), CurvyDepositPoolError>
+where
+    I: CurvyIndexSource,
+    A: CurvySdkAdapter,
+    S: CurvyDepositState,
+{
+    reconciled
+        .get_or_try_init(|| async {
+            if state_needs_sync(index, state, adapter).await? {
+                return Err(CurvyDepositPoolError::ReconciliationPending);
+            }
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+}
+
+/// Whether the endpoint cannot account for our durable state: its indexed head is behind a
+/// stored cursor, an owned note is unknown to it, or the SDK's own journal disagrees with the
+/// chain. The checks run in that order and the first to fail ends the check.
+///
+/// The owned notes are asked about [`NOTE_CHECK_CONCURRENCY`] at a time, stopping at the first
+/// unknown note or the first error: one round trip per note, in sequence, is what made the first
+/// deposit-data request miss the Exit's deadline.
+async fn state_needs_sync<I, A, S>(index: &I, state: &S, adapter: &A) -> Result<bool, CurvyDepositPoolError>
+where
+    I: CurvyIndexSource,
+    A: CurvySdkAdapter,
+    S: CurvyDepositState,
+{
+    use futures::{StreamExt, TryStreamExt};
+
+    let (head, _) = index.indexed_head().await.map_err(CurvyDepositPoolError::Indexer)?;
+    for kind in [CurvyEventKind::Pending, CurvyEventKind::Committed] {
+        if let Some(cursor) = state.cursor(kind)? {
+            let block = cursor
+                .block
+                .0
+                .parse::<u64>()
+                .map_err(|error| CurvyStateError::Corrupt(format!("invalid Curvy cursor block: {error}")))?;
+            if block > head {
+                return Ok(true);
+            }
+        }
+    }
+    let any_unknown = futures::stream::iter(state.owned_note_ids()?)
+        .map(|note_id| index.note_known(note_id))
+        .buffer_unordered(NOTE_CHECK_CONCURRENCY)
+        .map_err(CurvyDepositPoolError::Indexer)
+        .try_any(|known| std::future::ready(!known))
+        .await?;
+    if any_unknown {
+        return Ok(true);
+    }
+    adapter
+        .chain_state_is_consistent()
+        .await
+        .map(|consistent| !consistent)
+        .map_err(|error| CurvyDepositPoolError::Adapter(error.into()))
+}
+
 impl<N, I, A, S> Drop for CurvyDepositPool<N, I, A, S> {
     fn drop(&mut self) {
         if let Some(handle) = self.watcher.lock().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.reconciler.lock().take() {
             handle.abort();
         }
     }
