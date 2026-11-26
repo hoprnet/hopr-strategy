@@ -573,6 +573,9 @@ pub struct NonAnonymousDepositPool<N: HasChainApi, C = BlokliClient> {
     cfg: NonAnonymousDepositPoolConfig,
     active_deposit_trackers: Arc<AtomicUsize>,
     sent_to: moka::sync::Cache<Address, ()>,
+    /// What this pool swept out of each deposit address, so a deposit swept before the tracker's
+    /// next poll still counts as received.
+    swept_from: moka::sync::Cache<Address, HoprBalance>,
 }
 
 impl<N: HasChainApi> NonAnonymousDepositPool<N> {
@@ -641,8 +644,12 @@ impl<N: HasChainApi, C> NonAnonymousDepositPool<N, C> {
             cfg,
             active_deposit_trackers: Arc::new(AtomicUsize::new(0)),
             sent_to: moka::sync::Cache::builder()
-                .max_capacity(SENT_TO_CAPACITY)
-                .time_to_live(SENT_TO_TTL)
+                .max_capacity(ADDRESS_MEMORY_CAPACITY)
+                .time_to_live(ADDRESS_MEMORY_TTL)
+                .build(),
+            swept_from: moka::sync::Cache::builder()
+                .max_capacity(ADDRESS_MEMORY_CAPACITY)
+                .time_to_live(ADDRESS_MEMORY_TTL)
                 .build(),
         }
     }
@@ -656,8 +663,8 @@ impl<N: HasChainApi, C> NonAnonymousDepositPool<N, C> {
 ///
 /// Jitter matters here: without it, a batch whose items all fail against the same
 /// unhealthy RPC endpoint re-fires in lockstep on every attempt.
-const SENT_TO_CAPACITY: u64 = 4096;
-const SENT_TO_TTL: Duration = Duration::from_secs(3600);
+const ADDRESS_MEMORY_CAPACITY: u64 = 4096;
+const ADDRESS_MEMORY_TTL: Duration = Duration::from_secs(3600);
 
 fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
     backon::ExponentialBuilder::default()
@@ -1054,6 +1061,8 @@ where
         let target = min_amount;
         let max_tracking = self.cfg.max_deposit_tracking_time;
         let address = deposit_addr;
+        let swept_from = self.swept_from.clone();
+        let received = move |balance: HoprBalance| balance + swept_from.get(&address).unwrap_or(HoprBalance::zero());
 
         Ok(Box::pin(async move {
             let _tracker_slot = tracker_slot;
@@ -1067,7 +1076,13 @@ where
                 Some(poll_interval.as_millis() as u64),
             ));
 
-            let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
+            let immediate = node
+                .chain_api()
+                .balance(address)
+                .await
+                .ok()
+                .map(&received)
+                .filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
                 return Ok((id, dst, balance));
@@ -1081,7 +1096,8 @@ where
             let mut stream = polls
                 .then(move |_| {
                     let node = Arc::clone(&node);
-                    async move { node.chain_api().balance(address).await }
+                    let received = received.clone();
+                    async move { node.chain_api().balance(address).await.map(received) }
                 })
                 .filter_map(move |result| async move {
                     match result {
@@ -1138,14 +1154,17 @@ where
         let (client, node_key) = (&self.client, &self.node_key);
         let id = *id;
 
-        (move || sweep_single(Arc::clone(node), client.clone(), node_key, cfg, chain_key, dst))
+        let swept = (move || sweep_single(Arc::clone(node), client.clone(), node_key, cfg, chain_key, dst))
             .retry(retry_policy(cfg.max_sweep_retries))
             .sleep(backon::FuturesTimerSleeper)
             .notify(move |error, dur| {
                 tracing::warn!(%error, ?id, %dst, ?dur, "sweep failed, retrying in");
             })
-            .await
-            .map(|_| ())
+            .await?;
+        let from = chain_key.public().to_address();
+        let swept_earlier = self.swept_from.get(&from).unwrap_or(HoprBalance::zero());
+        self.swept_from.insert(from, swept_earlier + swept);
+        Ok(())
     }
 
     /// Its funding is the Safe, so there is no pool to move value into: a builder refuses a

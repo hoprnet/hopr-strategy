@@ -6119,6 +6119,50 @@ mod tests {
         Ok(())
     }
 
+    /// A deposit this pool already swept to the Safe still counts as received: the sweep can empty
+    /// the address within one poll interval of the deposit landing.
+    #[test_log::test(tokio::test)]
+    async fn test_notify_deposit_counts_a_deposit_already_swept() -> anyhow::Result<()> {
+        use hopr_api::chain::DepositPool;
+
+        let deposit = HoprBalance::new_base(40);
+        let rk = hex!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+        let ra = ChainKeypair::from_secret(&rk)?.public().to_address();
+        let sim = BlokliTestStateBuilder::default()
+            .with_generated_accounts(
+                &[&*ALICE, &*BOB, &*CHRIS],
+                false,
+                XDaiBalance::new_base(2),
+                HoprBalance::new_base(1000),
+            )
+            .with_balances([(ra, deposit)])
+            .with_balances([(ra, XDaiBalance::new_base(1))])
+            .build_dynamic_client(MODULE_ADDRESS.into());
+        let mut connector = TestChainConnector::new(sim, *BOB, BOB_KP.clone(), MODULE_ADDRESS.into());
+        connector.connect().await?;
+        let client = connector.client();
+        let cc = Arc::new(connector);
+        let pool = NonAnonymousDepositPool::with_client(
+            Arc::new(ChainNode(Arc::clone(&cc))),
+            BOB_KP.clone(),
+            pool_cfg(StdDuration::from_secs(2), XDaiBalance::zero()),
+            client,
+        );
+
+        pool.withdraw_deposit(
+            &pix_id(1),
+            &crate::pix::pools::plain::EthDepositKey::from_secret(&rk)?,
+            *CHRIS,
+            None,
+        )
+        .await?;
+        assert_eq!(hopr_balance(&*cc, ra).await?, HoprBalance::zero());
+
+        let (_, _, received) = pool.notify_deposit(pix_id(1), ra, deposit)?.await?;
+        assert_eq!(received, deposit);
+        Ok(())
+    }
+
     /// The non-anonymous pool generates its marker payload, filed under the allocation asked about.
     ///
     /// Asserted through the round trip to `PixDepositData` rather than on `ByteDepositData`
