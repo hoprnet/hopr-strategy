@@ -2818,14 +2818,50 @@ async fn owned_notes_are_checked_in_parallel() -> anyhow::Result<()> {
 async fn an_unknown_note_still_refuses_under_the_parallel_check() -> anyhow::Result<()> {
     let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
     let ids = record_owned_notes(harness.pool.state(), 16)?;
-    *harness.index.known_notes.lock() = Some(ids.iter().take(15).cloned().collect());
+    // The state lists notes in key order, so the first one asked about is the unknown one.
+    *harness.index.known_notes.lock() = Some(ids.iter().skip(1).cloned().collect());
 
     let error = harness.pool.ensure_reconciled().await.expect_err("one note is unknown");
     assert!(error.is_reconciliation_pending(), "{error}");
+    assert!(
+        harness.index.note_known_calls.load(Ordering::SeqCst) < 16,
+        "the check stops at the first unknown note"
+    );
     assert!(!harness.pool.reconciled.initialized());
 
     *harness.index.known_notes.lock() = None;
     harness.pool.ensure_reconciled().await?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_during_startup_reconciliation_waits_for_it() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    record_owned_notes(harness.pool.state(), 5)?;
+    *harness.index.note_known_delay.lock() = Some(Duration::from_secs(1));
+
+    harness.pool.start_reconciliation();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!harness.pool.reconciled.initialized(), "the check is still running");
+
+    tokio::time::timeout(Duration::from_secs(10), harness.pool.generate_deposit_data(&pix_id(9)))
+        .await
+        .map_err(|_| anyhow::anyhow!("the request did not complete"))??;
+    // One pass served both: the request waited for the running attempt instead of starting its own.
+    assert_eq!(harness.index.note_known_calls.load(Ordering::SeqCst), 5);
+    assert!(harness.pool.reconciled.initialized());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn starting_the_reconciliation_twice_runs_one_task() -> anyhow::Result<()> {
+    let harness = harness(RecordingAdapter::consistent(), Duration::from_secs(5)).await?;
+    *harness.index.head_failures.lock() = usize::MAX;
+    harness.pool.start_reconciliation();
+    harness.pool.start_reconciliation();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The pool's reference, the harness's own clone and the one task's; a second task would be a fourth.
+    assert_eq!(Arc::strong_count(&harness.index), 3);
     Ok(())
 }
 

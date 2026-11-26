@@ -1417,12 +1417,18 @@ where
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        // Like `ensure_watcher`: a task that is still running is not replaced, so calling this
+        // twice never detaches the first task from `Drop`.
+        let mut reconciler = self.reconciler.lock();
+        if reconciler.as_ref().is_some_and(|handle| !handle.is_finished()) {
+            return;
+        }
         let reconciled = Arc::clone(&self.reconciled);
         let index = Arc::clone(&self.index);
         let tracker = Arc::clone(&self.tracker);
         let adapter = Arc::clone(&self.adapter);
         let started = tokio::time::Instant::now();
-        *self.reconciler.lock() = Some(runtime.spawn(async move {
+        *reconciler = Some(runtime.spawn(async move {
             let mut delay = RECONCILE_RETRY_MIN;
             let mut attempts = 0_u32;
             while !reconciled.initialized() {
