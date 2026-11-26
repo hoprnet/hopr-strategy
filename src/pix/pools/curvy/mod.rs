@@ -409,6 +409,14 @@ pub struct CurvyDepositPoolConfig {
     #[default(default_blokli_url())]
     pub blokli_url: Url,
 
+    /// The address both of the pool's Blokli clients connect to for `blokli_url`'s host instead of
+    /// asking system DNS, e.g. `10.0.0.1:443`, for an embedder whose system DNS is unusable while
+    /// it holds the traffic. `Host` and TLS SNI keep the hostname. Port `0` means the URL's port,
+    /// and a port spelled out in `blokli_url` always wins (reqwest's rule, as for the node's own
+    /// override). Default: `None`.
+    #[serde(default)]
+    pub blokli_dns_override: Option<std::net::SocketAddr>,
+
     /// How long [`DepositPool::notify_deposit`]'s future waits for the allocation to be committed
     /// and final before resolving to an error. Default: 60 seconds.
     ///
@@ -1151,7 +1159,8 @@ where
 
     /// [`Self::new`], but the requests to the Curvy relayer and the Curvy indexer go through
     /// `http`, for example to send them from a given local address or through a proxy, outside a
-    /// tunnel. Blokli traffic does not use it. Timeouts are the same as under [`Self::new`].
+    /// tunnel. Blokli traffic does not use it; see [`CurvyDepositPoolConfig::blokli_dns_override`].
+    /// Timeouts are the same as under [`Self::new`].
     ///
     /// ```no_run
     /// # use std::sync::Arc;
@@ -1252,14 +1261,23 @@ where
             .unwrap_or_else(|| PathBuf::from(format!("curvy-pix-{}.redb", node.identity().node_address)));
         let state = RedbCurvyDepositState::open(&state_path, state_password)
             .map_err(|error| StrategyError::other(anyhow::anyhow!("{}: {error}", state_path.display())))?;
-        let blokli = Arc::new(BlokliClient::new(cfg.blokli_url.clone(), BlokliClientConfig::default()));
+        let blokli = Arc::new(BlokliClient::new(
+            cfg.blokli_url.clone(),
+            BlokliClientConfig {
+                dns_override: cfg.blokli_dns_override.map(|addr| blokli_client::BlokliDnsOverride {
+                    ip: addr.ip(),
+                    port: Some(addr.port()).filter(|&port| port != 0),
+                }),
+                ..Default::default()
+            },
+        ));
         // One handle, shared by the bridge that stamps the id on notes and the tracker whose
         // detector filters on it, so an unstated id is looked up once and both use the same answer.
         let token = match cfg.token {
             Some(id) => VaultToken::configured(id),
             None => VaultToken::from_blokli(Arc::clone(&blokli)),
         };
-        let adapter = RsSdkCurvyAdapter::new(
+        let mut adapter = RsSdkCurvyAdapter::new(
             Arc::clone(&blokli),
             cfg.blokli_url.to_string(),
             RsSdkCurvyAdapterConfig::new(operator_key, token.clone())
@@ -1290,9 +1308,15 @@ where
         )
         .map_err(StrategyError::other)?
         .with_indexer_http_client(http.clone());
+        // The SDK's chain needs the override on its own HTTP client.
+        if let Some(addr) = cfg.blokli_dns_override {
+            let blokli_http = sdk::blokli_http_client(&cfg.blokli_url, addr).map_err(StrategyError::other)?;
+            adapter = adapter.with_blokli_http_client(blokli_http);
+        }
         tracing::info!(
             state = %state_path.display(),
             blokli = %cfg.blokli_url,
+            blokli_dns_override = ?cfg.blokli_dns_override,
             %token,
             shielding = ?cfg.shielding,
             submission = ?cfg.submission,

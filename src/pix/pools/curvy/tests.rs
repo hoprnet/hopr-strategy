@@ -3707,6 +3707,56 @@ async fn the_pool_builds_over_an_injected_http_client() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn the_blokli_dns_override_reads_a_socket_address() -> anyhow::Result<()> {
+    let stated: CurvyDepositPoolConfig = serde_json::from_str(r#"{"blokli_dns_override":"[::1]:8545"}"#)?;
+    assert_eq!(stated.blokli_dns_override, Some("[::1]:8545".parse()?));
+    assert_eq!(
+        serde_json::from_str::<CurvyDepositPoolConfig>("{}")?.blokli_dns_override,
+        None
+    );
+    assert!(
+        serde_json::from_str::<CurvyDepositPoolConfig>(r#"{"blokli_dns_override":"blokli.example:443"}"#).is_err(),
+        "a hostname would need the DNS the override is there to avoid"
+    );
+    Ok(())
+}
+
+/// The override reaches both of the pool's Blokli clients, and only when set; port `0` leaves
+/// the port to the URL.
+#[tokio::test]
+async fn the_blokli_dns_override_reaches_both_blokli_clients() -> anyhow::Result<()> {
+    for (addr, port) in [
+        (None, None),
+        (Some("10.20.30.40:8545"), Some(8545)),
+        (Some("10.20.30.40:0"), None),
+    ] {
+        let addr: Option<std::net::SocketAddr> = addr.map(str::parse).transpose()?;
+        let state = tempfile::tempdir()?;
+        let pool = CurvyDepositPool::new(
+            test_node().await?,
+            CurvyDepositPoolConfig {
+                blokli_url: "https://blokli.example/".parse()?,
+                blokli_dns_override: addr,
+                relayer_url: Some("http://127.0.0.1:1/".parse()?),
+                state_path: Some(state.path().join("curvy.redb")),
+                token: Some(2),
+                ..Default::default()
+            },
+            TEST_PASSWORD,
+        )?;
+        let super::NoteIndex::Blokli(index) = pool.index.as_ref() else {
+            panic!("the default note source is Blokli");
+        };
+        assert_eq!(
+            index.0.config().dns_override,
+            addr.map(|addr| blokli_client::BlokliDnsOverride { ip: addr.ip(), port })
+        );
+        assert_eq!(pool.adapter.blokli_http.is_some(), addr.is_some());
+    }
+    Ok(())
+}
+
 /// Against Curvy's staging indexer for Gnosis. Network; run by hand:
 /// The whole pool over a demo run's Exit state against Curvy staging: registering the watch
 /// must discover and complete the allocation's committed note.
