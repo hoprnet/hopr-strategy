@@ -628,6 +628,22 @@ impl RsSdkCurvyAdapterConfig {
     }
 }
 
+/// Polls `fut` to completion without holding a runtime worker.
+///
+/// The SDK rebuilds the whole committed-notes tree inside its async calls (`sync`), which is
+/// serial hashing that would otherwise stall the worker polling it, and with it packet traffic.
+/// On a multi-thread runtime the future runs under [`tokio::task::block_in_place`], which hands
+/// the worker's core to another thread. On any other runtime flavor (the current-thread runtimes
+/// of the tests, where `block_in_place` panics) it is simply awaited.
+async fn off_runtime_workers<F: std::future::Future>(fut: F) -> F::Output {
+    let handle = tokio::runtime::Handle::current();
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        fut.await
+    }
+}
+
 /// Errors raised by the rs-sdk bridge.
 #[derive(Debug, thiserror::Error)]
 pub enum RsSdkCurvyAdapterError {
@@ -2370,14 +2386,13 @@ where
                 }
             }
             if !ids.is_empty() {
-                let entries = client
-                    .commit(
-                        &ids,
-                        CircuitFamily::Pix,
-                        &self.config.operator_private_key,
-                        self.config.route,
-                    )
-                    .await?;
+                let entries = off_runtime_workers(client.commit(
+                    &ids,
+                    CircuitFamily::Pix,
+                    &self.config.operator_private_key,
+                    self.config.route,
+                ))
+                .await?;
                 for entry in &entries {
                     tracing::info!(tx = %entry.tx_hash, notes = ids.len(), "committed pending Curvy notes");
                 }
@@ -2547,15 +2562,14 @@ where
         })?;
         let relay_fee = Self::relay_fee_recipient(relay, endpoints.chain_id, self.token().await?).await?;
         let fee_recipient = self.fee_recipient().await?;
-        let request = client
-            .build_pix_aggregation(
-                &self.spender,
-                &inputs,
-                &allocations,
-                relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
-                fee_recipient.as_ref(),
-            )
-            .await?;
+        let request = off_runtime_workers(client.build_pix_aggregation(
+            &self.spender,
+            &inputs,
+            &allocations,
+            relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
+            fee_recipient.as_ref(),
+        ))
+        .await?;
         self.prepare_relay_aggregation(&request, endpoints, &inputs, &records)
     }
 
@@ -3170,9 +3184,14 @@ where
             attempts = self.state.lock().operator_aggregations.len(),
             "no journalled Curvy PIX aggregation landed; proving a replacement over the same inputs"
         );
-        let request = client
-            .build_pix_aggregation(&self.spender, &inputs, &allocations, None, fee_recipient.as_ref())
-            .await?;
+        let request = off_runtime_workers(client.build_pix_aggregation(
+            &self.spender,
+            &inputs,
+            &allocations,
+            None,
+            fee_recipient.as_ref(),
+        ))
+        .await?;
         let mut ledger = self
             .submit_operator_aggregation(client, endpoints, request, &inputs, &records)
             .await?;
@@ -3442,15 +3461,14 @@ where
                 .map(|(id, address, scan_key, amount)| StoredAllocation::new(*id, address, *scan_key, *amount))
                 .collect::<Result<Vec<_>, _>>()?;
             let funding_notes = funding.iter().map(|(_, note, _)| note.clone()).collect::<Vec<_>>();
-            let request = client
-                .build_pix_aggregation(
-                    &self.spender,
-                    &funding_notes,
-                    &allocations,
-                    relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
-                    fee_recipient.as_ref(),
-                )
-                .await?;
+            let request = off_runtime_workers(client.build_pix_aggregation(
+                &self.spender,
+                &funding_notes,
+                &allocations,
+                relay_fee.as_ref().map(|(identity, amount)| (identity, *amount)),
+                fee_recipient.as_ref(),
+            ))
+            .await?;
             if self.config.submission == CurvySubmission::Relayer {
                 self.prepare_relay_aggregation(&request, endpoints, &funding_notes, &allocation_records)?;
                 // Past this point the aggregation may have been POSTed: a rebuild inside the
@@ -3578,7 +3596,7 @@ where
         let mut withdrawn = 0_u128;
         for chunk in notes.chunks(MAX_WITHDRAWAL_INPUTS) {
             let spends = chunk.iter().map(|note| (secret, note)).collect::<Vec<_>>();
-            let request = client.build_pix_withdrawal(&spends, &destination.to_string()).await?;
+            let request = off_runtime_workers(client.build_pix_withdrawal(&spends, &destination.to_string())).await?;
             // No fee note here, unlike an aggregation: the vault reimburses the submitter's gas
             // on chain, which is why the relayer does not price withdrawals at all.
             let amount = match (self.config.submission, self.relay.as_ref()) {
@@ -3887,6 +3905,67 @@ mod tests {
             "a view tag wider than uint16 is refused"
         );
         Ok(())
+    }
+
+    /// A CPU-bound tree rebuild must not stall the runtime's only worker: a ticker sharing it
+    /// stays on time while the build runs through `off_runtime_workers`. The multi-thread runtime
+    /// exercises its `block_in_place` branch.
+    #[test]
+    fn off_runtime_workers_keeps_the_worker_free() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // The build is driven from a spawned task: the root future of `block_on` would run on
+        // this thread, leaving the single worker to the ticker regardless.
+        let (build_time, worst) = runtime
+            .block_on(runtime.spawn(async {
+                assert_eq!(
+                    tokio::runtime::Handle::current().runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                );
+                let stop = Arc::new(AtomicBool::new(false));
+                let ticker = tokio::spawn({
+                    let stop = Arc::clone(&stop);
+                    async move {
+                        let mut interval = tokio::time::interval(Duration::from_millis(1));
+                        let mut worst = Duration::ZERO;
+                        let mut last = Instant::now();
+                        while !stop.load(Ordering::Relaxed) {
+                            interval.tick().await;
+                            let now = Instant::now();
+                            worst = worst.max(now.duration_since(last));
+                            last = now;
+                        }
+                        worst
+                    }
+                });
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let leaves = (0..20_000u64).map(Fr::from).collect::<Vec<_>>();
+                let started = Instant::now();
+                off_runtime_workers(async {
+                    curvy_core::imt::Imt::from_leaves(30, &leaves);
+                })
+                .await;
+                let build_time = started.elapsed();
+                stop.store(true, Ordering::Relaxed);
+                (build_time, ticker.await.expect("ticker"))
+            }))
+            .expect("test task");
+        assert!(
+            build_time > Duration::from_millis(100),
+            "the build must be heavy enough to matter: {build_time:?}"
+        );
+        assert!(
+            worst * 4 < build_time,
+            "the ticker stalled for {worst:?} during a {build_time:?} build"
+        );
     }
 
     use curvy_core::{field::Fr, witness::Note};
