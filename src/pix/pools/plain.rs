@@ -44,7 +44,10 @@ use backon::Retryable;
 use futures::{StreamExt, TryFutureExt};
 use hopr_api::{
     ChainKeypair,
-    chain::{ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource},
+    chain::{
+        ChainValues, ChainWriteAccountOperations, DepositNotification, DepositPool, PoolTransferSource,
+        SubmissionFailure,
+    },
     node::{HasChainApi, PixAddressId},
     types::{
         crypto::prelude::Keypair,
@@ -142,6 +145,10 @@ pub const DEPOSIT_MARKER_PAYLOAD: [u8; DEPOSIT_MARKER_PAYLOAD_LEN] = {
 pub(crate) enum PlainDepositError {
     #[error("the Safe cannot cover the deposit and its reserve, so nothing was sent")]
     Unaffordable { after_attempt: bool },
+    /// The Exit may have swept an earlier transfer that landed, so the balance check cannot tell
+    /// whether another one would pay twice.
+    #[error("a transfer to this deposit address was already sent, so another could pay twice")]
+    AlreadySent,
 }
 
 /// Rejects deposit data that is not [`DEPOSIT_MARKER_PAYLOAD`] filed under `id`.
@@ -565,6 +572,10 @@ pub struct NonAnonymousDepositPool<N: HasChainApi, C = BlokliClient> {
     client: C,
     cfg: NonAnonymousDepositPoolConfig,
     active_deposit_trackers: Arc<AtomicUsize>,
+    sent_to: moka::sync::Cache<Address, ()>,
+    /// What this pool swept out of each deposit address, so a deposit swept before the tracker's
+    /// next poll still counts as received.
+    swept_from: moka::sync::Cache<Address, HoprBalance>,
 }
 
 impl<N: HasChainApi> NonAnonymousDepositPool<N> {
@@ -632,6 +643,14 @@ impl<N: HasChainApi, C> NonAnonymousDepositPool<N, C> {
             client,
             cfg,
             active_deposit_trackers: Arc::new(AtomicUsize::new(0)),
+            sent_to: moka::sync::Cache::builder()
+                .max_capacity(ADDRESS_MEMORY_CAPACITY)
+                .time_to_live(ADDRESS_MEMORY_TTL)
+                .build(),
+            swept_from: moka::sync::Cache::builder()
+                .max_capacity(ADDRESS_MEMORY_CAPACITY)
+                .time_to_live(ADDRESS_MEMORY_TTL)
+                .build(),
         }
     }
 }
@@ -644,6 +663,9 @@ impl<N: HasChainApi, C> NonAnonymousDepositPool<N, C> {
 ///
 /// Jitter matters here: without it, a batch whose items all fail against the same
 /// unhealthy RPC endpoint re-fires in lockstep on every attempt.
+const ADDRESS_MEMORY_CAPACITY: u64 = 4096;
+const ADDRESS_MEMORY_TTL: Duration = Duration::from_secs(3600);
+
 fn retry_policy(max_times: usize) -> backon::ExponentialBuilder {
     backon::ExponentialBuilder::default()
         .with_max_times(max_times)
@@ -731,10 +753,9 @@ async fn deposit_once(
     cfg: &NonAnonymousDepositPoolConfig,
     dest_addr: Address,
     amount: HoprBalance,
-    // Set once this call is about to send the transfer. A retry reuses it, so a later gate
-    // refusal knows an earlier attempt may already have landed.
-    after_attempt: Arc<std::sync::atomic::AtomicBool>,
+    sent_to: &moka::sync::Cache<Address, ()>,
 ) -> Result<(), StrategyError> {
+    let already_sent = sent_to.contains_key(&dest_addr);
     let current: HoprBalance = node
         .chain_api()
         .balance(dest_addr)
@@ -764,16 +785,22 @@ async fn deposit_once(
             "insufficient wxHOPR in the Safe to fund the deposit"
         );
         return Err(StrategyError::other(PlainDepositError::Unaffordable {
-            after_attempt: after_attempt.load(std::sync::atomic::Ordering::Relaxed),
+            after_attempt: already_sent,
         }));
     }
 
-    after_attempt.store(true, std::sync::atomic::Ordering::Relaxed);
-    node.chain_api()
-        .withdraw(amount, &dest_addr)
-        .and_then(identity)
-        .await
-        .map_err(StrategyError::other)?;
+    if !sent_to.entry(dest_addr).or_insert(()).is_fresh() {
+        return Err(StrategyError::other(PlainDepositError::AlreadySent));
+    }
+    let chain = node.chain_api();
+    if let Err(error) = chain.withdraw(amount, &dest_addr).and_then(identity).await {
+        // Refused before broadcast, so nothing can land and the next attempt may send. Only this
+        // call's own mark is cleared: an earlier attempt would have refused at the claim above.
+        if matches!(chain.submission_failure(&error), SubmissionFailure::NotSubmitted) {
+            sent_to.invalidate(&dest_addr);
+        }
+        return Err(StrategyError::other(error));
+    }
 
     Ok(())
 }
@@ -975,11 +1002,9 @@ where
     /// Deposit funds from the node's own account to a deposit address, retrying up to
     /// [`NonAnonymousDepositPoolConfig::max_deposit_retries`] times.
     ///
-    /// What makes the retry safe is that every attempt re-reads the destination balance and
-    /// reports success without sending anything if it already holds `amount`; a submitted
-    /// transfer whose confirmation was lost is therefore not sent twice. The guarantee is
-    /// balance-based rather than transaction-based, so a third party funding the same
-    /// address also satisfies the check.
+    /// Every attempt reports success without sending if the destination already holds `amount`,
+    /// and a destination that was already sent to is never sent to again, as the Exit may have
+    /// swept the earlier transfer: an unconfirmed transfer can leave the deposit unpaid, not paid twice.
     ///
     /// `id` does not select anything to settle against — the destination address is what identifies
     /// the deposit on-chain, and this pool keeps no allocation-indexed state of its own. Beyond
@@ -1003,8 +1028,8 @@ where
         let (node, cfg) = (&self.node, &self.cfg);
         let id = *id;
 
-        let after_attempt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        (move || deposit_once(Arc::clone(node), cfg, dest_addr, amount, Arc::clone(&after_attempt)))
+        let sent_to = &self.sent_to;
+        (move || deposit_once(Arc::clone(node), cfg, dest_addr, amount, sent_to))
             .retry(retry_policy(self.cfg.max_deposit_retries))
             .sleep(backon::FuturesTimerSleeper)
             .notify(move |error, dur| {
@@ -1036,18 +1061,28 @@ where
         let target = min_amount;
         let max_tracking = self.cfg.max_deposit_tracking_time;
         let address = deposit_addr;
+        let swept_from = self.swept_from.clone();
+        let received = move |balance: HoprBalance| balance + swept_from.get(&address).unwrap_or(HoprBalance::zero());
 
         Ok(Box::pin(async move {
             let _tracker_slot = tracker_slot;
 
-            let poll_interval = (max_tracking / 10).max(Duration::from_secs(1));
+            // Capped because the Exit's own sweep empties the address once the cycle recovers,
+            // and a poll that comes after it never sees the deposit.
+            let poll_interval = (max_tracking / 10).clamp(Duration::from_secs(1), Duration::from_secs(5));
 
             let phase_jitter = Duration::from_millis(hopr_api::types::crypto_random::random_integer(
                 0,
                 Some(poll_interval.as_millis() as u64),
             ));
 
-            let immediate = node.chain_api().balance(address).await.ok().filter(|b| *b >= target);
+            let immediate = node
+                .chain_api()
+                .balance(address)
+                .await
+                .ok()
+                .map(&received)
+                .filter(|b| *b >= target);
 
             if let Some(balance) = immediate {
                 return Ok((id, dst, balance));
@@ -1055,10 +1090,14 @@ where
 
             futures_time::task::sleep(phase_jitter.into()).await;
 
-            let mut stream = futures_time::stream::interval(poll_interval.into())
+            // The first poll right after the jitter, since `interval` waits a full period first.
+            let polls = futures::stream::once(futures::future::ready(()))
+                .chain(futures_time::stream::interval(poll_interval.into()).map(|_| ()));
+            let mut stream = polls
                 .then(move |_| {
                     let node = Arc::clone(&node);
-                    async move { node.chain_api().balance(address).await }
+                    let received = received.clone();
+                    async move { node.chain_api().balance(address).await.map(received) }
                 })
                 .filter_map(move |result| async move {
                     match result {
@@ -1115,14 +1154,17 @@ where
         let (client, node_key) = (&self.client, &self.node_key);
         let id = *id;
 
-        (move || sweep_single(Arc::clone(node), client.clone(), node_key, cfg, chain_key, dst))
+        let swept = (move || sweep_single(Arc::clone(node), client.clone(), node_key, cfg, chain_key, dst))
             .retry(retry_policy(cfg.max_sweep_retries))
             .sleep(backon::FuturesTimerSleeper)
             .notify(move |error, dur| {
                 tracing::warn!(%error, ?id, %dst, ?dur, "sweep failed, retrying in");
             })
-            .await
-            .map(|_| ())
+            .await?;
+        let from = chain_key.public().to_address();
+        let swept_earlier = self.swept_from.get(&from).unwrap_or(HoprBalance::zero());
+        self.swept_from.insert(from, swept_earlier + swept);
+        Ok(())
     }
 
     /// Its funding is the Safe, so there is no pool to move value into: a builder refuses a
@@ -1634,18 +1676,11 @@ mod tests {
             min_safe_hopr_reserve: HoprBalance::zero(),
             ..cfg()
         };
-        let attempts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_to = moka::sync::Cache::builder().max_capacity(8).build();
         let node = f.pool.node.clone();
-        super::deposit_once(
-            Arc::clone(&node),
-            &affordable,
-            f.dest_addr,
-            amount,
-            Arc::clone(&attempts),
-        )
-        .await?;
+        super::deposit_once(Arc::clone(&node), &affordable, f.dest_addr, amount, &sent_to).await?;
         assert!(
-            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            sent_to.contains_key(&f.dest_addr),
             "reaching the transfer must set the flag"
         );
 
@@ -1655,7 +1690,7 @@ mod tests {
             min_safe_hopr_reserve: HoprBalance::new_base(5),
             ..cfg()
         };
-        let error = super::deposit_once(Arc::clone(&node), &refused, f.dest_addr, amount * 2u32, attempts)
+        let error = super::deposit_once(Arc::clone(&node), &refused, f.dest_addr, amount * 2u32, &sent_to)
             .await
             .expect_err("the reserve refuses it");
         let StrategyError::Other(inner) = error else {
@@ -1665,6 +1700,41 @@ mod tests {
             inner.downcast_ref::<PlainDepositError>(),
             Some(&PlainDepositError::Unaffordable { after_attempt: true })
         );
+        Ok(())
+    }
+
+    /// The Exit may have swept an earlier transfer to this destination, so an empty destination
+    /// does not prove the deposit is unpaid.
+    #[test_log::test(tokio::test)]
+    async fn a_destination_already_sent_to_is_not_sent_to_again() -> anyhow::Result<()> {
+        let f = fixture(
+            Balances {
+                safe_hopr: HoprBalance::new_base(100),
+                ..Default::default()
+            },
+            cfg(),
+        )
+        .await?;
+        let sent_to = moka::sync::Cache::builder().max_capacity(8).build();
+        sent_to.insert(f.dest_addr, ());
+
+        let error = super::deposit_once(
+            f.pool.node.clone(),
+            &cfg(),
+            f.dest_addr,
+            HoprBalance::new_base(10),
+            &sent_to,
+        )
+        .await
+        .expect_err("the destination was already sent to");
+        let StrategyError::Other(inner) = error else {
+            anyhow::bail!("expected a typed refusal, got {error}");
+        };
+        assert_eq!(
+            inner.downcast_ref::<PlainDepositError>(),
+            Some(&PlainDepositError::AlreadySent)
+        );
+        assert!(f.hopr(f.dest_addr).await?.is_zero(), "nothing is sent again");
         Ok(())
     }
 
